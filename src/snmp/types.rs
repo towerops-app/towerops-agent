@@ -1,6 +1,5 @@
 use thiserror::Error;
 
-#[allow(dead_code)] // Some variants used only in full SNMP implementation
 #[derive(Debug, Error)]
 pub enum SnmpError {
     #[error("SNMP request failed: {0}")]
@@ -22,7 +21,7 @@ pub enum SnmpError {
 pub type SnmpResult<T> = Result<T, SnmpError>;
 
 /// SNMP value returned from a GET operation
-#[allow(dead_code)] // All variants used in full SNMP implementation
+#[allow(dead_code)] // Some variants' data not yet accessed directly
 #[derive(Debug, Clone)]
 pub enum SnmpValue {
     Integer(i64),

@@ -1,10 +1,25 @@
 use crate::buffer::Storage;
+use crate::buffer::StorageError;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ExecutorError {
+    #[error("Storage error: {0}")]
+    Storage(#[from] StorageError),
+    #[error("SNMP error: {0}")]
+    Snmp(#[from] crate::snmp::SnmpError),
+    #[error("Conversion error: {0}")]
+    Conversion(String),
+}
+
+pub type Result<T> = std::result::Result<T, ExecutorError>;
+
 use crate::config::EquipmentConfig;
 use crate::metrics::{InterfaceStat, Metric, SensorReading};
 use crate::snmp::SnmpClient;
-use anyhow::Result;
-use chrono::Utc;
-use tracing::{error, info, warn};
+
+use crate::metrics::Timestamp;
+use log::{error, info, warn};
 
 /// Executor handles polling individual pieces of equipment
 pub struct Executor {
@@ -71,7 +86,7 @@ impl Executor {
                         sensor_id: sensor.id.clone(),
                         value: final_value,
                         status: "ok".to_string(),
-                        timestamp: Utc::now(),
+                        timestamp: Timestamp::now(),
                     };
 
                     if let Err(e) = self.storage.store_metric(&Metric::SensorReading(reading)) {
@@ -186,7 +201,7 @@ impl Executor {
                 if_out_errors: out_errors,
                 if_in_discards: in_discards,
                 if_out_discards: out_discards,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
             };
 
             if let Err(e) = self.storage.store_metric(&Metric::InterfaceStat(stat)) {
@@ -212,6 +227,6 @@ impl Executor {
 
         value
             .as_i64()
-            .ok_or_else(|| anyhow::anyhow!("Could not convert value to i64"))
+            .ok_or_else(|| ExecutorError::Conversion("Could not convert value to i64".into()))
     }
 }

@@ -1,13 +1,30 @@
 use crate::api_client::ApiClient;
+use crate::buffer::StorageError;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum SchedulerError {
+    #[error("API error: {0}")]
+    Api(#[from] crate::api_client::ApiError),
+    #[error("Storage error: {0}")]
+    Storage(#[from] StorageError),
+    #[error("SNMP error: {0}")]
+    Snmp(#[from] crate::snmp::SnmpError),
+    #[error("Executor error: {0}")]
+    Executor(#[from] super::executor::ExecutorError),
+}
+
+pub type Result<T> = std::result::Result<T, SchedulerError>;
+
 use crate::buffer::Storage;
 use crate::config::{AgentConfig, HeartbeatMetadata};
 use crate::poller::Executor;
 use crate::snmp::SnmpClient;
-use anyhow::Result;
-use chrono::Utc;
+
+use crate::metrics::Timestamp;
+use log::{error, info, warn};
 use std::time::Duration;
 use tokio::time::interval;
-use tracing::{error, info, warn};
 
 /// Main scheduler that orchestrates polling, config refresh, and metrics submission
 pub struct Scheduler {
@@ -16,7 +33,7 @@ pub struct Scheduler {
     executor: Executor,
     config_refresh_seconds: u64,
     current_config: Option<AgentConfig>,
-    start_time: chrono::DateTime<Utc>,
+    start_time: Timestamp,
 }
 
 impl Scheduler {
@@ -34,7 +51,7 @@ impl Scheduler {
             executor,
             config_refresh_seconds,
             current_config: None,
-            start_time: Utc::now(),
+            start_time: Timestamp::now(),
         }
     }
 
@@ -105,7 +122,7 @@ impl Scheduler {
                     "Failed to fetch config, continuing with cached config: {}",
                     e
                 );
-                Err(e)
+                Err(e.into())
             }
         }
     }
@@ -130,15 +147,13 @@ impl Scheduler {
             }
             Err(e) => {
                 warn!("Failed to submit metrics, will retry later: {}", e);
-                Err(e)
+                Err(e.into())
             }
         }
     }
 
     async fn send_heartbeat(&self) -> Result<()> {
-        let uptime = Utc::now()
-            .signed_duration_since(self.start_time)
-            .num_seconds() as u64;
+        let uptime = self.start_time.elapsed_secs() as u64;
 
         let hostname = hostname::get()
             .ok()
@@ -171,7 +186,7 @@ impl Scheduler {
             // Check if it's time to poll this equipment
             let should_poll = match poll_times.get(&equipment.id) {
                 Some(last_poll) => {
-                    let elapsed = Utc::now().signed_duration_since(*last_poll).num_seconds() as u64;
+                    let elapsed = last_poll.elapsed_secs() as u64;
                     elapsed >= equipment.poll_interval_seconds
                 }
                 None => true, // Never polled before

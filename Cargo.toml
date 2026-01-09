@@ -5,16 +5,14 @@ edition = "2021"
 
 [dependencies]
 snmp = "0.2"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-tokio = { version = "1", features = ["full"] }
+ureq = { version = "2.10", features = ["json"], default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
 thiserror = "1.0"
-chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.0", features = ["derive", "env"] }
 hostname = "0.4"
 

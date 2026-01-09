@@ -5,10 +5,9 @@ mod metrics;
 mod poller;
 mod snmp;
 
-use anyhow::Result;
 use clap::Parser;
+use log::info;
 use poller::Scheduler;
-use tracing::info;
 
 #[derive(Parser)]
 #[command(name = "towerops-agent")]
@@ -32,14 +31,9 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
 
@@ -52,8 +46,22 @@ async fn main() -> Result<()> {
     info!("Database path: {}", args.database_path);
 
     // Initialize components
-    let api_client = api_client::ApiClient::new(args.api_url, args.token)?;
-    let storage = buffer::Storage::new(args.database_path)?;
+    let api_client = match api_client::ApiClient::new(args.api_url, args.token) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("Failed to create API client: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let storage = match buffer::Storage::new(args.database_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to create storage: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     let snmp_client = snmp::SnmpClient::new();
 
     // Create and run scheduler
@@ -64,5 +72,8 @@ async fn main() -> Result<()> {
         args.config_refresh_seconds,
     );
 
-    scheduler.run().await
+    if let Err(e) = scheduler.run().await {
+        eprintln!("Scheduler error: {}", e);
+        std::process::exit(1);
+    }
 }

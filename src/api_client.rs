@@ -1,14 +1,29 @@
 use crate::config::{AgentConfig, HeartbeatMetadata};
 use crate::metrics::Metric;
-use anyhow::{Context, Result};
-use reqwest::Client;
 use serde_json::json;
 use std::time::Duration;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("HTTP request failed: {0}")]
+    RequestFailed(String),
+
+    #[error("HTTP status error: {0}")]
+    StatusError(u16),
+
+    #[error("JSON parsing error: {0}")]
+    JsonError(#[from] std::io::Error),
+
+    #[error("Task join error: {0}")]
+    JoinError(String),
+}
+
+pub type Result<T> = std::result::Result<T, ApiError>;
 
 /// API client for communicating with the Towerops server
 #[derive(Clone)]
 pub struct ApiClient {
-    client: Client,
     base_url: String,
     token: String,
 }
@@ -16,38 +31,34 @@ pub struct ApiClient {
 impl ApiClient {
     /// Create a new API client
     pub fn new(base_url: String, token: String) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .context("Failed to create HTTP client")?;
-
-        Ok(Self {
-            client,
-            base_url,
-            token,
-        })
+        Ok(Self { base_url, token })
     }
 
     /// Fetch configuration from the API
     pub async fn fetch_config(&self) -> Result<AgentConfig> {
         let url = format!("{}/api/v1/agent/config", self.base_url);
+        let token = self.token.clone();
 
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .send()
-            .await
-            .context("Failed to send config request")?;
+        let config = tokio::task::spawn_blocking(move || {
+            let response = ureq::get(&url)
+                .set("Authorization", &format!("Bearer {}", token))
+                .timeout(Duration::from_secs(30))
+                .call()
+                .map_err(|e| ApiError::RequestFailed(e.to_string()))?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Config request failed with status: {}", response.status());
-        }
+            let status = response.status();
+            if status != 200 {
+                return Err(ApiError::StatusError(status));
+            }
 
-        let config: AgentConfig = response
-            .json()
-            .await
-            .context("Failed to parse config response")?;
+            let config: AgentConfig = response
+                .into_json()
+                .map_err(|e| ApiError::RequestFailed(e.to_string()))?;
+
+            Ok(config)
+        })
+        .await
+        .map_err(|e| ApiError::JoinError(e.to_string()))??;
 
         Ok(config)
     }
@@ -59,22 +70,24 @@ impl ApiClient {
         }
 
         let url = format!("{}/api/v1/agent/metrics", self.base_url);
+        let token = self.token.clone();
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .json(&json!({ "metrics": metrics }))
-            .send()
-            .await
-            .context("Failed to send metrics request")?;
+        tokio::task::spawn_blocking(move || {
+            let response = ureq::post(&url)
+                .set("Authorization", &format!("Bearer {}", token))
+                .timeout(Duration::from_secs(30))
+                .send_json(json!({ "metrics": metrics }))
+                .map_err(|e| ApiError::RequestFailed(e.to_string()))?;
 
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "Metrics submission failed with status: {}",
-                response.status()
-            );
-        }
+            let status = response.status();
+            if status != 200 {
+                return Err(ApiError::StatusError(status));
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| ApiError::JoinError(e.to_string()))??;
 
         Ok(())
     }
@@ -82,19 +95,24 @@ impl ApiClient {
     /// Send heartbeat to the API
     pub async fn heartbeat(&self, metadata: HeartbeatMetadata) -> Result<()> {
         let url = format!("{}/api/v1/agent/heartbeat", self.base_url);
+        let token = self.token.clone();
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .json(&metadata)
-            .send()
-            .await
-            .context("Failed to send heartbeat request")?;
+        tokio::task::spawn_blocking(move || {
+            let response = ureq::post(&url)
+                .set("Authorization", &format!("Bearer {}", token))
+                .timeout(Duration::from_secs(30))
+                .send_json(&metadata)
+                .map_err(|e| ApiError::RequestFailed(e.to_string()))?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Heartbeat failed with status: {}", response.status());
-        }
+            let status = response.status();
+            if status != 200 {
+                return Err(ApiError::StatusError(status));
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| ApiError::JoinError(e.to_string()))??;
 
         Ok(())
     }
