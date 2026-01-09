@@ -17,7 +17,7 @@ variables:
 # Test stage - compile and check code
 test:
   stage: test
-  image: rust:1.82-alpine
+  image: rust:1.83-alpine
   before_script:
     - apk add --no-cache musl-dev
   script:
