@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   towerops-agent:
-    image: registry.gitlab.com/graham/towerops-agent:latest
+    image: registry.gitlab.com/towerops/towerops-agent:latest
     container_name: towerops-agent
     restart: unless-stopped
 
