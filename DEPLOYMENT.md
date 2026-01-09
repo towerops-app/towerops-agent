@@ -193,7 +193,12 @@ docker run --rm \
 
 ### Test Before Pushing
 
+**Prerequisites**: Rust 1.82+ (required for Cargo.lock v4)
+
 ```bash
+# Check Rust version
+rustc --version  # Should be 1.82.0 or later
+
 # Check compilation
 cargo check --release
 
@@ -285,6 +290,22 @@ Recommended settings:
 - Remove tags older than: 90 days
 
 ## Troubleshooting
+
+### Pipeline Fails with "lock file version not understood"
+
+**Symptom**:
+```
+error: failed to parse lock file at: /builds/graham/towerops-agent/Cargo.lock
+Caused by:
+  lock file version `4` was found, but this version of Cargo does not understand this lock file
+```
+
+**Cause**: Cargo.lock version 4 requires Rust 1.77+
+
+**Fix**: The CI configuration uses Rust 1.82. If you see this error:
+1. Update `.gitlab-ci.yml` to use `rust:1.82-alpine` or later
+2. Update `Dockerfile` to use `rust:1.82-alpine` or later
+3. Regenerate Cargo.lock: `cargo update` (if needed)
 
 ### Pipeline Fails at Test Stage
 
