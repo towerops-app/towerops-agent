@@ -21,7 +21,7 @@ impl Timestamp {
         Self::now().secs - self.secs
     }
 
-    pub fn to_rfc3339(&self) -> String {
+    pub fn to_rfc3339(self) -> String {
         // Convert Unix timestamp to RFC3339 format
         // This is a simplified implementation that produces UTC timestamps
         let secs = self.secs;
