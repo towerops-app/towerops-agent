@@ -91,7 +91,7 @@ If the API is unreachable, metrics are stored locally for up to 24 hours. When c
 
 ### Prerequisites
 
-- Rust 1.75 or later
+- Rust 1.82 or later (required for Cargo.lock v4)
 - SQLite development libraries
 
 ### Build
