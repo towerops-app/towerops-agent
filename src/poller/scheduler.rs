@@ -101,7 +101,10 @@ impl Scheduler {
                 Ok(())
             }
             Err(e) => {
-                warn!("Failed to fetch config, continuing with cached config: {}", e);
+                warn!(
+                    "Failed to fetch config, continuing with cached config: {}",
+                    e
+                );
                 Err(e)
             }
         }
@@ -168,9 +171,7 @@ impl Scheduler {
             // Check if it's time to poll this equipment
             let should_poll = match poll_times.get(&equipment.id) {
                 Some(last_poll) => {
-                    let elapsed = Utc::now()
-                        .signed_duration_since(*last_poll)
-                        .num_seconds() as u64;
+                    let elapsed = Utc::now().signed_duration_since(*last_poll).num_seconds() as u64;
                     elapsed >= equipment.poll_interval_seconds
                 }
                 None => true, // Never polled before

@@ -39,6 +39,7 @@ impl SnmpClient {
     /// Perform an SNMP WALK operation to get multiple values
     ///
     /// TODO: Complete SNMP library integration with proper walk implementation
+    #[allow(dead_code)] // Used in full SNMP implementation
     pub async fn walk(
         &self,
         ip_address: &str,

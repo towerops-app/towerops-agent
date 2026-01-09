@@ -57,11 +57,7 @@ impl Storage {
 
         conn.execute(
             "INSERT INTO metrics (metric_type, data, timestamp) VALUES (?1, ?2, ?3)",
-            params![
-                metric.metric_type(),
-                data,
-                metric.timestamp().to_rfc3339()
-            ],
+            params![metric.metric_type(), data, metric.timestamp().to_rfc3339()],
         )
         .context("Failed to insert metric")?;
 
@@ -125,6 +121,7 @@ impl Storage {
     }
 
     /// Get the last poll time for equipment
+    #[allow(dead_code)] // Used in full SNMP implementation
     pub fn get_last_poll_time(&self, equipment_id: &str) -> Result<Option<DateTime<Utc>>> {
         let conn = self.conn.lock().unwrap();
 
