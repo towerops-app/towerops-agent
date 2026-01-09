@@ -1,3 +1,3 @@
 mod storage;
 
-pub use storage::Storage;
+pub use storage::{Storage, StorageError};

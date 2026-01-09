@@ -20,6 +20,7 @@ test:
   image: rust:1.83-alpine
   before_script:
     - apk add --no-cache musl-dev
+    - rustup component add rustfmt clippy
   script:
     - cargo check --release
     - cargo fmt -- --check
