@@ -41,10 +41,7 @@ impl ApiClient {
             .context("Failed to send config request")?;
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "Config request failed with status: {}",
-                response.status()
-            );
+            anyhow::bail!("Config request failed with status: {}", response.status());
         }
 
         let config: AgentConfig = response
@@ -96,10 +93,7 @@ impl ApiClient {
             .context("Failed to send heartbeat request")?;
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "Heartbeat failed with status: {}",
-                response.status()
-            );
+            anyhow::bail!("Heartbeat failed with status: {}", response.status());
         }
 
         Ok(())
