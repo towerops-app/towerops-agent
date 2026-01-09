@@ -17,6 +17,14 @@ The Towerops agent enables customers to deploy SNMP polling infrastructure on th
 
 ## Quick Start
 
+### Using Pre-built Image
+
+Pull the latest image from GitLab Container Registry:
+
+```bash
+docker pull registry.gitlab.com/graham/towerops-agent:latest
+```
+
 ### Using Docker Compose
 
 1. Create a `docker-compose.yml` file:
@@ -25,7 +33,7 @@ The Towerops agent enables customers to deploy SNMP polling infrastructure on th
 version: '3.8'
 services:
   towerops-agent:
-    image: towerops/agent:latest
+    image: registry.gitlab.com/graham/towerops-agent:latest
     restart: unless-stopped
     environment:
       - TOWEROPS_API_URL=https://app.towerops.com
