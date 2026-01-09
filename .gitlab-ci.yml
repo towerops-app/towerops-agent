@@ -9,7 +9,7 @@ stages:
 variables:
   # GitLab Container Registry
   REGISTRY: registry.gitlab.com
-  IMAGE_NAME: graham/towerops-agent
+  IMAGE_NAME: towerops/towerops-agent
   # Docker BuildKit for better caching
   DOCKER_BUILDKIT: 1
   DOCKER_TLS_CERTDIR: "/certs"

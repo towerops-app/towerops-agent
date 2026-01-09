@@ -22,7 +22,7 @@ The Towerops agent enables customers to deploy SNMP polling infrastructure on th
 Pull the latest image from GitLab Container Registry:
 
 ```bash
-docker pull registry.gitlab.com/graham/towerops-agent:latest
+docker pull registry.gitlab.com/towerops/towerops-agent:latest
 ```
 
 ### Using Docker Compose
@@ -33,7 +33,7 @@ docker pull registry.gitlab.com/graham/towerops-agent:latest
 version: '3.8'
 services:
   towerops-agent:
-    image: registry.gitlab.com/graham/towerops-agent:latest
+    image: registry.gitlab.com/towerops/towerops-agent:latest
     restart: unless-stopped
     environment:
       - TOWEROPS_API_URL=https://app.towerops.com

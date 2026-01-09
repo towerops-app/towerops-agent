@@ -22,7 +22,7 @@ The agent uses GitLab CI/CD to automatically build and publish Docker images to 
 
 All images are pushed to:
 ```
-registry.gitlab.com/graham/towerops-agent
+registry.gitlab.com/towerops/towerops-agent
 ```
 
 ## Creating a Release
@@ -58,7 +58,7 @@ GitLab CI will automatically:
 
 Check the Container Registry:
 ```
-https://gitlab.com/graham/towerops-agent/container_registry
+https://gitlab.com/towerops/towerops-agent/container_registry
 ```
 
 You should see:
@@ -71,13 +71,13 @@ You should see:
 ### Pull Latest
 
 ```bash
-docker pull registry.gitlab.com/graham/towerops-agent:latest
+docker pull registry.gitlab.com/towerops/towerops-agent:latest
 ```
 
 ### Pull Specific Version
 
 ```bash
-docker pull registry.gitlab.com/graham/towerops-agent:0.1.0
+docker pull registry.gitlab.com/towerops/towerops-agent:0.1.0
 ```
 
 ### Docker Compose
@@ -86,9 +86,9 @@ Update `docker-compose.yml`:
 ```yaml
 services:
   towerops-agent:
-    image: registry.gitlab.com/graham/towerops-agent:latest
+    image: registry.gitlab.com/towerops/towerops-agent:latest
     # Or pin to specific version:
-    # image: registry.gitlab.com/graham/towerops-agent:0.1.0
+    # image: registry.gitlab.com/towerops/towerops-agent:0.1.0
     environment:
       - TOWEROPS_API_URL=https://app.towerops.com
       - TOWEROPS_AGENT_TOKEN=${AGENT_TOKEN}
@@ -107,7 +107,7 @@ Create `docker-compose.yml`:
 version: '3.8'
 services:
   towerops-agent:
-    image: registry.gitlab.com/graham/towerops-agent:latest
+    image: registry.gitlab.com/towerops/towerops-agent:latest
     container_name: towerops-agent
     restart: unless-stopped
     environment:
@@ -140,7 +140,7 @@ docker run -d \
   -e TOWEROPS_API_URL=https://app.towerops.com \
   -e TOWEROPS_AGENT_TOKEN=<token> \
   -v $(pwd)/data:/data \
-  registry.gitlab.com/graham/towerops-agent:latest
+  registry.gitlab.com/towerops/towerops-agent:latest
 ```
 
 ## CI/CD Configuration
@@ -165,7 +165,7 @@ These are automatically available in all GitLab CI/CD pipelines.
 
 ### Viewing Pipeline Status
 
-1. Go to: https://gitlab.com/graham/towerops-agent/-/pipelines
+1. Go to: https://gitlab.com/towerops/towerops-agent/-/pipelines
 2. Click on a pipeline to see detailed logs
 3. Check job logs if build fails
 
@@ -228,7 +228,7 @@ git tag -d v0.2.0
 git push origin :refs/tags/v0.2.0
 
 # Customers can use previous version
-docker pull registry.gitlab.com/graham/towerops-agent:0.1.0
+docker pull registry.gitlab.com/towerops/towerops-agent:0.1.0
 ```
 
 **Option 2: Quick Fix**
@@ -247,7 +247,7 @@ git push origin main --tags
 
 Update customer docker-compose.yml:
 ```yaml
-image: registry.gitlab.com/graham/towerops-agent:0.1.0  # Pin to working version
+image: registry.gitlab.com/towerops/towerops-agent:0.1.0  # Pin to working version
 ```
 
 ## Multi-Architecture Support (Optional)
@@ -265,7 +265,7 @@ This will build for:
 ### Check Image Size
 
 ```bash
-docker images registry.gitlab.com/graham/towerops-agent
+docker images registry.gitlab.com/towerops/towerops-agent
 ```
 
 Expected size: 10-20 MB
@@ -274,7 +274,7 @@ Expected size: 10-20 MB
 
 GitLab provides 10 GB of free registry storage. Monitor usage at:
 ```
-https://gitlab.com/graham/towerops-agent/-/packages
+https://gitlab.com/towerops/towerops-agent/-/packages
 ```
 
 ### Cleanup Old Images
@@ -295,7 +295,7 @@ Recommended settings:
 
 **Symptom**:
 ```
-error: failed to parse lock file at: /builds/graham/towerops-agent/Cargo.lock
+error: failed to parse lock file at: /builds/towerops/towerops-agent/Cargo.lock
 Caused by:
   lock file version `4` was found, but this version of Cargo does not understand this lock file
 ```
@@ -404,5 +404,5 @@ For issues with deployment:
 ---
 
 **Last Updated**: January 9, 2026
-**Registry**: registry.gitlab.com/graham/towerops-agent
+**Registry**: registry.gitlab.com/towerops/towerops-agent
 **Current Version**: 0.1.0 (pre-release)
