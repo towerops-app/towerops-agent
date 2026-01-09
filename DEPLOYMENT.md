@@ -193,11 +193,11 @@ docker run --rm \
 
 ### Test Before Pushing
 
-**Prerequisites**: Rust 1.82+ (required for Cargo.lock v4)
+**Prerequisites**: Rust 1.83+ (required by dependencies)
 
 ```bash
 # Check Rust version
-rustc --version  # Should be 1.82.0 or later
+rustc --version  # Should be 1.83.0 or later
 
 # Check compilation
 cargo check --release
@@ -300,12 +300,12 @@ Caused by:
   lock file version `4` was found, but this version of Cargo does not understand this lock file
 ```
 
-**Cause**: Cargo.lock version 4 requires Rust 1.77+
+**Cause**: Dependencies require Rust 1.83+
 
-**Fix**: The CI configuration uses Rust 1.82. If you see this error:
-1. Update `.gitlab-ci.yml` to use `rust:1.82-alpine` or later
-2. Update `Dockerfile` to use `rust:1.82-alpine` or later
-3. Regenerate Cargo.lock: `cargo update` (if needed)
+**Fix**: The CI configuration uses Rust 1.83. If you see this error:
+1. Update `.gitlab-ci.yml` to use `rust:1.83-alpine` or later
+2. Update `Dockerfile` to use `rust:1.83-alpine` or later
+3. Local development: Update Rust with `rustup update stable`
 
 ### Pipeline Fails at Test Stage
 
