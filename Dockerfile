@@ -4,10 +4,11 @@ FROM rust:1.83-alpine AS builder
 WORKDIR /app
 
 # Install build dependencies
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev protobuf-dev
 
-# Copy manifests
-COPY Cargo.toml Cargo.lock ./
+# Copy manifests and build files
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto ./proto
 
 # Create a dummy main.rs to build dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
