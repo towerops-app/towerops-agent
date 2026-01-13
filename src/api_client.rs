@@ -1,5 +1,7 @@
 use crate::config::{AgentConfig, HeartbeatMetadata};
 use crate::metrics::Metric;
+use crate::proto::agent;
+use prost::Message;
 use serde_json::json;
 use std::time::Duration;
 use thiserror::Error;
@@ -63,7 +65,7 @@ impl ApiClient {
         Ok(config)
     }
 
-    /// Submit metrics to the API
+    /// Submit metrics to the API using Protocol Buffers
     pub async fn submit_metrics(&self, metrics: Vec<Metric>) -> Result<()> {
         if metrics.is_empty() {
             return Ok(());
@@ -73,10 +75,28 @@ impl ApiClient {
         let token = self.token.clone();
 
         tokio::task::spawn_blocking(move || {
+            // Convert metrics to protobuf
+            let proto_metrics: Vec<agent::Metric> = metrics
+                .into_iter()
+                .map(|m| convert_metric_to_proto(&m))
+                .collect();
+
+            let batch = agent::MetricBatch {
+                metrics: proto_metrics,
+            };
+
+            // Encode to bytes
+            let mut buf = Vec::new();
+            batch
+                .encode(&mut buf)
+                .map_err(|e| ApiError::RequestFailed(format!("Protobuf encoding error: {}", e)))?;
+
+            // Send as protobuf
             let response = ureq::post(&url)
                 .set("Authorization", &format!("Bearer {}", token))
+                .set("Content-Type", "application/x-protobuf")
                 .timeout(Duration::from_secs(30))
-                .send_json(json!({ "metrics": metrics }))
+                .send_bytes(&buf)
                 .map_err(|e| ApiError::RequestFailed(e.to_string()))?;
 
             let status = response.status();
@@ -115,5 +135,37 @@ impl ApiClient {
         .map_err(|e| ApiError::JoinError(e.to_string()))??;
 
         Ok(())
+    }
+}
+
+/// Convert internal Metric type to protobuf Metric
+fn convert_metric_to_proto(metric: &Metric) -> agent::Metric {
+    use crate::metrics::Metric as M;
+
+    match metric {
+        M::SensorReading(sr) => agent::Metric {
+            metric_type: Some(agent::metric::MetricType::SensorReading(
+                agent::SensorReading {
+                    sensor_id: sr.sensor_id.clone(),
+                    value: sr.value,
+                    status: sr.status.clone(),
+                    timestamp: sr.timestamp.to_unix_timestamp(),
+                },
+            )),
+        },
+        M::InterfaceStat(is) => agent::Metric {
+            metric_type: Some(agent::metric::MetricType::InterfaceStat(
+                agent::InterfaceStat {
+                    interface_id: is.interface_id.clone(),
+                    if_in_octets: is.if_in_octets,
+                    if_out_octets: is.if_out_octets,
+                    if_in_errors: is.if_in_errors,
+                    if_out_errors: is.if_out_errors,
+                    if_in_discards: is.if_in_discards,
+                    if_out_discards: is.if_out_discards,
+                    timestamp: is.timestamp.to_unix_timestamp(),
+                },
+            )),
+        },
     }
 }

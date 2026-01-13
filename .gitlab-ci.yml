@@ -1,5 +1,5 @@
 # GitLab CI/CD Configuration for Towerops Agent
-# Builds and publishes Docker image to GitLab Container Registry
+# Builds and publishes Docker image to Docker Hub
 
 stages:
   - test
@@ -7,9 +7,9 @@ stages:
   - release
 
 variables:
-  # GitLab Container Registry
-  REGISTRY: registry.gitlab.com
-  IMAGE_NAME: towerops/towerops-agent
+  # Docker Hub Registry
+  REGISTRY: docker.io
+  IMAGE_NAME: gmcintire/towerops-agent
   # Docker BuildKit for better caching
   DOCKER_BUILDKIT: 1
   DOCKER_TLS_CERTDIR: "/certs"
@@ -17,6 +17,8 @@ variables:
 # Test stage - compile and check code
 test:
   stage: test
+  tags:
+    - vntx
   image: rust:1.83-alpine
   before_script:
     - apk add --no-cache musl-dev
@@ -37,11 +39,13 @@ test:
 # Build Docker image for branches (test build)
 build:test:
   stage: build
+  tags:
+    - vntx
   image: docker:24-dind
   services:
     - docker:24-dind
   before_script:
-    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_TOKEN
   script:
     - |
       docker build \
@@ -59,11 +63,13 @@ build:test:
 # Build and push for main branch
 build:main:
   stage: build
+  tags:
+    - vntx
   image: docker:24-dind
   services:
     - docker:24-dind
   before_script:
-    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_TOKEN
   script:
     - |
       docker build \
@@ -82,11 +88,13 @@ build:main:
 # Release build for tags (versioned releases)
 release:
   stage: release
+  tags:
+    - vntx
   image: docker:24-dind
   services:
     - docker:24-dind
   before_script:
-    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_TOKEN
   script:
     - |
       # Extract version from tag (assumes tags like v0.1.0)
@@ -114,11 +122,13 @@ release:
 
 build:multiarch:
   stage: build
+  tags:
+    - vntx
   image: docker:24-dind
   services:
     - docker:24-dind
   before_script:
-    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_TOKEN
     # Enable buildx for multi-arch
     - docker buildx create --use --name multiarch-builder
     - docker buildx inspect --bootstrap

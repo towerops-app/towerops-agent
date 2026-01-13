@@ -3,6 +3,7 @@ mod buffer;
 mod config;
 mod metrics;
 mod poller;
+mod proto;
 mod snmp;
 
 use clap::Parser;
