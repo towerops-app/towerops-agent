@@ -21,6 +21,10 @@ impl Timestamp {
         Self::now().secs - self.secs
     }
 
+    pub fn to_unix_timestamp(&self) -> i64 {
+        self.secs
+    }
+
     pub fn to_rfc3339(self) -> String {
         // Convert Unix timestamp to RFC3339 format
         // This is a simplified implementation that produces UTC timestamps

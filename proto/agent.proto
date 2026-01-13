@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package towerops.agent;
+
+// Configuration received from the API
+message AgentConfig {
+  string version = 1;
+  uint32 poll_interval_seconds = 2;
+  repeated Equipment equipment = 3;
+}
+
+message Equipment {
+  string id = 1;
+  string name = 2;
+  string ip_address = 3;
+  SnmpConfig snmp = 4;
+  uint32 poll_interval_seconds = 5;
+  repeated Sensor sensors = 6;
+  repeated Interface interfaces = 7;
+}
+
+message SnmpConfig {
+  bool enabled = 1;
+  string version = 2;
+  string community = 3;
+  uint32 port = 4;
+}
+
+message Sensor {
+  string id = 1;
+  string type = 2;
+  string oid = 3;
+  double divisor = 4;
+  string unit = 5;
+  map<string, string> metadata = 6;
+}
+
+message Interface {
+  string id = 1;
+  uint32 if_index = 2;
+  string if_name = 3;
+}
+
+// Metrics submitted to the API
+message MetricBatch {
+  repeated Metric metrics = 1;
+}
+
+message Metric {
+  oneof metric_type {
+    SensorReading sensor_reading = 1;
+    InterfaceStat interface_stat = 2;
+  }
+}
+
+message SensorReading {
+  string sensor_id = 1;
+  double value = 2;
+  string status = 3;
+  int64 timestamp = 4; // Unix timestamp in seconds
+}
+
+message InterfaceStat {
+  string interface_id = 1;
+  int64 if_in_octets = 2;
+  int64 if_out_octets = 3;
+  int64 if_in_errors = 4;
+  int64 if_out_errors = 5;
+  int64 if_in_discards = 6;
+  int64 if_out_discards = 7;
+  int64 timestamp = 8; // Unix timestamp in seconds
+}
+
+// Heartbeat metadata
+message HeartbeatMetadata {
+  string version = 1;
+  string hostname = 2;
+  uint64 uptime_seconds = 3;
+}
+
+message HeartbeatResponse {
+  string status = 1;
+}
