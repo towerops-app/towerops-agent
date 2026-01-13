@@ -2,7 +2,6 @@ use crate::config::{AgentConfig, HeartbeatMetadata};
 use crate::metrics::Metric;
 use crate::proto::agent;
 use prost::Message;
-use serde_json::json;
 use std::time::Duration;
 use thiserror::Error;
 
