@@ -18,10 +18,11 @@ Lightweight Rust agent for remote SNMP polling. Deployed on customer networks to
 
 ### Core Functionality
 - [x] **API Client** (`api_client.rs`)
-  - fetch_config() - GET /api/v1/agent/config
-  - submit_metrics() - POST /api/v1/agent/metrics
-  - heartbeat() - POST /api/v1/agent/heartbeat
-  - Uses reqwest with rustls-tls (30s timeout)
+  - fetch_config() - GET /api/v1/agent/config (Protocol Buffers)
+  - submit_metrics() - POST /api/v1/agent/metrics (Protocol Buffers)
+  - heartbeat() - POST /api/v1/agent/heartbeat (Protocol Buffers)
+  - Uses ureq with rustls-tls (30s timeout)
+  - Full Protocol Buffers integration for all endpoints
 
 - [x] **Storage** (`buffer/storage.rs`)
   - store_metric() - Save metrics to SQLite
@@ -49,6 +50,20 @@ Lightweight Rust agent for remote SNMP polling. Deployed on customer networks to
   - Logging with tracing
   - Graceful startup/shutdown
 
+### Protocol Buffers Integration
+- [x] **Protobuf Definitions** (`proto/agent.proto`)
+  - AgentConfig, Equipment, SnmpConfig, Sensor, Interface
+  - MetricBatch, Metric, SensorReading, InterfaceStat
+  - HeartbeatMetadata, HeartbeatResponse
+- [x] **Code Generation** (`build.rs`)
+  - Uses prost-build to compile protobuf definitions
+  - Generates Rust types at build time
+- [x] **API Communication**
+  - Config endpoint: Accepts `application/x-protobuf`, decodes response
+  - Metrics endpoint: Encodes batch to protobuf, sends with proper content-type
+  - Heartbeat endpoint: Encodes metadata to protobuf
+  - Conversion functions between protobuf and internal types
+
 ### Build & Deployment
 - [x] Cargo.toml with optimized release profile
   - opt-level = "z"
@@ -59,12 +74,14 @@ Lightweight Rust agent for remote SNMP polling. Deployed on customer networks to
 - [x] docker-compose.example.yml
 - [x] README with user documentation
 - [x] .gitignore and .dockerignore
+- [x] GitLab CI/CD configured for Docker Hub
 
 ### Build Status
 ```bash
 ✅ cargo build --release - SUCCESS
-⚠️  5 warnings (unused code - expected)
+⚠️  1 warning (HeartbeatResponse unused - expected)
 📦 Target size optimized for minimal footprint
+🚀 Protobuf integration complete
 ```
 
 ## What's Incomplete 🔄
