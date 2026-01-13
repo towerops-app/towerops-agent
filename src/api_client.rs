@@ -157,6 +157,16 @@ impl ApiClient {
                 return Err(ApiError::StatusError(status));
             }
 
+            // Read and decode response
+            let mut bytes = Vec::new();
+            response
+                .into_reader()
+                .read_to_end(&mut bytes)
+                .map_err(|e| ApiError::RequestFailed(e.to_string()))?;
+
+            let _heartbeat_response = agent::HeartbeatResponse::decode(&bytes[..])
+                .map_err(|e| ApiError::RequestFailed(format!("Heartbeat response decode error: {}", e)))?;
+
             Ok(())
         })
         .await
