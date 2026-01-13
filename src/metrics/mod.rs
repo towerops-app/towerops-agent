@@ -21,7 +21,7 @@ impl Timestamp {
         Self::now().secs - self.secs
     }
 
-    pub fn to_unix_timestamp(&self) -> i64 {
+    pub fn to_unix_timestamp(self) -> i64 {
         self.secs
     }
 
