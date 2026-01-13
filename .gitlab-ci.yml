@@ -62,9 +62,9 @@ build:main:
   services:
     - docker:24-dind
   before_script:
-    - docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_TOKEN
+    - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
     # Enable buildx for multi-arch
-    - docker buildx create --use --name multiarch-builder
+    - docker buildx create --driver docker-container --name multiarch-builder --use
     - docker buildx inspect --bootstrap
   script:
     - |
@@ -88,9 +88,9 @@ release:multiarch:
   services:
     - docker:24-dind
   before_script:
-    - docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_TOKEN
+    - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
     # Enable buildx for multi-arch
-    - docker buildx create --use --name multiarch-builder
+    - docker buildx create --driver docker-container --name multiarch-builder --use
     - docker buildx inspect --bootstrap
   script:
     - |
