@@ -1,10 +1,22 @@
 # Build stage
 FROM rust:1.83-alpine AS builder
 
+# Build arguments provided by Docker buildx
+ARG TARGETPLATFORM
+
 WORKDIR /app
 
 # Install build dependencies
 RUN apk add --no-cache musl-dev protobuf-dev
+
+# Determine Rust target based on platform and add it
+RUN case "$TARGETPLATFORM" in \
+    "linux/amd64") RUST_TARGET="x86_64-unknown-linux-musl" ;; \
+    "linux/arm64") RUST_TARGET="aarch64-unknown-linux-musl" ;; \
+    *) echo "Unsupported platform: $TARGETPLATFORM" && exit 1 ;; \
+    esac && \
+    echo "$RUST_TARGET" > /tmp/rust-target && \
+    rustup target add "$RUST_TARGET"
 
 # Copy manifests and build files
 COPY Cargo.toml Cargo.lock build.rs ./
@@ -14,7 +26,8 @@ COPY proto ./proto
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
 # Build dependencies (cached layer)
-RUN cargo build --release --target x86_64-unknown-linux-musl
+RUN RUST_TARGET=$(cat /tmp/rust-target) && \
+    cargo build --release --target "$RUST_TARGET"
 
 # Remove dummy src
 RUN rm -rf src
@@ -23,7 +36,10 @@ RUN rm -rf src
 COPY src ./src
 
 # Build the actual application
-RUN touch src/main.rs && cargo build --release --target x86_64-unknown-linux-musl
+RUN RUST_TARGET=$(cat /tmp/rust-target) && \
+    touch src/main.rs && \
+    cargo build --release --target "$RUST_TARGET" && \
+    cp "target/$RUST_TARGET/release/towerops-agent" /tmp/towerops-agent
 
 # Runtime stage
 FROM alpine:3.19
@@ -35,7 +51,7 @@ RUN apk add --no-cache ca-certificates
 RUN mkdir -p /data
 
 # Copy binary from builder
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/towerops-agent /usr/local/bin/
+COPY --from=builder /tmp/towerops-agent /usr/local/bin/towerops-agent
 
 # Volume for database
 VOLUME ["/data"]
