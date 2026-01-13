@@ -32,7 +32,6 @@ test:
     key: ${CI_COMMIT_REF_SLUG}-cargo
     paths:
       - target/
-      - .cargo/
 
 # Build Docker image for branches (test build)
 build:test:
