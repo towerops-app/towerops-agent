@@ -45,7 +45,8 @@ RUN RUST_TARGET=$(cat /tmp/rust-target) && \
 FROM alpine:3.19
 
 # Install runtime dependencies
-RUN apk add --no-cache ca-certificates su-exec
+# docker-cli is needed for self-update functionality
+RUN apk add --no-cache ca-certificates su-exec docker-cli
 
 # Create data directory
 RUN mkdir -p /data

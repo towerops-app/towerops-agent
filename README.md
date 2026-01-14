@@ -12,6 +12,7 @@ The Towerops agent enables customers to deploy SNMP polling infrastructure on th
 - **Secure Communication**: All communication with Towerops API uses HTTPS with token authentication
 - **Metric Buffering**: Stores up to 24 hours of metrics in SQLite when API is unavailable
 - **Automatic Configuration**: Fetches polling configuration from the Towerops API
+- **Automatic Updates**: Checks for new versions hourly and self-updates when available (requires Docker socket access)
 - **Low Resource Usage**: Built in Rust for minimal memory and CPU footprint (< 256 MB RAM typical)
 - **Docker Ready**: Pre-built Docker images for easy deployment
 
@@ -40,6 +41,8 @@ services:
       - TOWEROPS_AGENT_TOKEN=your-agent-token-here
     volumes:
       - ./data:/data
+      # Required for automatic self-updates
+      - /var/run/docker.sock:/var/run/docker.sock
 ```
 
 2. Start the agent:
@@ -47,6 +50,8 @@ services:
 ```bash
 docker-compose up -d
 ```
+
+**Note**: The Docker socket mount (`/var/run/docker.sock`) is required for automatic updates. The agent checks for new versions hourly and will automatically pull and restart with the latest version when available.
 
 ### Configuration
 

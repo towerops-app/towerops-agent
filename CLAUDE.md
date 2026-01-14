@@ -37,6 +37,7 @@ Lightweight Rust agent for remote SNMP polling. Deployed on customer networks to
   - Heartbeat every 60 seconds
   - Cleanup every hour
   - Poll check every 5 seconds
+  - Update check and auto-update every hour
 
 - [x] **Executor** (`poller/executor.rs`)
   - poll_sensors() - Poll configured sensors
@@ -51,11 +52,14 @@ Lightweight Rust agent for remote SNMP polling. Deployed on customer networks to
   - Graceful startup/shutdown
   - Docker image version checking on startup
 
-- [x] **Version Checking** (`version.rs`)
+- [x] **Version Checking & Auto-Update** (`version.rs`)
   - Checks Docker Hub for newer image versions on startup
+  - Performs periodic checks every hour (configurable in scheduler)
+  - Automatically pulls new image and restarts when update available
   - Compares current version with latest available
   - Logs warnings if updates are available
   - Non-blocking, fails gracefully if Docker Hub unavailable
+  - Requires Docker socket mount (`/var/run/docker.sock`) for self-update
 
 ### Protocol Buffers Integration
 - [x] **Protobuf Definitions** (`proto/agent.proto`)
