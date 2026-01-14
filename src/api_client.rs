@@ -46,6 +46,8 @@ pub struct ApiClient {
 impl ApiClient {
     /// Create a new API client
     pub fn new(base_url: String, token: String) -> Result<Self> {
+        // Strip trailing slash from base_url to avoid double slashes in URLs
+        let base_url = base_url.trim_end_matches('/').to_string();
         Ok(Self { base_url, token })
     }
 
