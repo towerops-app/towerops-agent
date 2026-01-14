@@ -24,7 +24,10 @@ pub fn check_for_updates() {
     match check_docker_hub() {
         Ok(Some(latest_version)) => {
             if latest_version != CURRENT_VERSION {
-                warn!("⚠️  Newer version available: {} (current: {})", latest_version, CURRENT_VERSION);
+                warn!(
+                    "⚠️  Newer version available: {} (current: {})",
+                    latest_version, CURRENT_VERSION
+                );
                 warn!("   Update with: docker pull {}:latest", DOCKER_IMAGE);
             } else {
                 info!("✓ Running latest version ({})", CURRENT_VERSION);
