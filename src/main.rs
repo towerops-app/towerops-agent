@@ -5,6 +5,7 @@ mod metrics;
 mod poller;
 mod proto;
 mod snmp;
+mod version;
 
 use clap::Parser;
 use log::{info, LevelFilter, Metadata, Record};
@@ -71,6 +72,10 @@ async fn main() {
     let args = Args::parse();
 
     info!("Towerops agent starting");
+
+    // Check for newer Docker image version
+    version::check_for_updates();
+
     info!("API URL: {}", args.api_url);
     info!(
         "Config refresh interval: {} seconds",

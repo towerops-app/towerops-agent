@@ -49,6 +49,13 @@ Lightweight Rust agent for remote SNMP polling. Deployed on customer networks to
   - Environment variable support
   - Logging with tracing
   - Graceful startup/shutdown
+  - Docker image version checking on startup
+
+- [x] **Version Checking** (`version.rs`)
+  - Checks Docker Hub for newer image versions on startup
+  - Compares current version with latest available
+  - Logs warnings if updates are available
+  - Non-blocking, fails gracefully if Docker Hub unavailable
 
 ### Protocol Buffers Integration
 - [x] **Protobuf Definitions** (`proto/agent.proto`)
@@ -246,6 +253,7 @@ towerops-agent/
 │   ├── main.rs              # Entry point, CLI, initialization
 │   ├── config.rs            # Types matching API responses
 │   ├── api_client.rs        # HTTP client for Towerops API
+│   ├── version.rs           # Docker image version checking
 │   ├── metrics/
 │   │   └── mod.rs          # Metric types (SensorReading, InterfaceStat)
 │   ├── snmp/
