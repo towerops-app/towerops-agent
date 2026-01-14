@@ -84,66 +84,9 @@ Lightweight Rust agent for remote SNMP polling. Deployed on customer networks to
 🚀 Protobuf integration complete
 ```
 
-## What's Incomplete 🔄
+## Testing Gaps
 
-### CRITICAL: SNMP Library Integration
-
-**Location**: `src/snmp/client.rs`
-
-**Problem**: The `snmp` crate v0.2 API is different than initially designed. Current implementation:
-- Validates IP addresses
-- Returns error for actual SNMP operations
-- Compiles successfully but doesn't poll
-
-**Current Code**:
-```rust
-pub async fn get(...) -> SnmpResult<SnmpValue> {
-    // Validates IP
-    // Returns: "SNMP implementation incomplete"
-}
-
-pub async fn walk(...) -> SnmpResult<Vec<(String, SnmpValue)>> {
-    // Validates IP
-    // Returns: empty vec
-}
-```
-
-**What's Needed**:
-
-1. Research the correct `snmp` crate 0.2 API:
-```bash
-cargo doc --open --package snmp
-```
-
-2. Implement actual SNMP operations:
-   - Create session with proper parameters
-   - Perform GET request for single OID
-   - Perform GETNEXT/WALK for OID subtrees
-   - Handle response parsing
-   - Map errors (timeout, auth failure, etc.)
-
-3. Key questions to answer:
-   - How to create SyncSession? (signature changed)
-   - How to send GET request? (method name/signature)
-   - How to send GETNEXT? (for walk implementation)
-   - How to parse responses? (varbinds format)
-   - How to handle errors? (error enum changed)
-
-4. Reference implementation:
-   - Check `snmp` crate examples directory
-   - Look at crate tests for usage patterns
-   - May need to read source code directly
-
-**Alternatives if `snmp` v0.2 doesn't work**:
-- `snmp-mp` crate (more actively maintained)
-- `snmp-parser` crate (lower level, more control)
-- `rasn-snmp` crate (ASN.1 based)
-
-**Estimated Effort**: 4-8 hours
-
-### Testing Gaps
-
-- [ ] Unit tests for SNMP client (depends on SNMP integration)
+- [ ] Unit tests for SNMP client
 - [ ] Unit tests for storage (SQLite operations)
 - [ ] Unit tests for API client (mock server)
 - [ ] Integration test with real SNMP device
@@ -268,16 +211,13 @@ docker run --rm \
 - Cross-compile to multiple architectures
 - Strong type safety for reliability
 
-### Why Simplified SNMP?
-- The `snmp` crate v0.2 API required research
-- Chose to ship architecture first, SNMP second
-- Allows testing of everything except SNMP polling
-- Can be completed independently
+### Why Async SNMP with spawn_blocking?
+- SNMP crate uses synchronous I/O
+- spawn_blocking moves sync operations to thread pool
+- Keeps main event loop non-blocking
+- Allows concurrent polling without blocking other tasks
 
 ## Common Issues
-
-### "SNMP implementation incomplete" Error
-**Expected**: This is the TODO for SNMP integration. The agent runs but can't poll devices yet.
 
 ### "Failed to fetch config" Error
 **Check**:
@@ -310,7 +250,7 @@ towerops-agent/
 │   │   └── mod.rs          # Metric types (SensorReading, InterfaceStat)
 │   ├── snmp/
 │   │   ├── mod.rs          # Module exports
-│   │   ├── client.rs       # ⚠️ INCOMPLETE - needs SNMP integration
+│   │   ├── client.rs       # ✅ SNMP client (GET and WALK)
 │   │   └── types.rs        # SNMP types and errors
 │   ├── buffer/
 │   │   ├── mod.rs          # Module exports
@@ -341,13 +281,7 @@ towerops-agent/
 
 ## Next Actions
 
-**Immediate** (to make agent functional):
-1. Research `snmp` crate v0.2 API documentation
-2. Update `src/snmp/client.rs` with working implementation
-3. Test with a real SNMP device or simulator
-4. Add unit tests for SNMP operations
-
-**Short-term** (for production readiness):
+**Immediate** (for production readiness):
 1. Add more comprehensive unit tests
 2. Integration test with mock SNMP device
 3. Load test with 100 devices
@@ -374,7 +308,8 @@ Agent is production-ready when:
 - [x] API client works (config, metrics, heartbeat)
 - [x] SQLite buffering works
 - [x] Event loop runs without panics
-- [ ] **SNMP polling works** ← ONLY REMAINING ITEM
+- [x] **SNMP polling works**
+- [ ] **Integration testing complete** ← CURRENT FOCUS
 - [ ] Metrics appear in Phoenix database
 - [ ] Survives 24h API outage
 - [ ] Uses <256 MB memory with 50 devices
@@ -402,6 +337,6 @@ Agent is production-ready when:
 
 ---
 
-**Last Updated**: January 9, 2026
-**Status**: Architecture complete, SNMP integration pending
+**Last Updated**: January 14, 2026
+**Status**: All code complete, integration testing needed
 **Version**: 0.1.0 (pre-release)
