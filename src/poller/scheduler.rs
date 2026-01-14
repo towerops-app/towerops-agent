@@ -101,6 +101,7 @@ impl Scheduler {
         let mut heartbeat_ticker = interval(Duration::from_secs(60));
         let mut cleanup_ticker = interval(Duration::from_secs(3600)); // Cleanup every hour
         let mut poll_ticker = interval(Duration::from_secs(5)); // Check if polling needed every 5s
+        let mut update_ticker = interval(Duration::from_secs(3600)); // Check for updates every hour
 
         loop {
             tokio::select! {
@@ -132,6 +133,10 @@ impl Scheduler {
                     if let Err(e) = self.poll_equipment().await {
                         error!("Polling error: {}", e);
                     }
+                }
+
+                _ = update_ticker.tick() => {
+                    self.check_and_update().await;
                 }
             }
         }
@@ -249,5 +254,28 @@ impl Scheduler {
         }
 
         Ok(())
+    }
+
+    async fn check_and_update(&self) {
+        info!("Checking for agent updates");
+
+        // Run version check in blocking thread to avoid blocking event loop
+        let result = tokio::task::spawn_blocking(crate::version::perform_self_update).await;
+
+        match result {
+            Ok(Ok(true)) => {
+                info!("Update initiated, container will restart with new version");
+                // perform_self_update calls std::process::exit(0), so we won't reach here
+            }
+            Ok(Ok(false)) => {
+                info!("Already running latest version");
+            }
+            Ok(Err(e)) => {
+                warn!("Failed to perform self-update: {}", e);
+            }
+            Err(e) => {
+                error!("Update check task failed: {}", e);
+            }
+        }
     }
 }

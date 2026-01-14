@@ -30,6 +30,10 @@ services:
       # Persistent storage for metrics buffering
       - ./data:/data
 
+      # Docker socket (required for automatic self-updates)
+      # The agent will check for updates hourly and automatically update itself
+      - /var/run/docker.sock:/var/run/docker.sock
+
     # Optional: Resource limits
     deploy:
       resources:
