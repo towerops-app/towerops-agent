@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 snmp = "0.2"
-ureq = { version = "2.10", features = ["json"], default-features = false }
+ureq = { version = "2.10", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
