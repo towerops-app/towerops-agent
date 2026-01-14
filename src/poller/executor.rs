@@ -1,15 +1,35 @@
 use crate::buffer::Storage;
 use crate::buffer::StorageError;
-use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum ExecutorError {
-    #[error("Storage error: {0}")]
-    Storage(#[from] StorageError),
-    #[error("SNMP error: {0}")]
-    Snmp(#[from] crate::snmp::SnmpError),
-    #[error("Conversion error: {0}")]
+    Storage(StorageError),
+    Snmp(crate::snmp::SnmpError),
     Conversion(String),
+}
+
+impl std::fmt::Display for ExecutorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(err) => write!(f, "Storage error: {}", err),
+            Self::Snmp(err) => write!(f, "SNMP error: {}", err),
+            Self::Conversion(msg) => write!(f, "Conversion error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ExecutorError {}
+
+impl From<StorageError> for ExecutorError {
+    fn from(err: StorageError) -> Self {
+        Self::Storage(err)
+    }
+}
+
+impl From<crate::snmp::SnmpError> for ExecutorError {
+    fn from(err: crate::snmp::SnmpError) -> Self {
+        Self::Snmp(err)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ExecutorError>;

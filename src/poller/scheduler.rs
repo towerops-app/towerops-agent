@@ -1,17 +1,49 @@
 use crate::api_client::ApiClient;
 use crate::buffer::StorageError;
-use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum SchedulerError {
-    #[error("API error: {0}")]
-    Api(#[from] crate::api_client::ApiError),
-    #[error("Storage error: {0}")]
-    Storage(#[from] StorageError),
-    #[error("SNMP error: {0}")]
-    Snmp(#[from] crate::snmp::SnmpError),
-    #[error("Executor error: {0}")]
-    Executor(#[from] super::executor::ExecutorError),
+    Api(crate::api_client::ApiError),
+    Storage(StorageError),
+    Snmp(crate::snmp::SnmpError),
+    Executor(super::executor::ExecutorError),
+}
+
+impl std::fmt::Display for SchedulerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Api(err) => write!(f, "API error: {}", err),
+            Self::Storage(err) => write!(f, "Storage error: {}", err),
+            Self::Snmp(err) => write!(f, "SNMP error: {}", err),
+            Self::Executor(err) => write!(f, "Executor error: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for SchedulerError {}
+
+impl From<crate::api_client::ApiError> for SchedulerError {
+    fn from(err: crate::api_client::ApiError) -> Self {
+        Self::Api(err)
+    }
+}
+
+impl From<StorageError> for SchedulerError {
+    fn from(err: StorageError) -> Self {
+        Self::Storage(err)
+    }
+}
+
+impl From<crate::snmp::SnmpError> for SchedulerError {
+    fn from(err: crate::snmp::SnmpError) -> Self {
+        Self::Snmp(err)
+    }
+}
+
+impl From<super::executor::ExecutorError> for SchedulerError {
+    fn from(err: super::executor::ExecutorError) -> Self {
+        Self::Executor(err)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, SchedulerError>;
@@ -155,10 +187,10 @@ impl Scheduler {
     async fn send_heartbeat(&self) -> Result<()> {
         let uptime = self.start_time.elapsed_secs() as u64;
 
-        let hostname = hostname::get()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .unwrap_or_else(|| "unknown".to_string());
+        // Get hostname from environment or system
+        let hostname = std::env::var("HOSTNAME")
+            .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
+            .unwrap_or_else(|_| "unknown".to_string());
 
         let metadata = HeartbeatMetadata {
             version: env!("CARGO_PKG_VERSION").to_string(),
