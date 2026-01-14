@@ -1,22 +1,25 @@
-use thiserror::Error;
-
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum SnmpError {
-    #[error("SNMP request failed: {0}")]
     RequestFailed(String),
-
-    #[error("Invalid OID: {0}")]
     InvalidOid(String),
-
-    #[error("Timeout")]
     Timeout,
-
-    #[error("Authentication failure")]
     AuthFailure,
-
-    #[error("Network unreachable")]
     NetworkUnreachable,
 }
+
+impl std::fmt::Display for SnmpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RequestFailed(msg) => write!(f, "SNMP request failed: {}", msg),
+            Self::InvalidOid(oid) => write!(f, "Invalid OID: {}", oid),
+            Self::Timeout => write!(f, "Timeout"),
+            Self::AuthFailure => write!(f, "Authentication failure"),
+            Self::NetworkUnreachable => write!(f, "Network unreachable"),
+        }
+    }
+}
+
+impl std::error::Error for SnmpError {}
 
 pub type SnmpResult<T> = Result<T, SnmpError>;
 

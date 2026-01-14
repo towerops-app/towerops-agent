@@ -6,21 +6,32 @@ use crate::proto::agent;
 use prost::Message;
 use std::io::Read;
 use std::time::Duration;
-use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum ApiError {
-    #[error("HTTP request failed: {0}")]
     RequestFailed(String),
-
-    #[error("HTTP status error: {0}")]
     StatusError(u16),
-
-    #[error("JSON parsing error: {0}")]
-    JsonError(#[from] std::io::Error),
-
-    #[error("Task join error: {0}")]
+    JsonError(std::io::Error),
     JoinError(String),
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RequestFailed(msg) => write!(f, "HTTP request failed: {}", msg),
+            Self::StatusError(status) => write!(f, "HTTP status error: {}", status),
+            Self::JsonError(err) => write!(f, "JSON parsing error: {}", err),
+            Self::JoinError(msg) => write!(f, "Task join error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+impl From<std::io::Error> for ApiError {
+    fn from(err: std::io::Error) -> Self {
+        Self::JsonError(err)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ApiError>;

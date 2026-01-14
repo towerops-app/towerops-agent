@@ -7,8 +7,40 @@ mod proto;
 mod snmp;
 
 use clap::Parser;
-use log::info;
+use log::{info, LevelFilter, Metadata, Record};
 use poller::Scheduler;
+use std::env;
+
+/// Minimal logger that writes to stderr
+struct SimpleLogger {
+    level: LevelFilter,
+}
+
+impl log::Log for SimpleLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= self.level
+    }
+
+    fn log(&self, record: &Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_logger() {
+    let level = env::var("RUST_LOG")
+        .unwrap_or_else(|_| "info".to_string())
+        .parse::<LevelFilter>()
+        .unwrap_or(LevelFilter::Info);
+
+    let logger = SimpleLogger { level };
+    log::set_boxed_logger(Box::new(logger))
+        .map(|()| log::set_max_level(level))
+        .ok();
+}
 
 #[derive(Parser)]
 #[command(name = "towerops-agent")]
@@ -34,7 +66,7 @@ struct Args {
 #[tokio::main]
 async fn main() {
     // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    init_logger();
 
     let args = Args::parse();
 

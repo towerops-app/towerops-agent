@@ -2,18 +2,42 @@ use crate::metrics::{Metric, Timestamp};
 use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum StorageError {
-    #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(rusqlite::Error),
+    Serialization(serde_json::Error),
+    Io(std::io::Error),
+}
 
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(err) => write!(f, "Database error: {}", err),
+            Self::Serialization(err) => write!(f, "Serialization error: {}", err),
+            Self::Io(err) => write!(f, "IO error: {}", err),
+        }
+    }
+}
 
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+impl std::error::Error for StorageError {}
+
+impl From<rusqlite::Error> for StorageError {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Database(err)
+    }
+}
+
+impl From<serde_json::Error> for StorageError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Serialization(err)
+    }
+}
+
+impl From<std::io::Error> for StorageError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
