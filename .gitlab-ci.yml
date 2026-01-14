@@ -12,7 +12,8 @@ variables:
   IMAGE_NAME: gmcintire/towerops-agent
   # Docker BuildKit for better caching
   DOCKER_BUILDKIT: 1
-  DOCKER_TLS_CERTDIR: "/certs"
+  # Disable TLS for buildx compatibility
+  DOCKER_TLS_CERTDIR: ""
 
 # Test stage - compile and check code
 test:
@@ -64,7 +65,7 @@ build:main:
   before_script:
     - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
     # Enable buildx for multi-arch
-    - docker buildx create --driver docker-container --name multiarch-builder --use
+    - docker buildx create --driver docker-container --name multiarch-builder --use || docker buildx use multiarch-builder
     - docker buildx inspect --bootstrap
   script:
     - |
@@ -90,7 +91,7 @@ release:multiarch:
   before_script:
     - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
     # Enable buildx for multi-arch
-    - docker buildx create --driver docker-container --name multiarch-builder --use
+    - docker buildx create --driver docker-container --name multiarch-builder --use || docker buildx use multiarch-builder
     - docker buildx inspect --bootstrap
   script:
     - |
