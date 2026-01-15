@@ -1,6 +1,7 @@
 mod api_client;
 mod buffer;
 mod config;
+mod health;
 mod metrics;
 mod poller;
 mod proto;
@@ -99,6 +100,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Start health endpoint server
+    let health_server = health::HealthServer::new(storage.clone());
+    health_server.start(8080);
 
     let snmp_client = snmp::SnmpClient::new();
 
