@@ -66,6 +66,10 @@ build:main:
     - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
     - docker buildx create --driver docker-container --name builder --use || docker buildx use builder
     - docker buildx inspect --bootstrap
+    # Extract version from Cargo.toml
+    - apk add --no-cache grep sed
+    - VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+    - echo "Building version $VERSION"
   script:
     - |
       docker buildx build \
@@ -73,10 +77,11 @@ build:main:
         --cache-from type=registry,ref=$REGISTRY/$IMAGE_NAME:buildcache \
         --cache-to type=registry,ref=$REGISTRY/$IMAGE_NAME:buildcache,mode=max \
         --tag $REGISTRY/$IMAGE_NAME:latest \
+        --tag $REGISTRY/$IMAGE_NAME:$VERSION \
         --tag $REGISTRY/$IMAGE_NAME:main-$CI_COMMIT_SHORT_SHA \
         --push \
         .
-    - echo "IMAGE_TAG=latest" >> build.env
+    - echo "IMAGE_TAG=$VERSION" >> build.env
   artifacts:
     reports:
       dotenv: build.env
