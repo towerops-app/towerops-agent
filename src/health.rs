@@ -33,18 +33,6 @@ impl HealthServer {
         }
     }
 
-    pub fn update_config_fetch_time(&self) {
-        if let Ok(mut last_fetch) = self.config_last_fetch.lock() {
-            *last_fetch = Some(Timestamp::now());
-        }
-    }
-
-    pub fn record_error(&self, error: String) {
-        if let Ok(mut last_error) = self.last_error.lock() {
-            *last_error = Some(error);
-        }
-    }
-
     pub fn start(self, port: u16) {
         thread::spawn(move || {
             let addr = format!("0.0.0.0:{}", port);
