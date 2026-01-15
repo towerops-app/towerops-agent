@@ -275,7 +275,13 @@ impl Scheduler {
 
             let task = tokio::spawn(async move {
                 // Acquire permit before polling (limits concurrency)
-                let _permit = permit.acquire().await.unwrap();
+                let _permit = match permit.acquire().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!("Failed to acquire polling permit: {}", e);
+                        return;
+                    }
+                };
 
                 info!("Polling equipment: {}", equipment.name);
 
