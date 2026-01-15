@@ -86,7 +86,10 @@ impl Storage {
     /// Store a metric in the buffer
     pub fn store_metric(&self, metric: &Metric) -> Result<()> {
         let data = serde_json::to_string(metric)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Database(rusqlite::Error::InvalidQuery))?;
 
         conn.execute(
             "INSERT INTO metrics (metric_type, data, timestamp) VALUES (?1, ?2, ?3)",
@@ -98,7 +101,10 @@ impl Storage {
 
     /// Get pending metrics that haven't been sent yet
     pub fn get_pending_metrics(&self, limit: usize) -> Result<Vec<(i64, Metric)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Database(rusqlite::Error::InvalidQuery))?;
 
         let mut stmt = conn
             .prepare("SELECT id, data FROM metrics WHERE sent = 0 ORDER BY created_at LIMIT ?1")?;
@@ -126,7 +132,10 @@ impl Storage {
             return Ok(());
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Database(rusqlite::Error::InvalidQuery))?;
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let query = format!("UPDATE metrics SET sent = 1 WHERE id IN ({})", placeholders);
 
@@ -138,7 +147,10 @@ impl Storage {
 
     /// Clean up old metrics that have been sent
     pub fn cleanup_old_metrics(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Database(rusqlite::Error::InvalidQuery))?;
 
         conn.execute(
             "DELETE FROM metrics WHERE sent = 1 AND created_at < datetime('now', '-24 hours')",
@@ -151,7 +163,10 @@ impl Storage {
     /// Get the last poll time for equipment
     #[allow(dead_code)] // Used in full SNMP implementation
     pub fn get_last_poll_time(&self, equipment_id: &str) -> Result<Option<Timestamp>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Database(rusqlite::Error::InvalidQuery))?;
 
         let result: std::result::Result<String, _> = conn.query_row(
             "SELECT last_poll_time FROM last_poll_times WHERE equipment_id = ?1",
@@ -172,7 +187,10 @@ impl Storage {
 
     /// Update the last poll time for equipment
     pub fn update_last_poll_time(&self, equipment_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Database(rusqlite::Error::InvalidQuery))?;
         let now = Timestamp::now().to_rfc3339();
 
         conn.execute(
@@ -185,7 +203,10 @@ impl Storage {
 
     /// Get all last poll times
     pub fn get_all_last_poll_times(&self) -> Result<std::collections::HashMap<String, Timestamp>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Database(rusqlite::Error::InvalidQuery))?;
 
         let mut stmt = conn.prepare("SELECT equipment_id, last_poll_time FROM last_poll_times")?;
 
