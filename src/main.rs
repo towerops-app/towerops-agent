@@ -8,12 +8,13 @@ mod proto;
 mod snmp;
 mod version;
 
+use chrono::Local;
 use clap::Parser;
 use log::{info, LevelFilter, Metadata, Record};
 use poller::Scheduler;
 use std::env;
 
-/// Minimal logger that writes to stderr
+/// Minimal logger that writes to stderr with timestamps
 struct SimpleLogger {
     level: LevelFilter,
 }
@@ -25,7 +26,8 @@ impl log::Log for SimpleLogger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
-            eprintln!("[{}] {}", record.level(), record.args());
+            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            eprintln!("[{}] [{}] {}", timestamp, record.level(), record.args());
         }
     }
 
