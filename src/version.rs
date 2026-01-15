@@ -6,137 +6,72 @@ const DOCKER_IMAGE: &str = "gmcintire/towerops-agent";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
-struct DockerHubResponse {
-    results: Vec<DockerHubTag>,
-}
-
-#[derive(Debug, Deserialize)]
 struct DockerHubTag {
-    name: String,
-    #[allow(dead_code)]
     last_updated: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct UpdateInfo {
-    pub current_version: String,
-    pub latest_version: Option<String>,
-    pub update_available: bool,
-}
-
-/// Check if a newer version of the Docker image is available
+/// Simple startup check - just logs current version and that updates are automatic
 pub fn check_for_updates() {
     info!("Current version: {}", CURRENT_VERSION);
-    info!("Checking for newer Docker image versions...");
+    info!("Automatic updates enabled - will check every hour");
+}
 
-    match get_update_info() {
-        Ok(info) => {
-            if info.update_available {
-                if let Some(ref latest) = info.latest_version {
-                    warn!(
-                        "⚠️  Newer version available: {} (current: {})",
-                        latest, info.current_version
-                    );
-                    warn!("   Update with: docker pull {}:latest", DOCKER_IMAGE);
-                }
-            } else {
-                info!("✓ Running latest version ({})", info.current_version);
-            }
+/// Perform self-update by pulling latest image and exiting
+/// This always pulls latest since we use the :latest tag and can't reliably compare versions
+/// Returns Ok(true) if update was initiated, Ok(false) if pull showed no changes
+pub fn perform_self_update() -> Result<bool, String> {
+    // Check if latest tag exists on Docker Hub (quick sanity check)
+    match check_latest_exists() {
+        Ok(last_updated) => {
+            info!(
+                "Latest image on Docker Hub was updated at: {}",
+                last_updated
+            );
         }
         Err(e) => {
-            warn!("Failed to check for updates: {}", e);
+            warn!("Could not verify latest tag on Docker Hub: {}", e);
+            // Continue anyway - if pull fails we'll catch it below
         }
     }
-}
 
-/// Get update information without logging
-pub fn get_update_info() -> Result<UpdateInfo, String> {
-    let latest_version = check_docker_hub().map_err(|e| e.to_string())?;
-    let update_available = if let Some(ref latest) = latest_version {
-        latest != CURRENT_VERSION
-    } else {
-        false
-    };
+    // Pull the latest image
+    info!("Pulling latest Docker image: {}:latest", DOCKER_IMAGE);
+    let output = Command::new("docker")
+        .args(["pull", &format!("{}:latest", DOCKER_IMAGE)])
+        .output()
+        .map_err(|e| format!("Failed to execute docker command: {}", e))?;
 
-    Ok(UpdateInfo {
-        current_version: CURRENT_VERSION.to_string(),
-        latest_version,
-        update_available,
-    })
-}
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to pull image: {}", stderr));
+    }
 
-/// Perform self-update by pulling new image and exiting
-/// Returns Ok(true) if update was initiated, Ok(false) if already up-to-date
-pub fn perform_self_update() -> Result<bool, String> {
-    let info = get_update_info()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    if !info.update_available {
-        info!("Already running latest version, no update needed");
+    // Check if the image was actually updated
+    if stdout.contains("Image is up to date") || stdout.contains("Already exists") {
+        info!("Image is already up to date, no restart needed");
         return Ok(false);
     }
 
-    if let Some(ref latest) = info.latest_version {
-        warn!(
-            "Performing self-update: {} -> {}",
-            info.current_version, latest
-        );
+    info!("Successfully pulled new image");
+    info!("Exiting to allow restart with new version...");
 
-        // Pull the new image
-        info!("Pulling new Docker image: {}:latest", DOCKER_IMAGE);
-        let output = Command::new("docker")
-            .args(["pull", &format!("{}:latest", DOCKER_IMAGE)])
-            .output()
-            .map_err(|e| format!("Failed to execute docker command: {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Failed to pull image: {}", stderr));
-        }
-
-        info!("Successfully pulled new image");
-        info!("Exiting to allow restart with new version...");
-
-        // Exit with success code - orchestrator (docker-compose/k8s) will restart with new image
-        std::process::exit(0);
-    }
-
-    Ok(true)
+    // Exit with success code - orchestrator (docker-compose/k8s) will restart with new image
+    std::process::exit(0);
 }
 
-fn check_docker_hub() -> Result<Option<String>, Box<dyn std::error::Error>> {
+/// Check if the latest tag exists on Docker Hub and return its last_updated timestamp
+fn check_latest_exists() -> Result<String, Box<dyn std::error::Error>> {
     let url = format!(
-        "https://hub.docker.com/v2/repositories/{}/tags?page_size=10",
+        "https://hub.docker.com/v2/repositories/{}/tags/latest",
         DOCKER_IMAGE
     );
 
-    let response: DockerHubResponse = ureq::get(&url)
+    let response: DockerHubTag = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .call()?
         .into_json()?;
 
-    // Look for version tags (e.g., "0.1.0", "0.2.0")
-    // Ignore "latest" tag as it doesn't tell us the actual version
-    let version_tags: Vec<&str> = response
-        .results
-        .iter()
-        .map(|t| t.name.as_str())
-        .filter(|name| !name.eq_ignore_ascii_case("latest"))
-        .filter(|name| is_semver(name))
-        .collect();
-
-    if let Some(latest) = version_tags.first() {
-        Ok(Some(latest.to_string()))
-    } else {
-        // If no version tags found, try to get info from "latest" tag
-        // but we can't determine actual version number
-        Ok(None)
-    }
-}
-
-fn is_semver(s: &str) -> bool {
-    // Simple check: version string should match pattern like "0.1.0" or "v0.1.0"
-    let s = s.strip_prefix('v').unwrap_or(s);
-    let parts: Vec<&str> = s.split('.').collect();
-
-    parts.len() == 3 && parts.iter().all(|p| p.parse::<u32>().is_ok())
+    Ok(response.last_updated)
 }
