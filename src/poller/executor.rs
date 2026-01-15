@@ -68,16 +68,16 @@ impl Executor {
             equipment.name
         );
 
+        // Pre-extract SNMP credentials to avoid repeated field access in loop
+        let ip = &equipment.ip_address;
+        let community = &equipment.snmp.community;
+        let version = &equipment.snmp.version;
+        let port = equipment.snmp.port;
+
         for sensor in &equipment.sensors {
             match self
                 .snmp_client
-                .get(
-                    &equipment.ip_address,
-                    &equipment.snmp.community,
-                    &equipment.snmp.version,
-                    equipment.snmp.port,
-                    &sensor.oid,
-                )
+                .get(ip, community, version, port, &sensor.oid)
                 .await
             {
                 Ok(value) => {
@@ -138,6 +138,12 @@ impl Executor {
             equipment.name
         );
 
+        // Pre-extract SNMP credentials to avoid repeated field access in loop
+        let ip = &equipment.ip_address;
+        let community = &equipment.snmp.community;
+        let version = &equipment.snmp.version;
+        let port = equipment.snmp.port;
+
         for interface in &equipment.interfaces {
             // OIDs for interface statistics (from IF-MIB)
             let if_in_octets_oid = format!("1.3.6.1.2.1.2.2.1.10.{}", interface.if_index);
@@ -156,48 +162,12 @@ impl Executor {
                 in_discards_result,
                 out_discards_result,
             ) = tokio::join!(
-                self.get_counter(
-                    &equipment.ip_address,
-                    &equipment.snmp.community,
-                    &equipment.snmp.version,
-                    equipment.snmp.port,
-                    &if_in_octets_oid
-                ),
-                self.get_counter(
-                    &equipment.ip_address,
-                    &equipment.snmp.community,
-                    &equipment.snmp.version,
-                    equipment.snmp.port,
-                    &if_out_octets_oid
-                ),
-                self.get_counter(
-                    &equipment.ip_address,
-                    &equipment.snmp.community,
-                    &equipment.snmp.version,
-                    equipment.snmp.port,
-                    &if_in_errors_oid
-                ),
-                self.get_counter(
-                    &equipment.ip_address,
-                    &equipment.snmp.community,
-                    &equipment.snmp.version,
-                    equipment.snmp.port,
-                    &if_out_errors_oid
-                ),
-                self.get_counter(
-                    &equipment.ip_address,
-                    &equipment.snmp.community,
-                    &equipment.snmp.version,
-                    equipment.snmp.port,
-                    &if_in_discards_oid
-                ),
-                self.get_counter(
-                    &equipment.ip_address,
-                    &equipment.snmp.community,
-                    &equipment.snmp.version,
-                    equipment.snmp.port,
-                    &if_out_discards_oid
-                ),
+                self.get_counter(ip, community, version, port, &if_in_octets_oid),
+                self.get_counter(ip, community, version, port, &if_out_octets_oid),
+                self.get_counter(ip, community, version, port, &if_in_errors_oid),
+                self.get_counter(ip, community, version, port, &if_out_errors_oid),
+                self.get_counter(ip, community, version, port, &if_in_discards_oid),
+                self.get_counter(ip, community, version, port, &if_out_discards_oid),
             );
 
             let in_octets = in_octets_result.unwrap_or(0);
