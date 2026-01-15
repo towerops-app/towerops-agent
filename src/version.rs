@@ -1,36 +1,125 @@
 use log::{info, warn};
 use serde::Deserialize;
+use std::cmp::Ordering;
 use std::process::Command;
 
 const DOCKER_IMAGE: &str = "gmcintire/towerops-agent";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
-struct DockerHubTag {
-    last_updated: String,
+struct DockerHubResponse {
+    results: Vec<DockerHubTag>,
 }
 
-/// Simple startup check - just logs current version and that updates are automatic
+#[derive(Debug, Deserialize)]
+struct DockerHubTag {
+    name: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Version {
+    major: u32,
+    minor: u32,
+    patch: u32,
+}
+
+impl Version {
+    fn parse(s: &str) -> Option<Self> {
+        let s = s.strip_prefix('v').unwrap_or(s);
+        let parts: Vec<&str> = s.split('.').collect();
+
+        if parts.len() != 3 {
+            return None;
+        }
+
+        Some(Version {
+            major: parts[0].parse().ok()?,
+            minor: parts[1].parse().ok()?,
+            patch: parts[2].parse().ok()?,
+        })
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.major.cmp(&other.major) {
+            Ordering::Equal => match self.minor.cmp(&other.minor) {
+                Ordering::Equal => self.patch.cmp(&other.patch),
+                other => other,
+            },
+            other => other,
+        }
+    }
+}
+
+/// Startup check - logs current version and checks for updates
 pub fn check_for_updates() {
     info!("Current version: {}", CURRENT_VERSION);
-    info!("Automatic updates enabled - will check every hour");
+
+    match get_latest_version() {
+        Ok(latest) => {
+            let current = Version::parse(CURRENT_VERSION);
+            let latest_version = Version::parse(&latest);
+
+            match (current, latest_version) {
+                (Some(curr), Some(lat)) => {
+                    if lat > curr {
+                        warn!(
+                            "⚠️  Newer version available: {} (current: {})",
+                            latest, CURRENT_VERSION
+                        );
+                        warn!("   Automatic updates will pull new version every hour");
+                    } else {
+                        info!("✓ Running latest version ({})", CURRENT_VERSION);
+                    }
+                }
+                _ => {
+                    info!("Could not compare versions, automatic updates enabled");
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Could not check for updates: {}", e);
+            info!("Automatic updates enabled - will check every hour");
+        }
+    }
 }
 
 /// Perform self-update by pulling latest image and exiting
-/// This always pulls latest since we use the :latest tag and can't reliably compare versions
-/// Returns Ok(true) if update was initiated, Ok(false) if pull showed no changes
+/// Returns Ok(true) if update was initiated, Ok(false) if already up to date
 pub fn perform_self_update() -> Result<bool, String> {
-    // Check if latest tag exists on Docker Hub (quick sanity check)
-    match check_latest_exists() {
-        Ok(last_updated) => {
-            info!(
-                "Latest image on Docker Hub was updated at: {}",
-                last_updated
-            );
+    // Check if a newer version is available
+    match get_latest_version() {
+        Ok(latest) => {
+            let current = Version::parse(CURRENT_VERSION);
+            let latest_version = Version::parse(&latest);
+
+            match (current, latest_version) {
+                (Some(curr), Some(lat)) => {
+                    if lat <= curr {
+                        info!(
+                            "Already running latest version ({} <= {})",
+                            latest, CURRENT_VERSION
+                        );
+                        return Ok(false);
+                    }
+
+                    info!("Update available: {} -> {}", CURRENT_VERSION, latest);
+                }
+                _ => {
+                    warn!("Could not parse versions, proceeding with update check");
+                }
+            }
         }
         Err(e) => {
-            warn!("Could not verify latest tag on Docker Hub: {}", e);
-            // Continue anyway - if pull fails we'll catch it below
+            warn!("Could not check Docker Hub for versions: {}", e);
+            // Continue anyway - try to pull and see if anything changed
         }
     }
 
@@ -61,17 +150,30 @@ pub fn perform_self_update() -> Result<bool, String> {
     std::process::exit(0);
 }
 
-/// Check if the latest tag exists on Docker Hub and return its last_updated timestamp
-fn check_latest_exists() -> Result<String, Box<dyn std::error::Error>> {
+/// Get the latest version from Docker Hub
+fn get_latest_version() -> Result<String, Box<dyn std::error::Error>> {
     let url = format!(
-        "https://hub.docker.com/v2/repositories/{}/tags/latest",
+        "https://hub.docker.com/v2/repositories/{}/tags?page_size=100",
         DOCKER_IMAGE
     );
 
-    let response: DockerHubTag = ureq::get(&url)
+    let response: DockerHubResponse = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .call()?
         .into_json()?;
 
-    Ok(response.last_updated)
+    // Filter for semver tags and find the latest
+    let mut versions: Vec<Version> = response
+        .results
+        .iter()
+        .filter_map(|tag| Version::parse(&tag.name))
+        .collect();
+
+    versions.sort();
+    versions.reverse(); // Highest version first
+
+    versions
+        .first()
+        .map(|v| format!("{}.{}.{}", v.major, v.minor, v.patch))
+        .ok_or_else(|| "No valid semver tags found".into())
 }
