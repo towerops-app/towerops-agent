@@ -42,6 +42,7 @@ use crate::metrics::Timestamp;
 use log::{error, info, warn};
 
 /// Executor handles polling individual pieces of equipment
+#[derive(Clone)]
 pub struct Executor {
     snmp_client: SnmpClient,
     storage: Storage,

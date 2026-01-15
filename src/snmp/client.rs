@@ -3,7 +3,7 @@ use snmp::SyncSession;
 use std::time::Duration;
 
 /// SNMP client for polling devices
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct SnmpClient;
 
 impl SnmpClient {

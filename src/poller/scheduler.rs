@@ -215,27 +215,45 @@ impl Scheduler {
 
         let poll_times = self.storage.get_all_last_poll_times()?;
 
-        for equipment in &config.equipment {
-            if !equipment.snmp.enabled {
-                continue;
-            }
-
-            // Check if it's time to poll this equipment
-            let should_poll = match poll_times.get(&equipment.id) {
-                Some(last_poll) => {
-                    let elapsed = last_poll.elapsed_secs() as u64;
-                    elapsed >= equipment.poll_interval_seconds
+        // Collect equipment that needs polling
+        let equipment_to_poll: Vec<_> = config
+            .equipment
+            .iter()
+            .filter(|eq| eq.snmp.enabled)
+            .filter(|eq| {
+                match poll_times.get(&eq.id) {
+                    Some(last_poll) => {
+                        let elapsed = last_poll.elapsed_secs() as u64;
+                        elapsed >= eq.poll_interval_seconds
+                    }
+                    None => true, // Never polled before
                 }
-                None => true, // Never polled before
-            };
+            })
+            .collect();
 
-            if should_poll {
+        if equipment_to_poll.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "Polling {} equipment items in parallel",
+            equipment_to_poll.len()
+        );
+
+        // Spawn parallel polling tasks
+        let mut tasks = Vec::new();
+        for equipment in equipment_to_poll {
+            let executor = self.executor.clone();
+            let storage = self.storage.clone();
+            let equipment = equipment.clone();
+
+            let task = tokio::spawn(async move {
                 info!("Polling equipment: {}", equipment.name);
 
                 // Poll sensors and interfaces in parallel
                 let (sensor_result, interface_result) = tokio::join!(
-                    self.executor.poll_sensors(equipment),
-                    self.executor.poll_interfaces(equipment)
+                    executor.poll_sensors(&equipment),
+                    executor.poll_interfaces(&equipment)
                 );
 
                 if let Err(e) = sensor_result {
@@ -247,9 +265,18 @@ impl Scheduler {
                 }
 
                 // Update last poll time
-                if let Err(e) = self.storage.update_last_poll_time(&equipment.id) {
+                if let Err(e) = storage.update_last_poll_time(&equipment.id) {
                     error!("Failed to update last poll time: {}", e);
                 }
+            });
+
+            tasks.push(task);
+        }
+
+        // Wait for all polling tasks to complete
+        for task in tasks {
+            if let Err(e) = task.await {
+                error!("Polling task failed: {}", e);
             }
         }
 
