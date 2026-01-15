@@ -55,7 +55,9 @@ use crate::snmp::SnmpClient;
 
 use crate::metrics::Timestamp;
 use log::{error, info, warn};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::time::interval;
 
 /// Main scheduler that orchestrates polling, config refresh, and metrics submission
@@ -165,28 +167,46 @@ impl Scheduler {
     }
 
     async fn flush_metrics(&self) -> Result<()> {
-        let pending = self.storage.get_pending_metrics(100)?;
+        // Process metrics in batches until queue is empty or we hit an error
+        // This handles high-volume scenarios with 10,000+ equipment
+        let mut total_flushed = 0;
+        const BATCH_SIZE: usize = 500;
+        const MAX_BATCHES: usize = 20; // Limit to 10,000 metrics per flush cycle
 
-        if pending.is_empty() {
-            return Ok(());
+        for _ in 0..MAX_BATCHES {
+            let pending = self.storage.get_pending_metrics(BATCH_SIZE)?;
+
+            if pending.is_empty() {
+                break;
+            }
+
+            let batch_size = pending.len();
+            let ids: Vec<i64> = pending.iter().map(|(id, _)| *id).collect();
+            let metrics: Vec<_> = pending.into_iter().map(|(_, m)| m).collect();
+
+            match self.api_client.submit_metrics(metrics).await {
+                Ok(_) => {
+                    self.storage.mark_metrics_sent(&ids)?;
+                    total_flushed += batch_size;
+                }
+                Err(e) => {
+                    warn!("Failed to submit batch of {} metrics: {}", batch_size, e);
+                    // Don't return error, just log and continue with remaining batches
+                    break;
+                }
+            }
+
+            // If we got less than batch size, we've emptied the queue
+            if batch_size < BATCH_SIZE {
+                break;
+            }
         }
 
-        info!("Flushing {} pending metrics to API", pending.len());
-
-        let ids: Vec<i64> = pending.iter().map(|(id, _)| *id).collect();
-        let metrics: Vec<_> = pending.into_iter().map(|(_, m)| m).collect();
-
-        match self.api_client.submit_metrics(metrics).await {
-            Ok(_) => {
-                self.storage.mark_metrics_sent(&ids)?;
-                info!("Successfully submitted {} metrics", ids.len());
-                Ok(())
-            }
-            Err(e) => {
-                warn!("Failed to submit metrics, will retry later: {}", e);
-                Err(e.into())
-            }
+        if total_flushed > 0 {
+            info!("Successfully flushed {} metrics to API", total_flushed);
         }
+
+        Ok(())
     }
 
     async fn send_heartbeat(&self) -> Result<()> {
@@ -240,14 +260,23 @@ impl Scheduler {
             equipment_to_poll.len()
         );
 
-        // Spawn parallel polling tasks
+        // Limit concurrent polling to prevent overwhelming the system
+        // With 10,000+ equipment, we don't want 10,000 concurrent tasks
+        const MAX_CONCURRENT_POLLS: usize = 100;
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_POLLS));
+
+        // Spawn parallel polling tasks with concurrency limit
         let mut tasks = Vec::new();
         for equipment in equipment_to_poll {
             let executor = self.executor.clone();
             let storage = self.storage.clone();
             let equipment = equipment.clone();
+            let permit = semaphore.clone();
 
             let task = tokio::spawn(async move {
+                // Acquire permit before polling (limits concurrency)
+                let _permit = permit.acquire().await.unwrap();
+
                 info!("Polling equipment: {}", equipment.name);
 
                 // Poll sensors and interfaces in parallel
