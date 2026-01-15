@@ -147,72 +147,65 @@ impl Executor {
             let if_in_discards_oid = format!("1.3.6.1.2.1.2.2.1.13.{}", interface.if_index);
             let if_out_discards_oid = format!("1.3.6.1.2.1.2.2.1.19.{}", interface.if_index);
 
-            // Poll each counter
-            let in_octets = self
-                .get_counter(
+            // Poll all counters in parallel for this interface
+            let (
+                in_octets_result,
+                out_octets_result,
+                in_errors_result,
+                out_errors_result,
+                in_discards_result,
+                out_discards_result,
+            ) = tokio::join!(
+                self.get_counter(
                     &equipment.ip_address,
                     &equipment.snmp.community,
                     &equipment.snmp.version,
                     equipment.snmp.port,
-                    &if_in_octets_oid,
-                )
-                .await
-                .unwrap_or(0);
+                    &if_in_octets_oid
+                ),
+                self.get_counter(
+                    &equipment.ip_address,
+                    &equipment.snmp.community,
+                    &equipment.snmp.version,
+                    equipment.snmp.port,
+                    &if_out_octets_oid
+                ),
+                self.get_counter(
+                    &equipment.ip_address,
+                    &equipment.snmp.community,
+                    &equipment.snmp.version,
+                    equipment.snmp.port,
+                    &if_in_errors_oid
+                ),
+                self.get_counter(
+                    &equipment.ip_address,
+                    &equipment.snmp.community,
+                    &equipment.snmp.version,
+                    equipment.snmp.port,
+                    &if_out_errors_oid
+                ),
+                self.get_counter(
+                    &equipment.ip_address,
+                    &equipment.snmp.community,
+                    &equipment.snmp.version,
+                    equipment.snmp.port,
+                    &if_in_discards_oid
+                ),
+                self.get_counter(
+                    &equipment.ip_address,
+                    &equipment.snmp.community,
+                    &equipment.snmp.version,
+                    equipment.snmp.port,
+                    &if_out_discards_oid
+                ),
+            );
 
-            let out_octets = self
-                .get_counter(
-                    &equipment.ip_address,
-                    &equipment.snmp.community,
-                    &equipment.snmp.version,
-                    equipment.snmp.port,
-                    &if_out_octets_oid,
-                )
-                .await
-                .unwrap_or(0);
-
-            let in_errors = self
-                .get_counter(
-                    &equipment.ip_address,
-                    &equipment.snmp.community,
-                    &equipment.snmp.version,
-                    equipment.snmp.port,
-                    &if_in_errors_oid,
-                )
-                .await
-                .unwrap_or(0);
-
-            let out_errors = self
-                .get_counter(
-                    &equipment.ip_address,
-                    &equipment.snmp.community,
-                    &equipment.snmp.version,
-                    equipment.snmp.port,
-                    &if_out_errors_oid,
-                )
-                .await
-                .unwrap_or(0);
-
-            let in_discards = self
-                .get_counter(
-                    &equipment.ip_address,
-                    &equipment.snmp.community,
-                    &equipment.snmp.version,
-                    equipment.snmp.port,
-                    &if_in_discards_oid,
-                )
-                .await
-                .unwrap_or(0);
-
-            let out_discards = self
-                .get_counter(
-                    &equipment.ip_address,
-                    &equipment.snmp.community,
-                    &equipment.snmp.version,
-                    equipment.snmp.port,
-                    &if_out_discards_oid,
-                )
-                .await
-                .unwrap_or(0);
+            let in_octets = in_octets_result.unwrap_or(0);
+            let out_octets = out_octets_result.unwrap_or(0);
+            let in_errors = in_errors_result.unwrap_or(0);
+            let out_errors = out_errors_result.unwrap_or(0);
+            let in_discards = in_discards_result.unwrap_or(0);
+            let out_discards = out_discards_result.unwrap_or(0);
 
             let stat = InterfaceStat {
                 interface_id: interface.id.clone(),
