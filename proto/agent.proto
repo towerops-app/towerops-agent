@@ -50,6 +50,7 @@ message Metric {
   oneof metric_type {
     SensorReading sensor_reading = 1;
     InterfaceStat interface_stat = 2;
+    NeighborDiscovery neighbor_discovery = 3;
   }
 }
 
@@ -69,6 +70,20 @@ message InterfaceStat {
   int64 if_in_discards = 6;
   int64 if_out_discards = 7;
   int64 timestamp = 8; // Unix timestamp in seconds
+}
+
+message NeighborDiscovery {
+  string interface_id = 1;
+  string protocol = 2; // "lldp" or "cdp"
+  string remote_chassis_id = 3;
+  string remote_system_name = 4;
+  string remote_system_description = 5;
+  string remote_platform = 6;
+  string remote_port_id = 7;
+  string remote_port_description = 8;
+  string remote_address = 9;
+  repeated string remote_capabilities = 10;
+  int64 timestamp = 11; // Unix timestamp in seconds
 }
 
 // Heartbeat metadata

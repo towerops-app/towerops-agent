@@ -36,7 +36,7 @@ pub type Result<T> = std::result::Result<T, ExecutorError>;
 
 use crate::config::EquipmentConfig;
 use crate::metrics::{InterfaceStat, Metric, SensorReading};
-use crate::snmp::SnmpClient;
+use crate::snmp::{discover_neighbors, SnmpClient};
 
 use crate::metrics::Timestamp;
 use log::{error, info, warn};
@@ -190,6 +190,44 @@ impl Executor {
 
             if let Err(e) = self.storage.store_metric(&Metric::InterfaceStat(stat)) {
                 error!("Failed to store interface stat: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Poll neighbors for a piece of equipment (LLDP/CDP)
+    pub async fn poll_neighbors(&self, equipment: &EquipmentConfig) -> Result<()> {
+        if !equipment.snmp.enabled || equipment.interfaces.is_empty() {
+            return Ok(());
+        }
+
+        info!("Polling neighbors for equipment: {}", equipment.name);
+
+        // Pre-extract SNMP credentials
+        let ip = &equipment.ip_address;
+        let community = &equipment.snmp.community;
+        let version = &equipment.snmp.version;
+        let port = equipment.snmp.port;
+
+        // Build interface list for neighbor discovery (interface_id, if_index)
+        let interfaces: Vec<(String, u32)> = equipment
+            .interfaces
+            .iter()
+            .map(|i| (i.id.clone(), i.if_index as u32))
+            .collect();
+
+        // Discover neighbors using LLDP and CDP
+        let neighbors =
+            discover_neighbors(&self.snmp_client, ip, community, version, port, &interfaces).await;
+
+        // Store neighbor discoveries
+        for neighbor in neighbors {
+            if let Err(e) = self
+                .storage
+                .store_metric(&Metric::NeighborDiscovery(neighbor))
+            {
+                error!("Failed to store neighbor discovery: {}", e);
             }
         }
 

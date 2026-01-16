@@ -6,7 +6,9 @@ edition = "2021"
 [dependencies]
 snmp = "0.2"
 ureq = { version = "2.10", features = ["json"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -16,6 +18,10 @@ prost = "0.13"
 prost-types = "0.13"
 tiny_http = "0.12"
 chrono = "0.4"
+anyhow = "1.0"
+thiserror = "1.0"
+base64 = "0.21"
+hostname = "0.3"
 
 [build-dependencies]
 prost-build = "0.13"
