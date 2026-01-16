@@ -30,7 +30,10 @@ fn get_version() -> String {
     }
 
     // Fallback: Try short commit hash only
-    if let Ok(output) = Command::new("git").args(["rev-parse", "--short", "HEAD"]).output() {
+    if let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+    {
         if output.status.success() {
             let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
             return format!("{}.{}", env!("CARGO_PKG_VERSION"), commit);
@@ -56,10 +59,18 @@ fn parse_git_describe(desc: &str) -> Option<String> {
             let commit_count = parts[0];
             let hash = parts[1].strip_prefix('g').unwrap_or(parts[1]);
             let version = format!("{}.{}.{}", base, commit_count, hash);
-            return Some(if dirty { format!("{}-modified", version) } else { version });
+            return Some(if dirty {
+                format!("{}-modified", version)
+            } else {
+                version
+            });
         }
     }
 
     // No commits after tag, just use the tag
-    Some(if dirty { format!("{}-modified", desc) } else { desc.to_string() })
+    Some(if dirty {
+        format!("{}-modified", desc)
+    } else {
+        desc.to_string()
+    })
 }

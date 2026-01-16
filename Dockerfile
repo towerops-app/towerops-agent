@@ -7,7 +7,7 @@ ARG TARGETPLATFORM
 WORKDIR /app
 
 # Install build dependencies
-RUN apk add --no-cache musl-dev protobuf-dev openssl-dev openssl-libs-static
+RUN apk add --no-cache musl-dev protobuf-dev
 
 # Determine Rust target based on platform and add it
 RUN case "$TARGETPLATFORM" in \
