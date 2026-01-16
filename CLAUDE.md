@@ -9,9 +9,9 @@ Lightweight Rust agent for remote SNMP polling. Deployed on customer networks to
 ## What's Complete ✅
 
 ### Architecture & Design
-- [x] Complete module structure (12 source files)
+- [x] Complete module structure (13 source files)
 - [x] Configuration types matching Phoenix API responses
-- [x] Metric types (SensorReading, InterfaceStat) with proper serialization
+- [x] Metric types (SensorReading, InterfaceStat, NeighborDiscovery) with proper serialization
 - [x] Event loop with 5 concurrent tasks (tokio::select!)
 - [x] SQLite buffering with 24-hour retention
 - [x] Error types and result handling throughout
@@ -42,8 +42,16 @@ Lightweight Rust agent for remote SNMP polling. Deployed on customer networks to
 - [x] **Executor** (`poller/executor.rs`)
   - poll_sensors() - Poll configured sensors
   - poll_interfaces() - Poll interface statistics
+  - poll_neighbors() - Poll LLDP and CDP neighbors
   - Parallel polling with tokio::join!
   - Applies sensor divisors
+
+- [x] **Neighbor Discovery** (`snmp/neighbor.rs`)
+  - discover_neighbors() - Main discovery function
+  - discover_lldp_neighbors() - LLDP-MIB (IEEE 802.1AB)
+  - discover_cdp_neighbors() - CISCO-CDP-MIB
+  - Parses remote device information and capabilities
+  - Associates neighbors with local interfaces
 
 - [x] **Main** (`main.rs`)
   - CLI with clap (--api-url, --token, etc.)
@@ -64,7 +72,7 @@ Lightweight Rust agent for remote SNMP polling. Deployed on customer networks to
 ### Protocol Buffers Integration
 - [x] **Protobuf Definitions** (`proto/agent.proto`)
   - AgentConfig, Equipment, SnmpConfig, Sensor, Interface
-  - MetricBatch, Metric, SensorReading, InterfaceStat
+  - MetricBatch, Metric, SensorReading, InterfaceStat, NeighborDiscovery
   - HeartbeatMetadata, HeartbeatResponse
 - [x] **Code Generation** (`build.rs`)
   - Uses prost-build to compile protobuf definitions
@@ -259,10 +267,11 @@ towerops-agent/
 │   ├── api_client.rs        # HTTP client for Towerops API
 │   ├── version.rs           # Docker image version checking
 │   ├── metrics/
-│   │   └── mod.rs          # Metric types (SensorReading, InterfaceStat)
+│   │   └── mod.rs          # Metric types (SensorReading, InterfaceStat, NeighborDiscovery)
 │   ├── snmp/
 │   │   ├── mod.rs          # Module exports
 │   │   ├── client.rs       # ✅ SNMP client (GET and WALK)
+│   │   ├── neighbor.rs     # ✅ LLDP and CDP neighbor discovery
 │   │   └── types.rs        # SNMP types and errors
 │   ├── buffer/
 │   │   ├── mod.rs          # Module exports
@@ -321,8 +330,10 @@ Agent is production-ready when:
 - [x] SQLite buffering works
 - [x] Event loop runs without panics
 - [x] **SNMP polling works**
+- [x] **Neighbor discovery works (LLDP/CDP)**
 - [ ] **Integration testing complete** ← CURRENT FOCUS
 - [ ] Metrics appear in Phoenix database
+- [ ] Neighbor data appears in Phoenix database
 - [ ] Survives 24h API outage
 - [ ] Uses <256 MB memory with 50 devices
 - [ ] Runs for 7+ days without issues

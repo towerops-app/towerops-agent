@@ -285,10 +285,11 @@ impl Scheduler {
 
                 info!("Polling equipment: {}", equipment.name);
 
-                // Poll sensors and interfaces in parallel
-                let (sensor_result, interface_result) = tokio::join!(
+                // Poll sensors, interfaces, and neighbors in parallel
+                let (sensor_result, interface_result, neighbor_result) = tokio::join!(
                     executor.poll_sensors(&equipment),
-                    executor.poll_interfaces(&equipment)
+                    executor.poll_interfaces(&equipment),
+                    executor.poll_neighbors(&equipment)
                 );
 
                 if let Err(e) = sensor_result {
@@ -297,6 +298,10 @@ impl Scheduler {
 
                 if let Err(e) = interface_result {
                     error!("Failed to poll interfaces for {}: {}", equipment.name, e);
+                }
+
+                if let Err(e) = neighbor_result {
+                    error!("Failed to poll neighbors for {}: {}", equipment.name, e);
                 }
 
                 // Update last poll time

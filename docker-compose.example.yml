@@ -2,7 +2,9 @@ version: '3.8'
 
 services:
   towerops-agent:
-    image: registry.gitlab.com/towerops/towerops-agent:latest
+    # Use 'main' tag for automatic updates (updated on every push to main)
+    # Or use 'latest' for stable releases only (updated on git tags)
+    image: gmcintire/towerops-agent:main
     container_name: towerops-agent
     restart: unless-stopped
 
@@ -30,9 +32,11 @@ services:
       # Persistent storage for metrics buffering
       - ./data:/data
 
-      # Docker socket (required for automatic self-updates)
-      # The agent will check for updates hourly and automatically update itself
-      - /var/run/docker.sock:/var/run/docker.sock
+    labels:
+      # Enable automatic updates via Watchtower
+      - "com.centurylinklabs.watchtower.enable=true"
+      # Optional: Set update scope (can be used to group updates)
+      - "com.centurylinklabs.watchtower.scope=towerops"
 
     # Optional: Resource limits
     deploy:
@@ -41,5 +45,53 @@ services:
           cpus: '0.5'
           memory: 512M
         reservations:
+          cpus: '0.1'
+          memory: 128M
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: towerops-watchtower
+    restart: unless-stopped
+
+    environment:
+      # Check for updates every 15 minutes (900 seconds)
+      # For production, consider increasing to 1800 (30 min) or 3600 (1 hour)
+      - WATCHTOWER_POLL_INTERVAL=900
+
+      # Only update containers with the watchtower.enable label
+      - WATCHTOWER_LABEL_ENABLE=true
+
+      # Clean up old images after update
+      - WATCHTOWER_CLEANUP=true
+
+      # Include stopped containers in updates
+      - WATCHTOWER_INCLUDE_STOPPED=true
+
+      # Optional: Send notifications (Slack, Discord, email, etc.)
+      # See: https://containrrr.dev/watchtower/notifications/
+      # - WATCHTOWER_NOTIFICATIONS=slack
+      # - WATCHTOWER_NOTIFICATION_SLACK_HOOK_URL=https://hooks.slack.com/services/...
+
+      # Optional: Only update containers with specific scope
+      # - WATCHTOWER_SCOPE=towerops
+
+      # Log level (panic, fatal, error, warn, info, debug, trace)
+      - WATCHTOWER_LOG_LEVEL=info
+
+      # Optional: Run once and exit (for scheduled cron jobs)
+      # - WATCHTOWER_RUN_ONCE=true
+
+      # Optional: Custom update schedule (cron format)
+      # Default: check every POLL_INTERVAL seconds
+      # - WATCHTOWER_SCHEDULE=0 0 4 * * *  # 4am daily
+
+    volumes:
+      # Docker socket to monitor and update containers
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    # Optional: Resource limits
+    deploy:
+      resources:
+        limits:
           cpus: '0.1'
           memory: 128M

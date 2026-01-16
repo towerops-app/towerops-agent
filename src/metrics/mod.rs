@@ -108,6 +108,8 @@ pub enum Metric {
     SensorReading(SensorReading),
     #[serde(rename = "interface_stat")]
     InterfaceStat(InterfaceStat),
+    #[serde(rename = "neighbor_discovery")]
+    NeighborDiscovery(NeighborDiscovery),
 }
 
 impl Metric {
@@ -115,6 +117,7 @@ impl Metric {
         match self {
             Metric::SensorReading(_) => "sensor_reading",
             Metric::InterfaceStat(_) => "interface_stat",
+            Metric::NeighborDiscovery(_) => "neighbor_discovery",
         }
     }
 
@@ -122,6 +125,7 @@ impl Metric {
         match self {
             Metric::SensorReading(sr) => &sr.timestamp,
             Metric::InterfaceStat(is) => &is.timestamp,
+            Metric::NeighborDiscovery(nd) => &nd.timestamp,
         }
     }
 }
@@ -145,5 +149,21 @@ pub struct InterfaceStat {
     pub if_out_errors: i64,
     pub if_in_discards: i64,
     pub if_out_discards: i64,
+    pub timestamp: Timestamp,
+}
+
+/// Neighbor discovery metric (LLDP/CDP)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeighborDiscovery {
+    pub interface_id: String,
+    pub protocol: String,
+    pub remote_chassis_id: String,
+    pub remote_system_name: String,
+    pub remote_system_description: String,
+    pub remote_platform: String,
+    pub remote_port_id: String,
+    pub remote_port_description: String,
+    pub remote_address: String,
+    pub remote_capabilities: Vec<String>,
     pub timestamp: Timestamp,
 }

@@ -4,7 +4,11 @@ use std::cmp::Ordering;
 use std::process::Command;
 
 const DOCKER_IMAGE: &str = "gmcintire/towerops-agent";
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// Get version at runtime - prefers BUILD_VERSION from build.rs, falls back to Cargo.toml
+fn current_version() -> &'static str {
+    option_env!("BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
 
 #[derive(Debug, Deserialize)]
 struct DockerHubResponse {
@@ -60,11 +64,12 @@ impl Ord for Version {
 
 /// Startup check - logs current version and checks for updates
 pub fn check_for_updates() {
-    info!("Current version: {}", CURRENT_VERSION);
+    let current_ver = current_version();
+    info!("Current version: {}", current_ver);
 
     match get_latest_version() {
         Ok(latest) => {
-            let current = Version::parse(CURRENT_VERSION);
+            let current = Version::parse(current_ver);
             let latest_version = Version::parse(&latest);
 
             match (current, latest_version) {
@@ -72,11 +77,11 @@ pub fn check_for_updates() {
                     if lat > curr {
                         warn!(
                             "⚠️  Newer version available: {} (current: {})",
-                            latest, CURRENT_VERSION
+                            latest, current_ver
                         );
                         warn!("   Automatic updates will pull new version every hour");
                     } else {
-                        info!("✓ Running latest version ({})", CURRENT_VERSION);
+                        info!("✓ Running latest version ({})", current_ver);
                     }
                 }
                 _ => {
@@ -94,10 +99,12 @@ pub fn check_for_updates() {
 /// Perform self-update by pulling latest image and exiting
 /// Returns Ok(true) if update was initiated, Ok(false) if already up to date
 pub fn perform_self_update() -> Result<bool, String> {
+    let current_ver = current_version();
+
     // Check if a newer version is available
     match get_latest_version() {
         Ok(latest) => {
-            let current = Version::parse(CURRENT_VERSION);
+            let current = Version::parse(current_ver);
             let latest_version = Version::parse(&latest);
 
             match (current, latest_version) {
@@ -105,12 +112,12 @@ pub fn perform_self_update() -> Result<bool, String> {
                     if lat <= curr {
                         info!(
                             "Already running latest version ({} <= {})",
-                            latest, CURRENT_VERSION
+                            latest, current_ver
                         );
                         return Ok(false);
                     }
 
-                    info!("Update available: {} -> {}", CURRENT_VERSION, latest);
+                    info!("Update available: {} -> {}", current_ver, latest);
                 }
                 _ => {
                     warn!("Could not parse versions, proceeding with update check");

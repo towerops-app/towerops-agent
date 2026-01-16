@@ -303,5 +303,22 @@ fn convert_metric_to_proto(metric: &Metric) -> agent::Metric {
                 },
             )),
         },
+        M::NeighborDiscovery(nd) => agent::Metric {
+            metric_type: Some(agent::metric::MetricType::NeighborDiscovery(
+                agent::NeighborDiscovery {
+                    interface_id: nd.interface_id.clone(),
+                    protocol: nd.protocol.clone(),
+                    remote_chassis_id: nd.remote_chassis_id.clone(),
+                    remote_system_name: nd.remote_system_name.clone(),
+                    remote_system_description: nd.remote_system_description.clone(),
+                    remote_platform: nd.remote_platform.clone(),
+                    remote_port_id: nd.remote_port_id.clone(),
+                    remote_port_description: nd.remote_port_description.clone(),
+                    remote_address: nd.remote_address.clone(),
+                    remote_capabilities: nd.remote_capabilities.clone(),
+                    timestamp: nd.timestamp.to_unix_timestamp(),
+                },
+            )),
+        },
     }
 }
