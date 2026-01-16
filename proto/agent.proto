@@ -96,3 +96,59 @@ message HeartbeatMetadata {
 message HeartbeatResponse {
   string status = 1;
 }
+
+// WebSocket-specific messages
+
+enum JobType {
+  DISCOVER = 0;
+  POLL = 1;
+}
+
+enum QueryType {
+  GET = 0;
+  WALK = 1;
+}
+
+message AgentJobList {
+  repeated AgentJob jobs = 1;
+}
+
+message AgentJob {
+  string job_id = 1;
+  JobType job_type = 2;
+  string equipment_id = 3;
+  SnmpDevice device = 4;
+  repeated SnmpQuery queries = 5;
+}
+
+message SnmpDevice {
+  string ip = 1;
+  string community = 2;
+  string version = 3;
+  uint32 port = 4;
+}
+
+message SnmpQuery {
+  QueryType query_type = 1;
+  repeated string oids = 2;
+}
+
+message SnmpResult {
+  string equipment_id = 1;
+  JobType job_type = 2;
+  map<string, string> oid_values = 3;
+  int64 timestamp = 4;
+}
+
+message AgentHeartbeat {
+  string version = 1;
+  string hostname = 2;
+  uint64 uptime_seconds = 3;
+  string ip_address = 4;
+}
+
+message AgentError {
+  string equipment_id = 1;
+  string error_message = 2;
+  int64 timestamp = 3;
+}

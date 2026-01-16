@@ -4,14 +4,22 @@
 /// persistent WebSocket connection. The server sends SNMP query jobs as protobuf
 /// messages, the agent executes raw SNMP queries, and sends results back.
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use prost::Message;
 use std::collections::HashMap;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async, tungstenite::protocol::Message as WsMessage, MaybeTlsStream, WebSocketStream,
+};
 
-use crate::proto::{AgentError, AgentHeartbeat, AgentJob, AgentJobList, JobType, QueryType, SnmpResult};
+use crate::proto::agent::{
+    AgentError, AgentHeartbeat, AgentJob, AgentJobList, JobType, QueryType, SnmpResult,
+};
+use crate::snmp::{SnmpClient, SnmpValue};
 
 /// Phoenix channel message format (JSON wrapper around binary protobuf).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -28,6 +36,8 @@ pub struct AgentClient {
     ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     token: String,
     agent_id: String,
+    result_tx: mpsc::UnboundedSender<SnmpResult>,
+    result_rx: mpsc::UnboundedReceiver<SnmpResult>,
 }
 
 impl AgentClient {
@@ -49,10 +59,14 @@ impl AgentClient {
 
         log::info!("Connected to Towerops server at {}", url);
 
+        let (result_tx, result_rx) = mpsc::unbounded_channel();
+
         Ok(Self {
             ws_stream,
             token: token.to_string(),
             agent_id: generate_agent_id(),
+            result_tx,
+            result_rx,
         })
     }
 
@@ -93,6 +107,11 @@ impl AgentClient {
                     }
                 }
 
+                // Receive SNMP results from job tasks
+                Some(result) = self.result_rx.recv() => {
+                    self.send_result(result).await?;
+                }
+
                 // Send periodic heartbeats
                 _ = heartbeat_interval.tick() => {
                     self.send_heartbeat().await?;
@@ -112,7 +131,7 @@ impl AgentClient {
                 // Extract binary protobuf from payload
                 if let serde_json::Value::Object(map) = phoenix_msg.payload {
                     if let Some(serde_json::Value::String(binary_b64)) = map.get("binary") {
-                        let binary = base64::decode(binary_b64)?;
+                        let binary = BASE64.decode(binary_b64)?;
                         let job_list = AgentJobList::decode(&binary[..])?;
                         self.handle_jobs(job_list).await?;
                     }
@@ -145,8 +164,9 @@ impl AgentClient {
             log::info!("Executing job: {} (type: {:?})", job.job_id, job_type);
 
             // Spawn task to execute job
+            let result_tx = self.result_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = execute_job(job).await {
+                if let Err(e) = execute_job(job, result_tx).await {
                     log::error!("Job execution failed: {}", e);
                 }
             });
@@ -170,7 +190,7 @@ impl AgentClient {
         let msg = PhoenixMessage {
             topic: format!("agent:{}", self.agent_id),
             event: "heartbeat".to_string(),
-            payload: serde_json::json!({"binary": base64::encode(&binary)}),
+            payload: serde_json::json!({"binary": BASE64.encode(&binary)}),
             reference: None,
         };
 
@@ -188,7 +208,7 @@ impl AgentClient {
         let msg = PhoenixMessage {
             topic: format!("agent:{}", self.agent_id),
             event: "result".to_string(),
-            payload: serde_json::json!({"binary": base64::encode(&binary)}),
+            payload: serde_json::json!({"binary": BASE64.encode(&binary)}),
             reference: None,
         };
 
@@ -206,7 +226,7 @@ impl AgentClient {
         let msg = PhoenixMessage {
             topic: format!("agent:{}", self.agent_id),
             event: "error".to_string(),
-            payload: serde_json::json!({"binary": base64::encode(&binary)}),
+            payload: serde_json::json!({"binary": BASE64.encode(&binary)}),
             reference: None,
         };
 
@@ -219,9 +239,10 @@ impl AgentClient {
 }
 
 /// Execute an SNMP job and collect results.
-async fn execute_job(job: AgentJob) -> Result<()> {
+async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>) -> Result<()> {
     let device = job.device.context("Job missing device info")?;
-    let mut oid_values = HashMap::new();
+    let mut oid_values: HashMap<String, String> = HashMap::new();
+    let snmp_client = SnmpClient::new();
 
     for query in job.queries {
         let query_type = QueryType::from_i32(query.query_type).unwrap_or(QueryType::Get);
@@ -230,9 +251,18 @@ async fn execute_job(job: AgentJob) -> Result<()> {
             QueryType::Get => {
                 // Execute SNMP GET for each OID
                 for oid in &query.oids {
-                    match snmp_get(&device.ip, &device.community, &device.version, device.port, oid).await {
+                    match snmp_client
+                        .get(
+                            &device.ip,
+                            &device.community,
+                            &device.version,
+                            device.port as u16,
+                            oid,
+                        )
+                        .await
+                    {
                         Ok(value) => {
-                            oid_values.insert(oid.clone(), value);
+                            oid_values.insert(oid.clone(), value_to_string(value));
                         }
                         Err(e) => {
                             log::warn!("SNMP GET failed for OID {}: {}", oid, e);
@@ -243,9 +273,20 @@ async fn execute_job(job: AgentJob) -> Result<()> {
             QueryType::Walk => {
                 // Execute SNMP WALK for each base OID
                 for base_oid in &query.oids {
-                    match snmp_walk(&device.ip, &device.community, &device.version, device.port, base_oid).await {
+                    match snmp_client
+                        .walk(
+                            &device.ip,
+                            &device.community,
+                            &device.version,
+                            device.port as u16,
+                            base_oid,
+                        )
+                        .await
+                    {
                         Ok(results) => {
-                            oid_values.extend(results);
+                            for (oid, value) in results {
+                                oid_values.insert(oid, value_to_string(value));
+                            }
                         }
                         Err(e) => {
                             log::warn!("SNMP WALK failed for OID {}: {}", base_oid, e);
@@ -266,56 +307,29 @@ async fn execute_job(job: AgentJob) -> Result<()> {
             .as_secs() as i64,
     };
 
-    // Send result back to server
-    // TODO: Get client reference to send result
-    log::info!("Collected {} OID values for job {}", result.oid_values.len(), job.job_id);
+    log::info!(
+        "Collected {} OID values for job {}",
+        result.oid_values.len(),
+        job.job_id
+    );
+
+    // Send result back to main client task
+    result_tx.send(result).ok();
 
     Ok(())
 }
 
-/// Execute SNMP GET operation.
-///
-/// Returns the value as a string (already formatted).
-async fn snmp_get(
-    ip: &str,
-    community: &str,
-    version: &str,
-    port: u32,
-    oid: &str,
-) -> Result<String> {
-    // TODO: Implement raw SNMP GET over UDP
-    // 1. Construct SNMP GET PDU (BER encoded)
-    // 2. Send UDP packet to ip:port
-    // 3. Wait for response with timeout
-    // 4. Parse response and extract value
-    // 5. Format value as string
-
-    log::debug!("SNMP GET: {} @ {}:{} (community: {}, version: {})", oid, ip, port, community, version);
-
-    // Placeholder
-    Err(anyhow::anyhow!("SNMP GET not yet implemented"))
-}
-
-/// Execute SNMP WALK operation.
-///
-/// Returns a map of OID → value (all as strings).
-async fn snmp_walk(
-    ip: &str,
-    community: &str,
-    version: &str,
-    port: u32,
-    base_oid: &str,
-) -> Result<HashMap<String, String>> {
-    // TODO: Implement raw SNMP WALK over UDP
-    // 1. Start with GETNEXT(base_oid)
-    // 2. Loop: GETNEXT(last_oid) until OID no longer starts with base_oid
-    // 3. Collect all OID/value pairs
-    // 4. Return map
-
-    log::debug!("SNMP WALK: {} @ {}:{} (community: {}, version: {})", base_oid, ip, port, community, version);
-
-    // Placeholder
-    Err(anyhow::anyhow!("SNMP WALK not yet implemented"))
+/// Convert SnmpValue to String for protobuf transmission.
+fn value_to_string(value: SnmpValue) -> String {
+    match value {
+        SnmpValue::Integer(i) => i.to_string(),
+        SnmpValue::String(s) => s,
+        SnmpValue::Counter32(c) => c.to_string(),
+        SnmpValue::Counter64(c) => c.to_string(),
+        SnmpValue::Gauge32(g) => g.to_string(),
+        SnmpValue::TimeTicks(t) => t.to_string(),
+        SnmpValue::IpAddress(ip) => ip,
+    }
 }
 
 /// Generate a unique agent ID.
