@@ -1,1 +1,1 @@
-../scripts/monitor-deploy.sh
+../towerops-web/scripts/monitor-deploy.sh
