@@ -67,6 +67,9 @@ services:
       # Include stopped containers in updates
       - WATCHTOWER_INCLUDE_STOPPED=true
 
+      # Use latest Docker API version (prevents "client version too old" errors)
+      - DOCKER_API_VERSION=1.44
+
       # Optional: Send notifications (Slack, Discord, email, etc.)
       # See: https://containrrr.dev/watchtower/notifications/
       # - WATCHTOWER_NOTIFICATIONS=slack
