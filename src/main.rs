@@ -6,8 +6,10 @@ mod websocket_client;
 
 use chrono::Local;
 use clap::Parser;
-use log::{info, warn, LevelFilter, Metadata, Record};
+use log::{error, info, warn, LevelFilter, Metadata, Record};
 use std::env;
+use std::time::Duration;
+use tokio::time::sleep;
 use websocket_client::AgentClient;
 
 /// Minimal logger that writes to stderr with timestamps
@@ -88,20 +90,45 @@ async fn main() {
         }
     });
 
-    // Connect to Towerops server via WebSocket
-    let mut client = match AgentClient::connect(&ws_url, &args.token).await {
-        Ok(client) => client,
-        Err(e) => {
-            eprintln!("Failed to connect to server: {}", e);
-            std::process::exit(1);
+    // Retry loop with exponential backoff
+    let mut retry_delay = Duration::from_secs(1);
+    let max_retry_delay = Duration::from_secs(60);
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+
+        if attempt > 1 {
+            info!(
+                "Retry attempt {} - waiting {} seconds before reconnecting",
+                attempt,
+                retry_delay.as_secs()
+            );
+            sleep(retry_delay).await;
+
+            // Exponential backoff: double the delay, capped at max
+            retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
         }
-    };
 
-    // Run the agent event loop
-    if let Err(e) = client.run().await {
-        eprintln!("Agent error: {}", e);
-        std::process::exit(1);
+        // Connect to Towerops server via WebSocket
+        let mut client = match AgentClient::connect(&ws_url, &args.token).await {
+            Ok(client) => {
+                info!("Successfully connected to server");
+                // Reset retry delay on successful connection
+                retry_delay = Duration::from_secs(1);
+                attempt = 0;
+                client
+            }
+            Err(e) => {
+                error!("Failed to connect to server: {}", e);
+                continue;
+            }
+        };
+
+        // Run the agent event loop
+        if let Err(e) = client.run().await {
+            error!("Agent disconnected: {}", e);
+            // Loop will retry with backoff
+        }
     }
-
-    info!("Agent shutting down");
 }
