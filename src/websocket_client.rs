@@ -17,7 +17,7 @@ use tokio_tungstenite::{
 };
 
 use crate::proto::agent::{
-    AgentError, AgentHeartbeat, AgentJob, AgentJobList, JobType, QueryType, SnmpResult,
+    AgentHeartbeat, AgentJob, AgentJobList, JobType, QueryType, SnmpResult,
 };
 use crate::snmp::{SnmpClient, SnmpValue};
 
@@ -34,7 +34,6 @@ struct PhoenixMessage {
 /// WebSocket client for agent communication.
 pub struct AgentClient {
     ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    token: String,
     agent_id: String,
     result_tx: mpsc::UnboundedSender<SnmpResult>,
     result_rx: mpsc::UnboundedReceiver<SnmpResult>,
@@ -63,7 +62,6 @@ impl AgentClient {
 
         Ok(Self {
             ws_stream,
-            token: token.to_string(),
             agent_id: generate_agent_id(),
             result_tx,
             result_rx,
@@ -160,7 +158,7 @@ impl AgentClient {
         log::info!("Received {} jobs from server", job_list.jobs.len());
 
         for job in job_list.jobs {
-            let job_type = JobType::from_i32(job.job_type).unwrap_or(JobType::Poll);
+            let job_type = JobType::try_from(job.job_type).unwrap_or(JobType::Poll);
             log::info!("Executing job: {} (type: {:?})", job.job_id, job_type);
 
             // Spawn task to execute job
@@ -218,24 +216,6 @@ impl AgentClient {
         log::debug!("Sent SNMP result for equipment {}", result.equipment_id);
         Ok(())
     }
-
-    /// Send error to server.
-    async fn send_error(&mut self, error: AgentError) -> Result<()> {
-        let binary = error.encode_to_vec();
-
-        let msg = PhoenixMessage {
-            topic: format!("agent:{}", self.agent_id),
-            event: "error".to_string(),
-            payload: serde_json::json!({"binary": BASE64.encode(&binary)}),
-            reference: None,
-        };
-
-        let text = serde_json::to_string(&msg)?;
-        self.ws_stream.send(WsMessage::Text(text)).await?;
-
-        log::warn!("Sent error for equipment {}", error.equipment_id);
-        Ok(())
-    }
 }
 
 /// Execute an SNMP job and collect results.
@@ -245,7 +225,7 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
     let snmp_client = SnmpClient::new();
 
     for query in job.queries {
-        let query_type = QueryType::from_i32(query.query_type).unwrap_or(QueryType::Get);
+        let query_type = QueryType::try_from(query.query_type).unwrap_or(QueryType::Get);
 
         match query_type {
             QueryType::Get => {

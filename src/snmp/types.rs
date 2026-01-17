@@ -37,6 +37,7 @@ pub enum SnmpValue {
 }
 
 impl SnmpValue {
+    #[allow(dead_code)]
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             SnmpValue::Integer(v) => Some(*v),
@@ -48,6 +49,7 @@ impl SnmpValue {
         }
     }
 
+    #[allow(dead_code)]
     pub fn as_f64(&self) -> Option<f64> {
         self.as_i64().map(|v| v as f64)
     }
