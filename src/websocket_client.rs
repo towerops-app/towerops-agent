@@ -241,14 +241,14 @@ impl AgentClient {
         let text = serde_json::to_string(&msg)?;
         self.ws_stream.send(WsMessage::Text(text)).await?;
 
-        log::debug!("Sent SNMP result for equipment {}", result.equipment_id);
+        log::debug!("Sent SNMP result for device {}", result.device_id);
         Ok(())
     }
 }
 
 /// Execute an SNMP job and collect results.
 async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>) -> Result<()> {
-    let device = job.device.context("Job missing device info")?;
+    let snmp_device = job.snmp_device.context("Job missing SNMP device info")?;
     let mut oid_values: HashMap<String, String> = HashMap::new();
     let snmp_client = SnmpClient::new();
 
@@ -261,10 +261,10 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
                 for oid in &query.oids {
                     match snmp_client
                         .get(
-                            &device.ip,
-                            &device.community,
-                            &device.version,
-                            device.port as u16,
+                            &snmp_device.ip,
+                            &snmp_device.community,
+                            &snmp_device.version,
+                            snmp_device.port as u16,
                             oid,
                         )
                         .await
@@ -283,10 +283,10 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
                 for base_oid in &query.oids {
                     match snmp_client
                         .walk(
-                            &device.ip,
-                            &device.community,
-                            &device.version,
-                            device.port as u16,
+                            &snmp_device.ip,
+                            &snmp_device.community,
+                            &snmp_device.version,
+                            snmp_device.port as u16,
                             base_oid,
                         )
                         .await
@@ -307,7 +307,7 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
 
     // Build result
     let result = SnmpResult {
-        equipment_id: job.equipment_id,
+        device_id: job.device_id,
         job_type: job.job_type,
         oid_values,
         timestamp: std::time::SystemTime::now()
