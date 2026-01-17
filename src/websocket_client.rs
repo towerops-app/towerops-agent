@@ -3,6 +3,8 @@
 /// This replaces the complex REST API + polling architecture with a single
 /// persistent WebSocket connection. The server sends SNMP query jobs as protobuf
 /// messages, the agent executes raw SNMP queries, and sends results back.
+///
+/// Connection URL: {url}/socket/agent/websocket?token={token}
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -49,7 +51,7 @@ impl AgentClient {
     /// let client = AgentClient::connect("wss://towerops.net", "token123").await?;
     /// ```
     pub async fn connect(url: &str, token: &str) -> Result<Self> {
-        let ws_url = format!("{}/socket/agent?token={}", url, token);
+        let ws_url = format!("{}/socket/agent/websocket?token={}", url, token);
         log::info!("Connecting to WebSocket: {}", ws_url);
 
         let (mut ws_stream, _) = connect_async(&ws_url)
