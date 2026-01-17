@@ -52,7 +52,7 @@ impl AgentClient {
         let ws_url = format!("{}/socket/agent?token={}", url, token);
         log::info!("Connecting to WebSocket: {}", ws_url);
 
-        let (ws_stream, _) = connect_async(&ws_url)
+        let (mut ws_stream, _) = connect_async(&ws_url)
             .await
             .map_err(|e| {
                 log::error!("WebSocket connection failed: {}", e);
@@ -62,11 +62,24 @@ impl AgentClient {
 
         log::info!("Connected to Towerops server at {}", url);
 
+        let agent_id = generate_agent_id();
         let (result_tx, result_rx) = mpsc::unbounded_channel();
+
+        // Join Phoenix channel
+        let join_msg = PhoenixMessage {
+            topic: format!("agent:{}", agent_id),
+            event: "phx_join".to_string(),
+            payload: serde_json::json!({}),
+            reference: Some("1".to_string()),
+        };
+
+        let join_text = serde_json::to_string(&join_msg)?;
+        ws_stream.send(WsMessage::Text(join_text)).await?;
+        log::info!("Sent channel join request for agent:{}", agent_id);
 
         Ok(Self {
             ws_stream,
-            agent_id: generate_agent_id(),
+            agent_id,
             result_tx,
             result_rx,
         })
@@ -129,6 +142,9 @@ impl AgentClient {
         let phoenix_msg: PhoenixMessage = serde_json::from_str(text)?;
 
         match phoenix_msg.event.as_str() {
+            "phx_reply" => {
+                log::info!("Channel join reply: {:?}", phoenix_msg.payload);
+            }
             "jobs" => {
                 // Extract binary protobuf from payload
                 if let serde_json::Value::Object(map) = phoenix_msg.payload {
