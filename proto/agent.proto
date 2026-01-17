@@ -6,10 +6,10 @@ package towerops.agent;
 message AgentConfig {
   string version = 1;
   uint32 poll_interval_seconds = 2;
-  repeated Equipment equipment = 3;
+  repeated Device devices = 3;
 }
 
-message Equipment {
+message Device {
   string id = 1;
   string name = 2;
   string ip_address = 3;
@@ -116,8 +116,8 @@ message AgentJobList {
 message AgentJob {
   string job_id = 1;
   JobType job_type = 2;
-  string equipment_id = 3;
-  SnmpDevice device = 4;
+  string device_id = 3;
+  SnmpDevice snmp_device = 4;
   repeated SnmpQuery queries = 5;
 }
 
@@ -134,7 +134,7 @@ message SnmpQuery {
 }
 
 message SnmpResult {
-  string equipment_id = 1;
+  string device_id = 1;
   JobType job_type = 2;
   map<string, string> oid_values = 3;
   int64 timestamp = 4;
@@ -148,7 +148,7 @@ message AgentHeartbeat {
 }
 
 message AgentError {
-  string equipment_id = 1;
+  string device_id = 1;
   string error_message = 2;
   int64 timestamp = 3;
 }
