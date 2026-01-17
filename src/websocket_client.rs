@@ -4,7 +4,8 @@
 /// persistent WebSocket connection. The server sends SNMP query jobs as protobuf
 /// messages, the agent executes raw SNMP queries, and sends results back.
 ///
-/// Connection URL: {url}/socket/agent/websocket?token={token}
+/// Connection URL: {url}/socket/agent/websocket
+/// Authentication: Token sent in Phoenix channel join payload
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -51,7 +52,7 @@ impl AgentClient {
     /// let client = AgentClient::connect("wss://towerops.net", "token123").await?;
     /// ```
     pub async fn connect(url: &str, token: &str) -> Result<Self> {
-        let ws_url = format!("{}/socket/agent/websocket?token={}", url, token);
+        let ws_url = format!("{}/socket/agent/websocket", url);
         log::info!("Connecting to WebSocket: {}", ws_url);
 
         let (mut ws_stream, _) = connect_async(&ws_url)
@@ -67,17 +68,20 @@ impl AgentClient {
         let agent_id = generate_agent_id();
         let (result_tx, result_rx) = mpsc::unbounded_channel();
 
-        // Join Phoenix channel
+        // Join Phoenix channel with token in payload
         let join_msg = PhoenixMessage {
             topic: format!("agent:{}", agent_id),
             event: "phx_join".to_string(),
-            payload: serde_json::json!({}),
+            payload: serde_json::json!({"token": token}),
             reference: Some("1".to_string()),
         };
 
         let join_text = serde_json::to_string(&join_msg)?;
         ws_stream.send(WsMessage::Text(join_text)).await?;
-        log::info!("Sent channel join request for agent:{}", agent_id);
+        log::info!(
+            "Sent channel join request with token for agent:{}",
+            agent_id
+        );
 
         Ok(Self {
             ws_stream,
