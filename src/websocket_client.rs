@@ -16,9 +16,7 @@ use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message as WsMessage, MaybeTlsStream, WebSocketStream,
 };
 
-use crate::proto::agent::{
-    AgentHeartbeat, AgentJob, AgentJobList, JobType, QueryType, SnmpResult,
-};
+use crate::proto::agent::{AgentHeartbeat, AgentJob, AgentJobList, JobType, QueryType, SnmpResult};
 use crate::snmp::{SnmpClient, SnmpValue};
 
 /// Phoenix channel message format (JSON wrapper around binary protobuf).
