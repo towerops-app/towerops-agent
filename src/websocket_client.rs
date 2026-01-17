@@ -50,8 +50,14 @@ impl AgentClient {
     /// ```
     pub async fn connect(url: &str, token: &str) -> Result<Self> {
         let ws_url = format!("{}/socket/agent?token={}", url, token);
+        log::info!("Connecting to WebSocket: {}", ws_url);
+
         let (ws_stream, _) = connect_async(&ws_url)
             .await
+            .map_err(|e| {
+                log::error!("WebSocket connection failed: {}", e);
+                e
+            })
             .context("Failed to connect to WebSocket")?;
 
         log::info!("Connected to Towerops server at {}", url);
