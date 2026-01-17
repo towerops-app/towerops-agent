@@ -52,7 +52,9 @@ impl AgentClient {
     /// let client = AgentClient::connect("wss://towerops.net", "token123").await?;
     /// ```
     pub async fn connect(url: &str, token: &str) -> Result<Self> {
-        let ws_url = format!("{}/socket/agent/websocket", url);
+        // Strip trailing slash from base URL to avoid double slashes
+        let base_url = url.trim_end_matches('/');
+        let ws_url = format!("{}/socket/agent/websocket", base_url);
         log::info!("Connecting to WebSocket: {}", ws_url);
 
         let (mut ws_stream, _) = connect_async(&ws_url)
