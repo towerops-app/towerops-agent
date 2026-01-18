@@ -22,6 +22,8 @@ anyhow = "1.0"
 thiserror = "1.0"
 base64 = "0.21"
 hostname = "0.3"
+socket2 = "0.5"
+rand = "0.8"
 
 [build-dependencies]
 prost-build = "0.13"

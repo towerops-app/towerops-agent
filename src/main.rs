@@ -1,4 +1,5 @@
 mod health;
+mod ping;
 mod proto;
 mod snmp;
 mod version;
