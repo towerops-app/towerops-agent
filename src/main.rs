@@ -12,10 +12,10 @@ use tokio::time::sleep;
 use websocket_client::AgentClient;
 
 // Log levels
-static LOG_LEVEL: std::sync::OnceLock<LogLevel> = std::sync::OnceLock::new();
+pub(crate) static LOG_LEVEL: std::sync::OnceLock<LogLevel> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum LogLevel {
+pub(crate) enum LogLevel {
     Error = 1,
     Warn = 2,
     Info = 3,
@@ -34,40 +34,44 @@ impl LogLevel {
     }
 }
 
+#[macro_export]
 macro_rules! log_error {
     ($($arg:tt)*) => {{
-        let level = LOG_LEVEL.get().copied().unwrap_or(LogLevel::Info);
-        if level >= LogLevel::Error {
+        let level = $crate::LOG_LEVEL.get().copied().unwrap_or($crate::LogLevel::Info);
+        if level >= $crate::LogLevel::Error {
             let ts = $crate::format_timestamp();
             eprintln!("[{}] [ERROR] {}", ts, format!($($arg)*));
         }
     }};
 }
 
+#[macro_export]
 macro_rules! log_warn {
     ($($arg:tt)*) => {{
-        let level = LOG_LEVEL.get().copied().unwrap_or(LogLevel::Info);
-        if level >= LogLevel::Warn {
+        let level = $crate::LOG_LEVEL.get().copied().unwrap_or($crate::LogLevel::Info);
+        if level >= $crate::LogLevel::Warn {
             let ts = $crate::format_timestamp();
             eprintln!("[{}] [WARN] {}", ts, format!($($arg)*));
         }
     }};
 }
 
+#[macro_export]
 macro_rules! log_info {
     ($($arg:tt)*) => {{
-        let level = LOG_LEVEL.get().copied().unwrap_or(LogLevel::Info);
-        if level >= LogLevel::Info {
+        let level = $crate::LOG_LEVEL.get().copied().unwrap_or($crate::LogLevel::Info);
+        if level >= $crate::LogLevel::Info {
             let ts = $crate::format_timestamp();
             eprintln!("[{}] [INFO] {}", ts, format!($($arg)*));
         }
     }};
 }
 
+#[macro_export]
 macro_rules! log_debug {
     ($($arg:tt)*) => {{
-        let level = LOG_LEVEL.get().copied().unwrap_or(LogLevel::Info);
-        if level >= LogLevel::Debug {
+        let level = $crate::LOG_LEVEL.get().copied().unwrap_or($crate::LogLevel::Info);
+        if level >= $crate::LogLevel::Debug {
             let ts = $crate::format_timestamp();
             eprintln!("[{}] [DEBUG] {}", ts, format!($($arg)*));
         }
@@ -243,44 +247,6 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use log::Log;
-
-    #[test]
-    fn test_simple_logger_enabled() {
-        let logger = SimpleLogger {
-            level: LevelFilter::Info,
-        };
-
-        // Info level should be enabled
-        let info_metadata = log::MetadataBuilder::new()
-            .level(log::Level::Info)
-            .target("test")
-            .build();
-        assert!(logger.enabled(&info_metadata));
-
-        // Debug level should not be enabled
-        let debug_metadata = log::MetadataBuilder::new()
-            .level(log::Level::Debug)
-            .target("test")
-            .build();
-        assert!(!logger.enabled(&debug_metadata));
-
-        // Error level should be enabled
-        let error_metadata = log::MetadataBuilder::new()
-            .level(log::Level::Error)
-            .target("test")
-            .build();
-        assert!(logger.enabled(&error_metadata));
-    }
-
-    #[test]
-    fn test_simple_logger_flush() {
-        let logger = SimpleLogger {
-            level: LevelFilter::Info,
-        };
-        // flush() does nothing, just verify it's callable
-        logger.flush();
-    }
 
     #[test]
     fn test_convert_http_to_websocket() {
