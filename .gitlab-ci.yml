@@ -77,6 +77,7 @@ build:main:
     - |
       docker buildx build \
         --platform linux/amd64 \
+        --build-arg VERSION=$VERSION \
         --cache-from type=registry,ref=$REGISTRY/$IMAGE_NAME:buildcache \
         --cache-to type=registry,ref=$REGISTRY/$IMAGE_NAME:buildcache,mode=max \
         --tag $REGISTRY/$IMAGE_NAME:latest \
@@ -116,6 +117,7 @@ release:multiarch:
 
       docker buildx build \
         --platform linux/amd64,linux/arm64 \
+        --build-arg VERSION=$VERSION \
         --cache-from type=registry,ref=$REGISTRY/$IMAGE_NAME:buildcache \
         --cache-to type=registry,ref=$REGISTRY/$IMAGE_NAME:buildcache,mode=max \
         --tag $REGISTRY/$IMAGE_NAME:$VERSION \

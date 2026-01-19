@@ -3,6 +3,7 @@ FROM rust:1.83-alpine AS builder
 
 # Build arguments provided by Docker buildx
 ARG TARGETPLATFORM
+ARG VERSION=0.1.0-unknown
 
 WORKDIR /app
 
@@ -27,7 +28,7 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs
 
 # Build dependencies (cached layer)
 RUN RUST_TARGET=$(cat /tmp/rust-target) && \
-    cargo build --release --target "$RUST_TARGET"
+    BUILD_VERSION="$VERSION" cargo build --release --target "$RUST_TARGET"
 
 # Remove dummy src
 RUN rm -rf src
@@ -38,7 +39,7 @@ COPY src ./src
 # Build the actual application
 RUN RUST_TARGET=$(cat /tmp/rust-target) && \
     touch src/main.rs && \
-    cargo build --release --target "$RUST_TARGET" && \
+    BUILD_VERSION="$VERSION" cargo build --release --target "$RUST_TARGET" && \
     cp "target/$RUST_TARGET/release/towerops-agent" /tmp/towerops-agent
 
 # Runtime stage
