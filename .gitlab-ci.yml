@@ -26,6 +26,7 @@ test:
     - cargo check --release
     - cargo fmt -- --check
     - cargo clippy -- -D warnings
+    - cargo test
   only:
     - branches
     - merge_requests

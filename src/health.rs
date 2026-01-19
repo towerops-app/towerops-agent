@@ -61,3 +61,47 @@ pub async fn start_health_server(port: u16) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_health_status_serialization() {
+        let status = HealthStatus {
+            status: "healthy".to_string(),
+            version: "0.1.0".to_string(),
+            uptime_seconds: 42,
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains(r#""status":"healthy""#));
+        assert!(json.contains(r#""version":"0.1.0""#));
+        assert!(json.contains(r#""uptime_seconds":42"#));
+    }
+
+    #[test]
+    fn test_health_status_deserialization() {
+        let json = r#"{"status":"healthy","version":"0.1.0","uptime_seconds":42}"#;
+        let status: HealthStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(status.status, "healthy");
+        assert_eq!(status.version, "0.1.0");
+        assert_eq!(status.uptime_seconds, 42);
+    }
+
+    #[test]
+    fn test_health_status_clone() {
+        let status = HealthStatus {
+            status: "healthy".to_string(),
+            version: "0.1.0".to_string(),
+            uptime_seconds: 42,
+        };
+        let cloned = status.clone();
+        assert_eq!(status.status, cloned.status);
+        assert_eq!(status.version, cloned.version);
+        assert_eq!(status.uptime_seconds, cloned.uptime_seconds);
+    }
+
+    // Note: start_health_server is tested manually/via integration tests
+    // Unit testing it requires complex async server mocking which is not practical
+}

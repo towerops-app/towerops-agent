@@ -108,7 +108,7 @@ fn build_icmp_echo_request(identifier: u16, sequence: u16) -> Vec<u8> {
 }
 
 fn parse_icmp_reply(packet: &[u8], expected_identifier: u16, expected_sequence: u16) -> Result<()> {
-    // ICMP reply might be wrapped in an IP header (20 bytes minimum)
+    // ICMP reply might be wrapped in an IP header
     // Try both raw ICMP and IP-wrapped formats
 
     // Try to parse as raw ICMP first
@@ -116,14 +116,40 @@ fn parse_icmp_reply(packet: &[u8], expected_identifier: u16, expected_sequence: 
         return Ok(());
     }
 
-    // Try to parse with IP header (skip first 20 bytes)
-    if packet.len() > 20 {
-        if let Ok(()) = try_parse_icmp(&packet[20..], expected_identifier, expected_sequence) {
-            return Ok(());
+    // Check if this looks like an IP packet (version 4 in high nibble of first byte)
+    if packet.len() >= 20 && (packet[0] >> 4) == 4 {
+        // Extract IP header length from IHL field (low nibble of first byte)
+        // IHL is in 32-bit words, so multiply by 4 to get bytes
+        let ihl = (packet[0] & 0x0F) as usize * 4;
+
+        if ihl >= 20 && packet.len() > ihl {
+            // Try to parse ICMP after skipping the IP header
+            if let Ok(()) = try_parse_icmp(&packet[ihl..], expected_identifier, expected_sequence) {
+                return Ok(());
+            }
         }
     }
 
-    Err(anyhow!("Invalid ICMP reply packet"))
+    // Log diagnostic information to help debug
+    let packet_preview = if packet.len() >= 8 {
+        format!(
+            "type={} code={} id={} seq={} len={}",
+            packet[0],
+            packet.get(1).unwrap_or(&0),
+            u16::from_be_bytes([*packet.get(4).unwrap_or(&0), *packet.get(5).unwrap_or(&0)]),
+            u16::from_be_bytes([*packet.get(6).unwrap_or(&0), *packet.get(7).unwrap_or(&0)]),
+            packet.len()
+        )
+    } else {
+        format!("len={} (too short)", packet.len())
+    };
+
+    Err(anyhow!(
+        "Invalid ICMP reply packet (expected id={}, seq={}): {}",
+        expected_identifier,
+        expected_sequence,
+        packet_preview
+    ))
 }
 
 fn try_parse_icmp(packet: &[u8], expected_identifier: u16, expected_sequence: u16) -> Result<()> {
@@ -183,18 +209,24 @@ mod tests {
 
     #[test]
     fn test_icmp_checksum() {
-        // Known ICMP echo request packet with correct checksum
-        let packet = vec![
-            0x08, 0x00, 0xf7, 0xff, 0x00, 0x01, 0x00, 0x01, 0x61, 0x62, 0x63, 0x64,
+        // Test that checksum calculation is consistent
+        // ICMP echo request packet: type=8, code=0, id=1, seq=1, data="abcd"
+        let mut packet = vec![
+            0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x61, 0x62, 0x63, 0x64,
         ];
 
-        // Calculate checksum for packet with checksum field zeroed
-        let mut test_packet = packet.clone();
-        test_packet[2] = 0;
-        test_packet[3] = 0;
+        // Calculate checksum
+        let checksum = icmp_checksum(&packet);
+        assert_ne!(checksum, 0, "Checksum should not be zero");
 
-        let checksum = icmp_checksum(&test_packet);
-        assert_eq!(checksum, 0xf7ff);
+        // Insert checksum into packet
+        packet[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+        // Verify: recalculating checksum with checksum field included should give 0
+        // (because the sum of all words including the checksum should wrap to 0xFFFF,
+        // and one's complement of 0xFFFF is 0)
+        let verification = icmp_checksum(&packet);
+        assert_eq!(verification, 0, "Checksum verification should be 0");
     }
 
     #[test]
@@ -216,5 +248,103 @@ mod tests {
         // Verify checksum is non-zero
         let checksum = u16::from_be_bytes([packet[2], packet[3]]);
         assert_ne!(checksum, 0);
+    }
+
+    #[test]
+    fn test_try_parse_icmp_success() {
+        // Valid ICMP echo reply packet
+        let packet = vec![
+            0x00, 0x00, 0x00, 0x00, // type=0 (reply), code=0, checksum
+            0x12, 0x34, // identifier
+            0x56, 0x78, // sequence
+            0x61, 0x62, 0x63, 0x64, // data
+        ];
+
+        let result = try_parse_icmp(&packet, 0x1234, 0x5678);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_parse_icmp_too_short() {
+        let packet = vec![0x00, 0x00, 0x00];
+        let result = try_parse_icmp(&packet, 0x1234, 0x5678);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    #[test]
+    fn test_try_parse_icmp_wrong_type() {
+        let packet = vec![
+            0x08, 0x00, 0x00, 0x00, // type=8 (request, not reply), code=0
+            0x12, 0x34, // identifier
+            0x56, 0x78, // sequence
+        ];
+
+        let result = try_parse_icmp(&packet, 0x1234, 0x5678);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("mismatch"));
+    }
+
+    #[test]
+    fn test_try_parse_icmp_wrong_identifier() {
+        let packet = vec![
+            0x00, 0x00, 0x00, 0x00, // type=0, code=0
+            0x99, 0x99, // wrong identifier
+            0x56, 0x78, // sequence
+        ];
+
+        let result = try_parse_icmp(&packet, 0x1234, 0x5678);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_icmp_reply_raw() {
+        // Raw ICMP packet (no IP header)
+        let packet = vec![
+            0x00, 0x00, 0x00, 0x00, // type=0, code=0, checksum
+            0x12, 0x34, // identifier
+            0x56, 0x78, // sequence
+        ];
+
+        let result = parse_icmp_reply(&packet, 0x1234, 0x5678);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_icmp_reply_with_ip_header() {
+        // IPv4 packet with ICMP payload
+        let packet = vec![
+            0x45, 0x00, 0x00, 0x54, // IPv4 header: version=4, IHL=5 (20 bytes)
+            0x00, 0x00, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, // TTL, protocol=ICMP
+            0xc0, 0xa8, 0x01, 0x01, // Source IP
+            0xc0, 0xa8, 0x01, 0x02, // Dest IP
+            // ICMP payload starts here (at byte 20)
+            0x00, 0x00, 0x00, 0x00, // type=0, code=0, checksum
+            0x12, 0x34, // identifier
+            0x56, 0x78, // sequence
+        ];
+
+        let result = parse_icmp_reply(&packet, 0x1234, 0x5678);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_icmp_reply_invalid() {
+        let packet = vec![0x00, 0x00];
+        let result = parse_icmp_reply(&packet, 0x1234, 0x5678);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid ICMP reply"));
+    }
+
+    #[test]
+    fn test_parse_icmp_reply_short_packet_error_message() {
+        let packet = vec![0x01, 0x02, 0x03];
+        let result = parse_icmp_reply(&packet, 0x1234, 0x5678);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("too short"));
     }
 }
