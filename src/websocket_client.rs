@@ -6,7 +6,6 @@
 ///
 /// Connection URL: {url}/socket/agent/websocket
 /// Authentication: Token sent in Phoenix channel join payload
-use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use prost::Message;
 use std::collections::HashMap;
@@ -16,6 +15,8 @@ use tokio::time::{interval, Duration};
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message as WsMessage, MaybeTlsStream, WebSocketStream,
 };
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 use crate::ping::ping;
 use crate::proto::agent::{
@@ -66,7 +67,7 @@ impl AgentClient {
                 log::error!("WebSocket connection failed: {}", e);
                 e
             })
-            .context("Failed to connect to WebSocket")?;
+            .map_err(|e| format!("Failed to connect to WebSocket: {}", e))?;
 
         log::info!("Connected to Towerops server at {}", url);
 
@@ -323,7 +324,9 @@ impl AgentClient {
 
 /// Execute an SNMP job and collect results.
 async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>) -> Result<()> {
-    let snmp_device = job.snmp_device.context("Job missing SNMP device info")?;
+    let snmp_device = job
+        .snmp_device
+        .ok_or("Job missing SNMP device info")?;
     let mut oid_values: HashMap<String, String> = HashMap::new();
     let snmp_client = SnmpClient::new();
 
@@ -468,7 +471,7 @@ fn base64_decode(encoded: &str) -> Result<Vec<u8>> {
             } else {
                 let val = decode_map[byte as usize];
                 if val == 0xFF {
-                    anyhow::bail!("Invalid base64 character");
+                    return Err("Invalid base64 character".into());
                 }
                 buf[i] = val;
             }

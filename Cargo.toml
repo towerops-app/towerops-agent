@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 snmp = "0.2"
-ureq = { version = "2.10", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
@@ -15,10 +14,7 @@ log = { version = "0.4", features = ["std"] }
 clap = { version = "4.0", features = ["derive", "env"] }
 prost = "0.13"
 prost-types = "0.13"
-tiny_http = "0.12"
-anyhow = "1.0"
 socket2 = "0.5"
-rand = "0.8"
 
 [build-dependencies]
 prost-build = "0.13"
