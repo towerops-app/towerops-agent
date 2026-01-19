@@ -2,6 +2,10 @@ use super::types::{SnmpError, SnmpResult, SnmpValue};
 use snmp::SyncSession;
 use std::time::Duration;
 
+// SNMP timeout in seconds - increased from 5s to 30s to match Phoenix app
+// and reduce timeouts for slow devices or congested networks
+const SNMP_TIMEOUT_SECS: u64 = 30;
+
 /// SNMP client for polling devices
 #[derive(Debug, Clone, Copy)]
 pub struct SnmpClient;
@@ -37,10 +41,14 @@ impl SnmpClient {
 
         // Run SNMP operation in blocking thread pool
         let result = tokio::task::spawn_blocking(move || {
-            // Create session with 5 second timeout
-            let mut session =
-                SyncSession::new(addr.as_str(), &community, Some(Duration::from_secs(5)), 0)
-                    .map_err(|_| SnmpError::NetworkUnreachable)?;
+            // Create session with configurable timeout
+            let mut session = SyncSession::new(
+                addr.as_str(),
+                &community,
+                Some(Duration::from_secs(SNMP_TIMEOUT_SECS)),
+                0,
+            )
+            .map_err(|_| SnmpError::NetworkUnreachable)?;
 
             // Perform GET request
             let mut response = session.get(&oid_parts).map_err(map_snmp_error)?;
@@ -93,10 +101,14 @@ impl SnmpClient {
 
         // Run SNMP walk in blocking thread pool
         let results = tokio::task::spawn_blocking(move || {
-            // Create session with 5 second timeout
-            let mut session =
-                SyncSession::new(addr.as_str(), &community, Some(Duration::from_secs(5)), 0)
-                    .map_err(|_| SnmpError::NetworkUnreachable)?;
+            // Create session with configurable timeout
+            let mut session = SyncSession::new(
+                addr.as_str(),
+                &community,
+                Some(Duration::from_secs(SNMP_TIMEOUT_SECS)),
+                0,
+            )
+            .map_err(|_| SnmpError::NetworkUnreachable)?;
 
             let mut results = Vec::new();
             let mut current_oid = base_oid_parts.clone();
