@@ -19,7 +19,10 @@ use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message as WsMessage, MaybeTlsStream, WebSocketStream,
 };
 
-use crate::proto::agent::{AgentHeartbeat, AgentJob, AgentJobList, JobType, QueryType, SnmpResult};
+use crate::ping::ping;
+use crate::proto::agent::{
+    AgentHeartbeat, AgentJob, AgentJobList, JobType, MonitoringCheck, QueryType, SnmpResult,
+};
 use crate::snmp::{SnmpClient, SnmpValue};
 
 /// Phoenix channel message format (JSON wrapper around binary protobuf).
@@ -38,6 +41,8 @@ pub struct AgentClient {
     agent_id: String,
     result_tx: mpsc::UnboundedSender<SnmpResult>,
     result_rx: mpsc::UnboundedReceiver<SnmpResult>,
+    monitoring_check_tx: mpsc::UnboundedSender<MonitoringCheck>,
+    monitoring_check_rx: mpsc::UnboundedReceiver<MonitoringCheck>,
 }
 
 impl AgentClient {
@@ -69,6 +74,7 @@ impl AgentClient {
 
         let agent_id = generate_agent_id();
         let (result_tx, result_rx) = mpsc::unbounded_channel();
+        let (monitoring_check_tx, monitoring_check_rx) = mpsc::unbounded_channel();
 
         // Join Phoenix channel with token in payload
         let join_msg = PhoenixMessage {
@@ -90,6 +96,8 @@ impl AgentClient {
             agent_id,
             result_tx,
             result_rx,
+            monitoring_check_tx,
+            monitoring_check_rx,
         })
     }
 
@@ -133,6 +141,11 @@ impl AgentClient {
                 // Receive SNMP results from job tasks
                 Some(result) = self.result_rx.recv() => {
                     self.send_result(result).await?;
+                }
+
+                // Receive monitoring checks from ping tasks
+                Some(check) = self.monitoring_check_rx.recv() => {
+                    self.send_monitoring_check(check).await?;
                 }
 
                 // Send periodic heartbeats
@@ -189,13 +202,55 @@ impl AgentClient {
             let job_type = JobType::try_from(job.job_type).unwrap_or(JobType::Poll);
             log::info!("Executing job: {} (type: {:?})", job.job_id, job_type);
 
-            // Spawn task to execute job
+            // Extract monitoring configuration before moving job
+            let monitoring_info = job.snmp_device.as_ref().and_then(|snmp_device| {
+                if snmp_device.monitoring_enabled {
+                    Some((
+                        snmp_device.ip.clone(),
+                        if snmp_device.check_interval_seconds > 0 {
+                            snmp_device.check_interval_seconds as u64
+                        } else {
+                            60
+                        },
+                    ))
+                } else {
+                    None
+                }
+            });
+
+            // Spawn task to execute SNMP job
             let result_tx = self.result_tx.clone();
+            let monitoring_check_tx = self.monitoring_check_tx.clone();
+            let device_id = job.device_id.clone();
+
             tokio::spawn(async move {
                 if let Err(e) = execute_job(job, result_tx).await {
                     log::error!("Job execution failed: {}", e);
                 }
             });
+
+            // Start monitoring task if enabled
+            if let Some((ip, interval_seconds)) = monitoring_info {
+                log::info!(
+                    "Starting ICMP monitoring for device {} every {} seconds",
+                    device_id,
+                    interval_seconds
+                );
+
+                let device_id_clone = device_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = run_monitoring_task(
+                        device_id_clone,
+                        ip,
+                        interval_seconds,
+                        monitoring_check_tx,
+                    )
+                    .await
+                    {
+                        log::error!("Monitoring task failed: {}", e);
+                    }
+                });
+            }
         }
 
         Ok(())
@@ -243,6 +298,33 @@ impl AgentClient {
 
         log::debug!("Sent SNMP result for device {}", result.device_id);
         Ok(())
+    }
+
+    /// Send monitoring check result to server.
+    async fn send_monitoring_check(&mut self, check: MonitoringCheck) -> Result<()> {
+        let binary = check.encode_to_vec();
+
+        let msg = PhoenixMessage {
+            topic: format!("agent:{}", self.agent_id),
+            event: "monitoring_check".to_string(),
+            payload: serde_json::json!({"binary": BASE64.encode(&binary)}),
+            reference: None,
+        };
+
+        let text = serde_json::to_string(&msg)?;
+        self.ws_stream.send(WsMessage::Text(text)).await?;
+
+        log::debug!(
+            "Sent monitoring check for device {}: {}",
+            check.device_id,
+            check.status
+        );
+        Ok(())
+    }
+
+    /// Get the monitoring check sender for spawning ping tasks.
+    pub fn monitoring_check_sender(&self) -> mpsc::UnboundedSender<MonitoringCheck> {
+        self.monitoring_check_tx.clone()
     }
 }
 
@@ -366,4 +448,71 @@ fn get_local_ip() -> Option<String> {
     // TODO: Implement IP detection
     // Could use local_ip_address crate or parse network interfaces
     None
+}
+
+/// Run continuous ICMP monitoring for a device.
+async fn run_monitoring_task(
+    device_id: String,
+    ip: String,
+    interval_seconds: u64,
+    check_tx: mpsc::UnboundedSender<MonitoringCheck>,
+) -> Result<()> {
+    let mut interval_timer = interval(Duration::from_secs(interval_seconds));
+
+    loop {
+        interval_timer.tick().await;
+
+        let ip_addr: std::net::IpAddr = match ip.parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                log::error!("Invalid IP address for device {}: {}", device_id, e);
+                continue;
+            }
+        };
+
+        let timeout = Duration::from_secs(5);
+
+        match ping(ip_addr, timeout).await {
+            Ok(rtt) => {
+                let check = MonitoringCheck {
+                    device_id: device_id.clone(),
+                    status: "success".to_string(),
+                    response_time_ms: rtt.as_secs_f64() * 1000.0,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_secs() as i64,
+                };
+
+                if let Err(e) = check_tx.send(check) {
+                    log::error!("Failed to send monitoring check: {}", e);
+                    break;
+                }
+
+                log::debug!(
+                    "ICMP ping successful for {}: {:.2}ms",
+                    ip,
+                    rtt.as_secs_f64() * 1000.0
+                );
+            }
+            Err(e) => {
+                let check = MonitoringCheck {
+                    device_id: device_id.clone(),
+                    status: "failure".to_string(),
+                    response_time_ms: 0.0,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_secs() as i64,
+                };
+
+                if let Err(send_err) = check_tx.send(check) {
+                    log::error!("Failed to send monitoring check: {}", send_err);
+                    break;
+                }
+
+                log::warn!("ICMP ping failed for {}: {}", ip, e);
+            }
+        }
+    }
+
+    Ok(())
 }
