@@ -6,14 +6,76 @@ mod version;
 mod websocket_client;
 
 use clap::Parser;
-use log::{error, info, warn, LevelFilter, Metadata, Record};
 use std::env;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use websocket_client::AgentClient;
 
+// Log levels
+static LOG_LEVEL: std::sync::OnceLock<LogLevel> = std::sync::OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LogLevel {
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+}
+
+impl LogLevel {
+    fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "error" => LogLevel::Error,
+            "warn" => LogLevel::Warn,
+            "info" => LogLevel::Info,
+            "debug" => LogLevel::Debug,
+            _ => LogLevel::Info,
+        }
+    }
+}
+
+macro_rules! log_error {
+    ($($arg:tt)*) => {{
+        let level = LOG_LEVEL.get().copied().unwrap_or(LogLevel::Info);
+        if level >= LogLevel::Error {
+            let ts = $crate::format_timestamp();
+            eprintln!("[{}] [ERROR] {}", ts, format!($($arg)*));
+        }
+    }};
+}
+
+macro_rules! log_warn {
+    ($($arg:tt)*) => {{
+        let level = LOG_LEVEL.get().copied().unwrap_or(LogLevel::Info);
+        if level >= LogLevel::Warn {
+            let ts = $crate::format_timestamp();
+            eprintln!("[{}] [WARN] {}", ts, format!($($arg)*));
+        }
+    }};
+}
+
+macro_rules! log_info {
+    ($($arg:tt)*) => {{
+        let level = LOG_LEVEL.get().copied().unwrap_or(LogLevel::Info);
+        if level >= LogLevel::Info {
+            let ts = $crate::format_timestamp();
+            eprintln!("[{}] [INFO] {}", ts, format!($($arg)*));
+        }
+    }};
+}
+
+macro_rules! log_debug {
+    ($($arg:tt)*) => {{
+        let level = LOG_LEVEL.get().copied().unwrap_or(LogLevel::Info);
+        if level >= LogLevel::Debug {
+            let ts = $crate::format_timestamp();
+            eprintln!("[{}] [DEBUG] {}", ts, format!($($arg)*));
+        }
+    }};
+}
+
 /// Format current timestamp as "YYYY-MM-DD HH:MM:SS.mmm"
-fn format_timestamp() -> String {
+pub fn format_timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -78,36 +140,10 @@ fn days_to_month_day(days: u16, is_leap: bool) -> (u8, u8) {
     (12, 31) // Fallback
 }
 
-/// Minimal logger that writes to stderr with timestamps
-struct SimpleLogger {
-    level: LevelFilter,
-}
-
-impl log::Log for SimpleLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.level
-    }
-
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            let timestamp = format_timestamp();
-            eprintln!("[{}] [{}] {}", timestamp, record.level(), record.args());
-        }
-    }
-
-    fn flush(&self) {}
-}
-
 fn init_logger() {
-    let level = env::var("RUST_LOG")
-        .unwrap_or_else(|_| "info".to_string())
-        .parse::<LevelFilter>()
-        .unwrap_or(LevelFilter::Info);
-
-    let logger = SimpleLogger { level };
-    log::set_boxed_logger(Box::new(logger))
-        .map(|()| log::set_max_level(level))
-        .ok();
+    let level_str = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+    let level = LogLevel::from_str(&level_str);
+    LOG_LEVEL.set(level).ok();
 }
 
 /// Convert HTTP(S) URL to WebSocket URL
@@ -144,7 +180,7 @@ async fn main() {
 
     let args = Args::parse();
 
-    info!("Towerops agent starting");
+    log_info!("Towerops agent starting");
 
     // Check for newer Docker image version
     version::check_for_updates();
@@ -152,12 +188,12 @@ async fn main() {
     // Convert HTTP(S) URL to WebSocket URL
     let ws_url = convert_to_websocket_url(&args.api_url);
 
-    info!("WebSocket URL: {}", ws_url);
+    log_info!("WebSocket URL: {}", ws_url);
 
     // Start simple health endpoint (no storage needed for WebSocket mode)
     tokio::spawn(async {
         if let Err(e) = health::start_health_server(8080).await {
-            warn!("Health server error: {}", e);
+            log_warn!("Health server error: {}", e);
         }
     });
 
@@ -170,7 +206,7 @@ async fn main() {
         attempt += 1;
 
         if attempt > 1 {
-            info!(
+            log_info!(
                 "Retry attempt {} - waiting {} seconds before reconnecting",
                 attempt,
                 retry_delay.as_secs()
@@ -184,21 +220,21 @@ async fn main() {
         // Connect to Towerops server via WebSocket
         let mut client = match AgentClient::connect(&ws_url, &args.token).await {
             Ok(client) => {
-                info!("Successfully connected to server");
+                log_info!("Successfully connected to server");
                 // Reset retry delay on successful connection
                 retry_delay = Duration::from_secs(1);
                 attempt = 0;
                 client
             }
             Err(e) => {
-                error!("Failed to connect to server: {}", e);
+                log_error!("Failed to connect to server: {}", e);
                 continue;
             }
         };
 
         // Run the agent event loop
         if let Err(e) = client.run().await {
-            error!("Agent disconnected: {}", e);
+            log_error!("Agent disconnected: {}", e);
             // Loop will retry with backoff
         }
     }
