@@ -321,11 +321,6 @@ impl AgentClient {
         );
         Ok(())
     }
-
-    /// Get the monitoring check sender for spawning ping tasks.
-    pub fn monitoring_check_sender(&self) -> mpsc::UnboundedSender<MonitoringCheck> {
-        self.monitoring_check_tx.clone()
-    }
 }
 
 /// Execute an SNMP job and collect results.
