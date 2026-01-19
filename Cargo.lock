@@ -1085,7 +1085,6 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "futures",
- "log",
  "prost",
  "prost-build",
  "prost-types",

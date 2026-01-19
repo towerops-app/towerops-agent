@@ -1,4 +1,3 @@
-use log::info;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,7 +18,7 @@ pub async fn start_health_server(port: u16) -> Result<()> {
     let start_time = Arc::new(Instant::now());
     let addr = format!("0.0.0.0:{}", port);
 
-    info!("Starting health endpoint on {}", addr);
+    crate::log_info!("Starting health endpoint on {}", addr);
     let listener = TcpListener::bind(&addr).await?;
 
     loop {
@@ -68,7 +67,7 @@ pub async fn start_health_server(port: u16) -> Result<()> {
                 });
             }
             Err(e) => {
-                log::warn!("Failed to accept health check connection: {}", e);
+                crate::log_warn!("Failed to accept health check connection: {}", e);
             }
         }
     }

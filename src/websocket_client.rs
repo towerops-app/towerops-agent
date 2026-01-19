@@ -59,17 +59,17 @@ impl AgentClient {
         // Strip trailing slash from base URL to avoid double slashes
         let base_url = url.trim_end_matches('/');
         let ws_url = format!("{}/socket/agent/websocket", base_url);
-        log::info!("Connecting to WebSocket: {}", ws_url);
+        crate::log_info!("Connecting to WebSocket: {}", ws_url);
 
         let (mut ws_stream, _) = connect_async(&ws_url)
             .await
             .map_err(|e| {
-                log::error!("WebSocket connection failed: {}", e);
+                crate::log_error!("WebSocket connection failed: {}", e);
                 e
             })
             .map_err(|e| format!("Failed to connect to WebSocket: {}", e))?;
 
-        log::info!("Connected to Towerops server at {}", url);
+        crate::log_info!("Connected to Towerops server at {}", url);
 
         let agent_id = generate_agent_id();
         let (result_tx, result_rx) = mpsc::unbounded_channel();
@@ -85,7 +85,7 @@ impl AgentClient {
 
         let join_text = serde_json::to_string(&join_msg)?;
         ws_stream.send(WsMessage::Text(join_text)).await?;
-        log::info!(
+        crate::log_info!(
             "Sent channel join request with token for agent:{}",
             agent_id
         );
@@ -122,15 +122,15 @@ impl AgentClient {
                             self.handle_text_message(&text).await?;
                         }
                         Some(Ok(WsMessage::Close(_))) => {
-                            log::info!("Server closed connection");
+                            crate::log_info!("Server closed connection");
                             break;
                         }
                         Some(Err(e)) => {
-                            log::error!("WebSocket error: {}", e);
+                            crate::log_error!("WebSocket error: {}", e);
                             return Err(e.into());
                         }
                         None => {
-                            log::info!("Connection closed");
+                            crate::log_info!("Connection closed");
                             break;
                         }
                         _ => {}
@@ -163,7 +163,7 @@ impl AgentClient {
 
         match phoenix_msg.event.as_str() {
             "phx_reply" => {
-                log::info!("Channel join reply: {:?}", phoenix_msg.payload);
+                crate::log_info!("Channel join reply: {:?}", phoenix_msg.payload);
             }
             "jobs" => {
                 // Extract binary protobuf from payload
@@ -176,7 +176,7 @@ impl AgentClient {
                 }
             }
             _ => {
-                log::debug!("Ignoring unknown event: {}", phoenix_msg.event);
+                crate::log_debug!("Ignoring unknown event: {}", phoenix_msg.event);
             }
         }
 
@@ -195,11 +195,11 @@ impl AgentClient {
 
     /// Process job list from server.
     async fn handle_jobs(&self, job_list: AgentJobList) -> Result<()> {
-        log::info!("Received {} jobs from server", job_list.jobs.len());
+        crate::log_info!("Received {} jobs from server", job_list.jobs.len());
 
         for job in job_list.jobs {
             let job_type = JobType::try_from(job.job_type).unwrap_or(JobType::Poll);
-            log::info!("Executing job: {} (type: {:?})", job.job_id, job_type);
+            crate::log_info!("Executing job: {} (type: {:?})", job.job_id, job_type);
 
             // Extract monitoring configuration before moving job
             let monitoring_info = job.snmp_device.as_ref().and_then(|snmp_device| {
@@ -224,13 +224,13 @@ impl AgentClient {
 
             tokio::spawn(async move {
                 if let Err(e) = execute_job(job, result_tx).await {
-                    log::error!("Job execution failed: {}", e);
+                    crate::log_error!("Job execution failed: {}", e);
                 }
             });
 
             // Start monitoring task if enabled
             if let Some((ip, interval_seconds)) = monitoring_info {
-                log::info!(
+                crate::log_info!(
                     "Starting ICMP monitoring for device {} every {} seconds",
                     device_id,
                     interval_seconds
@@ -246,7 +246,7 @@ impl AgentClient {
                     )
                     .await
                     {
-                        log::error!("Monitoring task failed: {}", e);
+                        crate::log_error!("Monitoring task failed: {}", e);
                     }
                 });
             }
@@ -277,7 +277,7 @@ impl AgentClient {
         let text = serde_json::to_string(&msg)?;
         self.ws_stream.send(WsMessage::Text(text)).await?;
 
-        log::debug!("Sent heartbeat");
+        crate::log_debug!("Sent heartbeat");
         Ok(())
     }
 
@@ -295,7 +295,7 @@ impl AgentClient {
         let text = serde_json::to_string(&msg)?;
         self.ws_stream.send(WsMessage::Text(text)).await?;
 
-        log::debug!("Sent SNMP result for device {}", result.device_id);
+        crate::log_debug!("Sent SNMP result for device {}", result.device_id);
         Ok(())
     }
 
@@ -313,7 +313,7 @@ impl AgentClient {
         let text = serde_json::to_string(&msg)?;
         self.ws_stream.send(WsMessage::Text(text)).await?;
 
-        log::debug!(
+        crate::log_debug!(
             "Sent monitoring check for device {}: {}",
             check.device_id,
             check.status
@@ -351,7 +351,7 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
                             oid_values.insert(oid.clone(), value_to_string(value));
                         }
                         Err(e) => {
-                            log::warn!("SNMP GET failed for OID {}: {}", oid, e);
+                            crate::log_warn!("SNMP GET failed for OID {}: {}", oid, e);
                         }
                     }
                 }
@@ -375,7 +375,7 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
                             }
                         }
                         Err(e) => {
-                            log::warn!("SNMP WALK failed for OID {}: {}", base_oid, e);
+                            crate::log_warn!("SNMP WALK failed for OID {}: {}", base_oid, e);
                         }
                     }
                 }
@@ -393,7 +393,7 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
             .as_secs() as i64,
     };
 
-    log::info!(
+    crate::log_info!(
         "Collected {} OID values for job {}",
         result.oid_values.len(),
         job.job_id
@@ -549,7 +549,7 @@ async fn run_monitoring_task(
         let ip_addr: std::net::IpAddr = match ip.parse() {
             Ok(addr) => addr,
             Err(e) => {
-                log::error!("Invalid IP address for device {}: {}", device_id, e);
+                crate::log_error!("Invalid IP address for device {}: {}", device_id, e);
                 continue;
             }
         };
@@ -568,11 +568,11 @@ async fn run_monitoring_task(
                 };
 
                 if let Err(e) = check_tx.send(check) {
-                    log::error!("Failed to send monitoring check: {}", e);
+                    crate::log_error!("Failed to send monitoring check: {}", e);
                     break;
                 }
 
-                log::debug!(
+                crate::log_debug!(
                     "ICMP ping successful for {}: {:.2}ms",
                     ip,
                     rtt.as_secs_f64() * 1000.0
@@ -589,11 +589,11 @@ async fn run_monitoring_task(
                 };
 
                 if let Err(send_err) = check_tx.send(check) {
-                    log::error!("Failed to send monitoring check: {}", send_err);
+                    crate::log_error!("Failed to send monitoring check: {}", send_err);
                     break;
                 }
 
-                log::warn!("ICMP ping failed for {}: {}", ip, e);
+                crate::log_warn!("ICMP ping failed for {}: {}", ip, e);
             }
         }
     }
@@ -663,8 +663,8 @@ mod tests {
         let uptime = get_uptime_seconds();
         // On Linux with /proc/uptime, should return non-zero
         // On other platforms or if file doesn't exist, returns 0
-        // Just verify it's callable and returns a number
-        assert!(uptime >= 0);
+        // uptime is u64, so always >= 0 - just verify it's callable
+        let _ = uptime;
     }
 
     #[test]
