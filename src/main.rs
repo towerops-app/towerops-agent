@@ -5,13 +5,78 @@ mod snmp;
 mod version;
 mod websocket_client;
 
-use chrono::Local;
 use clap::Parser;
 use log::{error, info, warn, LevelFilter, Metadata, Record};
 use std::env;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use websocket_client::AgentClient;
+
+/// Format current timestamp as "YYYY-MM-DD HH:MM:SS.mmm"
+fn format_timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+
+    let secs = now.as_secs();
+    let millis = now.subsec_millis();
+
+    // Calculate date/time components
+    const SECS_PER_DAY: u64 = 86400;
+    const SECS_PER_HOUR: u64 = 3600;
+    const SECS_PER_MIN: u64 = 60;
+
+    let days_since_epoch = secs / SECS_PER_DAY;
+    let secs_today = secs % SECS_PER_DAY;
+
+    let hour = (secs_today / SECS_PER_HOUR) as u8;
+    let min = ((secs_today % SECS_PER_HOUR) / SECS_PER_MIN) as u8;
+    let sec = (secs_today % SECS_PER_MIN) as u8;
+
+    // Simple epoch to date conversion (good enough for logging)
+    // Days since 1970-01-01
+    let mut year = 1970;
+    let mut days_left = days_since_epoch;
+
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days_left >= days_in_year {
+            days_left -= days_in_year;
+            year += 1;
+        } else {
+            break;
+        }
+    }
+
+    let (month, day) = days_to_month_day(days_left as u16, is_leap_year(year));
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        year, month, day, hour, min, sec, millis
+    )
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+fn days_to_month_day(days: u16, is_leap: bool) -> (u8, u8) {
+    let days_in_month = if is_leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut days_left = days;
+    for (month_idx, &days_in_month) in days_in_month.iter().enumerate() {
+        if days_left < days_in_month as u16 {
+            return ((month_idx + 1) as u8, (days_left + 1) as u8);
+        }
+        days_left -= days_in_month as u16;
+    }
+
+    (12, 31) // Fallback
+}
 
 /// Minimal logger that writes to stderr with timestamps
 struct SimpleLogger {
@@ -25,7 +90,7 @@ impl log::Log for SimpleLogger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
-            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            let timestamp = format_timestamp();
             eprintln!("[{}] [{}] {}", timestamp, record.level(), record.args());
         }
     }
@@ -219,6 +284,45 @@ mod tests {
             convert_to_websocket_url("localhost:4000"),
             "wss://localhost:4000"
         );
+    }
+
+    #[test]
+    fn test_format_timestamp() {
+        let timestamp = format_timestamp();
+        // Should be in format "YYYY-MM-DD HH:MM:SS.mmm"
+        assert!(timestamp.len() >= 23); // Minimum length
+        assert!(timestamp.contains('-'));
+        assert!(timestamp.contains(':'));
+        assert!(timestamp.contains('.'));
+    }
+
+    #[test]
+    fn test_is_leap_year() {
+        assert!(is_leap_year(2000)); // Divisible by 400
+        assert!(is_leap_year(2024)); // Divisible by 4, not by 100
+        assert!(!is_leap_year(1900)); // Divisible by 100, not by 400
+        assert!(!is_leap_year(2023)); // Not divisible by 4
+    }
+
+    #[test]
+    fn test_days_to_month_day() {
+        // January 1st (day 0)
+        assert_eq!(days_to_month_day(0, false), (1, 1));
+
+        // January 31st (day 30)
+        assert_eq!(days_to_month_day(30, false), (1, 31));
+
+        // February 1st (day 31)
+        assert_eq!(days_to_month_day(31, false), (2, 1));
+
+        // March 1st in non-leap year (day 59)
+        assert_eq!(days_to_month_day(59, false), (3, 1));
+
+        // March 1st in leap year (day 60)
+        assert_eq!(days_to_month_day(60, true), (3, 1));
+
+        // December 31st in non-leap year (day 364)
+        assert_eq!(days_to_month_day(364, false), (12, 31));
     }
 
     // Note: main() function and init_logger() are not unit tested as they
