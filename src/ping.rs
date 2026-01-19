@@ -164,14 +164,13 @@ fn parse_icmp_reply(packet: &[u8], expected_identifier: u16, expected_sequence: 
     };
 
     Err(anyhow!(
-        "Invalid ICMP reply packet (expected id={}, seq={}): {}",
-        expected_identifier,
+        "Invalid ICMP reply packet (expected seq={}): {}",
         expected_sequence,
         packet_preview
     ))
 }
 
-fn try_parse_icmp(packet: &[u8], expected_identifier: u16, expected_sequence: u16) -> Result<()> {
+fn try_parse_icmp(packet: &[u8], _expected_identifier: u16, expected_sequence: u16) -> Result<()> {
     if packet.len() < 8 {
         return Err(anyhow!("Packet too short"));
     }
@@ -181,11 +180,10 @@ fn try_parse_icmp(packet: &[u8], expected_identifier: u16, expected_sequence: u1
     let identifier = u16::from_be_bytes([packet[4], packet[5]]);
     let sequence = u16::from_be_bytes([packet[6], packet[7]]);
 
-    if icmp_type == ICMP_ECHOREPLY
-        && icmp_code == 0
-        && identifier == expected_identifier
-        && sequence == expected_sequence
-    {
+    // Note: When using SOCK_DGRAM for ICMP on Linux, the kernel manages the identifier field
+    // and may overwrite what we set. We only validate type, code, and sequence number.
+    // The sequence number is random and unique enough given our polling intervals (300s+).
+    if icmp_type == ICMP_ECHOREPLY && icmp_code == 0 && sequence == expected_sequence {
         Ok(())
     } else {
         Err(anyhow!(
@@ -305,11 +303,11 @@ mod tests {
     }
 
     #[test]
-    fn test_try_parse_icmp_wrong_identifier() {
+    fn test_try_parse_icmp_wrong_sequence() {
         let packet = vec![
             0x00, 0x00, 0x00, 0x00, // type=0, code=0
-            0x99, 0x99, // wrong identifier
-            0x56, 0x78, // sequence
+            0x12, 0x34, // identifier (not validated)
+            0x99, 0x99, // wrong sequence
         ];
 
         let result = try_parse_icmp(&packet, 0x1234, 0x5678);
