@@ -11,7 +11,14 @@ fn main() {
 }
 
 fn get_version() -> String {
-    // Try git describe first - gives us the most descriptive version
+    // First check if BUILD_VERSION is already set (e.g., from Docker build arg)
+    if let Ok(version) = std::env::var("BUILD_VERSION") {
+        if !version.is_empty() && version != "0.1.0-unknown" {
+            return version;
+        }
+    }
+
+    // Try git describe - gives us the most descriptive version
     // Examples:
     //   v0.2.0          -> "0.2.0"           (exact tag)
     //   v0.2.0-5-g831588e -> "0.2.0.5.831588e" (5 commits after v0.2.0)
