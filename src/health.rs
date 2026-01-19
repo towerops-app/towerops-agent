@@ -1,9 +1,11 @@
-use anyhow::Result;
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
-use tiny_http::{Response, Server};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthStatus {
@@ -12,54 +14,64 @@ pub struct HealthStatus {
     pub uptime_seconds: u64,
 }
 
-/// Start a simple health check HTTP server
+/// Start a simple health check HTTP server using raw TCP
 pub async fn start_health_server(port: u16) -> Result<()> {
     let start_time = Arc::new(Instant::now());
+    let addr = format!("0.0.0.0:{}", port);
 
-    tokio::task::spawn_blocking(move || {
-        let addr = format!("0.0.0.0:{}", port);
-        info!("Starting health endpoint on {}", addr);
+    info!("Starting health endpoint on {}", addr);
+    let listener = TcpListener::bind(&addr).await?;
 
-        let server = Server::http(&addr)
-            .map_err(|e| anyhow::anyhow!("Failed to start health server: {}", e))?;
+    loop {
+        match listener.accept().await {
+            Ok((mut socket, _)) => {
+                let start_time = Arc::clone(&start_time);
 
-        for request in server.incoming_requests() {
-            let path = request.url();
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 1024];
 
-            if path == "/health" {
-                let uptime = start_time.elapsed().as_secs();
-                let status = HealthStatus {
-                    status: "healthy".to_string(),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    uptime_seconds: uptime,
-                };
+                    // Read the HTTP request
+                    if let Ok(n) = socket.read(&mut buffer).await {
+                        if n > 0 {
+                            let request = String::from_utf8_lossy(&buffer[..n]);
 
-                let json = serde_json::to_string(&status).unwrap_or_else(|_| {
-                    r#"{"status":"error","message":"Failed to serialize health status"}"#
-                        .to_string()
+                            // Check if this is a GET request to /health
+                            if request.starts_with("GET /health") {
+                                let uptime = start_time.elapsed().as_secs();
+                                let status = HealthStatus {
+                                    status: "healthy".to_string(),
+                                    version: env!("CARGO_PKG_VERSION").to_string(),
+                                    uptime_seconds: uptime,
+                                };
+
+                                let json = serde_json::to_string(&status).unwrap_or_else(|_| {
+                                    r#"{"status":"error","message":"Failed to serialize health status"}"#
+                                        .to_string()
+                                });
+
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                    json.len(),
+                                    json
+                                );
+
+                                let _ = socket.write_all(response.as_bytes()).await;
+                            } else {
+                                // 404 for other paths
+                                let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot found";
+                                let _ = socket.write_all(response.as_bytes()).await;
+                            }
+                        }
+                    }
+
+                    let _ = socket.shutdown().await;
                 });
-
-                let response = Response::from_string(json)
-                    .with_header(
-                        tiny_http::Header::from_bytes(
-                            &b"Content-Type"[..],
-                            &b"application/json"[..],
-                        )
-                        .unwrap(),
-                    )
-                    .with_status_code(200);
-
-                let _ = request.respond(response);
-            } else {
-                let _ = request.respond(Response::from_string("Not found").with_status_code(404));
+            }
+            Err(e) => {
+                log::warn!("Failed to accept health check connection: {}", e);
             }
         }
-
-        Ok::<(), anyhow::Error>(())
-    })
-    .await??;
-
-    Ok(())
+    }
 }
 
 #[cfg(test)]

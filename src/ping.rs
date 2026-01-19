@@ -1,8 +1,9 @@
-use anyhow::{anyhow, Result};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// ICMP message types
 const ICMP_ECHO: u8 = 8;
@@ -33,7 +34,7 @@ pub async fn ping(ip: IpAddr, timeout_duration: Duration) -> Result<Duration> {
     match ip {
         IpAddr::V4(ipv4) => ping_ipv4(ipv4, timeout_duration).await?,
         IpAddr::V6(_) => {
-            return Err(anyhow!("IPv6 ping not yet implemented"));
+            return Err("IPv6 ping not yet implemented".into());
         }
     }
 
@@ -41,9 +42,13 @@ pub async fn ping(ip: IpAddr, timeout_duration: Duration) -> Result<Duration> {
 }
 
 async fn ping_ipv4(ip: Ipv4Addr, timeout_duration: Duration) -> Result<()> {
-    // Generate unique identifier and sequence number
-    let identifier = rand::random::<u16>();
-    let sequence = rand::random::<u16>();
+    // Generate unique identifier and sequence number using timestamp
+    // This provides sufficient randomness for ICMP ping identification
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let identifier = (now.as_nanos() & 0xFFFF) as u16;
+    let sequence = ((now.as_nanos() >> 16) & 0xFFFF) as u16;
 
     // Build ICMP echo request packet
     let packet = build_icmp_echo_request(identifier, sequence);
@@ -74,8 +79,10 @@ async fn ping_ipv4(ip: Ipv4Addr, timeout_duration: Duration) -> Result<()> {
     let mut buf = [0u8; 1024];
     let n = timeout(timeout_duration, socket.recv(&mut buf))
         .await
-        .map_err(|_| anyhow!("Ping timeout"))?
-        .map_err(|e| anyhow!("Failed to receive ping reply: {}", e))?;
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> { "Ping timeout".into() })?
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("Failed to receive ping reply: {}", e).into()
+        })?;
 
     // Parse and validate the reply
     parse_icmp_reply(&buf[..n], identifier, sequence)?;
@@ -163,16 +170,16 @@ fn parse_icmp_reply(packet: &[u8], expected_identifier: u16, expected_sequence: 
         format!("len={} (too short)", packet.len())
     };
 
-    Err(anyhow!(
+    Err(format!(
         "Invalid ICMP reply packet (expected seq={}): {}",
         expected_sequence,
         packet_preview
-    ))
+    ).into())
 }
 
 fn try_parse_icmp(packet: &[u8], _expected_identifier: u16, expected_sequence: u16) -> Result<()> {
     if packet.len() < 8 {
-        return Err(anyhow!("Packet too short"));
+        return Err("Packet too short".into());
     }
 
     let icmp_type = packet[0];
@@ -186,13 +193,13 @@ fn try_parse_icmp(packet: &[u8], _expected_identifier: u16, expected_sequence: u
     if icmp_type == ICMP_ECHOREPLY && icmp_code == 0 && sequence == expected_sequence {
         Ok(())
     } else {
-        Err(anyhow!(
+        Err(format!(
             "ICMP packet mismatch (type={}, code={}, id={}, seq={})",
             icmp_type,
             icmp_code,
             identifier,
             sequence
-        ))
+        ).into())
     }
 }
 
