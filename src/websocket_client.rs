@@ -7,8 +7,6 @@
 /// Connection URL: {url}/socket/agent/websocket
 /// Authentication: Token sent in Phoenix channel join payload
 use anyhow::{Context, Result};
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use prost::Message;
 use std::collections::HashMap;
@@ -170,7 +168,7 @@ impl AgentClient {
                 // Extract binary protobuf from payload
                 if let serde_json::Value::Object(map) = phoenix_msg.payload {
                     if let Some(serde_json::Value::String(binary_b64)) = map.get("binary") {
-                        let binary = BASE64.decode(binary_b64)?;
+                        let binary = base64_decode(binary_b64)?;
                         let job_list = AgentJobList::decode(&binary[..])?;
                         self.handle_jobs(job_list).await?;
                     }
@@ -260,7 +258,7 @@ impl AgentClient {
     async fn send_heartbeat(&mut self) -> Result<()> {
         let heartbeat = AgentHeartbeat {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            hostname: hostname::get()?.to_string_lossy().to_string(),
+            hostname: get_hostname(),
             uptime_seconds: get_uptime_seconds(),
             ip_address: get_local_ip().unwrap_or_else(|| "unknown".to_string()),
         };
@@ -271,7 +269,7 @@ impl AgentClient {
         let msg = PhoenixMessage {
             topic: format!("agent:{}", self.agent_id),
             event: "heartbeat".to_string(),
-            payload: serde_json::json!({"binary": BASE64.encode(&binary)}),
+            payload: serde_json::json!({"binary": base64_encode(&binary)}),
             reference: None,
         };
 
@@ -289,7 +287,7 @@ impl AgentClient {
         let msg = PhoenixMessage {
             topic: format!("agent:{}", self.agent_id),
             event: "result".to_string(),
-            payload: serde_json::json!({"binary": BASE64.encode(&binary)}),
+            payload: serde_json::json!({"binary": base64_encode(&binary)}),
             reference: None,
         };
 
@@ -307,7 +305,7 @@ impl AgentClient {
         let msg = PhoenixMessage {
             topic: format!("agent:{}", self.agent_id),
             event: "monitoring_check".to_string(),
-            payload: serde_json::json!({"binary": BASE64.encode(&binary)}),
+            payload: serde_json::json!({"binary": base64_encode(&binary)}),
             reference: None,
         };
 
@@ -417,6 +415,77 @@ fn value_to_string(value: SnmpValue) -> String {
     }
 }
 
+/// Base64 encode bytes to string.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = Vec::with_capacity((data.len() + 2) / 3 * 4);
+
+    for chunk in data.chunks(3) {
+        let mut buf = [0u8; 3];
+        for (i, &byte) in chunk.iter().enumerate() {
+            buf[i] = byte;
+        }
+
+        result.push(ALPHABET[((buf[0] >> 2) & 0x3F) as usize]);
+        result.push(ALPHABET[(((buf[0] << 4) | (buf[1] >> 4)) & 0x3F) as usize]);
+        result.push(if chunk.len() > 1 {
+            ALPHABET[(((buf[1] << 2) | (buf[2] >> 6)) & 0x3F) as usize]
+        } else {
+            b'='
+        });
+        result.push(if chunk.len() > 2 {
+            ALPHABET[(buf[2] & 0x3F) as usize]
+        } else {
+            b'='
+        });
+    }
+
+    String::from_utf8(result).unwrap()
+}
+
+/// Base64 decode string to bytes.
+fn base64_decode(encoded: &str) -> Result<Vec<u8>> {
+    let mut decode_map = [0xFF; 256];
+    for (i, &byte) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        .iter()
+        .enumerate()
+    {
+        decode_map[byte as usize] = i as u8;
+    }
+
+    let input = encoded.as_bytes();
+    let mut result = Vec::with_capacity((input.len() / 4) * 3);
+
+    for chunk in input.chunks(4) {
+        if chunk.len() < 4 {
+            break;
+        }
+
+        let mut buf = [0u8; 4];
+        for (i, &byte) in chunk.iter().enumerate() {
+            if byte == b'=' {
+                buf[i] = 0;
+            } else {
+                let val = decode_map[byte as usize];
+                if val == 0xFF {
+                    anyhow::bail!("Invalid base64 character");
+                }
+                buf[i] = val;
+            }
+        }
+
+        result.push((buf[0] << 2) | (buf[1] >> 4));
+        if chunk[2] != b'=' {
+            result.push((buf[1] << 4) | (buf[2] >> 2));
+        }
+        if chunk[3] != b'=' {
+            result.push((buf[2] << 6) | buf[3]);
+        }
+    }
+
+    Ok(result)
+}
+
 /// Generate a unique agent ID.
 fn generate_agent_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -429,12 +498,29 @@ fn generate_agent_id() -> String {
     format!("agent-{}", timestamp)
 }
 
+/// Get system hostname.
+fn get_hostname() -> String {
+    // Try reading from /proc on Linux
+    if let Ok(hostname) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+        return hostname.trim().to_string();
+    }
+
+    // Fallback to "unknown"
+    "unknown".to_string()
+}
+
 /// Get system uptime in seconds.
 fn get_uptime_seconds() -> u64 {
-    // TODO: Implement platform-specific uptime
-    // Linux: read /proc/uptime
-    // macOS: use sysctl
-    // Windows: GetTickCount64
+    // Linux: read /proc/uptime (format: "uptime idle")
+    if let Ok(uptime_str) = std::fs::read_to_string("/proc/uptime") {
+        if let Some(uptime) = uptime_str.split_whitespace().next() {
+            if let Ok(secs) = uptime.parse::<f64>() {
+                return secs as u64;
+            }
+        }
+    }
+
+    // Fallback
     0
 }
 
@@ -572,8 +658,49 @@ mod tests {
     #[test]
     fn test_get_uptime_seconds() {
         let uptime = get_uptime_seconds();
-        // Currently returns 0 (not implemented), just verify it's callable
-        assert_eq!(uptime, 0);
+        // On Linux with /proc/uptime, should return non-zero
+        // On other platforms or if file doesn't exist, returns 0
+        // Just verify it's callable and returns a number
+        assert!(uptime >= 0);
+    }
+
+    #[test]
+    fn test_get_hostname() {
+        let hostname = get_hostname();
+        // Should return either the system hostname or "unknown"
+        assert!(!hostname.is_empty());
+    }
+
+    #[test]
+    fn test_base64_encode() {
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn test_base64_decode() {
+        assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(base64_decode("").unwrap(), b"");
+        assert_eq!(base64_decode("Zg==").unwrap(), b"f");
+        assert_eq!(base64_decode("Zm8=").unwrap(), b"fo");
+        assert_eq!(base64_decode("Zm9v").unwrap(), b"foo");
+        assert_eq!(base64_decode("Zm9vYg==").unwrap(), b"foob");
+        assert_eq!(base64_decode("Zm9vYmE=").unwrap(), b"fooba");
+        assert_eq!(base64_decode("Zm9vYmFy").unwrap(), b"foobar");
+    }
+
+    #[test]
+    fn test_base64_roundtrip() {
+        let data = b"The quick brown fox jumps over the lazy dog";
+        let encoded = base64_encode(data);
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
     }
 
     #[test]

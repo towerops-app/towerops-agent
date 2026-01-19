@@ -16,11 +16,7 @@ clap = { version = "4.0", features = ["derive", "env"] }
 prost = "0.13"
 prost-types = "0.13"
 tiny_http = "0.12"
-chrono = "0.4"
 anyhow = "1.0"
-thiserror = "1.0"
-base64 = "0.21"
-hostname = "0.3"
 socket2 = "0.5"
 rand = "0.8"
 
