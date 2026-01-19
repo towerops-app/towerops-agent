@@ -131,13 +131,32 @@ fn parse_icmp_reply(packet: &[u8], expected_identifier: u16, expected_sequence: 
     }
 
     // Log diagnostic information to help debug
-    let packet_preview = if packet.len() >= 8 {
+    // Determine the ICMP portion (might need to skip IP header)
+    let icmp_packet = if packet.len() >= 20 && (packet[0] >> 4) == 4 {
+        let ihl = (packet[0] & 0x0F) as usize * 4;
+        if ihl >= 20 && packet.len() > ihl {
+            &packet[ihl..]
+        } else {
+            packet
+        }
+    } else {
+        packet
+    };
+
+    let packet_preview = if icmp_packet.len() >= 8 {
         format!(
-            "type={} code={} id={} seq={} len={}",
-            packet[0],
-            packet.get(1).unwrap_or(&0),
-            u16::from_be_bytes([*packet.get(4).unwrap_or(&0), *packet.get(5).unwrap_or(&0)]),
-            u16::from_be_bytes([*packet.get(6).unwrap_or(&0), *packet.get(7).unwrap_or(&0)]),
+            "type={} code={} id={} seq={} len={} (total={})",
+            icmp_packet[0],
+            icmp_packet.get(1).unwrap_or(&0),
+            u16::from_be_bytes([
+                *icmp_packet.get(4).unwrap_or(&0),
+                *icmp_packet.get(5).unwrap_or(&0)
+            ]),
+            u16::from_be_bytes([
+                *icmp_packet.get(6).unwrap_or(&0),
+                *icmp_packet.get(7).unwrap_or(&0)
+            ]),
+            icmp_packet.len(),
             packet.len()
         )
     } else {
