@@ -54,3 +54,57 @@ impl SnmpValue {
         self.as_i64().map(|v| v as f64)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_snmp_error_display() {
+        assert_eq!(
+            format!("{}", SnmpError::RequestFailed("test error".to_string())),
+            "SNMP request failed: test error"
+        );
+        assert_eq!(
+            format!("{}", SnmpError::InvalidOid("1.2.3".to_string())),
+            "Invalid OID: 1.2.3"
+        );
+        assert_eq!(format!("{}", SnmpError::Timeout), "Timeout");
+        assert_eq!(
+            format!("{}", SnmpError::AuthFailure),
+            "Authentication failure"
+        );
+        assert_eq!(
+            format!("{}", SnmpError::NetworkUnreachable),
+            "Network unreachable"
+        );
+    }
+
+    #[test]
+    fn test_snmp_error_is_error() {
+        let error: &dyn std::error::Error = &SnmpError::Timeout;
+        assert_eq!(format!("{}", error), "Timeout");
+    }
+
+    #[test]
+    fn test_snmp_value_as_i64() {
+        assert_eq!(SnmpValue::Integer(42).as_i64(), Some(42));
+        assert_eq!(SnmpValue::Counter32(100).as_i64(), Some(100));
+        assert_eq!(SnmpValue::Counter64(1000).as_i64(), Some(1000));
+        assert_eq!(SnmpValue::Gauge32(50).as_i64(), Some(50));
+        assert_eq!(SnmpValue::TimeTicks(200).as_i64(), Some(200));
+        assert_eq!(SnmpValue::String("test".to_string()).as_i64(), None);
+        assert_eq!(SnmpValue::IpAddress("1.2.3.4".to_string()).as_i64(), None);
+    }
+
+    #[test]
+    fn test_snmp_value_as_f64() {
+        assert_eq!(SnmpValue::Integer(42).as_f64(), Some(42.0));
+        assert_eq!(SnmpValue::Counter32(100).as_f64(), Some(100.0));
+        assert_eq!(SnmpValue::Counter64(1000).as_f64(), Some(1000.0));
+        assert_eq!(SnmpValue::Gauge32(50).as_f64(), Some(50.0));
+        assert_eq!(SnmpValue::TimeTicks(200).as_f64(), Some(200.0));
+        assert_eq!(SnmpValue::String("test".to_string()).as_f64(), None);
+        assert_eq!(SnmpValue::IpAddress("1.2.3.4".to_string()).as_f64(), None);
+    }
+}

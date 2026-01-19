@@ -45,6 +45,20 @@ fn init_logger() {
         .ok();
 }
 
+/// Convert HTTP(S) URL to WebSocket URL
+fn convert_to_websocket_url(url: &str) -> String {
+    if url.starts_with("http://") {
+        url.replace("http://", "ws://")
+    } else if url.starts_with("https://") {
+        url.replace("https://", "wss://")
+    } else if url.starts_with("ws://") || url.starts_with("wss://") {
+        url.to_string()
+    } else {
+        // Default to wss:// for bare domains
+        format!("wss://{}", url)
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "towerops-agent")]
 #[command(about = "Towerops remote SNMP polling agent", long_about = None)]
@@ -71,16 +85,7 @@ async fn main() {
     version::check_for_updates();
 
     // Convert HTTP(S) URL to WebSocket URL
-    let ws_url = if args.api_url.starts_with("http://") {
-        args.api_url.replace("http://", "ws://")
-    } else if args.api_url.starts_with("https://") {
-        args.api_url.replace("https://", "wss://")
-    } else if args.api_url.starts_with("ws://") || args.api_url.starts_with("wss://") {
-        args.api_url.clone()
-    } else {
-        // Default to wss:// for bare domains
-        format!("wss://{}", args.api_url)
-    };
+    let ws_url = convert_to_websocket_url(&args.api_url);
 
     info!("WebSocket URL: {}", ws_url);
 
@@ -132,4 +137,91 @@ async fn main() {
             // Loop will retry with backoff
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use log::Log;
+
+    #[test]
+    fn test_simple_logger_enabled() {
+        let logger = SimpleLogger {
+            level: LevelFilter::Info,
+        };
+
+        // Info level should be enabled
+        let info_metadata = log::MetadataBuilder::new()
+            .level(log::Level::Info)
+            .target("test")
+            .build();
+        assert!(logger.enabled(&info_metadata));
+
+        // Debug level should not be enabled
+        let debug_metadata = log::MetadataBuilder::new()
+            .level(log::Level::Debug)
+            .target("test")
+            .build();
+        assert!(!logger.enabled(&debug_metadata));
+
+        // Error level should be enabled
+        let error_metadata = log::MetadataBuilder::new()
+            .level(log::Level::Error)
+            .target("test")
+            .build();
+        assert!(logger.enabled(&error_metadata));
+    }
+
+    #[test]
+    fn test_simple_logger_flush() {
+        let logger = SimpleLogger {
+            level: LevelFilter::Info,
+        };
+        // flush() does nothing, just verify it's callable
+        logger.flush();
+    }
+
+    #[test]
+    fn test_convert_http_to_websocket() {
+        assert_eq!(
+            convert_to_websocket_url("http://localhost:4000"),
+            "ws://localhost:4000"
+        );
+    }
+
+    #[test]
+    fn test_convert_https_to_websocket() {
+        assert_eq!(
+            convert_to_websocket_url("https://app.towerops.com"),
+            "wss://app.towerops.com"
+        );
+    }
+
+    #[test]
+    fn test_websocket_url_unchanged() {
+        assert_eq!(
+            convert_to_websocket_url("ws://localhost:4000"),
+            "ws://localhost:4000"
+        );
+        assert_eq!(
+            convert_to_websocket_url("wss://app.towerops.com"),
+            "wss://app.towerops.com"
+        );
+    }
+
+    #[test]
+    fn test_bare_domain_gets_wss() {
+        assert_eq!(
+            convert_to_websocket_url("app.towerops.com"),
+            "wss://app.towerops.com"
+        );
+        assert_eq!(
+            convert_to_websocket_url("localhost:4000"),
+            "wss://localhost:4000"
+        );
+    }
+
+    // Note: main() function and init_logger() are not unit tested as they
+    // involve global state and tokio runtime initialization.
+    // They are tested via manual/integration testing.
 }

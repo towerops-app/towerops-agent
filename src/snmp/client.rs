@@ -216,3 +216,205 @@ fn map_snmp_error(err: snmp::SnmpError) -> SnmpError {
         _ => SnmpError::RequestFailed(format!("{:?}", err)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_snmp_client_new() {
+        let client = SnmpClient::new();
+        // Just verify we can create it
+        assert!(format!("{:?}", client).contains("SnmpClient"));
+    }
+
+    #[test]
+    fn test_snmp_client_default() {
+        let client = SnmpClient::default();
+        assert!(format!("{:?}", client).contains("SnmpClient"));
+    }
+
+    #[test]
+    fn test_parse_oid_valid() {
+        let result = parse_oid("1.3.6.1.2.1.1.1.0");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![1, 3, 6, 1, 2, 1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn test_parse_oid_single() {
+        let result = parse_oid("1");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn test_parse_oid_invalid() {
+        let result = parse_oid("1.3.6.abc.2.1");
+        assert!(result.is_err());
+        match result {
+            Err(SnmpError::InvalidOid(msg)) => {
+                assert!(msg.contains("abc"));
+            }
+            _ => panic!("Expected InvalidOid error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_oid_empty() {
+        let result = parse_oid("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_format_oid() {
+        let oid = vec![1, 3, 6, 1, 2, 1, 1, 1, 0];
+        let result = format_oid(&oid);
+        assert_eq!(result, "1.3.6.1.2.1.1.1.0");
+    }
+
+    #[test]
+    fn test_format_oid_single() {
+        let oid = vec![42];
+        let result = format_oid(&oid);
+        assert_eq!(result, "42");
+    }
+
+    #[test]
+    fn test_format_oid_empty() {
+        let oid = vec![];
+        let result = format_oid(&oid);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_starts_with_true() {
+        let oid = vec![1, 3, 6, 1, 2, 1, 1, 1, 0];
+        let base = vec![1, 3, 6, 1];
+        assert!(starts_with(&oid, &base));
+    }
+
+    #[test]
+    fn test_starts_with_exact_match() {
+        let oid = vec![1, 3, 6, 1];
+        let base = vec![1, 3, 6, 1];
+        assert!(starts_with(&oid, &base));
+    }
+
+    #[test]
+    fn test_starts_with_false() {
+        let oid = vec![1, 3, 6, 1, 2, 1];
+        let base = vec![1, 3, 7];
+        assert!(!starts_with(&oid, &base));
+    }
+
+    #[test]
+    fn test_starts_with_oid_too_short() {
+        let oid = vec![1, 3];
+        let base = vec![1, 3, 6, 1];
+        assert!(!starts_with(&oid, &base));
+    }
+
+    #[test]
+    fn test_convert_value_integer() {
+        let value = snmp::Value::Integer(42);
+        let result = convert_value(value).unwrap();
+        match result {
+            SnmpValue::Integer(v) => assert_eq!(v, 42),
+            _ => panic!("Expected Integer"),
+        }
+    }
+
+    #[test]
+    fn test_convert_value_octet_string() {
+        let value = snmp::Value::OctetString(b"test".as_slice());
+        let result = convert_value(value).unwrap();
+        match result {
+            SnmpValue::String(s) => assert_eq!(s, "test"),
+            _ => panic!("Expected String"),
+        }
+    }
+
+    #[test]
+    fn test_convert_value_counter32() {
+        let value = snmp::Value::Counter32(12345);
+        let result = convert_value(value).unwrap();
+        match result {
+            SnmpValue::Counter32(v) => assert_eq!(v, 12345),
+            _ => panic!("Expected Counter32"),
+        }
+    }
+
+    #[test]
+    fn test_convert_value_counter64() {
+        let value = snmp::Value::Counter64(9876543210);
+        let result = convert_value(value).unwrap();
+        match result {
+            SnmpValue::Counter64(v) => assert_eq!(v, 9876543210),
+            _ => panic!("Expected Counter64"),
+        }
+    }
+
+    #[test]
+    fn test_convert_value_unsigned32() {
+        let value = snmp::Value::Unsigned32(999);
+        let result = convert_value(value).unwrap();
+        match result {
+            SnmpValue::Gauge32(v) => assert_eq!(v, 999),
+            _ => panic!("Expected Gauge32"),
+        }
+    }
+
+    #[test]
+    fn test_convert_value_timeticks() {
+        let value = snmp::Value::Timeticks(12345678);
+        let result = convert_value(value).unwrap();
+        match result {
+            SnmpValue::TimeTicks(v) => assert_eq!(v, 12345678),
+            _ => panic!("Expected TimeTicks"),
+        }
+    }
+
+    #[test]
+    fn test_convert_value_ip_address() {
+        let value = snmp::Value::IpAddress([192, 168, 1, 1]);
+        let result = convert_value(value).unwrap();
+        match result {
+            SnmpValue::IpAddress(ip) => assert_eq!(ip, "192.168.1.1"),
+            _ => panic!("Expected IpAddress"),
+        }
+    }
+
+    #[test]
+    fn test_map_snmp_error_send() {
+        let err = snmp::SnmpError::SendError;
+        let result = map_snmp_error(err);
+        match result {
+            SnmpError::NetworkUnreachable => {}
+            _ => panic!("Expected NetworkUnreachable"),
+        }
+    }
+
+    #[test]
+    fn test_map_snmp_error_receive() {
+        let err = snmp::SnmpError::ReceiveError;
+        let result = map_snmp_error(err);
+        match result {
+            SnmpError::Timeout => {}
+            _ => panic!("Expected Timeout"),
+        }
+    }
+
+    #[test]
+    fn test_map_snmp_error_community() {
+        let err = snmp::SnmpError::CommunityMismatch;
+        let result = map_snmp_error(err);
+        match result {
+            SnmpError::AuthFailure => {}
+            _ => panic!("Expected AuthFailure"),
+        }
+    }
+
+    // Note: get() and walk() methods require actual network operations
+    // and are tested via integration tests, not unit tests
+}

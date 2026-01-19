@@ -511,3 +511,112 @@ async fn run_monitoring_task(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_value_to_string_integer() {
+        let value = SnmpValue::Integer(42);
+        assert_eq!(value_to_string(value), "42");
+    }
+
+    #[test]
+    fn test_value_to_string_string() {
+        let value = SnmpValue::String("test".to_string());
+        assert_eq!(value_to_string(value), "test");
+    }
+
+    #[test]
+    fn test_value_to_string_counter32() {
+        let value = SnmpValue::Counter32(12345);
+        assert_eq!(value_to_string(value), "12345");
+    }
+
+    #[test]
+    fn test_value_to_string_counter64() {
+        let value = SnmpValue::Counter64(9876543210);
+        assert_eq!(value_to_string(value), "9876543210");
+    }
+
+    #[test]
+    fn test_value_to_string_gauge32() {
+        let value = SnmpValue::Gauge32(999);
+        assert_eq!(value_to_string(value), "999");
+    }
+
+    #[test]
+    fn test_value_to_string_timeticks() {
+        let value = SnmpValue::TimeTicks(12345678);
+        assert_eq!(value_to_string(value), "12345678");
+    }
+
+    #[test]
+    fn test_value_to_string_ip_address() {
+        let value = SnmpValue::IpAddress("192.168.1.1".to_string());
+        assert_eq!(value_to_string(value), "192.168.1.1");
+    }
+
+    #[test]
+    fn test_generate_agent_id() {
+        let id = generate_agent_id();
+        assert!(id.starts_with("agent-"));
+
+        // Verify the timestamp part is a number
+        let timestamp_str = id.strip_prefix("agent-").unwrap();
+        let timestamp: u64 = timestamp_str.parse().expect("Timestamp should be a number");
+        assert!(timestamp > 0);
+    }
+
+    #[test]
+    fn test_get_uptime_seconds() {
+        let uptime = get_uptime_seconds();
+        // Currently returns 0 (not implemented), just verify it's callable
+        assert_eq!(uptime, 0);
+    }
+
+    #[test]
+    fn test_get_local_ip() {
+        let ip = get_local_ip();
+        // Currently returns None (not implemented), just verify it's callable
+        assert!(ip.is_none());
+    }
+
+    #[test]
+    fn test_phoenix_message_serialization() {
+        let msg = PhoenixMessage {
+            topic: "agent:123".to_string(),
+            event: "phx_join".to_string(),
+            payload: serde_json::json!({"token": "test"}),
+            reference: Some("1".to_string()),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("agent:123"));
+        assert!(json.contains("phx_join"));
+        assert!(json.contains("token"));
+        assert!(json.contains("test"));
+    }
+
+    #[test]
+    fn test_phoenix_message_deserialization() {
+        let json =
+            r#"{"topic":"agent:123","event":"phx_reply","payload":{"status":"ok"},"ref":"1"}"#;
+        let msg: PhoenixMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.topic, "agent:123");
+        assert_eq!(msg.event, "phx_reply");
+        assert_eq!(msg.reference, Some("1".to_string()));
+    }
+
+    #[test]
+    fn test_phoenix_message_no_reference() {
+        let json = r#"{"topic":"agent:123","event":"job","payload":{},"ref":null}"#;
+        let msg: PhoenixMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.topic, "agent:123");
+        assert_eq!(msg.event, "job");
+        assert!(msg.reference.is_none());
+    }
+
+    // Note: AgentClient methods require WebSocket connection and are tested via integration tests
+}
