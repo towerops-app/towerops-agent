@@ -4,9 +4,6 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
-/// ICMP protocol number
-const IPPROTO_ICMP: i32 = 1;
-
 /// ICMP message types
 const ICMP_ECHO: u8 = 8;
 const ICMP_ECHOREPLY: u8 = 0;
