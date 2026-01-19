@@ -17,6 +17,8 @@ message Device {
   uint32 poll_interval_seconds = 5;
   repeated Sensor sensors = 6;
   repeated Interface interfaces = 7;
+  bool monitoring_enabled = 8;
+  uint32 check_interval_seconds = 9;
 }
 
 message SnmpConfig {
@@ -51,6 +53,7 @@ message Metric {
     SensorReading sensor_reading = 1;
     InterfaceStat interface_stat = 2;
     NeighborDiscovery neighbor_discovery = 3;
+    MonitoringCheck monitoring_check = 4;
   }
 }
 
@@ -84,6 +87,13 @@ message NeighborDiscovery {
   string remote_address = 9;
   repeated string remote_capabilities = 10;
   int64 timestamp = 11; // Unix timestamp in seconds
+}
+
+message MonitoringCheck {
+  string device_id = 1;
+  string status = 2; // "success" or "failure"
+  double response_time_ms = 3; // Optional - only present on success
+  int64 timestamp = 4; // Unix timestamp in seconds
 }
 
 // Heartbeat metadata
@@ -126,6 +136,8 @@ message SnmpDevice {
   string community = 2;
   string version = 3;
   uint32 port = 4;
+  bool monitoring_enabled = 5;
+  uint32 check_interval_seconds = 6;
 }
 
 message SnmpQuery {
