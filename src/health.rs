@@ -57,7 +57,8 @@ pub async fn start_health_server(port: u16) -> Result<()> {
                                 let _ = socket.write_all(response.as_bytes()).await;
                             } else {
                                 // 404 for other paths
-                                let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot found";
+                                let response =
+                                    "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot found";
                                 let _ = socket.write_all(response.as_bytes()).await;
                             }
                         }

@@ -324,9 +324,7 @@ impl AgentClient {
 
 /// Execute an SNMP job and collect results.
 async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>) -> Result<()> {
-    let snmp_device = job
-        .snmp_device
-        .ok_or("Job missing SNMP device info")?;
+    let snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
     let mut oid_values: HashMap<String, String> = HashMap::new();
     let snmp_client = SnmpClient::new();
 

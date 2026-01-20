@@ -172,9 +172,9 @@ fn parse_icmp_reply(packet: &[u8], expected_identifier: u16, expected_sequence: 
 
     Err(format!(
         "Invalid ICMP reply packet (expected seq={}): {}",
-        expected_sequence,
-        packet_preview
-    ).into())
+        expected_sequence, packet_preview
+    )
+    .into())
 }
 
 fn try_parse_icmp(packet: &[u8], _expected_identifier: u16, expected_sequence: u16) -> Result<()> {
@@ -195,11 +195,9 @@ fn try_parse_icmp(packet: &[u8], _expected_identifier: u16, expected_sequence: u
     } else {
         Err(format!(
             "ICMP packet mismatch (type={}, code={}, id={}, seq={})",
-            icmp_type,
-            icmp_code,
-            identifier,
-            sequence
-        ).into())
+            icmp_type, icmp_code, identifier, sequence
+        )
+        .into())
     }
 }
 
