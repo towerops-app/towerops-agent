@@ -22,6 +22,5 @@ mod tests {
         // Just verify it's a non-empty string
     }
 
-
     // Note: check_for_updates() just logs the version, no testing needed
 }
