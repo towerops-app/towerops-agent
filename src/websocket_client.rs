@@ -419,7 +419,7 @@ fn value_to_string(value: SnmpValue) -> String {
 /// Base64 encode bytes to string.
 fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = Vec::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = Vec::with_capacity(data.len().div_ceil(3) * 4);
 
     for chunk in data.chunks(3) {
         let mut buf = [0u8; 3];
