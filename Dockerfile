@@ -47,7 +47,8 @@ FROM alpine:3.19
 
 # Install runtime dependencies
 # docker-cli is needed for self-update functionality
-RUN apk add --no-cache ca-certificates su-exec docker-cli
+# iputils provides ping with setuid root (doesn't require CAP_NET_RAW)
+RUN apk add --no-cache ca-certificates su-exec docker-cli iputils
 
 # Create data directory
 RUN mkdir -p /data

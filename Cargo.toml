@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 snmp = "0.2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "process"] }
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }
@@ -13,7 +13,7 @@ serde_json = "1.0"
 clap = { version = "4.0", features = ["derive", "env"] }
 prost = "0.13"
 prost-types = "0.13"
-socket2 = "0.5"
+regex-lite = "0.1"
 
 [build-dependencies]
 prost-build = "0.13"
