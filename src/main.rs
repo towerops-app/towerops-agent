@@ -7,6 +7,8 @@ mod websocket_client;
 
 use clap::Parser;
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use websocket_client::AgentClient;
@@ -194,9 +196,14 @@ async fn main() {
 
     log_info!("WebSocket URL: {}", ws_url);
 
-    // Start simple health endpoint (no storage needed for WebSocket mode)
-    tokio::spawn(async {
-        if let Err(e) = health::start_health_server(8080).await {
+    // Shared connection state for health check
+    // Starts as false (not connected), updated when WebSocket connects/disconnects
+    let connected = Arc::new(AtomicBool::new(false));
+    let connected_for_health = Arc::clone(&connected);
+
+    // Start simple health endpoint with connection state
+    tokio::spawn(async move {
+        if let Err(e) = health::start_health_server(8080, connected_for_health).await {
             log_warn!("Health server error: {}", e);
         }
     });
@@ -225,6 +232,8 @@ async fn main() {
         let mut client = match AgentClient::connect(&ws_url, &args.token).await {
             Ok(client) => {
                 log_info!("Successfully connected to server");
+                // Mark as connected for health check
+                connected.store(true, Ordering::Relaxed);
                 // Reset retry delay on successful connection
                 retry_delay = Duration::from_secs(1);
                 attempt = 0;
@@ -232,6 +241,8 @@ async fn main() {
             }
             Err(e) => {
                 log_error!("Failed to connect to server: {}", e);
+                // Mark as disconnected for health check
+                connected.store(false, Ordering::Relaxed);
                 continue;
             }
         };
@@ -239,6 +250,8 @@ async fn main() {
         // Run the agent event loop
         if let Err(e) = client.run().await {
             log_error!("Agent disconnected: {}", e);
+            // Mark as disconnected for health check
+            connected.store(false, Ordering::Relaxed);
             // Loop will retry with backoff
         }
     }
