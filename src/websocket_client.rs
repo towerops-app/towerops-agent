@@ -10,11 +10,14 @@ use futures::{SinkExt, StreamExt};
 use prost::Message;
 use std::collections::HashMap;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use tokio::sync::{mpsc, watch};
+use tokio::time::{interval, timeout, Duration};
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message as WsMessage, MaybeTlsStream, WebSocketStream,
 };
+
+/// Connection timeout for WebSocket establishment (30 seconds)
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -59,15 +62,31 @@ impl AgentClient {
         // Strip trailing slash from base URL to avoid double slashes
         let base_url = url.trim_end_matches('/');
         let ws_url = format!("{}/socket/agent/websocket", base_url);
-        crate::log_info!("Connecting to WebSocket: {}", ws_url);
+        crate::log_info!(
+            "Connecting to WebSocket: {} (timeout: {}s)",
+            ws_url,
+            CONNECTION_TIMEOUT.as_secs()
+        );
 
-        let (mut ws_stream, _) = connect_async(&ws_url)
-            .await
-            .map_err(|e| {
+        // Wrap connection in timeout to avoid hanging indefinitely on bad network
+        let (mut ws_stream, _) = match timeout(CONNECTION_TIMEOUT, connect_async(&ws_url)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
                 crate::log_error!("WebSocket connection failed: {}", e);
-                e
-            })
-            .map_err(|e| format!("Failed to connect to WebSocket: {}", e))?;
+                return Err(format!("Failed to connect to WebSocket: {}", e).into());
+            }
+            Err(_) => {
+                crate::log_error!(
+                    "WebSocket connection timed out after {}s",
+                    CONNECTION_TIMEOUT.as_secs()
+                );
+                return Err(format!(
+                    "Connection timed out after {}s",
+                    CONNECTION_TIMEOUT.as_secs()
+                )
+                .into());
+            }
+        };
 
         crate::log_info!("Connected to Towerops server at {}", url);
 
@@ -107,11 +126,24 @@ impl AgentClient {
     /// - Executing SNMP queries
     /// - Sending results back
     /// - Periodic heartbeats
-    pub async fn run(&mut self) -> Result<()> {
+    /// - Graceful shutdown on SIGTERM
+    pub async fn run(&mut self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         let mut heartbeat_interval = interval(Duration::from_secs(60));
 
         loop {
             tokio::select! {
+                // Check for shutdown signal (highest priority)
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        crate::log_info!("Shutdown signal received, closing WebSocket connection gracefully");
+                        // Send close frame to server
+                        if let Err(e) = self.ws_stream.close(None).await {
+                            crate::log_warn!("Error sending WebSocket close frame: {}", e);
+                        }
+                        return Ok(());
+                    }
+                }
+
                 // Receive messages from server
                 msg = self.ws_stream.next() => {
                     match msg {

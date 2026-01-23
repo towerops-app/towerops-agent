@@ -10,6 +10,7 @@ use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 use tokio::time::sleep;
 use websocket_client::AgentClient;
 
@@ -201,6 +202,16 @@ async fn main() {
     let connected = Arc::new(AtomicBool::new(false));
     let connected_for_health = Arc::clone(&connected);
 
+    // Create shutdown signal channel
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Spawn signal handler for graceful shutdown
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        log_info!("Shutdown signal received, initiating graceful shutdown...");
+        let _ = shutdown_tx.send(true);
+    });
+
     // Start simple health endpoint with connection state
     tokio::spawn(async move {
         if let Err(e) = health::start_health_server(8080, connected_for_health).await {
@@ -214,6 +225,12 @@ async fn main() {
     let mut attempt = 0;
 
     loop {
+        // Check if shutdown was requested
+        if *shutdown_rx.borrow() {
+            log_info!("Shutdown requested, exiting main loop");
+            break;
+        }
+
         attempt += 1;
 
         if attempt > 1 {
@@ -247,13 +264,56 @@ async fn main() {
             }
         };
 
-        // Run the agent event loop
-        if let Err(e) = client.run().await {
-            log_error!("Agent disconnected: {}", e);
-            // Mark as disconnected for health check
-            connected.store(false, Ordering::Relaxed);
-            // Loop will retry with backoff
+        // Run the agent event loop with shutdown signal
+        match client.run(shutdown_rx.clone()).await {
+            Ok(()) => {
+                // Clean shutdown requested
+                if *shutdown_rx.borrow() {
+                    log_info!("Agent shutdown complete");
+                    break;
+                }
+            }
+            Err(e) => {
+                log_error!("Agent disconnected: {}", e);
+            }
         }
+
+        // Mark as disconnected for health check
+        connected.store(false, Ordering::Relaxed);
+        // Loop will retry with backoff (unless shutdown was requested)
+    }
+
+    log_info!("Towerops agent stopped");
+}
+
+/// Wait for SIGTERM or SIGINT shutdown signal.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+        let mut sigint =
+            signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                log_info!("Received SIGTERM");
+            }
+            _ = sigint.recv() => {
+                log_info!("Received SIGINT");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // On non-Unix platforms, just wait for Ctrl+C
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to register Ctrl+C handler");
+        log_info!("Received Ctrl+C");
     }
 }
 
