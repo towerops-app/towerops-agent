@@ -46,30 +46,16 @@ RUN RUST_TARGET=$(cat /tmp/rust-target) && \
 FROM alpine:3.19
 
 # Install runtime dependencies
-# docker-cli is needed for self-update functionality
 # iputils provides ping with setuid root (doesn't require CAP_NET_RAW)
-RUN apk add --no-cache ca-certificates su-exec docker-cli iputils
-
-# Create data directory
-RUN mkdir -p /data
+RUN apk add --no-cache ca-certificates iputils
 
 # Copy binary from builder
 COPY --from=builder /tmp/towerops-agent /usr/local/bin/towerops-agent
 
-# Copy entrypoint script
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
-
-# Volume for database
-VOLUME ["/data"]
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-  CMD test -f /data/towerops-agent.db || exit 1
-
-# Create non-root user (entrypoint will drop to this user)
+# Create non-root user
 RUN addgroup -g 1000 towerops && \
     adduser -D -u 1000 -G towerops towerops
 
-# Start as root, entrypoint will fix permissions and drop to towerops user
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+USER towerops
+
+ENTRYPOINT ["towerops-agent"]
