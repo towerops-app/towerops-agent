@@ -1,4 +1,3 @@
-mod health;
 mod ping;
 mod proto;
 mod snmp;
@@ -197,10 +196,9 @@ async fn main() {
 
     log_info!("WebSocket URL: {}", ws_url);
 
-    // Shared connection state for health check
+    // Shared connection state
     // Starts as false (not connected), updated when WebSocket connects/disconnects
     let connected = Arc::new(AtomicBool::new(false));
-    let connected_for_health = Arc::clone(&connected);
 
     // Create shutdown signal channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -210,13 +208,6 @@ async fn main() {
         wait_for_shutdown_signal().await;
         log_info!("Shutdown signal received, initiating graceful shutdown...");
         let _ = shutdown_tx.send(true);
-    });
-
-    // Start simple health endpoint with connection state
-    tokio::spawn(async move {
-        if let Err(e) = health::start_health_server(8080, connected_for_health).await {
-            log_warn!("Health server error: {}", e);
-        }
     });
 
     // Retry loop with exponential backoff
