@@ -381,7 +381,13 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
                             oid_values.insert(oid.clone(), value_to_string(value));
                         }
                         Err(e) => {
-                            crate::log_warn!("SNMP GET failed for OID {}: {}", oid, e);
+                            crate::log_warn!(
+                                "SNMP GET failed for device {} ({}), OID {}: {}",
+                                job.device_id,
+                                snmp_device.ip,
+                                oid,
+                                e
+                            );
                         }
                     }
                 }
@@ -405,7 +411,13 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
                             }
                         }
                         Err(e) => {
-                            crate::log_warn!("SNMP WALK failed for OID {}: {}", base_oid, e);
+                            crate::log_warn!(
+                                "SNMP WALK failed for device {} ({}), OID {}: {}",
+                                job.device_id,
+                                snmp_device.ip,
+                                base_oid,
+                                e
+                            );
                         }
                     }
                 }
