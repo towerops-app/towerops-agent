@@ -21,7 +21,7 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-use crate::ping::ping;
+use crate::ping::ping_with_retries;
 use crate::proto::agent::{
     AgentHeartbeat, AgentJob, AgentJobList, JobType, MonitoringCheck, QueryType, SnmpResult,
 };
@@ -666,7 +666,8 @@ async fn run_monitoring_task(
 
                 let timeout = Duration::from_secs(5);
 
-                match ping(ip_addr, timeout).await {
+                // Send 3 pings for reliability - only fail if all 3 fail
+                match ping_with_retries(ip_addr, timeout, 3).await {
                     Ok(rtt) => {
                         let check = MonitoringCheck {
                             device_id: device_id.clone(),
