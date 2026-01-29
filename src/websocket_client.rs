@@ -357,6 +357,23 @@ impl AgentClient {
 /// Execute an SNMP job and collect results.
 async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>) -> Result<()> {
     let snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
+
+    // Log SNMP connection parameters for debugging (mask community for security)
+    let community_masked = if snmp_device.community.len() > 4 {
+        format!("{}***", &snmp_device.community[..2])
+    } else {
+        "***".to_string()
+    };
+
+    crate::log_info!(
+        "Executing SNMP job for device {} at {}:{} (community: {}, version: {})",
+        job.device_id,
+        snmp_device.ip,
+        snmp_device.port,
+        community_masked,
+        snmp_device.version
+    );
+
     let mut oid_values: HashMap<String, String> = HashMap::new();
     let snmp_client = SnmpClient::new();
 
@@ -382,9 +399,12 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
                         }
                         Err(e) => {
                             crate::log_warn!(
-                                "SNMP GET failed for device {} ({}), OID {}: {}",
+                                "SNMP GET failed for device {} at {}:{} (version: {}, community: {}), OID {}: {}",
                                 job.device_id,
                                 snmp_device.ip,
+                                snmp_device.port,
+                                snmp_device.version,
+                                community_masked,
                                 oid,
                                 e
                             );
@@ -412,9 +432,12 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
                         }
                         Err(e) => {
                             crate::log_warn!(
-                                "SNMP WALK failed for device {} ({}), OID {}: {}",
+                                "SNMP WALK failed for device {} at {}:{} (version: {}, community: {}), OID {}: {}",
                                 job.device_id,
                                 snmp_device.ip,
+                                snmp_device.port,
+                                snmp_device.version,
+                                community_masked,
                                 base_oid,
                                 e
                             );
