@@ -24,29 +24,23 @@ impl SnmpClient {
         port: u16,
         oid: &str,
     ) -> SnmpResult<SnmpValue> {
-        // Only SNMPv2c is supported by the snmp crate
-        if version != "2c" {
-            return Err(SnmpError::RequestFailed(format!(
-                "Unsupported SNMP version: {}. Only 2c is supported.",
-                version
-            )));
-        }
-
         // Parse OID string to Vec<u32>
         let oid_parts = parse_oid(oid)?;
 
         // Clone data for the blocking task
         let addr = format!("{}:{}", ip_address, port);
         let community = community.as_bytes().to_vec();
+        let version_num = parse_snmp_version(version)?;
 
         // Run SNMP operation in blocking thread pool
         let result = tokio::task::spawn_blocking(move || {
             // Create session with configurable timeout
+            // The snmp crate supports both v1 (0) and v2c (1)
             let mut session = SyncSession::new(
                 addr.as_str(),
                 &community,
                 Some(Duration::from_secs(SNMP_TIMEOUT_SECS)),
-                0,
+                version_num,
             )
             .map_err(|_| SnmpError::NetworkUnreachable)?;
 
@@ -84,29 +78,23 @@ impl SnmpClient {
         port: u16,
         base_oid: &str,
     ) -> SnmpResult<Vec<(String, SnmpValue)>> {
-        // Only SNMPv2c is supported by the snmp crate
-        if version != "2c" {
-            return Err(SnmpError::RequestFailed(format!(
-                "Unsupported SNMP version: {}. Only 2c is supported.",
-                version
-            )));
-        }
-
         // Parse OID string to Vec<u32>
         let base_oid_parts = parse_oid(base_oid)?;
 
         // Clone data for the blocking task
         let addr = format!("{}:{}", ip_address, port);
         let community = community.as_bytes().to_vec();
+        let version_num = parse_snmp_version(version)?;
 
         // Run SNMP walk in blocking thread pool
         let results = tokio::task::spawn_blocking(move || {
             // Create session with configurable timeout
+            // The snmp crate supports both v1 (0) and v2c (1)
             let mut session = SyncSession::new(
                 addr.as_str(),
                 &community,
                 Some(Duration::from_secs(SNMP_TIMEOUT_SECS)),
-                0,
+                version_num,
             )
             .map_err(|_| SnmpError::NetworkUnreachable)?;
 
@@ -164,6 +152,21 @@ impl SnmpClient {
 impl Default for SnmpClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Parse SNMP version string to integer for snmp crate
+/// Returns: 0 for SNMPv1, 1 for SNMPv2c
+fn parse_snmp_version(version: &str) -> SnmpResult<i32> {
+    let normalized = version.trim().to_lowercase();
+
+    match normalized.as_str() {
+        "1" | "v1" | "snmpv1" => Ok(0),
+        "2c" | "v2c" | "snmpv2c" | "2" | "v2" => Ok(1),
+        _ => Err(SnmpError::RequestFailed(format!(
+            "Unsupported SNMP version: '{}'. Supported versions: 1, v1, 2c, v2c",
+            version
+        ))),
     }
 }
 
@@ -244,6 +247,36 @@ mod tests {
     fn test_snmp_client_default() {
         let client = SnmpClient::default();
         assert!(format!("{:?}", client).contains("SnmpClient"));
+    }
+
+    #[test]
+    fn test_parse_snmp_version_v1() {
+        assert_eq!(parse_snmp_version("1").unwrap(), 0);
+        assert_eq!(parse_snmp_version("v1").unwrap(), 0);
+        assert_eq!(parse_snmp_version("V1").unwrap(), 0);
+        assert_eq!(parse_snmp_version("snmpv1").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_parse_snmp_version_v2c() {
+        assert_eq!(parse_snmp_version("2c").unwrap(), 1);
+        assert_eq!(parse_snmp_version("2C").unwrap(), 1);
+        assert_eq!(parse_snmp_version("v2c").unwrap(), 1);
+        assert_eq!(parse_snmp_version("V2C").unwrap(), 1);
+        assert_eq!(parse_snmp_version("2").unwrap(), 1);
+        assert_eq!(parse_snmp_version("v2").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_parse_snmp_version_invalid() {
+        let result = parse_snmp_version("3");
+        assert!(result.is_err());
+        match result {
+            Err(SnmpError::RequestFailed(msg)) => {
+                assert!(msg.contains("Unsupported SNMP version"));
+            }
+            _ => panic!("Expected RequestFailed error"),
+        }
     }
 
     #[test]
