@@ -45,6 +45,8 @@ pub struct AgentClient {
     result_rx: mpsc::UnboundedReceiver<SnmpResult>,
     monitoring_check_tx: mpsc::UnboundedSender<MonitoringCheck>,
     monitoring_check_rx: mpsc::UnboundedReceiver<MonitoringCheck>,
+    task_shutdown_tx: watch::Sender<bool>,
+    task_shutdown_rx: watch::Receiver<bool>,
 }
 
 impl AgentClient {
@@ -93,6 +95,7 @@ impl AgentClient {
         let agent_id = generate_agent_id();
         let (result_tx, result_rx) = mpsc::unbounded_channel();
         let (monitoring_check_tx, monitoring_check_rx) = mpsc::unbounded_channel();
+        let (task_shutdown_tx, task_shutdown_rx) = watch::channel(false);
 
         // Join Phoenix channel with token in payload
         let join_msg = PhoenixMessage {
@@ -116,6 +119,8 @@ impl AgentClient {
             result_rx,
             monitoring_check_tx,
             monitoring_check_rx,
+            task_shutdown_tx,
+            task_shutdown_rx,
         })
     }
 
@@ -130,7 +135,7 @@ impl AgentClient {
     pub async fn run(&mut self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         let mut heartbeat_interval = interval(Duration::from_secs(60));
 
-        loop {
+        let result = loop {
             tokio::select! {
                 // Check for shutdown signal (highest priority)
                 _ = shutdown_rx.changed() => {
@@ -140,7 +145,7 @@ impl AgentClient {
                         if let Err(e) = self.ws_stream.close(None).await {
                             crate::log_warn!("Error sending WebSocket close frame: {}", e);
                         }
-                        return Ok(());
+                        break Ok(());
                     }
                 }
 
@@ -148,22 +153,26 @@ impl AgentClient {
                 msg = self.ws_stream.next() => {
                     match msg {
                         Some(Ok(WsMessage::Binary(data))) => {
-                            self.handle_message(&data).await?;
+                            if let Err(e) = self.handle_message(&data).await {
+                                crate::log_error!("Error handling binary message: {}", e);
+                            }
                         }
                         Some(Ok(WsMessage::Text(text))) => {
-                            self.handle_text_message(&text).await?;
+                            if let Err(e) = self.handle_text_message(&text).await {
+                                crate::log_error!("Error handling text message: {}", e);
+                            }
                         }
                         Some(Ok(WsMessage::Close(_))) => {
                             crate::log_info!("Server closed connection");
-                            break;
+                            break Ok(());
                         }
                         Some(Err(e)) => {
                             crate::log_error!("WebSocket error: {}", e);
-                            return Err(e.into());
+                            break Err(e.into());
                         }
                         None => {
                             crate::log_info!("Connection closed");
-                            break;
+                            break Ok(());
                         }
                         _ => {}
                     }
@@ -171,22 +180,35 @@ impl AgentClient {
 
                 // Receive SNMP results from job tasks
                 Some(result) = self.result_rx.recv() => {
-                    self.send_result(result).await?;
+                    if let Err(e) = self.send_result(result).await {
+                        crate::log_error!("Error sending SNMP result: {}", e);
+                    }
                 }
 
                 // Receive monitoring checks from ping tasks
                 Some(check) = self.monitoring_check_rx.recv() => {
-                    self.send_monitoring_check(check).await?;
+                    if let Err(e) = self.send_monitoring_check(check).await {
+                        crate::log_error!("Error sending monitoring check: {}", e);
+                    }
                 }
 
                 // Send periodic heartbeats
                 _ = heartbeat_interval.tick() => {
-                    self.send_heartbeat().await?;
+                    if let Err(e) = self.send_heartbeat().await {
+                        crate::log_error!("Error sending heartbeat: {}", e);
+                    }
                 }
             }
-        }
+        };
 
-        Ok(())
+        // Signal all spawned tasks to shut down
+        crate::log_info!("Shutting down all spawned tasks");
+        let _ = self.task_shutdown_tx.send(true);
+
+        // Give tasks a moment to shut down gracefully
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        result
     }
 
     /// Handle Phoenix channel message (JSON-wrapped).
@@ -253,6 +275,7 @@ impl AgentClient {
             let result_tx = self.result_tx.clone();
             let monitoring_check_tx = self.monitoring_check_tx.clone();
             let device_id = job.device_id.clone();
+            let shutdown_rx = self.task_shutdown_rx.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = execute_job(job, result_tx).await {
@@ -275,6 +298,7 @@ impl AgentClient {
                         ip,
                         interval_seconds,
                         monitoring_check_tx,
+                        shutdown_rx,
                     )
                     .await
                     {
@@ -465,7 +489,13 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
     );
 
     // Send result back to main client task
-    result_tx.send(result).ok();
+    if let Err(e) = result_tx.send(result) {
+        crate::log_warn!(
+            "Failed to send SNMP result for job {}: channel closed (connection may have dropped)",
+            job.job_id
+        );
+        return Err(format!("Result channel closed: {}", e).into());
+    }
 
     Ok(())
 }
@@ -605,65 +635,86 @@ async fn run_monitoring_task(
     ip: String,
     interval_seconds: u64,
     check_tx: mpsc::UnboundedSender<MonitoringCheck>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut interval_timer = interval(Duration::from_secs(interval_seconds));
 
+    crate::log_info!("Monitoring task started for device {} at {}", device_id, ip);
+
     loop {
-        interval_timer.tick().await;
-
-        let ip_addr: std::net::IpAddr = match ip.parse() {
-            Ok(addr) => addr,
-            Err(e) => {
-                crate::log_error!("Invalid IP address for device {}: {}", device_id, e);
-                continue;
+        tokio::select! {
+            // Check for shutdown signal
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    crate::log_info!(
+                        "Monitoring task for device {} shutting down gracefully",
+                        device_id
+                    );
+                    return Ok(());
+                }
             }
-        };
 
-        let timeout = Duration::from_secs(5);
-
-        match ping(ip_addr, timeout).await {
-            Ok(rtt) => {
-                let check = MonitoringCheck {
-                    device_id: device_id.clone(),
-                    status: "success".to_string(),
-                    response_time_ms: rtt.as_secs_f64() * 1000.0,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_secs() as i64,
+            // Wait for next interval
+            _ = interval_timer.tick() => {
+                let ip_addr: std::net::IpAddr = match ip.parse() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        crate::log_error!("Invalid IP address for device {}: {}", device_id, e);
+                        continue;
+                    }
                 };
 
-                if let Err(e) = check_tx.send(check) {
-                    crate::log_error!("Failed to send monitoring check: {}", e);
-                    break;
+                let timeout = Duration::from_secs(5);
+
+                match ping(ip_addr, timeout).await {
+                    Ok(rtt) => {
+                        let check = MonitoringCheck {
+                            device_id: device_id.clone(),
+                            status: "success".to_string(),
+                            response_time_ms: rtt.as_secs_f64() * 1000.0,
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)?
+                                .as_secs() as i64,
+                        };
+
+                        if let Err(_) = check_tx.send(check) {
+                            crate::log_warn!(
+                                "Monitoring task for device {}: channel closed, stopping task (connection may have dropped)",
+                                device_id
+                            );
+                            return Ok(());
+                        }
+
+                        crate::log_debug!(
+                            "ICMP ping successful for {}: {:.2}ms",
+                            ip,
+                            rtt.as_secs_f64() * 1000.0
+                        );
+                    }
+                    Err(e) => {
+                        let check = MonitoringCheck {
+                            device_id: device_id.clone(),
+                            status: "failure".to_string(),
+                            response_time_ms: 0.0,
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)?
+                                .as_secs() as i64,
+                        };
+
+                        if let Err(_) = check_tx.send(check) {
+                            crate::log_warn!(
+                                "Monitoring task for device {}: channel closed, stopping task (connection may have dropped)",
+                                device_id
+                            );
+                            return Ok(());
+                        }
+
+                        crate::log_warn!("ICMP ping failed for {}: {}", ip, e);
+                    }
                 }
-
-                crate::log_debug!(
-                    "ICMP ping successful for {}: {:.2}ms",
-                    ip,
-                    rtt.as_secs_f64() * 1000.0
-                );
-            }
-            Err(e) => {
-                let check = MonitoringCheck {
-                    device_id: device_id.clone(),
-                    status: "failure".to_string(),
-                    response_time_ms: 0.0,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_secs() as i64,
-                };
-
-                if let Err(send_err) = check_tx.send(check) {
-                    crate::log_error!("Failed to send monitoring check: {}", send_err);
-                    break;
-                }
-
-                crate::log_warn!("ICMP ping failed for {}: {}", ip, e);
             }
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
