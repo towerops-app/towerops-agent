@@ -677,7 +677,7 @@ async fn run_monitoring_task(
                                 .as_secs() as i64,
                         };
 
-                        if let Err(_) = check_tx.send(check) {
+                        if check_tx.send(check).is_err() {
                             crate::log_warn!(
                                 "Monitoring task for device {}: channel closed, stopping task (connection may have dropped)",
                                 device_id
@@ -701,7 +701,7 @@ async fn run_monitoring_task(
                                 .as_secs() as i64,
                         };
 
-                        if let Err(_) = check_tx.send(check) {
+                        if check_tx.send(check).is_err() {
                             crate::log_warn!(
                                 "Monitoring task for device {}: channel closed, stopping task (connection may have dropped)",
                                 device_id
