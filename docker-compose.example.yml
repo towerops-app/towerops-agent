@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  towerops-agent:
+    image: registry.gitlab.com/towerops/towerops-agent:latest
+    container_name: towerops-agent
+    restart: unless-stopped
+
+    environment:
+      # Required: Your Towerops API URL
+      - TOWEROPS_API_URL=https://app.towerops.com
+
+      # Required: Agent authentication token (from Towerops web UI)
+      # Get this from: Organization > Agents > Create New Agent
+      - TOWEROPS_AGENT_TOKEN=your-agent-token-here
+
+      # Optional: How often to refresh configuration (seconds)
+      # Default: 300 (5 minutes)
+      # - CONFIG_REFRESH_SECONDS=300
+
+      # Optional: Database path for metrics buffering
+      # Default: /data/towerops-agent.db
+      # - DATABASE_PATH=/data/towerops-agent.db
+
+      # Optional: Log level (error, warn, info, debug, trace)
+      # Default: info
+      # - RUST_LOG=info
+
+    volumes:
+      # Persistent storage for metrics buffering
+      - ./data:/data
+
+    # Optional: Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
