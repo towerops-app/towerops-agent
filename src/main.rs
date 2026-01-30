@@ -1,4 +1,3 @@
-mod ping;
 mod proto;
 mod snmp;
 mod version;

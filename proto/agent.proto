@@ -136,8 +136,6 @@ message SnmpDevice {
   string community = 2;
   string version = 3;
   uint32 port = 4;
-  bool monitoring_enabled = 5;
-  uint32 check_interval_seconds = 6;
 }
 
 message SnmpQuery {

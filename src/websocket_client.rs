@@ -21,10 +21,7 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-use crate::ping::ping_with_retries;
-use crate::proto::agent::{
-    AgentHeartbeat, AgentJob, AgentJobList, JobType, MonitoringCheck, QueryType, SnmpResult,
-};
+use crate::proto::agent::{AgentHeartbeat, AgentJob, AgentJobList, JobType, QueryType, SnmpResult};
 use crate::snmp::{SnmpClient, SnmpValue};
 
 /// Phoenix channel message format (JSON wrapper around binary protobuf).
@@ -43,10 +40,6 @@ pub struct AgentClient {
     agent_id: String,
     result_tx: mpsc::UnboundedSender<SnmpResult>,
     result_rx: mpsc::UnboundedReceiver<SnmpResult>,
-    monitoring_check_tx: mpsc::UnboundedSender<MonitoringCheck>,
-    monitoring_check_rx: mpsc::UnboundedReceiver<MonitoringCheck>,
-    task_shutdown_tx: watch::Sender<bool>,
-    task_shutdown_rx: watch::Receiver<bool>,
 }
 
 impl AgentClient {
@@ -94,8 +87,6 @@ impl AgentClient {
 
         let agent_id = generate_agent_id();
         let (result_tx, result_rx) = mpsc::unbounded_channel();
-        let (monitoring_check_tx, monitoring_check_rx) = mpsc::unbounded_channel();
-        let (task_shutdown_tx, task_shutdown_rx) = watch::channel(false);
 
         // Join Phoenix channel with token in payload
         let join_msg = PhoenixMessage {
@@ -117,10 +108,6 @@ impl AgentClient {
             agent_id,
             result_tx,
             result_rx,
-            monitoring_check_tx,
-            monitoring_check_rx,
-            task_shutdown_tx,
-            task_shutdown_rx,
         })
     }
 
@@ -185,13 +172,6 @@ impl AgentClient {
                     }
                 }
 
-                // Receive monitoring checks from ping tasks
-                Some(check) = self.monitoring_check_rx.recv() => {
-                    if let Err(e) = self.send_monitoring_check(check).await {
-                        crate::log_error!("Error sending monitoring check: {}", e);
-                    }
-                }
-
                 // Send periodic heartbeats
                 _ = heartbeat_interval.tick() => {
                     if let Err(e) = self.send_heartbeat().await {
@@ -200,13 +180,6 @@ impl AgentClient {
                 }
             }
         };
-
-        // Signal all spawned tasks to shut down
-        crate::log_info!("Shutting down all spawned tasks");
-        let _ = self.task_shutdown_tx.send(true);
-
-        // Give tasks a moment to shut down gracefully
-        tokio::time::sleep(Duration::from_secs(2)).await;
 
         result
     }
@@ -248,6 +221,10 @@ impl AgentClient {
     }
 
     /// Process job list from server.
+    ///
+    /// Each job is executed once in the background and results are sent back.
+    /// No long-running tasks are spawned - the agent is stateless.
+    /// Server handles all scheduling and retries via Oban.
     async fn handle_jobs(&self, job_list: AgentJobList) -> Result<()> {
         crate::log_info!("Received {} jobs from server", job_list.jobs.len());
 
@@ -255,57 +232,14 @@ impl AgentClient {
             let job_type = JobType::try_from(job.job_type).unwrap_or(JobType::Poll);
             crate::log_info!("Executing job: {} (type: {:?})", job.job_id, job_type);
 
-            // Extract monitoring configuration before moving job
-            let monitoring_info = job.snmp_device.as_ref().and_then(|snmp_device| {
-                if snmp_device.monitoring_enabled {
-                    Some((
-                        snmp_device.ip.clone(),
-                        if snmp_device.check_interval_seconds > 0 {
-                            snmp_device.check_interval_seconds as u64
-                        } else {
-                            60
-                        },
-                    ))
-                } else {
-                    None
-                }
-            });
-
-            // Spawn task to execute SNMP job
+            // Spawn task to execute SNMP job (one-off execution)
             let result_tx = self.result_tx.clone();
-            let monitoring_check_tx = self.monitoring_check_tx.clone();
-            let device_id = job.device_id.clone();
-            let shutdown_rx = self.task_shutdown_rx.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = execute_job(job, result_tx).await {
                     crate::log_error!("Job execution failed: {}", e);
                 }
             });
-
-            // Start monitoring task if enabled
-            if let Some((ip, interval_seconds)) = monitoring_info {
-                crate::log_info!(
-                    "Starting ICMP monitoring for device {} every {} seconds",
-                    device_id,
-                    interval_seconds
-                );
-
-                let device_id_clone = device_id.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = run_monitoring_task(
-                        device_id_clone,
-                        ip,
-                        interval_seconds,
-                        monitoring_check_tx,
-                        shutdown_rx,
-                    )
-                    .await
-                    {
-                        crate::log_error!("Monitoring task failed: {}", e);
-                    }
-                });
-            }
         }
 
         Ok(())
@@ -352,28 +286,6 @@ impl AgentClient {
         self.ws_stream.send(WsMessage::Text(text)).await?;
 
         crate::log_debug!("Sent SNMP result for device {}", result.device_id);
-        Ok(())
-    }
-
-    /// Send monitoring check result to server.
-    async fn send_monitoring_check(&mut self, check: MonitoringCheck) -> Result<()> {
-        let binary = check.encode_to_vec();
-
-        let msg = PhoenixMessage {
-            topic: format!("agent:{}", self.agent_id),
-            event: "monitoring_check".to_string(),
-            payload: serde_json::json!({"binary": base64_encode(&binary)}),
-            reference: None,
-        };
-
-        let text = serde_json::to_string(&msg)?;
-        self.ws_stream.send(WsMessage::Text(text)).await?;
-
-        crate::log_debug!(
-            "Sent monitoring check for device {}: {}",
-            check.device_id,
-            check.status
-        );
         Ok(())
     }
 }
@@ -627,95 +539,6 @@ fn get_local_ip() -> Option<String> {
     // TODO: Implement IP detection
     // Could use local_ip_address crate or parse network interfaces
     None
-}
-
-/// Run continuous ICMP monitoring for a device.
-async fn run_monitoring_task(
-    device_id: String,
-    ip: String,
-    interval_seconds: u64,
-    check_tx: mpsc::UnboundedSender<MonitoringCheck>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    let mut interval_timer = interval(Duration::from_secs(interval_seconds));
-
-    crate::log_info!("Monitoring task started for device {} at {}", device_id, ip);
-
-    loop {
-        tokio::select! {
-            // Check for shutdown signal
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    crate::log_info!(
-                        "Monitoring task for device {} shutting down gracefully",
-                        device_id
-                    );
-                    return Ok(());
-                }
-            }
-
-            // Wait for next interval
-            _ = interval_timer.tick() => {
-                let ip_addr: std::net::IpAddr = match ip.parse() {
-                    Ok(addr) => addr,
-                    Err(e) => {
-                        crate::log_error!("Invalid IP address for device {}: {}", device_id, e);
-                        continue;
-                    }
-                };
-
-                let timeout = Duration::from_secs(5);
-
-                // Send 3 pings for reliability - only fail if all 3 fail
-                match ping_with_retries(ip_addr, timeout, 3).await {
-                    Ok(rtt) => {
-                        let check = MonitoringCheck {
-                            device_id: device_id.clone(),
-                            status: "success".to_string(),
-                            response_time_ms: rtt.as_secs_f64() * 1000.0,
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)?
-                                .as_secs() as i64,
-                        };
-
-                        if check_tx.send(check).is_err() {
-                            crate::log_warn!(
-                                "Monitoring task for device {}: channel closed, stopping task (connection may have dropped)",
-                                device_id
-                            );
-                            return Ok(());
-                        }
-
-                        crate::log_debug!(
-                            "ICMP ping successful for {}: {:.2}ms",
-                            ip,
-                            rtt.as_secs_f64() * 1000.0
-                        );
-                    }
-                    Err(e) => {
-                        let check = MonitoringCheck {
-                            device_id: device_id.clone(),
-                            status: "failure".to_string(),
-                            response_time_ms: 0.0,
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)?
-                                .as_secs() as i64,
-                        };
-
-                        if check_tx.send(check).is_err() {
-                            crate::log_warn!(
-                                "Monitoring task for device {}: channel closed, stopping task (connection may have dropped)",
-                                device_id
-                            );
-                            return Ok(());
-                        }
-
-                        crate::log_warn!("ICMP ping failed for {}: {}", ip, e);
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
