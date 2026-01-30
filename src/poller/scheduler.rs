@@ -161,7 +161,7 @@ impl Scheduler {
             .unwrap_or_else(|| "unknown".to_string());
 
         let metadata = HeartbeatMetadata {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::version::current_version().to_string(),
             hostname,
             uptime_seconds: uptime,
         };

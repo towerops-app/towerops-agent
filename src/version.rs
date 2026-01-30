@@ -1,5 +1,5 @@
-// Get version at runtime - prefers BUILD_VERSION from build.rs, falls back to Cargo.toml
-fn current_version() -> &'static str {
+/// Get version at runtime - prefers BUILD_VERSION from build.rs, falls back to Cargo.toml
+pub fn current_version() -> &'static str {
     option_env!("BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
