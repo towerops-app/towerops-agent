@@ -122,7 +122,7 @@ impl AgentClient {
     pub async fn run(&mut self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         let mut heartbeat_interval = interval(Duration::from_secs(60));
 
-        let result = loop {
+        loop {
             tokio::select! {
                 // Check for shutdown signal (highest priority)
                 _ = shutdown_rx.changed() => {
@@ -166,8 +166,8 @@ impl AgentClient {
                 }
 
                 // Receive SNMP results from job tasks
-                Some(result) = self.result_rx.recv() => {
-                    if let Err(e) = self.send_result(result).await {
+                Some(snmp_result) = self.result_rx.recv() => {
+                    if let Err(e) = self.send_result(snmp_result).await {
                         crate::log_error!("Error sending SNMP result: {}", e);
                     }
                 }
@@ -179,9 +179,7 @@ impl AgentClient {
                     }
                 }
             }
-        };
-
-        result
+        }
     }
 
     /// Handle Phoenix channel message (JSON-wrapped).
