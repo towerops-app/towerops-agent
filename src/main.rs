@@ -172,7 +172,7 @@ fn convert_to_websocket_url(url: &str) -> String {
 #[command(name = "towerops-agent")]
 #[command(about = "Towerops remote SNMP polling agent", long_about = None)]
 struct Args {
-    /// API URL (e.g., wss://app.towerops.com or https://app.towerops.com)
+    /// API URL (e.g., wss://towerops.net or https://towerops.net)
     #[arg(long, env = "TOWEROPS_API_URL")]
     api_url: String,
 
@@ -352,8 +352,8 @@ mod tests {
     #[test]
     fn test_convert_https_to_websocket() {
         assert_eq!(
-            convert_to_websocket_url("https://app.towerops.com"),
-            "wss://app.towerops.com"
+            convert_to_websocket_url("https://towerops.net"),
+            "wss://towerops.net"
         );
     }
 
@@ -364,16 +364,16 @@ mod tests {
             "ws://localhost:4000"
         );
         assert_eq!(
-            convert_to_websocket_url("wss://app.towerops.com"),
-            "wss://app.towerops.com"
+            convert_to_websocket_url("wss://towerops.net"),
+            "wss://towerops.net"
         );
     }
 
     #[test]
     fn test_bare_domain_gets_wss() {
         assert_eq!(
-            convert_to_websocket_url("app.towerops.com"),
-            "wss://app.towerops.com"
+            convert_to_websocket_url("towerops.net"),
+            "wss://towerops.net"
         );
         assert_eq!(
             convert_to_websocket_url("localhost:4000"),
@@ -420,7 +420,118 @@ mod tests {
         assert_eq!(days_to_month_day(364, false), (12, 31));
     }
 
-    // Note: main() function and init_logger() are not unit tested as they
-    // involve global state and tokio runtime initialization.
-    // They are tested via manual/integration testing.
+    #[test]
+    fn test_log_level_from_str_error() {
+        assert_eq!(LogLevel::from_str("error"), LogLevel::Error);
+        assert_eq!(LogLevel::from_str("ERROR"), LogLevel::Error);
+        assert_eq!(LogLevel::from_str("Error"), LogLevel::Error);
+    }
+
+    #[test]
+    fn test_log_level_from_str_warn() {
+        assert_eq!(LogLevel::from_str("warn"), LogLevel::Warn);
+        assert_eq!(LogLevel::from_str("WARN"), LogLevel::Warn);
+        assert_eq!(LogLevel::from_str("Warn"), LogLevel::Warn);
+    }
+
+    #[test]
+    fn test_log_level_from_str_info() {
+        assert_eq!(LogLevel::from_str("info"), LogLevel::Info);
+        assert_eq!(LogLevel::from_str("INFO"), LogLevel::Info);
+        assert_eq!(LogLevel::from_str("Info"), LogLevel::Info);
+    }
+
+    #[test]
+    fn test_log_level_from_str_debug() {
+        assert_eq!(LogLevel::from_str("debug"), LogLevel::Debug);
+        assert_eq!(LogLevel::from_str("DEBUG"), LogLevel::Debug);
+        assert_eq!(LogLevel::from_str("Debug"), LogLevel::Debug);
+    }
+
+    #[test]
+    fn test_log_level_from_str_unknown() {
+        // Unknown values default to Info
+        assert_eq!(LogLevel::from_str("unknown"), LogLevel::Info);
+        assert_eq!(LogLevel::from_str("trace"), LogLevel::Info);
+        assert_eq!(LogLevel::from_str(""), LogLevel::Info);
+    }
+
+    #[test]
+    fn test_log_level_ordering() {
+        assert!(LogLevel::Error < LogLevel::Warn);
+        assert!(LogLevel::Warn < LogLevel::Info);
+        assert!(LogLevel::Info < LogLevel::Debug);
+    }
+
+    #[test]
+    fn test_log_level_eq() {
+        assert_eq!(LogLevel::Error, LogLevel::Error);
+        assert_eq!(LogLevel::Warn, LogLevel::Warn);
+        assert_eq!(LogLevel::Info, LogLevel::Info);
+        assert_eq!(LogLevel::Debug, LogLevel::Debug);
+    }
+
+    #[test]
+    fn test_log_level_copy() {
+        let level = LogLevel::Debug;
+        let copied = level;
+        assert_eq!(copied, LogLevel::Debug);
+    }
+
+    #[test]
+    fn test_log_level_clone() {
+        let level = LogLevel::Warn;
+        let cloned = level.clone();
+        assert_eq!(cloned, LogLevel::Warn);
+    }
+
+    #[test]
+    fn test_days_to_month_day_february() {
+        // February 28th in non-leap year (day 58)
+        assert_eq!(days_to_month_day(58, false), (2, 28));
+
+        // February 29th in leap year (day 59)
+        assert_eq!(days_to_month_day(59, true), (2, 29));
+    }
+
+    #[test]
+    fn test_days_to_month_day_later_months() {
+        // April 15th in non-leap year (day 105)
+        // Jan=31, Feb=28, Mar=31, Apr 1-15 = 31+28+31+14 = 104 (0-indexed day 104)
+        assert_eq!(days_to_month_day(104, false), (4, 15));
+
+        // July 4th in non-leap year
+        // Jan=31, Feb=28, Mar=31, Apr=30, May=31, Jun=30, Jul 1-4 = 31+28+31+30+31+30+3 = 184 (day 184)
+        assert_eq!(days_to_month_day(184, false), (7, 4));
+    }
+
+    #[test]
+    fn test_days_to_month_day_end_of_year() {
+        // December 31st in leap year (day 365)
+        assert_eq!(days_to_month_day(365, true), (12, 31));
+
+        // December 25th in non-leap year
+        // 31+28+31+30+31+30+31+31+30+31+30+24 = 358 (day 358)
+        assert_eq!(days_to_month_day(358, false), (12, 25));
+    }
+
+    #[test]
+    fn test_days_to_month_day_overflow_fallback() {
+        // Day 400 is beyond year - should fallback to Dec 31
+        assert_eq!(days_to_month_day(400, false), (12, 31));
+    }
+
+    #[test]
+    fn test_format_timestamp_structure() {
+        let timestamp = format_timestamp();
+        // Should be in format "YYYY-MM-DD HH:MM:SS.mmm"
+        let parts: Vec<&str> = timestamp.split(' ').collect();
+        assert_eq!(parts.len(), 2, "Expected date and time parts");
+
+        let date_parts: Vec<&str> = parts[0].split('-').collect();
+        assert_eq!(date_parts.len(), 3, "Expected year-month-day");
+
+        let time_parts: Vec<&str> = parts[1].split(':').collect();
+        assert_eq!(time_parts.len(), 3, "Expected hour:min:sec.ms");
+    }
 }

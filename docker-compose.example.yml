@@ -8,7 +8,7 @@ services:
 
     environment:
       # Required: Your Towerops API URL
-      - TOWEROPS_API_URL=https://app.towerops.com
+      - TOWEROPS_API_URL=https://towerops.net
 
       # Required: Agent authentication token (from Towerops web UI)
       # Get this from: Organization > Agents > Create New Agent

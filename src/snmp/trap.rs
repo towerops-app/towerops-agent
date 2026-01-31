@@ -729,4 +729,757 @@ mod tests {
     fn test_parse_ip_address_invalid_length() {
         assert!(parse_ip_address(&[192, 168, 1]).is_err());
     }
+
+    #[test]
+    fn test_generic_trap_from_u8_all_variants() {
+        assert!(matches!(
+            GenericTrap::from_u8(0),
+            Some(GenericTrap::ColdStart)
+        ));
+        assert!(matches!(
+            GenericTrap::from_u8(1),
+            Some(GenericTrap::WarmStart)
+        ));
+        assert!(matches!(
+            GenericTrap::from_u8(2),
+            Some(GenericTrap::LinkDown)
+        ));
+        assert!(matches!(GenericTrap::from_u8(3), Some(GenericTrap::LinkUp)));
+        assert!(matches!(
+            GenericTrap::from_u8(4),
+            Some(GenericTrap::AuthenticationFailure)
+        ));
+        assert!(matches!(
+            GenericTrap::from_u8(5),
+            Some(GenericTrap::EgpNeighborLoss)
+        ));
+        assert!(matches!(
+            GenericTrap::from_u8(6),
+            Some(GenericTrap::EnterpriseSpecific)
+        ));
+        assert!(GenericTrap::from_u8(7).is_none());
+        assert!(GenericTrap::from_u8(255).is_none());
+    }
+
+    #[test]
+    fn test_generic_trap_display_all_variants() {
+        assert_eq!(format!("{}", GenericTrap::ColdStart), "coldStart");
+        assert_eq!(format!("{}", GenericTrap::WarmStart), "warmStart");
+        assert_eq!(format!("{}", GenericTrap::LinkDown), "linkDown");
+        assert_eq!(format!("{}", GenericTrap::LinkUp), "linkUp");
+        assert_eq!(
+            format!("{}", GenericTrap::AuthenticationFailure),
+            "authenticationFailure"
+        );
+        assert_eq!(
+            format!("{}", GenericTrap::EgpNeighborLoss),
+            "egpNeighborLoss"
+        );
+        assert_eq!(
+            format!("{}", GenericTrap::EnterpriseSpecific),
+            "enterpriseSpecific"
+        );
+    }
+
+    #[test]
+    fn test_parse_tlv_simple() {
+        // INTEGER 5: tag=0x02, length=0x01, value=0x05
+        let data = [0x02, 0x01, 0x05];
+        let (tag, value, remaining) = parse_tlv(&data).unwrap();
+        assert_eq!(tag, 0x02);
+        assert_eq!(value, &[0x05]);
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tlv_with_remaining() {
+        // INTEGER 5 followed by more data
+        let data = [0x02, 0x01, 0x05, 0x04, 0x02, 0x41, 0x42];
+        let (tag, value, remaining) = parse_tlv(&data).unwrap();
+        assert_eq!(tag, 0x02);
+        assert_eq!(value, &[0x05]);
+        assert_eq!(remaining, &[0x04, 0x02, 0x41, 0x42]);
+    }
+
+    #[test]
+    fn test_parse_tlv_empty() {
+        let result = parse_tlv(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_tlv_too_short() {
+        // Says length is 5 but only has 2 bytes
+        let data = [0x02, 0x05, 0x01, 0x02];
+        let result = parse_tlv(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_length_empty() {
+        let result = parse_length(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_length_indefinite() {
+        // Indefinite length (0x80) not supported
+        let result = parse_length(&[0x80]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_length_too_long() {
+        // Length field says 5 bytes but not enough data
+        let result = parse_length(&[0x85, 0x01]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_integer_empty() {
+        assert_eq!(parse_integer(&[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_parse_integer_multibyte() {
+        // 256 = 0x0100
+        assert_eq!(parse_integer(&[0x01, 0x00]).unwrap(), 256);
+        // -256 = 0xFF00
+        assert_eq!(parse_integer(&[0xFF, 0x00]).unwrap(), -256);
+    }
+
+    #[test]
+    fn test_parse_unsigned() {
+        assert_eq!(parse_unsigned(&[]).unwrap(), 0);
+        assert_eq!(parse_unsigned(&[0x01]).unwrap(), 1);
+        assert_eq!(parse_unsigned(&[0xFF]).unwrap(), 255);
+        assert_eq!(parse_unsigned(&[0x01, 0x00]).unwrap(), 256);
+    }
+
+    #[test]
+    fn test_parse_oid_empty() {
+        assert_eq!(parse_oid(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn test_parse_value_to_string_integer() {
+        let result = parse_value_to_string(ber_tags::INTEGER, &[0x2A]);
+        assert_eq!(result, "42");
+    }
+
+    #[test]
+    fn test_parse_value_to_string_octet_string() {
+        let result = parse_value_to_string(ber_tags::OCTET_STRING, b"test");
+        assert_eq!(result, "test");
+    }
+
+    #[test]
+    fn test_parse_value_to_string_object_identifier() {
+        let oid_bytes = [0x2B, 0x06, 0x01, 0x02, 0x01];
+        let result = parse_value_to_string(ber_tags::OBJECT_IDENTIFIER, &oid_bytes);
+        assert_eq!(result, "1.3.6.1.2.1");
+    }
+
+    #[test]
+    fn test_parse_value_to_string_null() {
+        let result = parse_value_to_string(ber_tags::NULL, &[]);
+        assert_eq!(result, "null");
+    }
+
+    #[test]
+    fn test_parse_value_to_string_ip_address() {
+        let result = parse_value_to_string(ber_tags::IP_ADDRESS, &[10, 0, 0, 1]);
+        assert_eq!(result, "10.0.0.1");
+    }
+
+    #[test]
+    fn test_parse_value_to_string_counter32() {
+        let result = parse_value_to_string(ber_tags::COUNTER32, &[0x00, 0x01]);
+        assert_eq!(result, "1");
+    }
+
+    #[test]
+    fn test_parse_value_to_string_gauge32() {
+        let result = parse_value_to_string(ber_tags::GAUGE32, &[0x64]);
+        assert_eq!(result, "100");
+    }
+
+    #[test]
+    fn test_parse_value_to_string_timeticks() {
+        let result = parse_value_to_string(ber_tags::TIMETICKS, &[0x00, 0x01]);
+        assert_eq!(result, "1");
+    }
+
+    #[test]
+    fn test_parse_value_to_string_counter64() {
+        let result = parse_value_to_string(ber_tags::COUNTER64, &[0x01, 0x00]);
+        assert_eq!(result, "256");
+    }
+
+    #[test]
+    fn test_parse_value_to_string_unknown() {
+        let result = parse_value_to_string(0xFF, &[0x01]);
+        assert!(result.contains("tag=0xff"));
+    }
+
+    #[test]
+    fn test_parse_varbinds_empty() {
+        let result = parse_varbinds(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_snmp_trap_display_v1_no_varbinds() {
+        let trap = SnmpTrap {
+            source_addr: "192.168.1.1:161".parse().unwrap(),
+            version: SnmpVersion::V1,
+            community: "public".to_string(),
+            trap_oid: "1.3.6.1.4.1.9.9.41".to_string(),
+            generic_trap: Some(GenericTrap::ColdStart),
+            specific_trap: None,
+            uptime: 0,
+            varbinds: vec![],
+        };
+
+        let display = format!("{}", trap);
+        assert!(display.contains("[v1]"));
+        assert!(display.contains("generic=coldStart"));
+        assert!(!display.contains("varbinds="));
+    }
+
+    #[test]
+    fn test_snmp_trap_display_v1_no_generic_trap() {
+        let trap = SnmpTrap {
+            source_addr: "192.168.1.1:161".parse().unwrap(),
+            version: SnmpVersion::V1,
+            community: "public".to_string(),
+            trap_oid: "1.3.6.1.4.1.9".to_string(),
+            generic_trap: None,
+            specific_trap: None,
+            uptime: 100,
+            varbinds: vec![],
+        };
+
+        let display = format!("{}", trap);
+        assert!(display.contains("[v1]"));
+        assert!(!display.contains("generic="));
+        assert!(!display.contains("specific="));
+    }
+
+    #[test]
+    fn test_snmp_trap_display_multiple_varbinds() {
+        let trap = SnmpTrap {
+            source_addr: "10.0.0.1:162".parse().unwrap(),
+            version: SnmpVersion::V2c,
+            community: "private".to_string(),
+            trap_oid: "1.3.6.1.6.3.1.1.5.3".to_string(),
+            generic_trap: None,
+            specific_trap: None,
+            uptime: 5000,
+            varbinds: vec![
+                ("1.3.6.1.2.1.2.2.1.1".to_string(), "1".to_string()),
+                ("1.3.6.1.2.1.2.2.1.2".to_string(), "eth0".to_string()),
+            ],
+        };
+
+        let display = format!("{}", trap);
+        assert!(display.contains("10.0.0.1:162"));
+        assert!(display.contains("[v2c]"));
+        assert!(display.contains("varbinds=["));
+        assert!(display.contains(", "));
+    }
+
+    #[test]
+    fn test_trap_listener_new() {
+        let listener = TrapListener::new(1620);
+        assert_eq!(listener.port, 1620);
+    }
+
+    #[test]
+    fn test_parse_error_display() {
+        let err = ParseError("test error".to_string());
+        assert_eq!(format!("{}", err), "test error");
+    }
+
+    #[test]
+    fn test_snmp_version_eq() {
+        assert_eq!(SnmpVersion::V1, SnmpVersion::V1);
+        assert_eq!(SnmpVersion::V2c, SnmpVersion::V2c);
+        assert_ne!(SnmpVersion::V1, SnmpVersion::V2c);
+    }
+
+    #[test]
+    fn test_snmp_trap_clone() {
+        let trap = SnmpTrap {
+            source_addr: "192.168.1.1:161".parse().unwrap(),
+            version: SnmpVersion::V1,
+            community: "public".to_string(),
+            trap_oid: "1.3.6.1.4.1.9".to_string(),
+            generic_trap: Some(GenericTrap::LinkUp),
+            specific_trap: Some(42),
+            uptime: 12345,
+            varbinds: vec![("oid".to_string(), "value".to_string())],
+        };
+
+        let cloned = trap.clone();
+        assert_eq!(trap.source_addr, cloned.source_addr);
+        assert_eq!(trap.version, cloned.version);
+        assert_eq!(trap.community, cloned.community);
+    }
+
+    #[test]
+    fn test_generic_trap_copy() {
+        let trap = GenericTrap::WarmStart;
+        let copied = trap;
+        assert!(matches!(copied, GenericTrap::WarmStart));
+    }
+
+    #[test]
+    fn test_snmp_version_copy() {
+        let version = SnmpVersion::V2c;
+        let copied = version;
+        assert_eq!(copied, SnmpVersion::V2c);
+    }
+
+    // Test full SNMPv1 trap parsing with a minimal but valid trap packet
+    #[test]
+    fn test_parse_trap_v1() {
+        // Build a valid SNMPv1 trap packet
+        // Inner Trap-PDU contents:
+        //   OID 1.3 (enterprise): 06 01 2B
+        //   IpAddress 10.0.0.1: 40 04 0A 00 00 01
+        //   INTEGER 0 (generic): 02 01 00
+        //   INTEGER 0 (specific): 02 01 00
+        //   TimeTicks 0: 43 01 00
+        //   SEQUENCE {} (varbinds): 30 00
+        // Total Trap-PDU content = 3 + 6 + 3 + 3 + 3 + 2 = 20 bytes
+        let trap_pdu: Vec<u8> = vec![
+            0x06, 0x01, 0x2B, // OID 1.3
+            0x40, 0x04, 0x0A, 0x00, 0x00, 0x01, // IpAddress 10.0.0.1
+            0x02, 0x01, 0x00, // INTEGER 0 (generic-trap)
+            0x02, 0x01, 0x00, // INTEGER 0 (specific-trap)
+            0x43, 0x01, 0x00, // TimeTicks 0
+            0x30, 0x00, // SEQUENCE {} (varbinds)
+        ];
+
+        // Full message:
+        //   SEQUENCE { version, community, Trap-PDU }
+        //   version: 02 01 00 (3 bytes)
+        //   community "pub": 04 03 70 75 62 (5 bytes)
+        //   Trap-PDU [4]: A4 <len> <trap_pdu>
+        let mut trap_bytes: Vec<u8> = vec![
+            0x30,
+            0x00, // SEQUENCE with placeholder length
+            0x02,
+            0x01,
+            0x00, // INTEGER 0 (version SNMPv1)
+            0x04,
+            0x03,
+            0x70,
+            0x75,
+            0x62, // OCTET STRING "pub"
+            0xA4,
+            trap_pdu.len() as u8, // Trap-PDU tag with length
+        ];
+        trap_bytes.extend_from_slice(&trap_pdu);
+        // Fix outer SEQUENCE length
+        trap_bytes[1] = (trap_bytes.len() - 2) as u8;
+
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&trap_bytes, source_addr);
+        assert!(result.is_ok(), "Expected Ok, got {:?}", result);
+
+        let trap = result.unwrap();
+        assert_eq!(trap.version, SnmpVersion::V1);
+        assert_eq!(trap.community, "pub");
+        assert!(trap.generic_trap.is_some());
+    }
+
+    // Test full SNMPv2c trap parsing
+    #[test]
+    fn test_parse_trap_v2c() {
+        // Build a valid SNMPv2c trap packet
+        // Inner SNMPv2-Trap-PDU contents:
+        //   INTEGER 1 (request-id): 02 01 01
+        //   INTEGER 0 (error-status): 02 01 00
+        //   INTEGER 0 (error-index): 02 01 00
+        //   SEQUENCE {} (varbinds): 30 00
+        // Total PDU content = 3 + 3 + 3 + 2 = 11 bytes
+        let trap_pdu: Vec<u8> = vec![
+            0x02, 0x01, 0x01, // INTEGER 1 (request-id)
+            0x02, 0x01, 0x00, // INTEGER 0 (error-status)
+            0x02, 0x01, 0x00, // INTEGER 0 (error-index)
+            0x30, 0x00, // SEQUENCE {} (varbinds)
+        ];
+
+        // Full message:
+        //   SEQUENCE { version, community, SNMPv2-Trap-PDU }
+        let mut trap_bytes: Vec<u8> = vec![
+            0x30,
+            0x00, // SEQUENCE with placeholder length
+            0x02,
+            0x01,
+            0x01, // INTEGER 1 (version SNMPv2c)
+            0x04,
+            0x03,
+            0x70,
+            0x75,
+            0x62, // OCTET STRING "pub"
+            0xA7,
+            trap_pdu.len() as u8, // SNMPv2-Trap-PDU tag with length
+        ];
+        trap_bytes.extend_from_slice(&trap_pdu);
+        // Fix outer SEQUENCE length
+        trap_bytes[1] = (trap_bytes.len() - 2) as u8;
+
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&trap_bytes, source_addr);
+        assert!(result.is_ok(), "Expected Ok, got {:?}", result);
+
+        let trap = result.unwrap();
+        assert_eq!(trap.version, SnmpVersion::V2c);
+        assert_eq!(trap.community, "pub");
+    }
+
+    #[test]
+    fn test_parse_trap_invalid_outer_sequence() {
+        // Not a SEQUENCE
+        let trap_bytes: Vec<u8> = vec![0x02, 0x01, 0x00];
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&trap_bytes, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_trap_unsupported_version() {
+        // SEQUENCE with version 2 (not v1=0 or v2c=1)
+        let trap_bytes: Vec<u8> = vec![
+            0x30, 0x0A, // INTEGER 2 (unsupported)
+            0x02, 0x01, 0x02, // OCTET STRING "pub"
+            0x04, 0x03, 0x70, 0x75, 0x62, // Minimal PDU
+            0xA7, 0x00,
+        ];
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&trap_bytes, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_trap_invalid_version_tag() {
+        // Version is not an INTEGER
+        let trap_bytes: Vec<u8> = vec![
+            0x30, 0x08, // OCTET STRING instead of INTEGER for version
+            0x04, 0x01, 0x00, // OCTET STRING "pub"
+            0x04, 0x03, 0x70, 0x75, 0x62,
+        ];
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&trap_bytes, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_trap_invalid_community_tag() {
+        // Community is not an OCTET STRING
+        let trap_bytes: Vec<u8> = vec![
+            0x30, 0x08, // INTEGER 0 (version)
+            0x02, 0x01, 0x00, // INTEGER instead of OCTET STRING for community
+            0x02, 0x01, 0x00, // PDU
+            0xA4, 0x00,
+        ];
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&trap_bytes, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_trap_v1_invalid_pdu_tag() {
+        // V1 with wrong PDU tag (should be 0xA4)
+        let trap_bytes: Vec<u8> = vec![
+            0x30, 0x0B, // INTEGER 0 (version v1)
+            0x02, 0x01, 0x00, // OCTET STRING "pub"
+            0x04, 0x03, 0x70, 0x75, 0x62, // Wrong PDU tag (0xA7 is v2c)
+            0xA7, 0x00,
+        ];
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&trap_bytes, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_trap_v2c_invalid_pdu_tag() {
+        // V2c with wrong PDU tag (should be 0xA7)
+        let trap_bytes: Vec<u8> = vec![
+            0x30, 0x0B, // INTEGER 1 (version v2c)
+            0x02, 0x01, 0x01, // OCTET STRING "pub"
+            0x04, 0x03, 0x70, 0x75, 0x62, // Wrong PDU tag (0xA4 is v1)
+            0xA4, 0x00,
+        ];
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&trap_bytes, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_varbinds_invalid_varbind_tag() {
+        // Varbind is not a SEQUENCE
+        let data: Vec<u8> = vec![
+            // INTEGER instead of SEQUENCE
+            0x02, 0x01, 0x00,
+        ];
+        let result = parse_varbinds(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_varbinds_invalid_oid_tag() {
+        // Valid SEQUENCE but OID is wrong type
+        let data: Vec<u8> = vec![
+            // SEQUENCE
+            0x30, 0x06, // INTEGER instead of OID
+            0x02, 0x01, 0x00, // NULL value
+            0x05, 0x00,
+        ];
+        let result = parse_varbinds(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_varbinds_valid() {
+        // Valid varbind: SEQUENCE { OID 1.3, INTEGER 42 }
+        let data: Vec<u8> = vec![
+            // SEQUENCE
+            0x30, 0x06, // OID 1.3
+            0x06, 0x01, 0x2B, // INTEGER 42
+            0x02, 0x01, 0x2A,
+        ];
+        let result = parse_varbinds(&data).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "1.3");
+        assert_eq!(result[0].1, "42");
+    }
+
+    #[test]
+    fn test_parse_value_to_string_ip_address_invalid() {
+        // IP address with wrong length
+        let result = parse_value_to_string(ber_tags::IP_ADDRESS, &[192, 168, 1]);
+        assert_eq!(result, "?");
+    }
+
+    #[test]
+    fn test_parse_value_to_string_oid_empty() {
+        let result = parse_value_to_string(ber_tags::OBJECT_IDENTIFIER, &[]);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_parse_length_four_bytes() {
+        // Four-byte length: 0x84 followed by 4 bytes
+        let data = [0x84, 0x00, 0x00, 0x01, 0x00];
+        let result = parse_length(&data);
+        assert!(result.is_ok());
+        let (length, consumed) = result.unwrap();
+        assert_eq!(length, 256);
+        assert_eq!(consumed, 5);
+    }
+
+    #[test]
+    fn test_parse_integer_negative_multibyte() {
+        // -1 as two bytes: 0xFF 0xFF
+        assert_eq!(parse_integer(&[0xFF, 0xFF]).unwrap(), -1);
+        // -128 as single byte
+        assert_eq!(parse_integer(&[0x80]).unwrap(), -128);
+        // -129 as two bytes: 0xFF 0x7F
+        assert_eq!(parse_integer(&[0xFF, 0x7F]).unwrap(), -129);
+    }
+
+    #[test]
+    fn test_parse_unsigned_large() {
+        // Large counter value
+        let data = [0x01, 0x00, 0x00, 0x00];
+        let result = parse_unsigned(&data).unwrap();
+        assert_eq!(result, 16777216);
+    }
+
+    // Helper to build a minimal v1 trap with custom PDU content
+    fn build_v1_trap_packet(pdu_content: &[u8]) -> Vec<u8> {
+        let mut packet = vec![
+            0x30,
+            0x00, // SEQUENCE placeholder
+            0x02,
+            0x01,
+            0x00, // INTEGER 0 (version v1)
+            0x04,
+            0x03,
+            0x70,
+            0x75,
+            0x62, // OCTET STRING "pub"
+            0xA4,
+            pdu_content.len() as u8, // Trap-PDU
+        ];
+        packet.extend_from_slice(pdu_content);
+        packet[1] = (packet.len() - 2) as u8;
+        packet
+    }
+
+    // Helper to build a minimal v2c trap with custom PDU content
+    fn build_v2c_trap_packet(pdu_content: &[u8]) -> Vec<u8> {
+        let mut packet = vec![
+            0x30,
+            0x00, // SEQUENCE placeholder
+            0x02,
+            0x01,
+            0x01, // INTEGER 1 (version v2c)
+            0x04,
+            0x03,
+            0x70,
+            0x75,
+            0x62, // OCTET STRING "pub"
+            0xA7,
+            pdu_content.len() as u8, // SNMPv2-Trap-PDU
+        ];
+        packet.extend_from_slice(pdu_content);
+        packet[1] = (packet.len() - 2) as u8;
+        packet
+    }
+
+    #[test]
+    fn test_parse_v1_trap_invalid_enterprise_tag() {
+        // Enterprise should be OID, not INTEGER
+        let pdu = vec![
+            0x02, 0x01, 0x00, // INTEGER instead of OID
+        ];
+        let packet = build_v1_trap_packet(&pdu);
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&packet, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_v1_trap_invalid_agent_addr_tag() {
+        // Agent addr should be IP_ADDRESS
+        let pdu = vec![
+            0x06, 0x01, 0x2B, // OID 1.3 (enterprise)
+            0x02, 0x01, 0x00, // INTEGER instead of IpAddress
+        ];
+        let packet = build_v1_trap_packet(&pdu);
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&packet, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_v1_trap_invalid_generic_trap_tag() {
+        // Generic trap should be INTEGER
+        let pdu = vec![
+            0x06, 0x01, 0x2B, // OID 1.3 (enterprise)
+            0x40, 0x04, 0x0A, 0x00, 0x00, 0x01, // IpAddress 10.0.0.1
+            0x04, 0x01, 0x00, // OCTET STRING instead of INTEGER
+        ];
+        let packet = build_v1_trap_packet(&pdu);
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&packet, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_v1_trap_invalid_specific_trap_tag() {
+        // Specific trap should be INTEGER
+        let pdu = vec![
+            0x06, 0x01, 0x2B, // OID 1.3 (enterprise)
+            0x40, 0x04, 0x0A, 0x00, 0x00, 0x01, // IpAddress 10.0.0.1
+            0x02, 0x01, 0x00, // INTEGER 0 (generic)
+            0x04, 0x01, 0x00, // OCTET STRING instead of INTEGER
+        ];
+        let packet = build_v1_trap_packet(&pdu);
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&packet, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_v1_trap_invalid_timestamp_tag() {
+        // Timestamp should be TIMETICKS
+        let pdu = vec![
+            0x06, 0x01, 0x2B, // OID 1.3 (enterprise)
+            0x40, 0x04, 0x0A, 0x00, 0x00, 0x01, // IpAddress 10.0.0.1
+            0x02, 0x01, 0x00, // INTEGER 0 (generic)
+            0x02, 0x01, 0x00, // INTEGER 0 (specific)
+            0x02, 0x01, 0x00, // INTEGER instead of TIMETICKS
+        ];
+        let packet = build_v1_trap_packet(&pdu);
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&packet, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_v1_trap_invalid_varbinds_tag() {
+        // Varbinds should be SEQUENCE
+        let pdu = vec![
+            0x06, 0x01, 0x2B, // OID 1.3 (enterprise)
+            0x40, 0x04, 0x0A, 0x00, 0x00, 0x01, // IpAddress 10.0.0.1
+            0x02, 0x01, 0x00, // INTEGER 0 (generic)
+            0x02, 0x01, 0x00, // INTEGER 0 (specific)
+            0x43, 0x01, 0x00, // TimeTicks 0
+            0x02, 0x01, 0x00, // INTEGER instead of SEQUENCE
+        ];
+        let packet = build_v1_trap_packet(&pdu);
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&packet, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_v2c_trap_invalid_request_id_tag() {
+        // Request-id should be INTEGER
+        let pdu = vec![
+            0x04, 0x01, 0x00, // OCTET STRING instead of INTEGER
+        ];
+        let packet = build_v2c_trap_packet(&pdu);
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&packet, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_v2c_trap_invalid_error_status_tag() {
+        // Error-status should be INTEGER
+        let pdu = vec![
+            0x02, 0x01, 0x01, // INTEGER 1 (request-id)
+            0x04, 0x01, 0x00, // OCTET STRING instead of INTEGER
+        ];
+        let packet = build_v2c_trap_packet(&pdu);
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&packet, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_v2c_trap_invalid_error_index_tag() {
+        // Error-index should be INTEGER
+        let pdu = vec![
+            0x02, 0x01, 0x01, // INTEGER 1 (request-id)
+            0x02, 0x01, 0x00, // INTEGER 0 (error-status)
+            0x04, 0x01, 0x00, // OCTET STRING instead of INTEGER
+        ];
+        let packet = build_v2c_trap_packet(&pdu);
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&packet, source_addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_v2c_trap_invalid_varbinds_tag() {
+        // Varbinds should be SEQUENCE
+        let pdu = vec![
+            0x02, 0x01, 0x01, // INTEGER 1 (request-id)
+            0x02, 0x01, 0x00, // INTEGER 0 (error-status)
+            0x02, 0x01, 0x00, // INTEGER 0 (error-index)
+            0x02, 0x01, 0x00, // INTEGER instead of SEQUENCE
+        ];
+        let packet = build_v2c_trap_packet(&pdu);
+        let source_addr: SocketAddr = "192.168.1.1:162".parse().unwrap();
+        let result = parse_trap(&packet, source_addr);
+        assert!(result.is_err());
+    }
 }
