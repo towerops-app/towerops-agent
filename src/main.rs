@@ -183,6 +183,10 @@ struct Args {
     /// UDP port for SNMP trap listener
     #[arg(long, env = "TRAP_PORT", default_value_t = snmp::DEFAULT_TRAP_PORT)]
     trap_port: u16,
+
+    /// Enable SNMP trap listener
+    #[arg(long, env = "TRAP_ENABLED", default_value_t = false)]
+    trap_enabled: bool,
 }
 
 #[tokio::main]
@@ -197,22 +201,24 @@ async fn main() {
     // Check for newer Docker image version
     version::check_for_updates();
 
-    // Start SNMP trap listener
-    let trap_port = args.trap_port;
-    tokio::spawn(async move {
-        let (trap_tx, mut trap_rx) = tokio::sync::mpsc::channel::<snmp::SnmpTrap>(100);
-        let trap_listener = snmp::TrapListener::new(trap_port);
-
-        // Spawn the listener
+    // Start SNMP trap listener if enabled
+    if args.trap_enabled {
+        let trap_port = args.trap_port;
         tokio::spawn(async move {
-            trap_listener.run(trap_tx).await;
-        });
+            let (trap_tx, mut trap_rx) = tokio::sync::mpsc::channel::<snmp::SnmpTrap>(100);
+            let trap_listener = snmp::TrapListener::new(trap_port);
 
-        // Log received traps
-        while let Some(trap) = trap_rx.recv().await {
-            log_info!("{}", trap);
-        }
-    });
+            // Spawn the listener
+            tokio::spawn(async move {
+                trap_listener.run(trap_tx).await;
+            });
+
+            // Log received traps
+            while let Some(trap) = trap_rx.recv().await {
+                log_info!("{}", trap);
+            }
+        });
+    }
 
     // Convert HTTP(S) URL to WebSocket URL
     let ws_url = convert_to_websocket_url(&args.api_url);

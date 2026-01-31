@@ -18,7 +18,11 @@ services:
       # Default: info
       - LOG_LEVEL=info
 
-      # Optional: SNMP trap listener port
+      # Optional: Enable SNMP trap listener
+      # Default: false
+      - TRAP_ENABLED=true
+
+      # Optional: SNMP trap listener port (only used if TRAP_ENABLED=true)
       # Default: 162
       - TRAP_PORT=162
 
