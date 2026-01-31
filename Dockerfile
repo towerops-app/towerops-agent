@@ -1,8 +1,10 @@
+# syntax=docker/dockerfile:1.4
 # Build stage
 FROM rust:1.83-alpine AS builder
 
 # Build arguments provided by Docker buildx
 ARG TARGETPLATFORM
+ARG TARGETARCH
 ARG VERSION=0.1.0-unknown
 
 WORKDIR /app
@@ -26,8 +28,12 @@ COPY proto ./proto
 # Create a dummy main.rs to build dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
-# Build dependencies (cached layer)
-RUN RUST_TARGET=$(cat /tmp/rust-target) && \
+# Build dependencies (cached layer) with BuildKit cache mounts
+# Cache is separated by target architecture for multi-platform builds
+RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
+    --mount=type=cache,id=cargo-target-${TARGETARCH},target=/app/target \
+    RUST_TARGET=$(cat /tmp/rust-target) && \
     BUILD_VERSION="$VERSION" cargo build --release --target "$RUST_TARGET"
 
 # Remove dummy src
@@ -36,8 +42,11 @@ RUN rm -rf src
 # Copy actual source code
 COPY src ./src
 
-# Build the actual application
-RUN RUST_TARGET=$(cat /tmp/rust-target) && \
+# Build the actual application with BuildKit cache mounts
+RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
+    --mount=type=cache,id=cargo-target-${TARGETARCH},target=/app/target \
+    RUST_TARGET=$(cat /tmp/rust-target) && \
     touch src/main.rs && \
     BUILD_VERSION="$VERSION" cargo build --release --target "$RUST_TARGET" && \
     cp "target/$RUST_TARGET/release/towerops-agent" /tmp/towerops-agent
