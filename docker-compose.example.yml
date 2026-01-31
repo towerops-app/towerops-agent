@@ -1,6 +1,6 @@
 services:
   towerops-agent:
-    image: registry.gitlab.com/towerops/towerops-agent:latest
+    image: ghcr.io/towerops-app/towerops-agent:latest
     container_name: towerops-agent
     restart: unless-stopped
 

@@ -112,11 +112,11 @@ jobs:
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           cache-to: type=gha,scope=build-branch,mode=max
 
-  build-main:
-    name: Build (Main)
+  release:
+    name: Release (Multi-arch)
     needs: test
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
       packages: write
@@ -125,73 +125,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # Needed for git describe
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Generate version info
-        id: version
-        run: |
-          VERSION=$(git describe --tags --always --dirty=-modified | sed 's/^v//')
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          SHORT_SHA=${GITHUB_SHA::7}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
-          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-          echo "Building version $VERSION at $TIMESTAMP"
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          provenance: false
-          build-args: |
-            VERSION=${{ steps.version.outputs.version }}
-            BUILDKIT_INLINE_CACHE=1
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ steps.version.outputs.short_sha }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ steps.version.outputs.timestamp }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-from: |
-            type=gha,scope=build-main
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          cache-to: |
-            type=gha,scope=build-main,mode=max
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
-
-      - name: Summary
-        run: |
-          echo "### Built and pushed with tags:" >> $GITHUB_STEP_SUMMARY
-          echo "- \`latest\` (for production)" >> $GITHUB_STEP_SUMMARY
-          echo "- \`main\` (for Watchtower tracking)" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ steps.version.outputs.version }}\` (git describe)" >> $GITHUB_STEP_SUMMARY
-          echo "- \`main-${{ steps.version.outputs.short_sha }}\` (commit)" >> $GITHUB_STEP_SUMMARY
-          echo "- \`main-${{ steps.version.outputs.timestamp }}\` (timestamp)" >> $GITHUB_STEP_SUMMARY
-
-  release:
-    name: Release (Multi-arch)
-    needs: test
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -206,14 +139,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version from tag
+      - name: Generate version info
         id: version
         run: |
-          TAG=${GITHUB_REF#refs/tags/}
-          VERSION=${TAG#v}
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            # Tag push - extract version from tag
+            TAG=${GITHUB_REF#refs/tags/}
+            VERSION=${TAG#v}
+            echo "is_tag=true" >> $GITHUB_OUTPUT
+            echo "tag=$TAG" >> $GITHUB_OUTPUT
+          else
+            # Main branch push - use git describe
+            VERSION=$(git describe --tags --always --dirty=-modified | sed 's/^v//')
+            echo "is_tag=false" >> $GITHUB_OUTPUT
+          fi
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          SHORT_SHA=${GITHUB_SHA::7}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Releasing version: $VERSION"
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "Building version $VERSION"
 
       - name: Build and push (multi-arch)
         uses: docker/build-push-action@v6
@@ -226,11 +171,12 @@ jobs:
             VERSION=${{ steps.version.outputs.version }}
             BUILDKIT_INLINE_CACHE=1
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.version.outputs.short_sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.timestamp }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
           cache-from: |
-            type=gha,scope=build-main
             type=gha,scope=release
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
@@ -242,3 +188,8 @@ jobs:
         run: |
           echo "### Released version: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "Multi-architecture build (amd64, arm64)" >> $GITHUB_STEP_SUMMARY
+          echo "Tags pushed:" >> $GITHUB_STEP_SUMMARY
+          echo "- \`latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`sha-${{ steps.version.outputs.short_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ steps.version.outputs.timestamp }}\`" >> $GITHUB_STEP_SUMMARY
