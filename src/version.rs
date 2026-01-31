@@ -6,8 +6,8 @@ pub fn current_version() -> &'static str {
 /// Startup check - logs current version
 pub fn check_for_updates() {
     let current_ver = current_version();
-    crate::log_info!("Current version: {}", current_ver);
-    crate::log_info!("Watchtower will automatically update to new versions");
+    tracing::info!("Current version: {}", current_ver);
+    tracing::info!("Watchtower will automatically update to new versions");
 }
 
 #[cfg(test)]

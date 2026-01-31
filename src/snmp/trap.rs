@@ -137,11 +137,11 @@ impl TrapListener {
 
         let socket = match UdpSocket::bind(&bind_addr).await {
             Ok(s) => {
-                crate::log_info!("SNMP trap listener started on UDP port {}", self.port);
+                tracing::info!("SNMP trap listener started on UDP port {}", self.port);
                 s
             }
             Err(e) => {
-                crate::log_error!("Failed to bind trap listener to {}: {}", bind_addr, e);
+                tracing::error!("Failed to bind trap listener to {}: {}", bind_addr, e);
                 return;
             }
         };
@@ -156,17 +156,17 @@ impl TrapListener {
                     match parse_trap(packet, src_addr) {
                         Ok(trap) => {
                             if trap_tx.send(trap).await.is_err() {
-                                crate::log_warn!("Trap channel closed, stopping listener");
+                                tracing::warn!("Trap channel closed, stopping listener");
                                 break;
                             }
                         }
                         Err(e) => {
-                            crate::log_warn!("Failed to parse SNMP trap from {}: {}", src_addr, e);
+                            tracing::warn!("Failed to parse SNMP trap from {}: {}", src_addr, e);
                         }
                     }
                 }
                 Err(e) => {
-                    crate::log_warn!("Error receiving trap packet: {}", e);
+                    tracing::warn!("Error receiving trap packet: {}", e);
                 }
             }
         }
