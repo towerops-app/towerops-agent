@@ -106,28 +106,67 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.branch.outputs.name }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
           cache-from: |
-            type=gha,scope=build-branch
-            type=gha,scope=build-main
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+            type=gha,scope=build-amd64
+            type=gha,scope=release-amd64
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache-amd64
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          cache-to: type=gha,scope=build-branch,mode=max
+          cache-to: |
+            type=gha,scope=build-amd64,mode=max
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache-amd64,mode=max
 
-  release:
-    name: Release (Multi-arch)
-    needs: test
+  # Generate version info for release builds
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+      is_tag: ${{ steps.version.outputs.is_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate version info
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+            VERSION=${TAG#v}
+            echo "is_tag=true" >> $GITHUB_OUTPUT
+          else
+            VERSION=$(git describe --tags --always --dirty=-modified | sed 's/^v//')
+            echo "is_tag=false" >> $GITHUB_OUTPUT
+          fi
+          SHORT_SHA=${GITHUB_SHA::7}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+
+  # Build architecture-specific images in parallel
+  build-release:
+    name: Build (${{ matrix.platform }})
+    needs: [test, version]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+          - platform: linux/arm64
+            arch: arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Needed for git describe
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+        if: matrix.arch == 'arm64'
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -139,57 +178,69 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate version info
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            # Tag push - extract version from tag
-            TAG=${GITHUB_REF#refs/tags/}
-            VERSION=${TAG#v}
-            echo "is_tag=true" >> $GITHUB_OUTPUT
-            echo "tag=$TAG" >> $GITHUB_OUTPUT
-          else
-            # Main branch push - use git describe
-            VERSION=$(git describe --tags --always --dirty=-modified | sed 's/^v//')
-            echo "is_tag=false" >> $GITHUB_OUTPUT
-          fi
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          SHORT_SHA=${GITHUB_SHA::7}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
-          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-          echo "Building version $VERSION"
-
-      - name: Build and push (multi-arch)
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: true
           provenance: false
           build-args: |
-            VERSION=${{ steps.version.outputs.version }}
+            VERSION=${{ needs.version.outputs.version }}
             BUILDKIT_INLINE_CACHE=1
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.version.outputs.short_sha }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.timestamp }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
           cache-from: |
-            type=gha,scope=release
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            type=gha,scope=build-${{ matrix.arch }}
+            type=gha,scope=release-${{ matrix.arch }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache-${{ matrix.arch }}
           cache-to: |
-            type=gha,scope=release,mode=max
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+            type=gha,scope=release-${{ matrix.arch }},mode=max
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache-${{ matrix.arch }},mode=max
+
+  # Create multi-arch manifest after both builds complete
+  manifest:
+    name: Create Manifest
+    needs: [version, build-release]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifests
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          SHORT_SHA="${{ needs.version.outputs.short_sha }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+
+          # Create manifest for version tag
+          docker buildx imagetools create -t ${IMAGE}:${VERSION} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+
+          # Create manifest for latest
+          docker buildx imagetools create -t ${IMAGE}:latest \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+
+          # Create manifest for sha tag
+          docker buildx imagetools create -t ${IMAGE}:sha-${SHORT_SHA} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
 
       - name: Summary
         run: |
-          echo "### Released version: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "Multi-architecture build (amd64, arm64)" >> $GITHUB_STEP_SUMMARY
+          echo "### Released version: ${{ needs.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "Multi-architecture build (amd64, arm64) - built in parallel" >> $GITHUB_STEP_SUMMARY
           echo "Tags pushed:" >> $GITHUB_STEP_SUMMARY
           echo "- \`latest\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`sha-${{ steps.version.outputs.short_sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ steps.version.outputs.timestamp }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ needs.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`sha-${{ needs.version.outputs.short_sha }}\`" >> $GITHUB_STEP_SUMMARY
