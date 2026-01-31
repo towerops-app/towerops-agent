@@ -4,14 +4,15 @@ A lightweight Rust-based remote polling agent for Towerops SNMP monitoring.
 
 ## Overview
 
-The Towerops agent enables customers to deploy SNMP polling infrastructure on their internal networks. The agent polls SNMP devices locally and reports metrics to the Towerops API using token-based authentication.
+The Towerops agent enables customers to deploy SNMP polling infrastructure on their internal networks. The agent connects to the Towerops server via WebSocket and executes SNMP queries as directed by the server.
 
 ## Features
 
 - **Local SNMP Polling**: Poll devices on your internal network without exposing them to the internet
-- **Secure Communication**: All communication with Towerops API uses HTTPS with token authentication
-- **Metric Buffering**: Stores up to 24 hours of metrics in SQLite when API is unavailable
-- **Automatic Configuration**: Fetches polling configuration from the Towerops API
+- **SNMP Trap Receiver**: Listen for SNMP v1 and v2c traps from network devices
+- **Secure Communication**: All communication with Towerops uses WebSocket over TLS with token authentication
+- **Real-time Updates**: Server pushes configuration changes instantly via persistent WebSocket connection
+- **Automatic Reconnection**: Exponential backoff reconnection on network failures
 - **Automatic Updates**: Checks for new versions hourly and self-updates when available (requires Docker socket access)
 - **Low Resource Usage**: Built in Rust for minimal memory and CPU footprint (< 256 MB RAM typical)
 - **Docker Ready**: Pre-built Docker images for easy deployment
@@ -20,10 +21,10 @@ The Towerops agent enables customers to deploy SNMP polling infrastructure on th
 
 ### Using Pre-built Image
 
-Pull the latest image from GitLab Container Registry:
+Pull the latest image from Docker Hub:
 
 ```bash
-docker pull registry.gitlab.com/towerops/towerops-agent:latest
+docker pull gmcintire/towerops-agent:latest
 ```
 
 ### Using Docker Compose
@@ -32,17 +33,21 @@ docker pull registry.gitlab.com/towerops/towerops-agent:latest
 
 ```yaml
 version: '3.8'
+
 services:
   towerops-agent:
-    image: registry.gitlab.com/towerops/towerops-agent:latest
+    image: gmcintire/towerops-agent:latest
     restart: unless-stopped
     environment:
       - TOWEROPS_API_URL=https://app.towerops.com
       - TOWEROPS_AGENT_TOKEN=your-agent-token-here
-    volumes:
-      - ./data:/data
-      # Required for automatic self-updates
-      - /var/run/docker.sock:/var/run/docker.sock
+      - LOG_LEVEL=info
+      # Optional: Enable SNMP trap listener
+      - TRAP_ENABLED=true
+      - TRAP_PORT=162
+    ports:
+      # SNMP trap listener (UDP) - only needed if TRAP_ENABLED=true
+      - "162:162/udp"
 ```
 
 2. Start the agent:
@@ -50,8 +55,6 @@ services:
 ```bash
 docker-compose up -d
 ```
-
-**Note**: The Docker socket mount (`/var/run/docker.sock`) is required for automatic updates. The agent checks for new versions hourly and will automatically pull and restart with the latest version when available.
 
 ### Configuration
 
@@ -61,8 +64,9 @@ The agent is configured via environment variables:
 |----------|-------------|---------|
 | `TOWEROPS_API_URL` | Towerops API endpoint | Required |
 | `TOWEROPS_AGENT_TOKEN` | Agent authentication token | Required |
-| `CONFIG_REFRESH_SECONDS` | How often to refresh configuration | 300 (5 minutes) |
-| `DATABASE_PATH` | SQLite database path for buffering | `/data/towerops-agent.db` |
+| `LOG_LEVEL` | Logging level (error, warn, info, debug) | info |
+| `TRAP_ENABLED` | Enable SNMP trap listener | false |
+| `TRAP_PORT` | UDP port for SNMP traps | 162 |
 
 ### Obtaining an Agent Token
 
@@ -73,31 +77,34 @@ The agent is configured via environment variables:
 
 ## Architecture
 
-The agent consists of several components:
+The agent uses a WebSocket-based architecture for real-time communication:
 
-- **API Client**: Communicates with Towerops API to fetch configuration and submit metrics
-- **SNMP Poller**: Polls configured devices for sensor readings and interface statistics
-- **Storage Buffer**: SQLite database that buffers metrics during API outages
-- **Scheduler**: Coordinates polling intervals and metric submission
+- **WebSocket Client**: Maintains a persistent connection to the Towerops server
+- **SNMP Executor**: Executes SNMP queries (GET, WALK) as directed by the server
+- **Trap Listener**: Optional UDP listener for receiving SNMP traps from devices
 
-### Polling Flow
+### Communication Flow
 
-1. Agent fetches configuration from API every 5 minutes (configurable)
-2. For each equipment item, polls sensors and interfaces at configured intervals
-3. Metrics are stored locally in SQLite
-4. Every 30 seconds, pending metrics are submitted to the API
-5. Successfully submitted metrics are marked as sent and cleaned up after 24 hours
+1. Agent establishes WebSocket connection to `{api_url}/socket/agent/websocket`
+2. Agent authenticates by joining Phoenix channel with token
+3. Server pushes SNMP jobs (queries to execute) to agent
+4. Agent executes queries and sends results back via WebSocket
+5. Periodic heartbeats maintain connection health
+6. On disconnect, agent reconnects with exponential backoff (1s to 60s)
 
-### Buffering
+### SNMP Trap Listener
 
-If the API is unreachable, metrics are stored locally for up to 24 hours. When connectivity is restored, the agent automatically submits all buffered metrics.
+When enabled (`TRAP_ENABLED=true`), the agent listens for SNMP traps:
+
+- Supports SNMPv1 and SNMPv2c trap formats
+- Logs received traps with source address, enterprise OID, and variable bindings
+- Default port 162 (standard SNMP trap port)
 
 ## Building from Source
 
 ### Prerequisites
 
-- Rust 1.83 or later
-- SQLite development libraries
+- Rust 1.91 or later
 
 ### Build
 
@@ -117,39 +124,38 @@ docker build -t towerops-agent .
 
 ### Agent Not Connecting
 
-- Verify the API URL is correct
+- Verify the API URL is correct (accepts http://, https://, ws://, or wss://)
 - Check that the agent token is valid and hasn't been revoked
 - Ensure network connectivity to the Towerops API
+- Check logs for connection errors: `docker logs towerops-agent`
 
 ### No Metrics Appearing
 
 - Check that equipment is assigned to this agent in Towerops
 - Verify SNMP credentials are correct in Towerops equipment settings
 - Review agent logs for SNMP polling errors
+- Ensure the agent is connected (check Towerops UI for agent status)
 
-### High Memory Usage
+### Traps Not Received
 
-- Check the size of the SQLite database (`/data/towerops-agent.db`)
-- Verify metrics are being submitted successfully (check API connectivity)
+- Ensure `TRAP_ENABLED=true` is set
+- Verify UDP port 162 is exposed and not blocked by firewall
+- Check that devices are configured to send traps to the agent's IP
+- Look for trap messages in logs with `LOG_LEVEL=debug`
 
 ## Resource Requirements
 
-- **Memory**: 128-256 MB typical, 512 MB maximum
+- **Memory**: 64-128 MB typical, 256 MB maximum
 - **CPU**: 0.1-0.5 cores typical
-- **Disk**: ~100 MB for 24 hours of buffered metrics
-- **Network**: Minimal (metrics are small JSON payloads)
+- **Network**: Minimal (small protobuf messages over WebSocket)
 
 ## Security
 
 - Agent token should be kept secret (treat like a password)
-- All API communication uses HTTPS with certificate verification
-- Agent requires no inbound network connections
+- All API communication uses TLS with certificate verification
+- Agent requires no inbound network connections (except optional trap listener on UDP 162)
 - SNMP community strings are only used locally and never logged
-
-## Development Status
-
-**NOTE**: SNMP library integration is incomplete. The current implementation compiles but requires proper SNMP library integration for production use. This will be completed in the next development phase.
 
 ## License
 
-Copyright © 2026 Towerops
+Copyright 2026 Towerops
