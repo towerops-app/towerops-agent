@@ -57,7 +57,7 @@ impl AgentClient {
         // Strip trailing slash from base URL to avoid double slashes
         let base_url = url.trim_end_matches('/');
         let ws_url = format!("{}/socket/agent/websocket", base_url);
-        crate::log_info!(
+        tracing::info!(
             "Connecting to WebSocket: {} (timeout: {}s)",
             ws_url,
             CONNECTION_TIMEOUT.as_secs()
@@ -67,11 +67,11 @@ impl AgentClient {
         let (mut ws_stream, _) = match timeout(CONNECTION_TIMEOUT, connect_async(&ws_url)).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
-                crate::log_error!("WebSocket connection failed: {}", e);
+                tracing::error!("WebSocket connection failed: {}", e);
                 return Err(format!("Failed to connect to WebSocket: {}", e).into());
             }
             Err(_) => {
-                crate::log_error!(
+                tracing::error!(
                     "WebSocket connection timed out after {}s",
                     CONNECTION_TIMEOUT.as_secs()
                 );
@@ -83,7 +83,7 @@ impl AgentClient {
             }
         };
 
-        crate::log_info!("Connected to Towerops server at {}", url);
+        tracing::info!("Connected to Towerops server at {}", url);
 
         let agent_id = generate_agent_id();
         let (result_tx, result_rx) = mpsc::unbounded_channel();
@@ -98,7 +98,7 @@ impl AgentClient {
 
         let join_text = serde_json::to_string(&join_msg)?;
         ws_stream.send(WsMessage::Text(join_text)).await?;
-        crate::log_info!(
+        tracing::info!(
             "Sent channel join request with token for agent:{}",
             agent_id
         );
@@ -127,10 +127,10 @@ impl AgentClient {
                 // Check for shutdown signal (highest priority)
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
-                        crate::log_info!("Shutdown signal received, closing WebSocket connection gracefully");
+                        tracing::info!("Shutdown signal received, closing WebSocket connection gracefully");
                         // Send close frame to server
                         if let Err(e) = self.ws_stream.close(None).await {
-                            crate::log_warn!("Error sending WebSocket close frame: {}", e);
+                            tracing::warn!("Error sending WebSocket close frame: {}", e);
                         }
                         break Ok(());
                     }
@@ -141,24 +141,24 @@ impl AgentClient {
                     match msg {
                         Some(Ok(WsMessage::Binary(data))) => {
                             if let Err(e) = self.handle_message(&data).await {
-                                crate::log_error!("Error handling binary message: {}", e);
+                                tracing::error!("Error handling binary message: {}", e);
                             }
                         }
                         Some(Ok(WsMessage::Text(text))) => {
                             if let Err(e) = self.handle_text_message(&text).await {
-                                crate::log_error!("Error handling text message: {}", e);
+                                tracing::error!("Error handling text message: {}", e);
                             }
                         }
                         Some(Ok(WsMessage::Close(_))) => {
-                            crate::log_info!("Server closed connection");
+                            tracing::info!("Server closed connection");
                             break Ok(());
                         }
                         Some(Err(e)) => {
-                            crate::log_error!("WebSocket error: {}", e);
+                            tracing::error!("WebSocket error: {}", e);
                             break Err(e.into());
                         }
                         None => {
-                            crate::log_info!("Connection closed");
+                            tracing::info!("Connection closed");
                             break Ok(());
                         }
                         _ => {}
@@ -168,14 +168,14 @@ impl AgentClient {
                 // Receive SNMP results from job tasks
                 Some(snmp_result) = self.result_rx.recv() => {
                     if let Err(e) = self.send_result(snmp_result).await {
-                        crate::log_error!("Error sending SNMP result: {}", e);
+                        tracing::error!("Error sending SNMP result: {}", e);
                     }
                 }
 
                 // Send periodic heartbeats
                 _ = heartbeat_interval.tick() => {
                     if let Err(e) = self.send_heartbeat().await {
-                        crate::log_error!("Error sending heartbeat: {}", e);
+                        tracing::error!("Error sending heartbeat: {}", e);
                     }
                 }
             }
@@ -188,7 +188,7 @@ impl AgentClient {
 
         match phoenix_msg.event.as_str() {
             "phx_reply" => {
-                crate::log_info!("Channel join reply: {:?}", phoenix_msg.payload);
+                tracing::info!("Channel join reply: {:?}", phoenix_msg.payload);
             }
             "jobs" => {
                 // Extract binary protobuf from payload
@@ -201,7 +201,7 @@ impl AgentClient {
                 }
             }
             _ => {
-                crate::log_debug!("Ignoring unknown event: {}", phoenix_msg.event);
+                tracing::debug!("Ignoring unknown event: {}", phoenix_msg.event);
             }
         }
 
@@ -224,18 +224,18 @@ impl AgentClient {
     /// No long-running tasks are spawned - the agent is stateless.
     /// Server handles all scheduling and retries via Oban.
     async fn handle_jobs(&self, job_list: AgentJobList) -> Result<()> {
-        crate::log_info!("Received {} jobs from server", job_list.jobs.len());
+        tracing::info!("Received {} jobs from server", job_list.jobs.len());
 
         for job in job_list.jobs {
             let job_type = JobType::try_from(job.job_type).unwrap_or(JobType::Poll);
-            crate::log_info!("Executing job: {} (type: {:?})", job.job_id, job_type);
+            tracing::info!("Executing job: {} (type: {:?})", job.job_id, job_type);
 
             // Spawn task to execute SNMP job (one-off execution)
             let result_tx = self.result_tx.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = execute_job(job, result_tx).await {
-                    crate::log_error!("Job execution failed: {}", e);
+                    tracing::error!("Job execution failed: {}", e);
                 }
             });
         }
@@ -265,7 +265,7 @@ impl AgentClient {
         let text = serde_json::to_string(&msg)?;
         self.ws_stream.send(WsMessage::Text(text)).await?;
 
-        crate::log_debug!("Sent heartbeat");
+        tracing::debug!("Sent heartbeat");
         Ok(())
     }
 
@@ -283,7 +283,7 @@ impl AgentClient {
         let text = serde_json::to_string(&msg)?;
         self.ws_stream.send(WsMessage::Text(text)).await?;
 
-        crate::log_debug!("Sent SNMP result for device {}", result.device_id);
+        tracing::debug!("Sent SNMP result for device {}", result.device_id);
         Ok(())
     }
 }
@@ -299,7 +299,7 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
         "***".to_string()
     };
 
-    crate::log_info!(
+    tracing::info!(
         "Executing SNMP job for device {} at {}:{} (community: {}, version: {})",
         job.device_id,
         snmp_device.ip,
@@ -332,7 +332,7 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
                             oid_values.insert(oid.clone(), value_to_string(value));
                         }
                         Err(e) => {
-                            crate::log_warn!(
+                            tracing::warn!(
                                 "SNMP GET failed for device {} at {}:{} (version: {}, community: {}), OID {}: {}",
                                 job.device_id,
                                 snmp_device.ip,
@@ -365,7 +365,7 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
                             }
                         }
                         Err(e) => {
-                            crate::log_warn!(
+                            tracing::warn!(
                                 "SNMP WALK failed for device {} at {}:{} (version: {}, community: {}), OID {}: {}",
                                 job.device_id,
                                 snmp_device.ip,
@@ -392,7 +392,7 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
             .as_secs() as i64,
     };
 
-    crate::log_info!(
+    tracing::info!(
         "Collected {} OID values for job {}",
         result.oid_values.len(),
         job.job_id
@@ -400,7 +400,7 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
 
     // Send result back to main client task
     if let Err(e) = result_tx.send(result) {
-        crate::log_warn!(
+        tracing::warn!(
             "Failed to send SNMP result for job {}: channel closed (connection may have dropped)",
             job.job_id
         );
