@@ -22,5 +22,18 @@ mod tests {
         // Just verify it's a non-empty string
     }
 
-    // Note: check_for_updates() just logs the version, no testing needed
+    #[test]
+    fn test_current_version_format() {
+        let version = current_version();
+        // Version should be in semver-like format (e.g., "0.1.0" or custom BUILD_VERSION)
+        // At minimum, should have some content
+        assert!(version.len() >= 1);
+    }
+
+    #[test]
+    fn test_check_for_updates() {
+        // This function just logs, but we can call it to verify it doesn't panic
+        check_for_updates();
+        // If we get here, the function completed without panicking
+    }
 }

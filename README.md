@@ -39,7 +39,7 @@ services:
     image: gmcintire/towerops-agent:latest
     restart: unless-stopped
     environment:
-      - TOWEROPS_API_URL=https://app.towerops.com
+      - TOWEROPS_API_URL=https://towerops.net
       - TOWEROPS_AGENT_TOKEN=your-agent-token-here
       - LOG_LEVEL=info
       # Optional: Enable SNMP trap listener
