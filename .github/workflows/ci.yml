@@ -191,9 +191,9 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
           cache-from: |
-            type=gha,scope=build-${{ matrix.arch }}
             type=gha,scope=release-${{ matrix.arch }}
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache-${{ matrix.arch }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           cache-to: |
             type=gha,scope=release-${{ matrix.arch }},mode=max
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache-${{ matrix.arch }},mode=max
