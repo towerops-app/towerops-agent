@@ -86,7 +86,7 @@ The agent uses a WebSocket-based architecture for real-time communication:
 ### Communication Flow
 
 1. Agent establishes WebSocket connection to `{api_url}/socket/agent/websocket`
-2. Agent authenticates by joining Phoenix channel with token
+2. Agent authenticates by joining PubSub channel with token
 3. Server pushes SNMP jobs (queries to execute) to agent
 4. Agent executes queries and sends results back via WebSocket
 5. Periodic heartbeats maintain connection health
