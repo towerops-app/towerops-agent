@@ -32,6 +32,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Mount Cargo target
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-cargo-target
+          path: ./target
+
+      - name: Mount Cargo registry
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-cargo-registry
+          path: ~/.cargo/registry
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -43,13 +55,6 @@ jobs:
         with:
           packages: protobuf-compiler lld
           version: 1.0
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "rust-cache"
-          cache-on-failure: true
-          cache-all-crates: true
 
       - name: Check
         run: cargo check --release
