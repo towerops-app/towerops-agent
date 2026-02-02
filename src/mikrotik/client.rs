@@ -188,7 +188,14 @@ impl MikrotikClient {
         // Build and send the command
         let mut words = vec![command.to_string()];
         for (key, value) in args {
-            words.push(format!("={}={}", key, value));
+            // Query parameters use ? prefix, attributes use = prefix
+            if key.starts_with('?') || key.starts_with('.') {
+                // Query or special attribute - use as-is with = separator
+                words.push(format!("{}={}", key, value));
+            } else {
+                // Regular attribute - prepend with =
+                words.push(format!("={}={}", key, value));
+            }
         }
 
         self.send_sentence(&words).await?;

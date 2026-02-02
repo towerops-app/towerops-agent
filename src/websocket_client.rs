@@ -548,6 +548,13 @@ async fn execute_mikrotik_job(
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
+        tracing::debug!(
+            "Executing MikroTik command '{}' with {} args: {:?}",
+            cmd.command,
+            args.len(),
+            args
+        );
+
         match client.execute(&cmd.command, &args).await {
             Ok(response) => {
                 // Check for error in response
@@ -561,10 +568,27 @@ async fn execute_mikrotik_job(
                     break;
                 }
 
-                // Convert sentences to protobuf format
-                for sentence in response.sentences {
+                tracing::debug!(
+                    "Command '{}' returned {} sentences",
+                    cmd.command,
+                    response.sentences.len()
+                );
+
+                // Convert sentences to protobuf format and log attribute keys
+                for (idx, sentence) in response.sentences.iter().enumerate() {
+                    let attr_keys: Vec<&String> = sentence.attributes.keys().collect();
+                    let total_size: usize = sentence.attributes.values().map(|v| v.len()).sum();
+
+                    tracing::debug!(
+                        "Sentence {}: {} attributes ({} bytes total): {:?}",
+                        idx,
+                        sentence.attributes.len(),
+                        total_size,
+                        attr_keys
+                    );
+
                     all_sentences.push(MikrotikSentence {
-                        attributes: sentence.attributes,
+                        attributes: sentence.attributes.clone(),
                     });
                 }
             }
