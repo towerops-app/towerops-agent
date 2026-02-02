@@ -1,6 +1,7 @@
 mod mikrotik;
 mod proto;
 mod snmp;
+mod ssh;
 mod version;
 mod websocket_client;
 

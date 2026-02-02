@@ -17,6 +17,9 @@ prost = "0.14"
 prost-types = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+russh = "0.45"
+russh-keys = "0.45"
+async-trait = "0.1"
 
 [build-dependencies]
 prost-build = "0.14"
