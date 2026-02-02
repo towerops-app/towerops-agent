@@ -144,11 +144,11 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
 
-  # Build architecture-specific images in parallel
+  # Build architecture-specific images in parallel (native runners)
   build-release:
-    name: Build (${{ matrix.platform }})
+    name: Build (${{ matrix.arch }})
     needs: [test, version]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
@@ -158,15 +158,13 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
+            runner: ubuntu-latest
           - platform: linux/arm64
             arch: arm64
+            runner: ubuntu-24.04-arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        if: matrix.arch == 'arm64'
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
