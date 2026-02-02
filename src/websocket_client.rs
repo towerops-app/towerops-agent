@@ -21,7 +21,10 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-use crate::proto::agent::{AgentHeartbeat, AgentJob, AgentJobList, JobType, QueryType, SnmpResult};
+use crate::proto::agent::{
+    AgentHeartbeat, AgentJob, AgentJobList, JobType, MikrotikResult, MikrotikSentence, QueryType,
+    SnmpResult,
+};
 use crate::snmp::{SnmpClient, SnmpValue};
 
 /// Phoenix channel message format (JSON wrapper around binary protobuf).
@@ -40,6 +43,8 @@ pub struct AgentClient {
     agent_id: String,
     result_tx: mpsc::UnboundedSender<SnmpResult>,
     result_rx: mpsc::UnboundedReceiver<SnmpResult>,
+    mikrotik_result_tx: mpsc::UnboundedSender<MikrotikResult>,
+    mikrotik_result_rx: mpsc::UnboundedReceiver<MikrotikResult>,
 }
 
 impl AgentClient {
@@ -87,6 +92,7 @@ impl AgentClient {
 
         let agent_id = generate_agent_id();
         let (result_tx, result_rx) = mpsc::unbounded_channel();
+        let (mikrotik_result_tx, mikrotik_result_rx) = mpsc::unbounded_channel();
 
         // Join Phoenix channel with token in payload
         let join_msg = PhoenixMessage {
@@ -108,6 +114,8 @@ impl AgentClient {
             agent_id,
             result_tx,
             result_rx,
+            mikrotik_result_tx,
+            mikrotik_result_rx,
         })
     }
 
@@ -167,8 +175,15 @@ impl AgentClient {
 
                 // Receive SNMP results from job tasks
                 Some(snmp_result) = self.result_rx.recv() => {
-                    if let Err(e) = self.send_result(snmp_result).await {
+                    if let Err(e) = self.send_snmp_result(snmp_result).await {
                         tracing::error!("Error sending SNMP result: {}", e);
+                    }
+                }
+
+                // Receive MikroTik results from job tasks
+                Some(mikrotik_result) = self.mikrotik_result_rx.recv() => {
+                    if let Err(e) = self.send_mikrotik_result(mikrotik_result).await {
+                        tracing::error!("Error sending MikroTik result: {}", e);
                     }
                 }
 
@@ -190,7 +205,8 @@ impl AgentClient {
             "phx_reply" => {
                 tracing::info!("Channel join reply: {:?}", phoenix_msg.payload);
             }
-            "jobs" => {
+            // Handle all job events the same way - agent doesn't care about the context
+            "jobs" | "discovery_job" | "backup_job" => {
                 // Extract binary protobuf from payload
                 if let serde_json::Value::Object(map) = phoenix_msg.payload {
                     if let Some(serde_json::Value::String(binary_b64)) = map.get("binary") {
@@ -230,14 +246,26 @@ impl AgentClient {
             let job_type = JobType::try_from(job.job_type).unwrap_or(JobType::Poll);
             tracing::info!("Executing job: {} (type: {:?})", job.job_id, job_type);
 
-            // Spawn task to execute SNMP job (one-off execution)
-            let result_tx = self.result_tx.clone();
-
-            tokio::spawn(async move {
-                if let Err(e) = execute_job(job, result_tx).await {
-                    tracing::error!("Job execution failed: {}", e);
+            match job_type {
+                JobType::Mikrotik => {
+                    // Execute MikroTik API job
+                    let mikrotik_result_tx = self.mikrotik_result_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = execute_mikrotik_job(job, mikrotik_result_tx).await {
+                            tracing::error!("MikroTik job execution failed: {}", e);
+                        }
+                    });
                 }
-            });
+                _ => {
+                    // Execute SNMP job (discovery or polling)
+                    let result_tx = self.result_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = execute_snmp_job(job, result_tx).await {
+                            tracing::error!("SNMP job execution failed: {}", e);
+                        }
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -270,7 +298,7 @@ impl AgentClient {
     }
 
     /// Send SNMP results to server.
-    async fn send_result(&mut self, result: SnmpResult) -> Result<()> {
+    async fn send_snmp_result(&mut self, result: SnmpResult) -> Result<()> {
         let binary = result.encode_to_vec();
 
         let msg = PhoenixMessage {
@@ -286,10 +314,35 @@ impl AgentClient {
         tracing::debug!("Sent SNMP result for device {}", result.device_id);
         Ok(())
     }
+
+    /// Send MikroTik results to server.
+    async fn send_mikrotik_result(&mut self, result: MikrotikResult) -> Result<()> {
+        let binary = result.encode_to_vec();
+
+        let msg = PhoenixMessage {
+            topic: format!("agent:{}", self.agent_id),
+            event: "mikrotik_result".to_string(),
+            payload: serde_json::json!({"binary": base64_encode(&binary)}),
+            reference: None,
+        };
+
+        let text = serde_json::to_string(&msg)?;
+        self.ws_stream.send(WsMessage::Text(text)).await?;
+
+        tracing::debug!(
+            "Sent MikroTik result for device {} (job: {})",
+            result.device_id,
+            result.job_id
+        );
+        Ok(())
+    }
 }
 
 /// Execute an SNMP job and collect results.
-async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>) -> Result<()> {
+async fn execute_snmp_job(
+    job: AgentJob,
+    result_tx: mpsc::UnboundedSender<SnmpResult>,
+) -> Result<()> {
     let snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
 
     // Log SNMP connection parameters for debugging (mask community for security)
@@ -403,6 +456,150 @@ async fn execute_job(job: AgentJob, result_tx: mpsc::UnboundedSender<SnmpResult>
         tracing::warn!(
             "Failed to send SNMP result for job {}: channel closed (connection may have dropped)",
             job.job_id
+        );
+        return Err(format!("Result channel closed: {}", e).into());
+    }
+
+    Ok(())
+}
+
+/// Execute a MikroTik API job and collect results.
+async fn execute_mikrotik_job(
+    job: AgentJob,
+    result_tx: mpsc::UnboundedSender<MikrotikResult>,
+) -> Result<()> {
+    use crate::mikrotik::{MikrotikClient, SecretString};
+
+    let mikrotik_device = job
+        .mikrotik_device
+        .ok_or("Job missing MikroTik device info")?;
+
+    tracing::info!(
+        "Executing MikroTik job {} for device {} at {}:{} (ssl: {})",
+        job.job_id,
+        job.device_id,
+        mikrotik_device.ip,
+        mikrotik_device.port,
+        mikrotik_device.use_ssl
+    );
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+
+    let password = SecretString::new(&mikrotik_device.password);
+
+    // Connect and authenticate to MikroTik RouterOS API
+    let mut client = if mikrotik_device.use_ssl {
+        match MikrotikClient::connect(
+            &mikrotik_device.ip,
+            mikrotik_device.port as u16,
+            &mikrotik_device.username,
+            &password,
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(e) => {
+                let result = MikrotikResult {
+                    device_id: job.device_id,
+                    job_id: job.job_id,
+                    sentences: vec![],
+                    error: format!("Connection failed: {}", e),
+                    timestamp,
+                };
+                let _ = result_tx.send(result);
+                return Err(format!("MikroTik connection failed: {}", e).into());
+            }
+        }
+    } else {
+        match MikrotikClient::connect_plain(
+            &mikrotik_device.ip,
+            mikrotik_device.port as u16,
+            &mikrotik_device.username,
+            &password,
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(e) => {
+                let result = MikrotikResult {
+                    device_id: job.device_id,
+                    job_id: job.job_id,
+                    sentences: vec![],
+                    error: format!("Connection failed: {}", e),
+                    timestamp,
+                };
+                let _ = result_tx.send(result);
+                return Err(format!("MikroTik connection failed: {}", e).into());
+            }
+        }
+    };
+
+    // Execute each command and collect results
+    let mut all_sentences = Vec::new();
+    let mut error_message = String::new();
+
+    for cmd in &job.mikrotik_commands {
+        // Convert HashMap<String, String> to Vec<(&str, &str)> for the client API
+        let args: Vec<(&str, &str)> = cmd
+            .args
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        match client.execute(&cmd.command, &args).await {
+            Ok(response) => {
+                // Check for error in response
+                if let Some(err) = response.error {
+                    error_message = format!("Command '{}' error: {}", cmd.command, err);
+                    tracing::error!(
+                        "MikroTik command error for device {}: {}",
+                        job.device_id,
+                        error_message
+                    );
+                    break;
+                }
+
+                // Convert sentences to protobuf format
+                for sentence in response.sentences {
+                    all_sentences.push(MikrotikSentence {
+                        attributes: sentence.attributes,
+                    });
+                }
+            }
+            Err(e) => {
+                error_message = format!("Command '{}' failed: {}", cmd.command, e);
+                tracing::error!(
+                    "MikroTik command failed for device {}: {}",
+                    job.device_id,
+                    error_message
+                );
+                break;
+            }
+        }
+    }
+
+    // Build and send result
+    let result = MikrotikResult {
+        device_id: job.device_id,
+        job_id: job.job_id,
+        sentences: all_sentences,
+        error: error_message,
+        timestamp,
+    };
+
+    tracing::info!(
+        "MikroTik job {} completed with {} sentences",
+        result.job_id,
+        result.sentences.len()
+    );
+
+    let job_id_for_error = result.job_id.clone();
+    if let Err(e) = result_tx.send(result) {
+        tracing::warn!(
+            "Failed to send MikroTik result for job {}: channel closed",
+            job_id_for_error
         );
         return Err(format!("Result channel closed: {}", e).into());
     }
