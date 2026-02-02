@@ -103,7 +103,7 @@ impl AgentClient {
         };
 
         let join_text = serde_json::to_string(&join_msg)?;
-        ws_stream.send(WsMessage::Text(join_text)).await?;
+        ws_stream.send(WsMessage::Text(join_text.into())).await?;
         tracing::info!(
             "Sent channel join request with token for agent:{}",
             agent_id
@@ -291,7 +291,7 @@ impl AgentClient {
         };
 
         let text = serde_json::to_string(&msg)?;
-        self.ws_stream.send(WsMessage::Text(text)).await?;
+        self.ws_stream.send(WsMessage::Text(text.into())).await?;
 
         tracing::debug!("Sent heartbeat");
         Ok(())
@@ -309,7 +309,7 @@ impl AgentClient {
         };
 
         let text = serde_json::to_string(&msg)?;
-        self.ws_stream.send(WsMessage::Text(text)).await?;
+        self.ws_stream.send(WsMessage::Text(text.into())).await?;
 
         tracing::debug!("Sent SNMP result for device {}", result.device_id);
         Ok(())
@@ -327,7 +327,7 @@ impl AgentClient {
         };
 
         let text = serde_json::to_string(&msg)?;
-        self.ws_stream.send(WsMessage::Text(text)).await?;
+        self.ws_stream.send(WsMessage::Text(text.into())).await?;
 
         tracing::debug!(
             "Sent MikroTik result for device {} (job: {})",
