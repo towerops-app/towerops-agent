@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use russh::client;
-use russh_keys::key;
+use russh::keys::PublicKey;
+use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -22,18 +22,17 @@ pub type SshResult<T> = Result<T, SshError>;
 
 struct Client;
 
-#[async_trait]
 impl client::Handler for Client {
     type Error = russh::Error;
 
-    async fn check_server_key(
+    fn check_server_key(
         &mut self,
-        server_public_key: &key::PublicKey,
-    ) -> Result<bool, Self::Error> {
+        server_public_key: &PublicKey,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
         // Accept any server key (similar to SSH -o StrictHostKeyChecking=no)
         // In production, you might want to verify against known_hosts
         let _ = server_public_key; // Suppress unused warning
-        Ok(true)
+        async { Ok(true) }
     }
 }
 
@@ -58,7 +57,7 @@ impl SshClient {
             .await
             .map_err(|e| SshError::ConnectionFailed(e.to_string()))?;
 
-        if !auth_result {
+        if !auth_result.success() {
             return Err(SshError::AuthenticationFailed);
         }
 
