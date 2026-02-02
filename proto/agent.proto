@@ -112,6 +112,7 @@ message HeartbeatResponse {
 enum JobType {
   DISCOVER = 0;
   POLL = 1;
+  MIKROTIK = 2;
 }
 
 enum QueryType {
@@ -129,6 +130,8 @@ message AgentJob {
   string device_id = 3;
   SnmpDevice snmp_device = 4;
   repeated SnmpQuery queries = 5;
+  MikrotikDevice mikrotik_device = 6;
+  repeated MikrotikCommand mikrotik_commands = 7;
 }
 
 message SnmpDevice {
@@ -161,4 +164,31 @@ message AgentError {
   string device_id = 1;
   string error_message = 2;
   int64 timestamp = 3;
+}
+
+// MikroTik RouterOS API messages
+
+message MikrotikDevice {
+  string ip = 1;
+  uint32 port = 2;
+  string username = 3;
+  string password = 4;
+  bool use_ssl = 5;
+}
+
+message MikrotikCommand {
+  string command = 1;
+  map<string, string> args = 2;
+}
+
+message MikrotikResult {
+  string device_id = 1;
+  string job_id = 2;
+  repeated MikrotikSentence sentences = 3;
+  string error = 4;
+  int64 timestamp = 5;
+}
+
+message MikrotikSentence {
+  map<string, string> attributes = 1;
 }

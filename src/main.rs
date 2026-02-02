@@ -1,3 +1,4 @@
+mod mikrotik;
 mod proto;
 mod snmp;
 mod version;
@@ -44,12 +45,20 @@ fn convert_to_websocket_url(url: &str) -> String {
 #[command(about = "Towerops remote SNMP polling agent", long_about = None)]
 struct Args {
     /// API URL (e.g., wss://towerops.net or https://towerops.net)
-    #[arg(long, env = "TOWEROPS_API_URL")]
-    api_url: String,
+    #[arg(
+        long,
+        env = "TOWEROPS_API_URL",
+        required_unless_present = "mikrotik_test"
+    )]
+    api_url: Option<String>,
 
     /// Agent authentication token
-    #[arg(long, env = "TOWEROPS_AGENT_TOKEN")]
-    token: String,
+    #[arg(
+        long,
+        env = "TOWEROPS_AGENT_TOKEN",
+        required_unless_present = "mikrotik_test"
+    )]
+    token: Option<String>,
 
     /// UDP port for SNMP trap listener
     #[arg(long, env = "TRAP_PORT", default_value_t = snmp::DEFAULT_TRAP_PORT)]
@@ -58,6 +67,30 @@ struct Args {
     /// Enable SNMP trap listener
     #[arg(long, env = "TRAP_ENABLED", default_value_t = false)]
     trap_enabled: bool,
+
+    /// Run MikroTik API test instead of normal agent operation
+    #[arg(long)]
+    mikrotik_test: bool,
+
+    /// MikroTik device IP address (for --mikrotik-test)
+    #[arg(long, required_if_eq("mikrotik_test", "true"))]
+    mikrotik_ip: Option<String>,
+
+    /// MikroTik username (for --mikrotik-test)
+    #[arg(long, default_value = "admin")]
+    mikrotik_user: String,
+
+    /// MikroTik password (for --mikrotik-test)
+    #[arg(long, default_value = "")]
+    mikrotik_pass: String,
+
+    /// MikroTik API port (for --mikrotik-test)
+    #[arg(long, default_value_t = 8729)]
+    mikrotik_port: u16,
+
+    /// Use plain TCP instead of SSL (port 8728) - WARNING: credentials sent in plaintext
+    #[arg(long, default_value_t = false)]
+    mikrotik_plain: bool,
 }
 
 #[tokio::main]
@@ -66,6 +99,12 @@ async fn main() {
     init_logger();
 
     let args = Args::parse();
+
+    // Handle MikroTik test mode
+    if args.mikrotik_test {
+        run_mikrotik_test(&args).await;
+        return;
+    }
 
     tracing::info!("Towerops agent starting");
 
@@ -92,7 +131,7 @@ async fn main() {
     }
 
     // Convert HTTP(S) URL to WebSocket URL
-    let ws_url = convert_to_websocket_url(&args.api_url);
+    let ws_url = convert_to_websocket_url(args.api_url.as_ref().unwrap());
 
     tracing::info!("WebSocket URL: {}", ws_url);
 
@@ -137,7 +176,7 @@ async fn main() {
         }
 
         // Connect to Towerops server via WebSocket
-        let mut client = match AgentClient::connect(&ws_url, &args.token).await {
+        let mut client = match AgentClient::connect(&ws_url, args.token.as_ref().unwrap()).await {
             Ok(client) => {
                 tracing::info!("Successfully connected to server");
                 // Mark as connected for health check
@@ -175,6 +214,129 @@ async fn main() {
     }
 
     tracing::info!("Towerops agent stopped");
+}
+
+/// Run MikroTik API test
+async fn run_mikrotik_test(args: &Args) {
+    use mikrotik::{MikrotikClient, SecretString};
+
+    let ip = args.mikrotik_ip.as_ref().expect("--mikrotik-ip required");
+    let port = args.mikrotik_port;
+    let username = &args.mikrotik_user;
+    let password = SecretString::new(&args.mikrotik_pass);
+
+    println!("Connecting to MikroTik device at {}:{}...", ip, port);
+    println!("  Username: {}", username);
+    println!(
+        "  Password: {}",
+        if password.expose().is_empty() {
+            "(empty)"
+        } else {
+            "(set)"
+        }
+    );
+
+    // Quick TCP connectivity check first
+    print!("  Testing TCP connectivity... ");
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(format!("{}:{}", ip, port)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => println!("OK"),
+        Ok(Err(e)) => {
+            println!("FAILED");
+            eprintln!("\nTCP connection failed: {}", e);
+            eprintln!("Make sure the API-SSL service is enabled on the router:");
+            eprintln!("  /ip service set api-ssl disabled=no");
+            std::process::exit(1);
+        }
+        Err(_) => {
+            println!("TIMEOUT");
+            eprintln!("\nTCP connection timed out after 5 seconds.");
+            eprintln!("Check network connectivity and firewall rules.");
+            std::process::exit(1);
+        }
+    }
+
+    let use_plain = args.mikrotik_plain;
+    if use_plain {
+        print!("  Connecting (plain TCP) and authenticating... ");
+    } else {
+        print!("  Establishing TLS and authenticating... ");
+    }
+
+    let connect_result = if use_plain {
+        MikrotikClient::connect_plain(ip, port, username, &password).await
+    } else {
+        MikrotikClient::connect(ip, port, username, &password).await
+    };
+
+    let mut client = match connect_result {
+        Ok(client) => {
+            println!("OK");
+            client
+        }
+        Err(e) => {
+            println!("FAILED");
+            eprintln!("\nError: {}", e);
+            eprintln!("\nTroubleshooting tips:");
+            if use_plain {
+                eprintln!("  1. Verify the API service (non-SSL) is enabled:");
+                eprintln!("     /ip service set api disabled=no");
+            } else {
+                eprintln!("  1. Verify the API-SSL service is enabled:");
+                eprintln!("     /ip service set api-ssl disabled=no");
+            }
+            eprintln!("  2. Verify the username/password are correct");
+            eprintln!("  3. Check if the user has API access permission:");
+            eprintln!("     /user print");
+            std::process::exit(1);
+        }
+    };
+
+    println!("\nRunning /system/identity/print...");
+    match client.execute("/system/identity/print", &[]).await {
+        Ok(response) => {
+            if let Some(err) = response.error {
+                eprintln!("Command error: {}", err);
+            } else if let Some(sentence) = response.sentences.first() {
+                if let Some(name) = sentence.attributes.get("name") {
+                    println!("Device identity: {}", name);
+                } else {
+                    println!("Response: {:?}", sentence.attributes);
+                }
+            } else {
+                println!("No response data received");
+            }
+        }
+        Err(e) => {
+            eprintln!("Command failed: {}", e);
+        }
+    }
+
+    println!("\nRunning /system/resource/print...");
+    match client.execute("/system/resource/print", &[]).await {
+        Ok(response) => {
+            if let Some(err) = response.error {
+                eprintln!("Command error: {}", err);
+            } else if let Some(sentence) = response.sentences.first() {
+                println!("System resources:");
+                for (key, value) in &sentence.attributes {
+                    println!("  {}: {}", key, value);
+                }
+            } else {
+                println!("No response data received");
+            }
+        }
+        Err(e) => {
+            eprintln!("Command failed: {}", e);
+        }
+    }
+
+    let _ = client.close().await;
+    println!("\nTest complete.");
 }
 
 /// Wait for SIGTERM or SIGINT shutdown signal.
