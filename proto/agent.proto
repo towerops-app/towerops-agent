@@ -174,6 +174,7 @@ message MikrotikDevice {
   string username = 3;
   string password = 4;
   bool use_ssl = 5;
+  uint32 ssh_port = 6;
 }
 
 message MikrotikCommand {

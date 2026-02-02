@@ -21,6 +21,19 @@ use crate::snmp::SnmpClient;
 use crate::metrics::Timestamp;
 use log::{error, info, warn};
 
+/// Redact SNMP community string for logging, showing first 2 chars only
+fn redact_community(community: &str) -> String {
+    let len = community.len();
+    if len == 0 {
+        return "[redacted]".to_string();
+    }
+    if len <= 2 {
+        "**".to_string()
+    } else {
+        format!("{}***", &community[..2])
+    }
+}
+
 /// Executor handles polling individual pieces of equipment
 #[derive(Clone)]
 pub struct Executor {
@@ -43,9 +56,10 @@ impl Executor {
         }
 
         info!(
-            "Polling {} sensors for equipment: {}",
+            "Polling {} sensors for equipment: {} (community: {})",
             equipment.sensors.len(),
-            equipment.name
+            equipment.name,
+            redact_community(&equipment.snmp.community)
         );
 
         for sensor in &equipment.sensors {
@@ -113,9 +127,10 @@ impl Executor {
         }
 
         info!(
-            "Polling {} interfaces for equipment: {}",
+            "Polling {} interfaces for equipment: {} (community: {})",
             equipment.interfaces.len(),
-            equipment.name
+            equipment.name,
+            redact_community(&equipment.snmp.community)
         );
 
         for interface in &equipment.interfaces {
@@ -229,5 +244,36 @@ impl Executor {
         value
             .as_i64()
             .ok_or_else(|| ExecutorError::Conversion("Could not convert value to i64".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_redact_community_normal() {
+        assert_eq!(redact_community("public"), "pu***");
+    }
+
+    #[test]
+    fn test_redact_community_short() {
+        assert_eq!(redact_community("ab"), "**");
+        assert_eq!(redact_community("a"), "**");
+    }
+
+    #[test]
+    fn test_redact_community_empty() {
+        assert_eq!(redact_community(""), "[redacted]");
+    }
+
+    #[test]
+    fn test_redact_community_three_chars() {
+        assert_eq!(redact_community("abc"), "ab***");
+    }
+
+    #[test]
+    fn test_redact_community_long() {
+        assert_eq!(redact_community("mysecretcommunity"), "my***");
     }
 }

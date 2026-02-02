@@ -338,6 +338,19 @@ impl AgentClient {
     }
 }
 
+/// Redact SNMP community string for logging, showing first 2 chars only
+fn redact_community(community: &str) -> String {
+    let len = community.len();
+    if len == 0 {
+        return "[redacted]".to_string();
+    }
+    if len <= 2 {
+        "**".to_string()
+    } else {
+        format!("{}***", &community[..2])
+    }
+}
+
 /// Execute an SNMP job and collect results.
 async fn execute_snmp_job(
     job: AgentJob,
@@ -346,11 +359,7 @@ async fn execute_snmp_job(
     let snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
 
     // Log SNMP connection parameters for debugging (mask community for security)
-    let community_masked = if snmp_device.community.len() > 4 {
-        format!("{}***", &snmp_device.community[..2])
-    } else {
-        "***".to_string()
-    };
+    let community_masked = redact_community(&snmp_device.community);
 
     tracing::info!(
         "Executing SNMP job for device {} at {}:{} (community: {}, version: {})",
@@ -470,6 +479,20 @@ async fn execute_mikrotik_job(
 ) -> Result<()> {
     use crate::mikrotik::{MikrotikClient, SecretString};
 
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+
+    // Check if this is a backup job (job_id starts with "backup:")
+    // Backup jobs use SSH instead of API because /export doesn't work via API
+    if job.job_id.starts_with("backup:") {
+        let mikrotik_device = job
+            .mikrotik_device
+            .clone()
+            .ok_or("Job missing MikroTik device info")?;
+        return execute_mikrotik_backup_via_ssh(job, mikrotik_device, result_tx, timestamp).await;
+    }
+
     let mikrotik_device = job
         .mikrotik_device
         .ok_or("Job missing MikroTik device info")?;
@@ -482,10 +505,6 @@ async fn execute_mikrotik_job(
         mikrotik_device.port,
         mikrotik_device.use_ssl
     );
-
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs() as i64;
 
     let password = SecretString::new(&mikrotik_device.password);
 
@@ -587,6 +606,15 @@ async fn execute_mikrotik_job(
                         attr_keys
                     );
 
+                    // Log when we hit EOF during /file/read
+                    if cmd.command == "/file/read" {
+                        if let Some(data) = sentence.attributes.get("data") {
+                            if data.is_empty() {
+                                tracing::debug!("Reached end of file (empty chunk)");
+                            }
+                        }
+                    }
+
                     all_sentences.push(MikrotikSentence {
                         attributes: sentence.attributes.clone(),
                     });
@@ -624,6 +652,106 @@ async fn execute_mikrotik_job(
         tracing::warn!(
             "Failed to send MikroTik result for job {}: channel closed",
             job_id_for_error
+        );
+        return Err(format!("Result channel closed: {}", e).into());
+    }
+
+    Ok(())
+}
+
+/// Execute a MikroTik backup job via SSH (because /export doesn't work via API).
+async fn execute_mikrotik_backup_via_ssh(
+    job: AgentJob,
+    mikrotik_device: crate::proto::agent::MikrotikDevice,
+    result_tx: mpsc::UnboundedSender<MikrotikResult>,
+    timestamp: i64,
+) -> Result<()> {
+    use crate::ssh::SshClient;
+
+    tracing::info!(
+        "Executing backup via SSH for device {} at {}:{} (job: {})",
+        job.device_id,
+        mikrotik_device.ip,
+        mikrotik_device.ssh_port,
+        job.job_id
+    );
+
+    // Connect via SSH
+    let mut ssh_client = match SshClient::connect(
+        &mikrotik_device.ip,
+        mikrotik_device.ssh_port,
+        &mikrotik_device.username,
+        &mikrotik_device.password,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(e) => {
+            let error_msg = format!("SSH connection failed: {}", e);
+            tracing::error!("{}", error_msg);
+            let result = MikrotikResult {
+                device_id: job.device_id,
+                job_id: job.job_id,
+                sentences: vec![],
+                error: error_msg,
+                timestamp,
+            };
+            let _ = result_tx.send(result);
+            return Err(format!("SSH connection failed: {}", e).into());
+        }
+    };
+
+    // Execute /export compact command
+    let config = match ssh_client.execute_command("/export compact").await {
+        Ok(output) => output,
+        Err(e) => {
+            let error_msg = format!("SSH command failed: {}", e);
+            tracing::error!("{}", error_msg);
+            let result = MikrotikResult {
+                device_id: job.device_id,
+                job_id: job.job_id,
+                sentences: vec![],
+                error: error_msg,
+                timestamp,
+            };
+            let _ = result_tx.send(result);
+            let _ = ssh_client.close().await;
+            return Err(format!("SSH command failed: {}", e).into());
+        }
+    };
+
+    // Close SSH connection
+    let _ = ssh_client.close().await;
+
+    tracing::info!(
+        "Backup completed: {} bytes, {} lines",
+        config.len(),
+        config.lines().count()
+    );
+
+    // Return the config as a single sentence with "config" attribute
+    let mut attributes = std::collections::HashMap::new();
+    attributes.insert("config".to_string(), config);
+
+    let job_id_for_log = job.job_id.clone();
+
+    let result = MikrotikResult {
+        device_id: job.device_id,
+        job_id: job.job_id,
+        sentences: vec![MikrotikSentence { attributes }],
+        error: String::new(),
+        timestamp,
+    };
+
+    tracing::info!(
+        "MikroTik backup job {} completed successfully",
+        result.job_id
+    );
+
+    if let Err(e) = result_tx.send(result) {
+        tracing::warn!(
+            "Failed to send MikroTik backup result for job {}: channel closed",
+            job_id_for_log
         );
         return Err(format!("Result channel closed: {}", e).into());
     }
@@ -908,4 +1036,30 @@ mod tests {
     }
 
     // Note: AgentClient methods require WebSocket connection and are tested via integration tests
+
+    #[test]
+    fn test_redact_community_normal() {
+        assert_eq!(redact_community("public"), "pu***");
+    }
+
+    #[test]
+    fn test_redact_community_short() {
+        assert_eq!(redact_community("ab"), "**");
+        assert_eq!(redact_community("a"), "**");
+    }
+
+    #[test]
+    fn test_redact_community_empty() {
+        assert_eq!(redact_community(""), "[redacted]");
+    }
+
+    #[test]
+    fn test_redact_community_three_chars() {
+        assert_eq!(redact_community("abc"), "ab***");
+    }
+
+    #[test]
+    fn test_redact_community_long() {
+        assert_eq!(redact_community("mysecretcommunity"), "my***");
+    }
 }
