@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 # Build stage
-FROM rust:1.83-alpine AS builder
+FROM rust:1.85-alpine AS builder
 
 # Build arguments provided by Docker buildx
 ARG TARGETPLATFORM
