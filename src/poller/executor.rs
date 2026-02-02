@@ -30,7 +30,7 @@ fn redact_community(community: &str) -> String {
     if len <= 2 {
         "**".to_string()
     } else {
-        format!("{}***", &community[..2])
+        format!("{}**", &community[..2])
     }
 }
 
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_redact_community_normal() {
-        assert_eq!(redact_community("public"), "pu***");
+        assert_eq!(redact_community("public"), "pu**");
     }
 
     #[test]
@@ -269,11 +269,11 @@ mod tests {
 
     #[test]
     fn test_redact_community_three_chars() {
-        assert_eq!(redact_community("abc"), "ab***");
+        assert_eq!(redact_community("abc"), "ab**");
     }
 
     #[test]
     fn test_redact_community_long() {
-        assert_eq!(redact_community("mysecretcommunity"), "my***");
+        assert_eq!(redact_community("mysecretcommunity"), "my**");
     }
 }
