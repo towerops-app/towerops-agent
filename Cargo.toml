@@ -19,7 +19,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 russh = "0.54"
 async-trait = "0.1"
-home = "=0.5.9"  # Pin to avoid edition2024 requirement in 0.5.12
+home = "=0.5.12"  # Pin to avoid edition2024 requirement in 0.5.12
 
 [build-dependencies]
 prost-build = "0.14"
