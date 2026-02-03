@@ -340,15 +340,11 @@ impl AgentClient {
 
 /// Redact SNMP community string for logging, showing first 2 chars only
 fn redact_community(community: &str) -> String {
-    let len = community.len();
-    if len == 0 {
-        return "[redacted]".to_string();
+    if community.is_empty() {
+        return "**".to_string();
     }
-    if len <= 2 {
-        "**".to_string()
-    } else {
-        format!("{}**", &community[..2])
-    }
+    let visible = std::cmp::min(community.len(), 2);
+    format!("{}**", &community[..visible])
 }
 
 /// Execute an SNMP job and collect results.
@@ -1076,13 +1072,13 @@ mod tests {
 
     #[test]
     fn test_redact_community_short() {
-        assert_eq!(redact_community("ab"), "**");
-        assert_eq!(redact_community("a"), "**");
+        assert_eq!(redact_community("ab"), "ab**");
+        assert_eq!(redact_community("a"), "a**");
     }
 
     #[test]
     fn test_redact_community_empty() {
-        assert_eq!(redact_community(""), "[redacted]");
+        assert_eq!(redact_community(""), "**");
     }
 
     #[test]
