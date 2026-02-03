@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-snmp = "0.2"
+snmp2 = { version = "0.4", features = ["v3", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util"] }
 thiserror = "2"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }

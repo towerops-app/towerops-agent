@@ -358,6 +358,36 @@ async fn execute_snmp_job(
 ) -> Result<()> {
     let snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
 
+    // Build v3 config if version is "3"
+    let v3_config = if snmp_device.version == "3" {
+        Some(crate::snmp::V3Config {
+            username: snmp_device.v3_username.clone(),
+            auth_password: if !snmp_device.v3_auth_password.is_empty() {
+                Some(snmp_device.v3_auth_password.clone())
+            } else {
+                None
+            },
+            priv_password: if !snmp_device.v3_priv_password.is_empty() {
+                Some(snmp_device.v3_priv_password.clone())
+            } else {
+                None
+            },
+            auth_protocol: if !snmp_device.v3_auth_protocol.is_empty() {
+                Some(snmp_device.v3_auth_protocol.clone())
+            } else {
+                None
+            },
+            priv_protocol: if !snmp_device.v3_priv_protocol.is_empty() {
+                Some(snmp_device.v3_priv_protocol.clone())
+            } else {
+                None
+            },
+            security_level: snmp_device.v3_security_level.clone(),
+        })
+    } else {
+        None
+    };
+
     // Log SNMP connection parameters for debugging (mask community for security)
     let community_masked = redact_community(&snmp_device.community);
 
@@ -387,6 +417,7 @@ async fn execute_snmp_job(
                             &snmp_device.version,
                             snmp_device.port as u16,
                             oid,
+                            v3_config.clone(),
                         )
                         .await
                     {
@@ -418,6 +449,7 @@ async fn execute_snmp_job(
                             &snmp_device.version,
                             snmp_device.port as u16,
                             base_oid,
+                            v3_config.clone(),
                         )
                         .await
                     {

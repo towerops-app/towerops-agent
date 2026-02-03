@@ -10,7 +10,7 @@ ARG VERSION=0.1.0-unknown
 WORKDIR /app
 
 # Install build dependencies
-RUN apk add --no-cache musl-dev protobuf-dev
+RUN apk add --no-cache musl-dev protobuf-dev openssl-dev
 
 # Determine Rust target based on platform and add it
 RUN case "$TARGETPLATFORM" in \
@@ -56,7 +56,7 @@ FROM alpine:3.19
 
 # Install runtime dependencies
 # iputils provides ping with setuid root (doesn't require CAP_NET_RAW)
-RUN apk add --no-cache ca-certificates iputils
+RUN apk add --no-cache ca-certificates iputils openssl
 
 # Copy binary from builder
 COPY --from=builder /tmp/towerops-agent /usr/local/bin/towerops-agent
