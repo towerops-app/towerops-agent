@@ -10,7 +10,7 @@ ARG VERSION=0.1.0-unknown
 WORKDIR /app
 
 # Install build dependencies
-RUN apk add --no-cache musl-dev protobuf-dev openssl-dev
+RUN apk add --no-cache musl-dev protobuf-dev openssl-dev openssl-libs-static cmake perl g++
 
 # Determine Rust target based on platform and add it
 RUN case "$TARGETPLATFORM" in \
