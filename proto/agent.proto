@@ -26,6 +26,7 @@ message SnmpConfig {
   string version = 2;
   string community = 3;
   uint32 port = 4;
+  string transport = 5;
 }
 
 message Sensor {
@@ -148,6 +149,7 @@ message SnmpDevice {
   string v3_auth_password = 8;   // Decrypted before sending
   string v3_priv_protocol = 9;   // "DES" | "AES" | "AES-256" | etc.
   string v3_priv_password = 10;  // Decrypted before sending
+  string transport = 11;          // "udp" | "tcp"
 }
 
 message SnmpQuery {
