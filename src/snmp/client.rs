@@ -1,4 +1,5 @@
 use super::types::{SnmpError, SnmpResult, SnmpValue};
+use crate::secret::SecretString;
 use snmp2::SyncSession;
 use std::time::Duration;
 
@@ -7,14 +8,33 @@ use std::time::Duration;
 const SNMP_TIMEOUT_SECS: u64 = 30;
 
 /// SNMPv3 configuration bundle
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct V3Config {
     pub username: String,
-    pub auth_password: Option<String>,
-    pub priv_password: Option<String>,
+    pub auth_password: Option<SecretString>,
+    pub priv_password: Option<SecretString>,
     pub auth_protocol: Option<String>,
     pub priv_protocol: Option<String>,
     pub security_level: String,
+}
+
+impl std::fmt::Debug for V3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("V3Config")
+            .field("username", &self.username)
+            .field(
+                "auth_password",
+                &self.auth_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "priv_password",
+                &self.priv_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("auth_protocol", &self.auth_protocol)
+            .field("priv_protocol", &self.priv_protocol)
+            .field("security_level", &self.security_level)
+            .finish()
+    }
 }
 
 /// SNMP client for polling devices
@@ -283,9 +303,13 @@ fn create_v3_session(addr: &str, config: &V3Config) -> SnmpResult<SyncSession> {
                 parse_auth_protocol(config.auth_protocol.as_deref().ok_or_else(|| {
                     SnmpError::RequestFailed("Auth protocol required for authNoPriv".into())
                 })?)?;
-            let _auth_pass = config.auth_password.as_deref().ok_or_else(|| {
-                SnmpError::RequestFailed("Auth password required for authNoPriv".into())
-            })?;
+            let _auth_pass = config
+                .auth_password
+                .as_ref()
+                .map(|s| s.expose())
+                .ok_or_else(|| {
+                    SnmpError::RequestFailed("Auth password required for authNoPriv".into())
+                })?;
             Auth::AuthNoPriv
         }
 
@@ -295,16 +319,24 @@ fn create_v3_session(addr: &str, config: &V3Config) -> SnmpResult<SyncSession> {
                 parse_auth_protocol(config.auth_protocol.as_deref().ok_or_else(|| {
                     SnmpError::RequestFailed("Auth protocol required for authPriv".into())
                 })?)?;
-            let _auth_pass = config.auth_password.as_deref().ok_or_else(|| {
-                SnmpError::RequestFailed("Auth password required for authPriv".into())
-            })?;
+            let _auth_pass = config
+                .auth_password
+                .as_ref()
+                .map(|s| s.expose())
+                .ok_or_else(|| {
+                    SnmpError::RequestFailed("Auth password required for authPriv".into())
+                })?;
             let cipher =
                 parse_priv_protocol(config.priv_protocol.as_deref().ok_or_else(|| {
                     SnmpError::RequestFailed("Priv protocol required for authPriv".into())
                 })?)?;
-            let priv_pass = config.priv_password.as_deref().ok_or_else(|| {
-                SnmpError::RequestFailed("Priv password required for authPriv".into())
-            })?;
+            let priv_pass = config
+                .priv_password
+                .as_ref()
+                .map(|s| s.expose())
+                .ok_or_else(|| {
+                    SnmpError::RequestFailed("Priv password required for authPriv".into())
+                })?;
 
             Auth::AuthPriv {
                 cipher,
@@ -321,7 +353,12 @@ fn create_v3_session(addr: &str, config: &V3Config) -> SnmpResult<SyncSession> {
     };
 
     // Get auth password (empty for noAuthNoPriv)
-    let auth_password = config.auth_password.as_deref().unwrap_or("").as_bytes();
+    let auth_password = config
+        .auth_password
+        .as_ref()
+        .map(|s| s.expose())
+        .unwrap_or("")
+        .as_bytes();
 
     // Determine if we need auth protocol (before auth is moved)
     let needs_auth_protocol = !matches!(auth, Auth::NoAuthNoPriv);
@@ -401,7 +438,7 @@ mod tests {
 
     #[test]
     fn test_snmp_client_default() {
-        let client = SnmpClient::default();
+        let client = SnmpClient;
         assert!(format!("{:?}", client).contains("SnmpClient"));
     }
 

@@ -1,5 +1,6 @@
 mod mikrotik;
 mod proto;
+pub mod secret;
 mod snmp;
 mod ssh;
 mod version;
@@ -191,6 +192,8 @@ async fn async_main() {
     let max_retry_delay = Duration::from_secs(60);
     let mut attempt = 0;
 
+    let token = secret::SecretString::new(args.token.as_ref().unwrap().clone());
+
     loop {
         // Check if shutdown was requested
         if *shutdown_rx.borrow() {
@@ -213,7 +216,7 @@ async fn async_main() {
         }
 
         // Connect to Towerops server via WebSocket
-        let mut client = match AgentClient::connect(&ws_url, args.token.as_ref().unwrap()).await {
+        let mut client = match AgentClient::connect(&ws_url, &token).await {
             Ok(client) => {
                 tracing::info!("Successfully connected to server");
                 // Mark as connected for health check
@@ -255,6 +258,7 @@ async fn async_main() {
 
 /// Run SNMPv3 test
 async fn run_snmpv3_test(args: &Args) {
+    use secret::SecretString;
     use snmp::V3Config;
 
     let ip = args.snmpv3_ip.as_ref().expect("--snmpv3-ip required");
@@ -284,12 +288,12 @@ async fn run_snmpv3_test(args: &Args) {
     let v3_config = V3Config {
         username: username.clone(),
         auth_password: if !auth_pass.is_empty() {
-            Some(auth_pass.clone())
+            Some(SecretString::new(auth_pass.clone()))
         } else {
             None
         },
         priv_password: if !priv_pass.is_empty() {
-            Some(priv_pass.clone())
+            Some(SecretString::new(priv_pass.clone()))
         } else {
             None
         },
@@ -353,7 +357,8 @@ async fn run_snmpv3_test(args: &Args) {
 
 /// Run MikroTik API test
 async fn run_mikrotik_test(args: &Args) {
-    use mikrotik::{MikrotikClient, SecretString};
+    use mikrotik::MikrotikClient;
+    use secret::SecretString;
 
     let ip = args.mikrotik_ip.as_ref().expect("--mikrotik-ip required");
     let port = args.mikrotik_port;

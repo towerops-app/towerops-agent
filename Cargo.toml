@@ -20,6 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 russh = "0.57"
 async-trait = "0.1"
 home = "=0.5.12"
+zeroize = { version = "1", features = ["derive"] }
 
 [build-dependencies]
 prost-build = "0.14"

@@ -99,7 +99,7 @@ impl Default for PollerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snmp::V3Config;
+    use crate::secret::SecretString;
 
     #[test]
     fn test_registry_remove() {
@@ -110,7 +110,7 @@ mod tests {
             ip: "127.0.0.1".to_string(),
             port: 161,
             version: "2c".to_string(),
-            community: "public".to_string(),
+            community: SecretString::new("public"),
             v3_config: None,
         };
 
@@ -130,7 +130,7 @@ mod tests {
             ip: "192.168.1.1".to_string(),
             port: 161,
             version: "2c".to_string(),
-            community: "public".to_string(),
+            community: SecretString::new("public"),
             v3_config: None,
         };
 

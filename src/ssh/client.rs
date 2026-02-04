@@ -1,3 +1,4 @@
+use crate::secret::SecretString;
 use russh::client;
 use russh::keys::PublicKey;
 use std::future::Future;
@@ -42,7 +43,12 @@ pub struct SshClient {
 
 impl SshClient {
     /// Connect to an SSH server and authenticate with password
-    pub async fn connect(host: &str, port: u32, username: &str, password: &str) -> SshResult<Self> {
+    pub async fn connect(
+        host: &str,
+        port: u32,
+        username: &str,
+        password: &SecretString,
+    ) -> SshResult<Self> {
         let config = client::Config::default();
         let sh = Client;
 
@@ -53,7 +59,7 @@ impl SshClient {
             .map_err(|e| SshError::ConnectionFailed(e.to_string()))?;
 
         let auth_result = session
-            .authenticate_password(username, password)
+            .authenticate_password(username, password.expose())
             .await
             .map_err(|e| SshError::ConnectionFailed(e.to_string()))?;
 
