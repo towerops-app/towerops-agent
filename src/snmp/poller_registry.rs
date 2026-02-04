@@ -112,6 +112,7 @@ mod tests {
             version: "2c".to_string(),
             community: SecretString::new("public"),
             v3_config: None,
+            transport: "udp".to_string(),
         };
 
         // Create a poller
@@ -132,6 +133,7 @@ mod tests {
             version: "2c".to_string(),
             community: SecretString::new("public"),
             v3_config: None,
+            transport: "udp".to_string(),
         };
 
         let poller = DevicePoller::spawn("test-device".to_string(), config.clone());
