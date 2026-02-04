@@ -417,11 +417,11 @@ fn parse_auth_protocol(protocol: &str) -> Result<snmp2::v3::AuthProtocol, String
 
     match protocol.trim().to_uppercase().as_str() {
         "MD5" => Ok(AuthProtocol::Md5),
-        "SHA" | "SHA1" => Ok(AuthProtocol::Sha1),
-        "SHA224" => Ok(AuthProtocol::Sha224),
-        "SHA256" => Ok(AuthProtocol::Sha256),
-        "SHA384" => Ok(AuthProtocol::Sha384),
-        "SHA512" => Ok(AuthProtocol::Sha512),
+        "SHA" | "SHA1" | "SHA-1" => Ok(AuthProtocol::Sha1),
+        "SHA224" | "SHA-224" => Ok(AuthProtocol::Sha224),
+        "SHA256" | "SHA-256" => Ok(AuthProtocol::Sha256),
+        "SHA384" | "SHA-384" => Ok(AuthProtocol::Sha384),
+        "SHA512" | "SHA-512" => Ok(AuthProtocol::Sha512),
         _ => Err(format!("Unsupported auth protocol: '{}'", protocol)),
     }
 }
@@ -432,8 +432,8 @@ fn parse_priv_protocol(protocol: &str) -> Result<snmp2::v3::Cipher, String> {
 
     match protocol.trim().to_uppercase().as_str() {
         "DES" => Ok(Cipher::Des),
-        "AES" | "AES128" => Ok(Cipher::Aes128),
-        "AES192" => Ok(Cipher::Aes192),
+        "AES" | "AES128" | "AES-128" => Ok(Cipher::Aes128),
+        "AES192" | "AES-192" => Ok(Cipher::Aes192),
         "AES256" | "AES-256" | "AES-256-C" => Ok(Cipher::Aes256),
         _ => Err(format!("Unsupported priv protocol: '{}'", protocol)),
     }
@@ -476,5 +476,124 @@ fn convert_value(value: snmp2::Value) -> SnmpResult<SnmpValue> {
         ))),
         snmp2::Value::Null => Ok(SnmpValue::Null),
         _ => Ok(SnmpValue::Unsupported(format!("{:?}", value))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_auth_protocol_standard() {
+        use snmp2::v3::AuthProtocol;
+        assert!(matches!(parse_auth_protocol("MD5"), Ok(AuthProtocol::Md5)));
+        assert!(matches!(
+            parse_auth_protocol("SHA"),
+            Ok(AuthProtocol::Sha1)
+        ));
+        assert!(matches!(
+            parse_auth_protocol("SHA1"),
+            Ok(AuthProtocol::Sha1)
+        ));
+        assert!(matches!(
+            parse_auth_protocol("SHA256"),
+            Ok(AuthProtocol::Sha256)
+        ));
+        assert!(matches!(
+            parse_auth_protocol("SHA384"),
+            Ok(AuthProtocol::Sha384)
+        ));
+        assert!(matches!(
+            parse_auth_protocol("SHA512"),
+            Ok(AuthProtocol::Sha512)
+        ));
+    }
+
+    #[test]
+    fn test_parse_auth_protocol_hyphenated() {
+        use snmp2::v3::AuthProtocol;
+        assert!(matches!(
+            parse_auth_protocol("SHA-1"),
+            Ok(AuthProtocol::Sha1)
+        ));
+        assert!(matches!(
+            parse_auth_protocol("SHA-224"),
+            Ok(AuthProtocol::Sha224)
+        ));
+        assert!(matches!(
+            parse_auth_protocol("SHA-256"),
+            Ok(AuthProtocol::Sha256)
+        ));
+        assert!(matches!(
+            parse_auth_protocol("SHA-384"),
+            Ok(AuthProtocol::Sha384)
+        ));
+        assert!(matches!(
+            parse_auth_protocol("SHA-512"),
+            Ok(AuthProtocol::Sha512)
+        ));
+    }
+
+    #[test]
+    fn test_parse_auth_protocol_case_insensitive() {
+        use snmp2::v3::AuthProtocol;
+        assert!(matches!(
+            parse_auth_protocol("sha-256"),
+            Ok(AuthProtocol::Sha256)
+        ));
+        assert!(matches!(
+            parse_auth_protocol("md5"),
+            Ok(AuthProtocol::Md5)
+        ));
+    }
+
+    #[test]
+    fn test_parse_auth_protocol_invalid() {
+        assert!(parse_auth_protocol("INVALID").is_err());
+    }
+
+    #[test]
+    fn test_parse_priv_protocol_standard() {
+        use snmp2::v3::Cipher;
+        assert!(matches!(parse_priv_protocol("DES"), Ok(Cipher::Des)));
+        assert!(matches!(parse_priv_protocol("AES"), Ok(Cipher::Aes128)));
+        assert!(matches!(
+            parse_priv_protocol("AES128"),
+            Ok(Cipher::Aes128)
+        ));
+        assert!(matches!(
+            parse_priv_protocol("AES192"),
+            Ok(Cipher::Aes192)
+        ));
+        assert!(matches!(
+            parse_priv_protocol("AES256"),
+            Ok(Cipher::Aes256)
+        ));
+    }
+
+    #[test]
+    fn test_parse_priv_protocol_hyphenated() {
+        use snmp2::v3::Cipher;
+        assert!(matches!(
+            parse_priv_protocol("AES-128"),
+            Ok(Cipher::Aes128)
+        ));
+        assert!(matches!(
+            parse_priv_protocol("AES-192"),
+            Ok(Cipher::Aes192)
+        ));
+        assert!(matches!(
+            parse_priv_protocol("AES-256"),
+            Ok(Cipher::Aes256)
+        ));
+        assert!(matches!(
+            parse_priv_protocol("AES-256-C"),
+            Ok(Cipher::Aes256)
+        ));
+    }
+
+    #[test]
+    fn test_parse_priv_protocol_invalid() {
+        assert!(parse_priv_protocol("INVALID").is_err());
     }
 }
