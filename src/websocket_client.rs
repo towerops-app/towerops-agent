@@ -22,10 +22,10 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 use crate::proto::agent::{
-    AgentHeartbeat, AgentJob, AgentJobList, JobType, MikrotikResult, MikrotikSentence, QueryType,
-    SnmpResult,
+    AgentHeartbeat, AgentJob, AgentJobList, CredentialTestResult, JobType, MikrotikResult,
+    MikrotikSentence, QueryType, SnmpResult,
 };
-use crate::snmp::{SnmpClient, SnmpValue};
+use crate::snmp::{DeviceConfig, PollerRegistry, SnmpValue};
 
 /// Phoenix channel message format (JSON wrapper around binary protobuf).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -45,6 +45,9 @@ pub struct AgentClient {
     result_rx: mpsc::UnboundedReceiver<SnmpResult>,
     mikrotik_result_tx: mpsc::UnboundedSender<MikrotikResult>,
     mikrotik_result_rx: mpsc::UnboundedReceiver<MikrotikResult>,
+    credential_test_tx: mpsc::UnboundedSender<CredentialTestResult>,
+    credential_test_rx: mpsc::UnboundedReceiver<CredentialTestResult>,
+    poller_registry: PollerRegistry,
 }
 
 impl AgentClient {
@@ -93,6 +96,7 @@ impl AgentClient {
         let agent_id = generate_agent_id();
         let (result_tx, result_rx) = mpsc::unbounded_channel();
         let (mikrotik_result_tx, mikrotik_result_rx) = mpsc::unbounded_channel();
+        let (credential_test_tx, credential_test_rx) = mpsc::unbounded_channel();
 
         // Join Phoenix channel with token in payload
         let join_msg = PhoenixMessage {
@@ -116,6 +120,9 @@ impl AgentClient {
             result_rx,
             mikrotik_result_tx,
             mikrotik_result_rx,
+            credential_test_tx,
+            credential_test_rx,
+            poller_registry: PollerRegistry::new(),
         })
     }
 
@@ -159,14 +166,17 @@ impl AgentClient {
                         }
                         Some(Ok(WsMessage::Close(_))) => {
                             tracing::info!("Server closed connection");
+                            self.poller_registry.shutdown_all();
                             break Ok(());
                         }
                         Some(Err(e)) => {
                             tracing::error!("WebSocket error: {}", e);
+                            self.poller_registry.shutdown_all();
                             break Err(e.into());
                         }
                         None => {
                             tracing::info!("Connection closed");
+                            self.poller_registry.shutdown_all();
                             break Ok(());
                         }
                         _ => {}
@@ -187,10 +197,22 @@ impl AgentClient {
                     }
                 }
 
+                // Receive credential test results from job tasks
+                Some(credential_test_result) = self.credential_test_rx.recv() => {
+                    if let Err(e) = self.send_credential_test_result(credential_test_result).await {
+                        tracing::error!("Error sending credential test result: {}", e);
+                    }
+                }
+
                 // Send periodic heartbeats
                 _ = heartbeat_interval.tick() => {
                     if let Err(e) = self.send_heartbeat().await {
                         tracing::error!("Error sending heartbeat: {}", e);
+                    }
+                    // Log active poller count
+                    let count = self.poller_registry.count();
+                    if count > 0 {
+                        tracing::debug!("Active device pollers: {}", count);
                     }
                 }
             }
@@ -242,6 +264,24 @@ impl AgentClient {
     async fn handle_jobs(&self, job_list: AgentJobList) -> Result<()> {
         tracing::info!("Received {} jobs from server", job_list.jobs.len());
 
+        // Collect device IDs from current jobs
+        let mut current_device_ids = std::collections::HashSet::new();
+        for job in &job_list.jobs {
+            current_device_ids.insert(job.device_id.clone());
+        }
+
+        // Clean up pollers for devices no longer in job list
+        let active_devices = self.poller_registry.list_devices();
+        for device_id in active_devices {
+            if !current_device_ids.contains(&device_id) {
+                tracing::debug!(
+                    "Removing poller for device no longer in job list: {}",
+                    device_id
+                );
+                self.poller_registry.remove(&device_id);
+            }
+        }
+
         for job in job_list.jobs {
             let job_type = JobType::try_from(job.job_type).unwrap_or(JobType::Poll);
             tracing::info!("Executing job: {} (type: {:?})", job.job_id, job_type);
@@ -256,11 +296,21 @@ impl AgentClient {
                         }
                     });
                 }
+                JobType::TestCredentials => {
+                    // Execute credential test
+                    let credential_test_tx = self.credential_test_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = execute_credential_test(job, credential_test_tx).await {
+                            tracing::error!("Credential test execution failed: {}", e);
+                        }
+                    });
+                }
                 _ => {
                     // Execute SNMP job (discovery or polling)
                     let result_tx = self.result_tx.clone();
+                    let poller_registry = self.poller_registry.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = execute_snmp_job(job, result_tx).await {
+                        if let Err(e) = execute_snmp_job(job, result_tx, poller_registry).await {
                             tracing::error!("SNMP job execution failed: {}", e);
                         }
                     });
@@ -336,6 +386,28 @@ impl AgentClient {
         );
         Ok(())
     }
+
+    /// Send credential test result to server.
+    async fn send_credential_test_result(&mut self, result: CredentialTestResult) -> Result<()> {
+        let binary = result.encode_to_vec();
+
+        let msg = PhoenixMessage {
+            topic: format!("agent:{}", self.agent_id),
+            event: "credential_test_result".to_string(),
+            payload: serde_json::json!({"binary": base64_encode(&binary)}),
+            reference: None,
+        };
+
+        let text = serde_json::to_string(&msg)?;
+        self.ws_stream.send(WsMessage::Text(text.into())).await?;
+
+        tracing::info!(
+            "Sent credential test result (test_id: {}, success: {})",
+            result.test_id,
+            result.success
+        );
+        Ok(())
+    }
 }
 
 /// Redact SNMP community string for logging, showing first 2 chars only
@@ -351,12 +423,13 @@ fn redact_community(community: &str) -> String {
 async fn execute_snmp_job(
     job: AgentJob,
     result_tx: mpsc::UnboundedSender<SnmpResult>,
+    poller_registry: PollerRegistry,
 ) -> Result<()> {
     let snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
 
     // Build v3 config if version is "3"
     let v3_config = if snmp_device.version == "3" {
-        Some(crate::snmp::V3Config {
+        let config = crate::snmp::V3Config {
             username: snmp_device.v3_username.clone(),
             auth_password: if !snmp_device.v3_auth_password.is_empty() {
                 Some(snmp_device.v3_auth_password.clone())
@@ -379,7 +452,9 @@ async fn execute_snmp_job(
                 None
             },
             security_level: snmp_device.v3_security_level.clone(),
-        })
+        };
+
+        Some(config)
     } else {
         None
     };
@@ -396,8 +471,18 @@ async fn execute_snmp_job(
         snmp_device.version
     );
 
+    // Build device config and get or create persistent poller
+    let device_config = DeviceConfig {
+        ip: snmp_device.ip.clone(),
+        port: snmp_device.port as u16,
+        version: snmp_device.version.clone(),
+        community: snmp_device.community.clone(),
+        v3_config,
+    };
+
+    let poller = poller_registry.get_or_create(job.device_id.clone(), device_config);
+
     let mut oid_values: HashMap<String, String> = HashMap::new();
-    let snmp_client = SnmpClient::new();
 
     for query in job.queries {
         let query_type = QueryType::try_from(query.query_type).unwrap_or(QueryType::Get);
@@ -406,17 +491,7 @@ async fn execute_snmp_job(
             QueryType::Get => {
                 // Execute SNMP GET for each OID
                 for oid in &query.oids {
-                    match snmp_client
-                        .get(
-                            &snmp_device.ip,
-                            &snmp_device.community,
-                            &snmp_device.version,
-                            snmp_device.port as u16,
-                            oid,
-                            v3_config.clone(),
-                        )
-                        .await
-                    {
+                    match poller.get(oid.clone()).await {
                         Ok(value) => {
                             oid_values.insert(oid.clone(), value_to_string(value));
                         }
@@ -438,17 +513,7 @@ async fn execute_snmp_job(
             QueryType::Walk => {
                 // Execute SNMP WALK for each base OID
                 for base_oid in &query.oids {
-                    match snmp_client
-                        .walk(
-                            &snmp_device.ip,
-                            &snmp_device.community,
-                            &snmp_device.version,
-                            snmp_device.port as u16,
-                            base_oid,
-                            v3_config.clone(),
-                        )
-                        .await
-                    {
+                    match poller.walk(base_oid.clone()).await {
                         Ok(results) => {
                             for (oid, value) in results {
                                 oid_values.insert(oid, value_to_string(value));
@@ -492,6 +557,112 @@ async fn execute_snmp_job(
     if let Err(e) = result_tx.send(result) {
         tracing::warn!(
             "Failed to send SNMP result for job {}: channel closed (connection may have dropped)",
+            job.job_id
+        );
+        return Err(format!("Result channel closed: {}", e).into());
+    }
+
+    Ok(())
+}
+
+/// Execute a credential test job.
+///
+/// Tests SNMP credentials by performing a simple GET on sysDescr.0.
+/// Returns success with system description or failure with error message.
+async fn execute_credential_test(
+    job: AgentJob,
+    result_tx: mpsc::UnboundedSender<CredentialTestResult>,
+) -> Result<()> {
+    let snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
+
+    tracing::info!(
+        "Testing SNMP credentials for {}:{} (version: {})",
+        snmp_device.ip,
+        snmp_device.port,
+        snmp_device.version
+    );
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+
+    // Build v3 config if version is "3"
+    let v3_config = if snmp_device.version == "3" {
+        Some(crate::snmp::V3Config {
+            username: snmp_device.v3_username.clone(),
+            auth_password: if !snmp_device.v3_auth_password.is_empty() {
+                Some(snmp_device.v3_auth_password.clone())
+            } else {
+                None
+            },
+            priv_password: if !snmp_device.v3_priv_password.is_empty() {
+                Some(snmp_device.v3_priv_password.clone())
+            } else {
+                None
+            },
+            auth_protocol: if !snmp_device.v3_auth_protocol.is_empty() {
+                Some(snmp_device.v3_auth_protocol.clone())
+            } else {
+                None
+            },
+            priv_protocol: if !snmp_device.v3_priv_protocol.is_empty() {
+                Some(snmp_device.v3_priv_protocol.clone())
+            } else {
+                None
+            },
+            security_level: snmp_device.v3_security_level.clone(),
+        })
+    } else {
+        None
+    };
+
+    // Create a temporary SNMP client for testing (don't use persistent poller)
+    let snmp_client = crate::snmp::SnmpClient::new();
+
+    // Test with sysDescr.0 (standard system description OID)
+    let test_oid = "1.3.6.1.2.1.1.1.0".to_string();
+
+    let result = match snmp_client
+        .get(
+            &snmp_device.ip,
+            &snmp_device.community,
+            &snmp_device.version,
+            snmp_device.port as u16,
+            &test_oid,
+            v3_config,
+        )
+        .await
+    {
+        Ok(value) => {
+            let sys_descr = value_to_string(value);
+            tracing::info!("✓ Credential test succeeded: {}", sys_descr);
+
+            CredentialTestResult {
+                test_id: job.job_id.clone(),
+                success: true,
+                error_message: String::new(),
+                system_description: sys_descr,
+                timestamp,
+            }
+        }
+        Err(e) => {
+            let error_msg = format!("SNMP test failed: {}", e);
+            tracing::warn!("✗ Credential test failed: {}", error_msg);
+
+            CredentialTestResult {
+                test_id: job.job_id.clone(),
+                success: false,
+                error_message: error_msg,
+                system_description: String::new(),
+                timestamp,
+            }
+        }
+    };
+
+    // Send result back to main client task
+    if let Err(e) = result_tx.send(result) {
+        tracing::warn!(
+            "Failed to send credential test result for job {}: channel closed",
             job.job_id
         );
         return Err(format!("Result channel closed: {}", e).into());
@@ -792,11 +963,22 @@ fn value_to_string(value: SnmpValue) -> String {
     match value {
         SnmpValue::Integer(i) => i.to_string(),
         SnmpValue::String(s) => s,
+        SnmpValue::OctetString(bytes) => {
+            // Convert to hex string for non-printable data
+            bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(":")
+        }
+        SnmpValue::Oid(oid) => oid,
         SnmpValue::Counter32(c) => c.to_string(),
         SnmpValue::Counter64(c) => c.to_string(),
         SnmpValue::Gauge32(g) => g.to_string(),
         SnmpValue::TimeTicks(t) => t.to_string(),
         SnmpValue::IpAddress(ip) => ip,
+        SnmpValue::Null => "null".to_string(),
+        SnmpValue::Unsupported(s) => s,
     }
 }
 

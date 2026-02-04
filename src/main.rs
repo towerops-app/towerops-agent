@@ -92,18 +92,54 @@ struct Args {
     /// Use plain TCP instead of SSL (port 8728) - WARNING: credentials sent in plaintext
     #[arg(long, default_value_t = false)]
     mikrotik_plain: bool,
+
+    /// Run SNMPv3 test instead of normal agent operation
+    #[arg(long)]
+    snmpv3_test: bool,
+
+    /// Device IP address (for --snmpv3-test)
+    #[arg(long, required_if_eq("snmpv3_test", "true"))]
+    snmpv3_ip: Option<String>,
+
+    /// SNMPv3 username (for --snmpv3-test)
+    #[arg(long, default_value = "")]
+    snmpv3_user: String,
+
+    /// SNMPv3 auth password (for --snmpv3-test)
+    #[arg(long, default_value = "")]
+    snmpv3_auth_pass: String,
+
+    /// SNMPv3 priv password (for --snmpv3-test)
+    #[arg(long, default_value = "")]
+    snmpv3_priv_pass: String,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // Initialize logging
     init_logger();
 
+    // Build Tokio runtime with larger stack size for SNMPv3 crypto operations
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024) // 8MB stack (default is 2MB)
+        .build()
+        .expect("Failed to build Tokio runtime");
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() {
     let args = Args::parse();
 
     // Handle MikroTik test mode
     if args.mikrotik_test {
         run_mikrotik_test(&args).await;
+        return;
+    }
+
+    // Handle SNMPv3 test mode
+    if args.snmpv3_test {
+        run_snmpv3_test(&args).await;
         return;
     }
 
@@ -215,6 +251,104 @@ async fn main() {
     }
 
     tracing::info!("Towerops agent stopped");
+}
+
+/// Run SNMPv3 test
+async fn run_snmpv3_test(args: &Args) {
+    use snmp::V3Config;
+
+    let ip = args.snmpv3_ip.as_ref().expect("--snmpv3-ip required");
+    let username = &args.snmpv3_user;
+    let auth_pass = &args.snmpv3_auth_pass;
+    let priv_pass = &args.snmpv3_priv_pass;
+
+    println!("Testing SNMPv3 device at {}...", ip);
+    println!("  Username: {}", username);
+    println!(
+        "  Auth Password: {}",
+        if auth_pass.is_empty() {
+            "(empty)"
+        } else {
+            "(set)"
+        }
+    );
+    println!(
+        "  Priv Password: {}",
+        if priv_pass.is_empty() {
+            "(empty)"
+        } else {
+            "(set)"
+        }
+    );
+
+    let v3_config = V3Config {
+        username: username.clone(),
+        auth_password: if !auth_pass.is_empty() {
+            Some(auth_pass.clone())
+        } else {
+            None
+        },
+        priv_password: if !priv_pass.is_empty() {
+            Some(priv_pass.clone())
+        } else {
+            None
+        },
+        auth_protocol: Some("SHA".to_string()),
+        priv_protocol: Some("AES".to_string()),
+        security_level: "authPriv".to_string(),
+    };
+
+    let snmp_client = snmp::SnmpClient::new();
+
+    println!("\nTest 1: Get sysDescr.0 (1.3.6.1.2.1.1.1.0)");
+    match snmp_client
+        .get(
+            ip,
+            "",
+            "3",
+            161,
+            "1.3.6.1.2.1.1.1.0",
+            Some(v3_config.clone()),
+        )
+        .await
+    {
+        Ok(value) => println!("  Result: {:?}", value),
+        Err(e) => println!("  Error: {}", e),
+    }
+
+    println!("\nTest 2: Get sysUpTime.0 (1.3.6.1.2.1.1.3.0)");
+    match snmp_client
+        .get(
+            ip,
+            "",
+            "3",
+            161,
+            "1.3.6.1.2.1.1.3.0",
+            Some(v3_config.clone()),
+        )
+        .await
+    {
+        Ok(value) => println!("  Result: {:?}", value),
+        Err(e) => println!("  Error: {}", e),
+    }
+
+    println!("\nTest 3: Walk interfaces (1.3.6.1.2.1.2.2.1)");
+    match snmp_client
+        .walk(
+            ip,
+            "",
+            "3",
+            161,
+            "1.3.6.1.2.1.2.2.1",
+            Some(v3_config.clone()),
+        )
+        .await
+    {
+        Ok(values) => println!("  Found {} values", values.len()),
+        Err(e) => println!("  Error: {}", e),
+    }
+
+    println!("\nTest complete.");
 }
 
 /// Run MikroTik API test

@@ -113,6 +113,7 @@ enum JobType {
   DISCOVER = 0;
   POLL = 1;
   MIKROTIK = 2;
+  TEST_CREDENTIALS = 3;
 }
 
 enum QueryType {
@@ -172,6 +173,14 @@ message AgentError {
   string device_id = 1;
   string error_message = 2;
   int64 timestamp = 3;
+}
+
+message CredentialTestResult {
+  string test_id = 1;
+  bool success = 2;
+  string error_message = 3;  // Empty if success
+  string system_description = 4;  // sysDescr.0 value if success
+  int64 timestamp = 5;
 }
 
 // MikroTik RouterOS API messages
