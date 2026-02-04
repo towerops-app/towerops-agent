@@ -576,6 +576,11 @@ async fn execute_snmp_job(
         version: snmp_device.version.clone(),
         community: SecretString::new(snmp_device.community.clone()),
         v3_config,
+        transport: if snmp_device.transport.is_empty() {
+            "udp".to_string()
+        } else {
+            snmp_device.transport.clone()
+        },
     };
 
     // Zeroize credentials in protobuf message after extraction

@@ -30,6 +30,7 @@ pub struct DeviceConfig {
     pub version: String,
     pub community: SecretString,
     pub v3_config: Option<V3Config>,
+    pub transport: String,
 }
 
 impl std::fmt::Debug for DeviceConfig {
@@ -38,6 +39,7 @@ impl std::fmt::Debug for DeviceConfig {
             .field("ip", &self.ip)
             .field("port", &self.port)
             .field("version", &self.version)
+            .field("transport", &self.transport)
             .field("community", &"[REDACTED]")
             .field("v3_config", &self.v3_config)
             .finish()
@@ -185,11 +187,25 @@ fn run_poller_thread(
     Ok(())
 }
 
-/// Create an SNMP session based on version
+/// Create an SNMP session based on version and transport
 fn create_session(addr: &str, config: &DeviceConfig) -> Result<SyncSession, String> {
     let timeout = Some(Duration::from_secs(SNMP_TIMEOUT_SECS));
     let version_num = parse_snmp_version(&config.version)?;
+    let transport = config.transport.to_lowercase();
 
+    // TCP transport warning - not yet implemented
+    // TODO: Implement SNMP-over-TCP (RFC 3430) - requires low-level PDU handling
+    // since snmp2 crate doesn't expose internal types needed for TCP framing
+    if transport == "tcp" {
+        tracing::warn!(
+            "TCP transport requested for {} but not yet implemented. \
+             Falling back to UDP. TCP support requires custom PDU encoder/decoder \
+             since snmp2 crate doesn't expose necessary internal types.",
+            addr
+        );
+    }
+
+    // UDP transport (default, also used as fallback for TCP)
     if config.version == "3" {
         let v3_config = config
             .v3_config
