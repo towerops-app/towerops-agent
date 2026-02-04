@@ -1,1 +1,0 @@
-../towerops-web/scripts/monitor-deploy.sh
