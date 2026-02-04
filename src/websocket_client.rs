@@ -6,6 +6,8 @@
 ///
 /// Connection URL: {url}/socket/agent/websocket
 /// Authentication: Token sent in Phoenix channel join payload
+use crate::secret::SecretString;
+use futures::stream::SplitStream;
 use futures::{SinkExt, StreamExt};
 use prost::Message;
 use std::collections::HashMap;
@@ -15,6 +17,7 @@ use tokio::time::{interval, timeout, Duration};
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message as WsMessage, MaybeTlsStream, WebSocketStream,
 };
+use zeroize::Zeroize;
 
 /// Connection timeout for WebSocket establishment (30 seconds)
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,17 +40,33 @@ struct PhoenixMessage {
     reference: Option<String>,
 }
 
+/// Channel capacity for result backpressure. If the WebSocket write side
+/// falls behind, job tasks will slow down rather than consuming unbounded memory.
+const RESULT_CHANNEL_CAPACITY: usize = 1000;
+
+/// Channel capacity for outgoing WebSocket messages routed through the writer task.
+const WS_WRITE_CHANNEL_CAPACITY: usize = 500;
+
 /// WebSocket client for agent communication.
+///
+/// The WebSocket stream is split into a read half (owned here) and a write half
+/// (owned by a dedicated writer task). All outgoing messages are sent through
+/// `ws_write_tx`, allowing reads and writes to proceed concurrently.
 pub struct AgentClient {
-    ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ws_read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    ws_write_tx: mpsc::Sender<WsMessage>,
     agent_id: String,
-    result_tx: mpsc::UnboundedSender<SnmpResult>,
-    result_rx: mpsc::UnboundedReceiver<SnmpResult>,
-    mikrotik_result_tx: mpsc::UnboundedSender<MikrotikResult>,
-    mikrotik_result_rx: mpsc::UnboundedReceiver<MikrotikResult>,
-    credential_test_tx: mpsc::UnboundedSender<CredentialTestResult>,
-    credential_test_rx: mpsc::UnboundedReceiver<CredentialTestResult>,
+    result_tx: mpsc::Sender<SnmpResult>,
+    result_rx: mpsc::Receiver<SnmpResult>,
+    mikrotik_result_tx: mpsc::Sender<MikrotikResult>,
+    mikrotik_result_rx: mpsc::Receiver<MikrotikResult>,
+    credential_test_tx: mpsc::Sender<CredentialTestResult>,
+    credential_test_rx: mpsc::Receiver<CredentialTestResult>,
     poller_registry: PollerRegistry,
+    /// Counter for Phoenix transport heartbeat refs
+    phx_heartbeat_ref: u64,
+    /// Cached hostname (computed once at startup, avoids blocking /proc reads)
+    cached_hostname: String,
 }
 
 impl AgentClient {
@@ -61,7 +80,7 @@ impl AgentClient {
     /// ```no_run
     /// let client = AgentClient::connect("wss://towerops.net", "token123").await?;
     /// ```
-    pub async fn connect(url: &str, token: &str) -> Result<Self> {
+    pub async fn connect(url: &str, token: &SecretString) -> Result<Self> {
         // Strip trailing slash from base URL to avoid double slashes
         let base_url = url.trim_end_matches('/');
         let ws_url = format!("{}/socket/agent/websocket", base_url);
@@ -72,7 +91,7 @@ impl AgentClient {
         );
 
         // Wrap connection in timeout to avoid hanging indefinitely on bad network
-        let (mut ws_stream, _) = match timeout(CONNECTION_TIMEOUT, connect_async(&ws_url)).await {
+        let (ws_stream, _) = match timeout(CONNECTION_TIMEOUT, connect_async(&ws_url)).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 tracing::error!("WebSocket connection failed: {}", e);
@@ -94,27 +113,38 @@ impl AgentClient {
         tracing::info!("Connected to Towerops server at {}", url);
 
         let agent_id = generate_agent_id();
-        let (result_tx, result_rx) = mpsc::unbounded_channel();
-        let (mikrotik_result_tx, mikrotik_result_rx) = mpsc::unbounded_channel();
-        let (credential_test_tx, credential_test_rx) = mpsc::unbounded_channel();
+        let (result_tx, result_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
+        let (mikrotik_result_tx, mikrotik_result_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
+        let (credential_test_tx, credential_test_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
+
+        // Split the WebSocket stream so reads and writes can proceed concurrently.
+        // The write half is owned by a dedicated writer task.
+        let (ws_write, ws_read) = ws_stream.split();
+        let (ws_write_tx, ws_write_rx) = mpsc::channel::<WsMessage>(WS_WRITE_CHANNEL_CAPACITY);
+
+        tokio::spawn(ws_writer_task(ws_write, ws_write_rx));
 
         // Join Phoenix channel with token in payload
         let join_msg = PhoenixMessage {
             topic: format!("agent:{}", agent_id),
             event: "phx_join".to_string(),
-            payload: serde_json::json!({"token": token}),
+            payload: serde_json::json!({"token": token.expose()}),
             reference: Some("1".to_string()),
         };
 
         let join_text = serde_json::to_string(&join_msg)?;
-        ws_stream.send(WsMessage::Text(join_text.into())).await?;
+        ws_write_tx
+            .send(WsMessage::Text(join_text.into()))
+            .await
+            .map_err(|e| format!("Failed to send join message: {}", e))?;
         tracing::info!(
             "Sent channel join request with token for agent:{}",
             agent_id
         );
 
         Ok(Self {
-            ws_stream,
+            ws_read,
+            ws_write_tx,
             agent_id,
             result_tx,
             result_rx,
@@ -123,6 +153,8 @@ impl AgentClient {
             credential_test_tx,
             credential_test_rx,
             poller_registry: PollerRegistry::new(),
+            phx_heartbeat_ref: 0,
+            cached_hostname: get_hostname(),
         })
     }
 
@@ -136,6 +168,7 @@ impl AgentClient {
     /// - Graceful shutdown on SIGTERM
     pub async fn run(&mut self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         let mut heartbeat_interval = interval(Duration::from_secs(60));
+        let mut phx_heartbeat_interval = interval(Duration::from_secs(25));
 
         loop {
             tokio::select! {
@@ -143,16 +176,14 @@ impl AgentClient {
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         tracing::info!("Shutdown signal received, closing WebSocket connection gracefully");
-                        // Send close frame to server
-                        if let Err(e) = self.ws_stream.close(None).await {
-                            tracing::warn!("Error sending WebSocket close frame: {}", e);
-                        }
+                        // Send close frame through the writer task
+                        let _ = self.ws_write_tx.send(WsMessage::Close(None)).await;
                         break Ok(());
                     }
                 }
 
                 // Receive messages from server
-                msg = self.ws_stream.next() => {
+                msg = self.ws_read.next() => {
                     match msg {
                         Some(Ok(WsMessage::Binary(data))) => {
                             if let Err(e) = self.handle_message(&data).await {
@@ -213,6 +244,13 @@ impl AgentClient {
                     let count = self.poller_registry.count();
                     if count > 0 {
                         tracing::debug!("Active device pollers: {}", count);
+                    }
+                }
+
+                // Send Phoenix transport heartbeats to keep connection alive
+                _ = phx_heartbeat_interval.tick() => {
+                    if let Err(e) = self.send_phx_heartbeat().await {
+                        tracing::error!("Error sending Phoenix heartbeat: {}", e);
                     }
                 }
             }
@@ -325,7 +363,7 @@ impl AgentClient {
     async fn send_heartbeat(&mut self) -> Result<()> {
         let heartbeat = AgentHeartbeat {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            hostname: get_hostname(),
+            hostname: self.cached_hostname.clone(),
             uptime_seconds: get_uptime_seconds(),
             ip_address: get_local_ip().unwrap_or_else(|| "unknown".to_string()),
         };
@@ -341,9 +379,39 @@ impl AgentClient {
         };
 
         let text = serde_json::to_string(&msg)?;
-        self.ws_stream.send(WsMessage::Text(text.into())).await?;
+        self.ws_write_tx
+            .send(WsMessage::Text(text.into()))
+            .await
+            .map_err(|e| format!("Writer task closed: {}", e))?;
 
         tracing::debug!("Sent heartbeat");
+        Ok(())
+    }
+
+    /// Send Phoenix transport heartbeat to keep the WebSocket connection alive.
+    ///
+    /// This is separate from the application heartbeat. Phoenix's transport layer
+    /// expects periodic messages on the "phoenix" topic to detect dead connections.
+    async fn send_phx_heartbeat(&mut self) -> Result<()> {
+        self.phx_heartbeat_ref += 1;
+
+        let msg = PhoenixMessage {
+            topic: "phoenix".to_string(),
+            event: "heartbeat".to_string(),
+            payload: serde_json::json!({}),
+            reference: Some(self.phx_heartbeat_ref.to_string()),
+        };
+
+        let text = serde_json::to_string(&msg)?;
+        self.ws_write_tx
+            .send(WsMessage::Text(text.into()))
+            .await
+            .map_err(|e| format!("Writer task closed: {}", e))?;
+
+        tracing::debug!(
+            "Sent Phoenix transport heartbeat (ref: {})",
+            self.phx_heartbeat_ref
+        );
         Ok(())
     }
 
@@ -359,7 +427,10 @@ impl AgentClient {
         };
 
         let text = serde_json::to_string(&msg)?;
-        self.ws_stream.send(WsMessage::Text(text.into())).await?;
+        self.ws_write_tx
+            .send(WsMessage::Text(text.into()))
+            .await
+            .map_err(|e| format!("Writer task closed: {}", e))?;
 
         tracing::debug!("Sent SNMP result for device {}", result.device_id);
         Ok(())
@@ -377,7 +448,10 @@ impl AgentClient {
         };
 
         let text = serde_json::to_string(&msg)?;
-        self.ws_stream.send(WsMessage::Text(text.into())).await?;
+        self.ws_write_tx
+            .send(WsMessage::Text(text.into()))
+            .await
+            .map_err(|e| format!("Writer task closed: {}", e))?;
 
         tracing::debug!(
             "Sent MikroTik result for device {} (job: {})",
@@ -399,7 +473,10 @@ impl AgentClient {
         };
 
         let text = serde_json::to_string(&msg)?;
-        self.ws_stream.send(WsMessage::Text(text.into())).await?;
+        self.ws_write_tx
+            .send(WsMessage::Text(text.into()))
+            .await
+            .map_err(|e| format!("Writer task closed: {}", e))?;
 
         tracing::info!(
             "Sent credential test result (test_id: {}, success: {})",
@@ -410,34 +487,55 @@ impl AgentClient {
     }
 }
 
-/// Redact SNMP community string for logging, showing first 2 chars only
-fn redact_community(community: &str) -> String {
-    if community.is_empty() {
-        return "**".to_string();
+/// Dedicated writer task that owns the WebSocket write half.
+///
+/// All outgoing messages are funnelled through an mpsc channel, allowing the
+/// main event loop to continue reading while writes are in progress.
+async fn ws_writer_task(
+    mut ws_sink: futures::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>,
+    mut rx: mpsc::Receiver<WsMessage>,
+) {
+    while let Some(msg) = rx.recv().await {
+        let is_close = matches!(msg, WsMessage::Close(_));
+        if let Err(e) = ws_sink.send(msg).await {
+            tracing::error!("WebSocket write error: {}", e);
+            break;
+        }
+        if is_close {
+            break;
+        }
     }
-    let visible = std::cmp::min(community.len(), 2);
-    format!("{}**", &community[..visible])
+    tracing::debug!("WebSocket writer task stopped");
+}
+
+/// Redact SNMP community string for logging.
+fn redact_community(community: &str) -> &'static str {
+    if community.is_empty() {
+        "(empty)"
+    } else {
+        "***"
+    }
 }
 
 /// Execute an SNMP job and collect results.
 async fn execute_snmp_job(
     job: AgentJob,
-    result_tx: mpsc::UnboundedSender<SnmpResult>,
+    result_tx: mpsc::Sender<SnmpResult>,
     poller_registry: PollerRegistry,
 ) -> Result<()> {
-    let snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
+    let mut snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
 
     // Build v3 config if version is "3"
     let v3_config = if snmp_device.version == "3" {
         let config = crate::snmp::V3Config {
             username: snmp_device.v3_username.clone(),
             auth_password: if !snmp_device.v3_auth_password.is_empty() {
-                Some(snmp_device.v3_auth_password.clone())
+                Some(SecretString::new(snmp_device.v3_auth_password.clone()))
             } else {
                 None
             },
             priv_password: if !snmp_device.v3_priv_password.is_empty() {
-                Some(snmp_device.v3_priv_password.clone())
+                Some(SecretString::new(snmp_device.v3_priv_password.clone()))
             } else {
                 None
             },
@@ -476,9 +574,14 @@ async fn execute_snmp_job(
         ip: snmp_device.ip.clone(),
         port: snmp_device.port as u16,
         version: snmp_device.version.clone(),
-        community: snmp_device.community.clone(),
+        community: SecretString::new(snmp_device.community.clone()),
         v3_config,
     };
+
+    // Zeroize credentials in protobuf message after extraction
+    snmp_device.community.zeroize();
+    snmp_device.v3_auth_password.zeroize();
+    snmp_device.v3_priv_password.zeroize();
 
     let poller = poller_registry.get_or_create(job.device_id.clone(), device_config);
 
@@ -554,7 +657,7 @@ async fn execute_snmp_job(
     );
 
     // Send result back to main client task
-    if let Err(e) = result_tx.send(result) {
+    if let Err(e) = result_tx.send(result).await {
         tracing::warn!(
             "Failed to send SNMP result for job {}: channel closed (connection may have dropped)",
             job.job_id
@@ -571,9 +674,9 @@ async fn execute_snmp_job(
 /// Returns success with system description or failure with error message.
 async fn execute_credential_test(
     job: AgentJob,
-    result_tx: mpsc::UnboundedSender<CredentialTestResult>,
+    result_tx: mpsc::Sender<CredentialTestResult>,
 ) -> Result<()> {
-    let snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
+    let mut snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
 
     tracing::info!(
         "Testing SNMP credentials for {}:{} (version: {})",
@@ -591,12 +694,12 @@ async fn execute_credential_test(
         Some(crate::snmp::V3Config {
             username: snmp_device.v3_username.clone(),
             auth_password: if !snmp_device.v3_auth_password.is_empty() {
-                Some(snmp_device.v3_auth_password.clone())
+                Some(SecretString::new(snmp_device.v3_auth_password.clone()))
             } else {
                 None
             },
             priv_password: if !snmp_device.v3_priv_password.is_empty() {
-                Some(snmp_device.v3_priv_password.clone())
+                Some(SecretString::new(snmp_device.v3_priv_password.clone()))
             } else {
                 None
             },
@@ -615,6 +718,11 @@ async fn execute_credential_test(
     } else {
         None
     };
+
+    // Zeroize credentials in protobuf message after extraction
+    snmp_device.community.zeroize();
+    snmp_device.v3_auth_password.zeroize();
+    snmp_device.v3_priv_password.zeroize();
 
     // Create a temporary SNMP client for testing (don't use persistent poller)
     let snmp_client = crate::snmp::SnmpClient::new();
@@ -660,7 +768,7 @@ async fn execute_credential_test(
     };
 
     // Send result back to main client task
-    if let Err(e) = result_tx.send(result) {
+    if let Err(e) = result_tx.send(result).await {
         tracing::warn!(
             "Failed to send credential test result for job {}: channel closed",
             job.job_id
@@ -674,9 +782,9 @@ async fn execute_credential_test(
 /// Execute a MikroTik API job and collect results.
 async fn execute_mikrotik_job(
     job: AgentJob,
-    result_tx: mpsc::UnboundedSender<MikrotikResult>,
+    result_tx: mpsc::Sender<MikrotikResult>,
 ) -> Result<()> {
-    use crate::mikrotik::{MikrotikClient, SecretString};
+    use crate::mikrotik::MikrotikClient;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -692,7 +800,7 @@ async fn execute_mikrotik_job(
         return execute_mikrotik_backup_via_ssh(job, mikrotik_device, result_tx, timestamp).await;
     }
 
-    let mikrotik_device = job
+    let mut mikrotik_device = job
         .mikrotik_device
         .ok_or("Job missing MikroTik device info")?;
 
@@ -726,7 +834,7 @@ async fn execute_mikrotik_job(
                     error: format!("Connection failed: {}", e),
                     timestamp,
                 };
-                let _ = result_tx.send(result);
+                let _ = result_tx.send(result).await;
                 return Err(format!("MikroTik connection failed: {}", e).into());
             }
         }
@@ -748,11 +856,14 @@ async fn execute_mikrotik_job(
                     error: format!("Connection failed: {}", e),
                     timestamp,
                 };
-                let _ = result_tx.send(result);
+                let _ = result_tx.send(result).await;
                 return Err(format!("MikroTik connection failed: {}", e).into());
             }
         }
     };
+
+    // Zeroize credentials in protobuf message after extraction
+    mikrotik_device.password.zeroize();
 
     // Execute each command and collect results
     let mut all_sentences = Vec::new();
@@ -847,7 +958,7 @@ async fn execute_mikrotik_job(
     );
 
     let job_id_for_error = result.job_id.clone();
-    if let Err(e) = result_tx.send(result) {
+    if let Err(e) = result_tx.send(result).await {
         tracing::warn!(
             "Failed to send MikroTik result for job {}: channel closed",
             job_id_for_error
@@ -861,8 +972,8 @@ async fn execute_mikrotik_job(
 /// Execute a MikroTik backup job via SSH (because /export doesn't work via API).
 async fn execute_mikrotik_backup_via_ssh(
     job: AgentJob,
-    mikrotik_device: crate::proto::agent::MikrotikDevice,
-    result_tx: mpsc::UnboundedSender<MikrotikResult>,
+    mut mikrotik_device: crate::proto::agent::MikrotikDevice,
+    result_tx: mpsc::Sender<MikrotikResult>,
     timestamp: i64,
 ) -> Result<()> {
     use crate::ssh::SshClient;
@@ -875,12 +986,14 @@ async fn execute_mikrotik_backup_via_ssh(
         job.job_id
     );
 
+    let password = SecretString::new(mikrotik_device.password.clone());
+
     // Connect via SSH
     let mut ssh_client = match SshClient::connect(
         &mikrotik_device.ip,
         mikrotik_device.ssh_port,
         &mikrotik_device.username,
-        &mikrotik_device.password,
+        &password,
     )
     .await
     {
@@ -895,7 +1008,7 @@ async fn execute_mikrotik_backup_via_ssh(
                 error: error_msg,
                 timestamp,
             };
-            let _ = result_tx.send(result);
+            let _ = result_tx.send(result).await;
             return Err(format!("SSH connection failed: {}", e).into());
         }
     };
@@ -913,7 +1026,7 @@ async fn execute_mikrotik_backup_via_ssh(
                 error: error_msg,
                 timestamp,
             };
-            let _ = result_tx.send(result);
+            let _ = result_tx.send(result).await;
             let _ = ssh_client.close().await;
             return Err(format!("SSH command failed: {}", e).into());
         }
@@ -921,6 +1034,9 @@ async fn execute_mikrotik_backup_via_ssh(
 
     // Close SSH connection
     let _ = ssh_client.close().await;
+
+    // Zeroize credentials in protobuf message after use
+    mikrotik_device.password.zeroize();
 
     tracing::info!(
         "Backup completed: {} bytes, {} lines",
@@ -947,7 +1063,7 @@ async fn execute_mikrotik_backup_via_ssh(
         result.job_id
     );
 
-    if let Err(e) = result_tx.send(result) {
+    if let Err(e) = result_tx.send(result).await {
         tracing::warn!(
             "Failed to send MikroTik backup result for job {}: channel closed",
             job_id_for_log
@@ -1249,27 +1365,27 @@ mod tests {
 
     #[test]
     fn test_redact_community_normal() {
-        assert_eq!(redact_community("public"), "pu**");
+        assert_eq!(redact_community("public"), "***");
     }
 
     #[test]
     fn test_redact_community_short() {
-        assert_eq!(redact_community("ab"), "ab**");
-        assert_eq!(redact_community("a"), "a**");
+        assert_eq!(redact_community("ab"), "***");
+        assert_eq!(redact_community("a"), "***");
     }
 
     #[test]
     fn test_redact_community_empty() {
-        assert_eq!(redact_community(""), "**");
+        assert_eq!(redact_community(""), "(empty)");
     }
 
     #[test]
     fn test_redact_community_three_chars() {
-        assert_eq!(redact_community("abc"), "ab**");
+        assert_eq!(redact_community("abc"), "***");
     }
 
     #[test]
     fn test_redact_community_long() {
-        assert_eq!(redact_community("mysecretcommunity"), "my**");
+        assert_eq!(redact_community("mysecretcommunity"), "***");
     }
 }

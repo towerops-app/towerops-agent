@@ -27,7 +27,7 @@ mod tests {
         let version = current_version();
         // Version should be in semver-like format (e.g., "0.1.0" or custom BUILD_VERSION)
         // At minimum, should have some content
-        assert!(version.len() >= 1);
+        assert!(!version.is_empty());
     }
 
     #[test]

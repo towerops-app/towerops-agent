@@ -1,5 +1,6 @@
 use super::types::{SnmpError, SnmpResult, SnmpValue};
 use super::V3Config;
+use crate::secret::SecretString;
 use snmp2::{Oid, SyncSession};
 use std::str::FromStr;
 use std::time::Duration;
@@ -22,13 +23,25 @@ pub enum SnmpRequest {
 }
 
 /// Configuration for a device poller
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DeviceConfig {
     pub ip: String,
     pub port: u16,
     pub version: String,
-    pub community: String,
+    pub community: SecretString,
     pub v3_config: Option<V3Config>,
+}
+
+impl std::fmt::Debug for DeviceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceConfig")
+            .field("ip", &self.ip)
+            .field("port", &self.port)
+            .field("version", &self.version)
+            .field("community", &"[REDACTED]")
+            .field("v3_config", &self.v3_config)
+            .finish()
+    }
 }
 
 /// Per-device polling thread that maintains a persistent SNMP session
@@ -184,7 +197,12 @@ fn create_session(addr: &str, config: &DeviceConfig) -> Result<SyncSession, Stri
             .ok_or("v3_config required for SNMPv3")?;
         create_v3_session(addr, timeout, v3_config)
     } else {
-        create_v1v2c_session(addr, config.community.as_bytes(), timeout, version_num)
+        create_v1v2c_session(
+            addr,
+            config.community.expose().as_bytes(),
+            timeout,
+            version_num,
+        )
     }
 }
 
@@ -227,7 +245,8 @@ fn create_v3_session(
             )?;
             let priv_pass = config
                 .priv_password
-                .as_deref()
+                .as_ref()
+                .map(|s| s.expose())
                 .ok_or("Priv password required for authPriv")?;
 
             Auth::AuthPriv {
@@ -244,7 +263,12 @@ fn create_v3_session(
     };
 
     let username = config.username.as_bytes();
-    let auth_password = config.auth_password.as_deref().unwrap_or("").as_bytes();
+    let auth_password = config
+        .auth_password
+        .as_ref()
+        .map(|s| s.expose())
+        .unwrap_or("")
+        .as_bytes();
     let needs_auth_protocol = !matches!(auth, Auth::NoAuthNoPriv);
 
     let mut security = Security::new(username, auth_password).with_auth(auth);
