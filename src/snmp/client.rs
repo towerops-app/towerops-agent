@@ -60,8 +60,16 @@ impl SnmpClient {
                 create_v1v2c_session(&addr, &community, version_num)?
             };
 
-            // Perform GET request
-            let response = session.get(&oid_parsed).map_err(map_snmp_error)?;
+            // Perform GET request (with retry for v3 engine ID discovery)
+            let mut response = match session.get(&oid_parsed) {
+                Ok(resp) => resp,
+                Err(snmp2::Error::AuthUpdated) => {
+                    tracing::debug!("SNMPv3 engine ID discovered, retrying request");
+                    // Retry after engine ID discovery
+                    session.get(&oid_parsed).map_err(map_snmp_error)?
+                }
+                Err(e) => return Err(map_snmp_error(e)),
+            };
 
             // Check for error status
             if response.error_status != 0 {
@@ -72,7 +80,7 @@ impl SnmpClient {
             }
 
             // Extract first varbind
-            for (_name, value) in response.varbinds {
+            if let Some((_name, value)) = response.varbinds.next() {
                 return convert_value(value);
             }
 
@@ -129,7 +137,16 @@ impl SnmpClient {
 
                 // Extract data we need from the response immediately
                 let (error_status, varbind_data) = {
-                    let response = session.getnext(&oid_to_query).map_err(map_snmp_error)?;
+                    // Perform GETNEXT request (with retry for v3 engine ID discovery)
+                    let response = match session.getnext(&oid_to_query) {
+                        Ok(resp) => resp,
+                        Err(snmp2::Error::AuthUpdated) => {
+                            tracing::debug!("SNMPv3 engine ID discovered, retrying getnext");
+                            // Retry after engine ID discovery
+                            session.getnext(&oid_to_query).map_err(map_snmp_error)?
+                        }
+                        Err(e) => return Err(map_snmp_error(e)),
+                    };
                     let status = response.error_status;
 
                     // Collect all varbind data as owned strings/values immediately
@@ -322,8 +339,18 @@ fn create_v3_session(addr: &str, config: &V3Config) -> SnmpResult<SyncSession> {
     let timeout = Some(Duration::from_secs(SNMP_TIMEOUT_SECS));
     let req_id = 1;
 
-    SyncSession::new_v3(addr, timeout, req_id, security)
-        .map_err(|e| SnmpError::RequestFailed(format!("SNMPv3 session creation failed: {:?}", e)))
+    let mut session = SyncSession::new_v3(addr, timeout, req_id, security).map_err(|e| {
+        SnmpError::RequestFailed(format!("SNMPv3 session creation failed: {:?}", e))
+    })?;
+
+    // For authPriv/authNoPriv, perform engine ID discovery using session.init()
+    if needs_auth_protocol {
+        session.init().map_err(|e| {
+            SnmpError::RequestFailed(format!("Engine ID discovery failed: {:?}", e))
+        })?;
+    }
+
+    Ok(session)
 }
 
 /// Convert snmp2 crate's Value to our SnmpValue

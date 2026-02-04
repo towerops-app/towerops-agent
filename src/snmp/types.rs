@@ -29,11 +29,15 @@ pub type SnmpResult<T> = Result<T, SnmpError>;
 pub enum SnmpValue {
     Integer(i64),
     String(String),
+    OctetString(Vec<u8>),
+    Oid(String),
     Counter32(u32),
     Counter64(u64),
     Gauge32(u32),
     TimeTicks(u32),
     IpAddress(String),
+    Null,
+    Unsupported(String),
 }
 
 impl SnmpValue {
