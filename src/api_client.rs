@@ -2,9 +2,9 @@ use crate::config::{AgentConfig, HeartbeatMetadata};
 use crate::metrics::Metric;
 use crate::proto::agent;
 use prost::Message;
-use serde_json::json;
 use std::time::Duration;
 use thiserror::Error;
+use tracing::debug;
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -49,15 +49,19 @@ impl ApiClient {
                 .map_err(|e| ApiError::RequestFailed(e.to_string()))?;
 
             let status = response.status();
+            debug!("fetch_config response: status={}", status);
+
             if status != 200 {
                 return Err(ApiError::StatusError(status));
             }
 
-            let config: AgentConfig = response
-                .into_json()
+            let body = response
+                .into_string()
                 .map_err(|e| ApiError::RequestFailed(e.to_string()))?;
+            debug!("fetch_config response body: {}", body);
 
-            Ok(config)
+            let config: AgentConfig = serde_json::from_str(&body)
+                .map_err(|e| ApiError::RequestFailed(e.to_string()))?;
         })
         .await
         .map_err(|e| ApiError::JoinError(e.to_string()))??;
@@ -100,9 +104,16 @@ impl ApiClient {
                 .map_err(|e| ApiError::RequestFailed(e.to_string()))?;
 
             let status = response.status();
+            debug!("submit_metrics response: status={}", status);
+
             if status != 200 {
                 return Err(ApiError::StatusError(status));
             }
+
+            let body = response
+                .into_string()
+                .map_err(|e| ApiError::RequestFailed(e.to_string()))?;
+            debug!("submit_metrics response body: {}", body);
 
             Ok(())
         })
@@ -125,9 +136,16 @@ impl ApiClient {
                 .map_err(|e| ApiError::RequestFailed(e.to_string()))?;
 
             let status = response.status();
+            debug!("heartbeat response: status={}", status);
+
             if status != 200 {
                 return Err(ApiError::StatusError(status));
             }
+
+            let body = response
+                .into_string()
+                .map_err(|e| ApiError::RequestFailed(e.to_string()))?;
+            debug!("heartbeat response body: {}", body);
 
             Ok(())
         })
