@@ -647,8 +647,9 @@ async fn execute_snmp_job(
 
     // Build result
     let result = SnmpResult {
-        device_id: job.device_id,
+        device_id: job.device_id.clone(),
         job_type: job.job_type,
+        job_id: job.job_id.clone(),
         oid_values,
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
