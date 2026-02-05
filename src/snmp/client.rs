@@ -3,9 +3,10 @@ use crate::secret::SecretString;
 use snmp2::SyncSession;
 use std::time::Duration;
 
-// SNMP timeout in seconds - increased from 5s to 30s to match Phoenix app
-// and reduce timeouts for slow devices or congested networks
-const SNMP_TIMEOUT_SECS: u64 = 30;
+// SNMP timeout in seconds - increased to 60s for SNMPv3 operations
+// SNMPv3 has significant encryption/auth overhead, especially for large walks
+// MikroTik enterprise tree (1.3.6.1.4.1.14988) can take 16+ seconds with v3
+const SNMP_TIMEOUT_SECS: u64 = 60;
 
 /// SNMPv3 configuration bundle
 #[derive(Clone)]

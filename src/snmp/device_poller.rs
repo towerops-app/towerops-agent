@@ -6,7 +6,9 @@ use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-const SNMP_TIMEOUT_SECS: u64 = 30;
+// SNMP timeout in seconds - increased to 60s for SNMPv3 operations
+// SNMPv3 has significant encryption/auth overhead
+const SNMP_TIMEOUT_SECS: u64 = 60;
 
 /// Request to perform an SNMP operation
 #[derive(Debug)]
@@ -487,10 +489,7 @@ mod tests {
     fn test_parse_auth_protocol_standard() {
         use snmp2::v3::AuthProtocol;
         assert!(matches!(parse_auth_protocol("MD5"), Ok(AuthProtocol::Md5)));
-        assert!(matches!(
-            parse_auth_protocol("SHA"),
-            Ok(AuthProtocol::Sha1)
-        ));
+        assert!(matches!(parse_auth_protocol("SHA"), Ok(AuthProtocol::Sha1)));
         assert!(matches!(
             parse_auth_protocol("SHA1"),
             Ok(AuthProtocol::Sha1)
@@ -541,10 +540,7 @@ mod tests {
             parse_auth_protocol("sha-256"),
             Ok(AuthProtocol::Sha256)
         ));
-        assert!(matches!(
-            parse_auth_protocol("md5"),
-            Ok(AuthProtocol::Md5)
-        ));
+        assert!(matches!(parse_auth_protocol("md5"), Ok(AuthProtocol::Md5)));
     }
 
     #[test]
@@ -557,35 +553,17 @@ mod tests {
         use snmp2::v3::Cipher;
         assert!(matches!(parse_priv_protocol("DES"), Ok(Cipher::Des)));
         assert!(matches!(parse_priv_protocol("AES"), Ok(Cipher::Aes128)));
-        assert!(matches!(
-            parse_priv_protocol("AES128"),
-            Ok(Cipher::Aes128)
-        ));
-        assert!(matches!(
-            parse_priv_protocol("AES192"),
-            Ok(Cipher::Aes192)
-        ));
-        assert!(matches!(
-            parse_priv_protocol("AES256"),
-            Ok(Cipher::Aes256)
-        ));
+        assert!(matches!(parse_priv_protocol("AES128"), Ok(Cipher::Aes128)));
+        assert!(matches!(parse_priv_protocol("AES192"), Ok(Cipher::Aes192)));
+        assert!(matches!(parse_priv_protocol("AES256"), Ok(Cipher::Aes256)));
     }
 
     #[test]
     fn test_parse_priv_protocol_hyphenated() {
         use snmp2::v3::Cipher;
-        assert!(matches!(
-            parse_priv_protocol("AES-128"),
-            Ok(Cipher::Aes128)
-        ));
-        assert!(matches!(
-            parse_priv_protocol("AES-192"),
-            Ok(Cipher::Aes192)
-        ));
-        assert!(matches!(
-            parse_priv_protocol("AES-256"),
-            Ok(Cipher::Aes256)
-        ));
+        assert!(matches!(parse_priv_protocol("AES-128"), Ok(Cipher::Aes128)));
+        assert!(matches!(parse_priv_protocol("AES-192"), Ok(Cipher::Aes192)));
+        assert!(matches!(parse_priv_protocol("AES-256"), Ok(Cipher::Aes256)));
         assert!(matches!(
             parse_priv_protocol("AES-256-C"),
             Ok(Cipher::Aes256)
