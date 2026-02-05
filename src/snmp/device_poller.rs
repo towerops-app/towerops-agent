@@ -6,9 +6,10 @@ use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-// SNMP timeout in seconds - increased to 60s for SNMPv3 operations
+// SNMP timeout in seconds - increased to 90s for SNMPv3 operations
 // SNMPv3 has significant encryption/auth overhead
-const SNMP_TIMEOUT_SECS: u64 = 60;
+// Full discovery can take 50+ seconds with complete MikroTik OID tree traversal
+const SNMP_TIMEOUT_SECS: u64 = 90;
 
 /// Request to perform an SNMP operation
 #[derive(Debug)]
