@@ -3,10 +3,10 @@ use crate::secret::SecretString;
 use snmp2::SyncSession;
 use std::time::Duration;
 
-// SNMP timeout in seconds - increased to 60s for SNMPv3 operations
+// SNMP timeout in seconds - increased to 90s for SNMPv3 operations
 // SNMPv3 has significant encryption/auth overhead, especially for large walks
-// MikroTik enterprise tree (1.3.6.1.4.1.14988) can take 16+ seconds with v3
-const SNMP_TIMEOUT_SECS: u64 = 60;
+// Full discovery can take 50+ seconds with complete MikroTik OID tree traversal
+const SNMP_TIMEOUT_SECS: u64 = 90;
 
 /// SNMPv3 configuration bundle
 #[derive(Clone)]
