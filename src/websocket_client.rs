@@ -471,14 +471,16 @@ impl AgentClient {
                     "Removing poller for device no longer in job list: {}",
                     device_id
                 );
-                self.poller_registry.remove(&device_id);
+                let device_ip = self.poller_registry.remove(&device_id);
 
                 #[cfg(feature = "tui")]
                 if let Some(ref bus) = self.event_bus {
-                    let _ = bus.send(crate::tui::AgentEvent::PollerRemoved {
-                        device_id: device_id.clone(),
-                        total_count: self.poller_registry.count(),
-                    });
+                    if let Some(ip) = device_ip {
+                        let _ = bus.send(crate::tui::AgentEvent::PollerRemoved {
+                            device_ip: ip,
+                            total_count: self.poller_registry.count(),
+                        });
+                    }
                 }
             }
         }
@@ -873,7 +875,7 @@ async fn execute_snmp_job(
         if count_after > count_before {
             if let Some(ref bus) = event_bus {
                 let _ = bus.send(crate::tui::AgentEvent::PollerCreated {
-                    device_id: job.device_id.clone(),
+                    device_ip: snmp_device.ip.clone(),
                     total_count: count_after,
                 });
             }

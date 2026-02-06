@@ -51,15 +51,20 @@ impl PollerRegistry {
 
     /// Remove a device poller (shutdown thread)
     /// Called when a device is deleted or no longer needs polling
-    pub fn remove(&self, device_id: &str) {
+    /// Returns the device IP if the poller was found
+    pub fn remove(&self, device_id: &str) -> Option<String> {
         let mut pollers = self.pollers.write().unwrap();
         if let Some(poller) = pollers.remove(device_id) {
+            let ip = poller.config().ip.clone();
             poller.shutdown();
             tracing::info!(
                 "Removed device poller for {} (remaining: {})",
                 device_id,
                 pollers.len()
             );
+            Some(ip)
+        } else {
+            None
         }
     }
 
@@ -121,8 +126,9 @@ mod tests {
         assert_eq!(poller.device_id(), "test-device");
 
         // Remove the poller
-        registry.remove("test-device");
+        let removed_ip = registry.remove("test-device");
         assert_eq!(registry.count(), 0);
+        assert_eq!(removed_ip, Some("127.0.0.1".to_string()));
     }
 
     #[test]

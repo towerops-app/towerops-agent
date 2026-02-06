@@ -106,27 +106,27 @@ impl AgentState {
                 )
             }
             AgentEvent::PollerCreated {
-                device_id,
+                device_ip,
                 total_count,
             } => {
                 self.active_pollers = *total_count;
-                if !self.active_devices.contains(device_id) {
-                    self.active_devices.push(device_id.clone());
+                if !self.active_devices.contains(device_ip) {
+                    self.active_devices.push(device_ip.clone());
                 }
                 format!(
                     "Poller created for {} ({} total pollers)",
-                    device_id, total_count
+                    device_ip, total_count
                 )
             }
             AgentEvent::PollerRemoved {
-                device_id,
+                device_ip,
                 total_count,
             } => {
                 self.active_pollers = *total_count;
-                self.active_devices.retain(|d| d != device_id);
+                self.active_devices.retain(|d| d != device_ip);
                 format!(
                     "Poller removed for {} ({} total pollers)",
-                    device_id, total_count
+                    device_ip, total_count
                 )
             }
             AgentEvent::HeartbeatSent => {
