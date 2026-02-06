@@ -21,6 +21,16 @@ russh = "0.57"
 async-trait = "0.1"
 home = "=0.5.12"
 zeroize = { version = "1", features = ["derive"] }
+hostname = "0.4"
+anyhow = "1.0"
+
+# TUI dependencies (optional feature)
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+
+[features]
+default = ["tui"]
+tui = ["ratatui", "crossterm"]
 
 [build-dependencies]
 prost-build = "0.14"

@@ -3,6 +3,8 @@ mod proto;
 pub mod secret;
 mod snmp;
 mod ssh;
+#[cfg(feature = "tui")]
+mod tui;
 mod version;
 mod websocket_client;
 
@@ -16,16 +18,45 @@ use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 use websocket_client::AgentClient;
 
-fn init_logger() {
+fn init_logger(suppress_stdout: bool) {
     // Use LOG_LEVEL env var (fall back to RUST_LOG for backwards compatibility)
     let filter = env::var("LOG_LEVEL")
         .or_else(|_| env::var("RUST_LOG"))
         .unwrap_or_else(|_| "info".to_string());
 
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&filter))
-        .with_target(false)
-        .init();
+        .with_target(false);
+
+    if suppress_stdout {
+        // Route to sink when TUI is active (using closure to create MakeWriter)
+        builder.with_writer(std::io::sink).init();
+    } else {
+        builder.init();
+    }
+}
+
+/// Determine if TUI should be enabled based on CLI flags and TTY detection
+#[cfg(feature = "tui")]
+fn should_enable_tui(args: &Args) -> bool {
+    // If explicitly disabled, never enable
+    if args.no_tui {
+        return false;
+    }
+
+    // If explicitly enabled, always enable
+    if let Some(explicit) = args.tui {
+        return explicit;
+    }
+
+    // Auto-detect: check if stdout is a TTY
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+}
+
+#[cfg(not(feature = "tui"))]
+fn should_enable_tui(_args: &Args) -> bool {
+    false
 }
 
 /// Convert HTTP(S) URL to WebSocket URL
@@ -113,12 +144,17 @@ struct Args {
     /// SNMPv3 priv password (for --snmpv3-test)
     #[arg(long, default_value = "")]
     snmpv3_priv_pass: String,
+
+    /// Enable TUI mode (auto-detects TTY by default)
+    #[arg(long, env = "TOWEROPS_TUI")]
+    tui: Option<bool>,
+
+    /// Force disable TUI even if TTY is available
+    #[arg(long, env = "TOWEROPS_NO_TUI", default_value_t = false)]
+    no_tui: bool,
 }
 
 fn main() {
-    // Initialize logging
-    init_logger();
-
     // Build Tokio runtime with larger stack size for SNMPv3 crypto operations
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -131,6 +167,12 @@ fn main() {
 
 async fn async_main() {
     let args = Args::parse();
+
+    // Determine if TUI should be enabled (before initializing logger)
+    let tui_enabled = should_enable_tui(&args);
+
+    // Initialize logging (suppress stdout if TUI is enabled)
+    init_logger(tui_enabled);
 
     // Handle MikroTik test mode
     if args.mikrotik_test {
@@ -181,11 +223,57 @@ async fn async_main() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Spawn signal handler for graceful shutdown
+    let shutdown_tx_clone = shutdown_tx.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         tracing::info!("Shutdown signal received, initiating graceful shutdown...");
-        let _ = shutdown_tx.send(true);
+        let _ = shutdown_tx_clone.send(true);
     });
+
+    // Setup TUI if enabled
+    #[cfg(feature = "tui")]
+    let (event_bus, _tui_handle) = if tui_enabled {
+        use std::sync::Mutex;
+
+        // Get hostname for TUI state
+        let hostname = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Create event bus and shared state
+        let event_bus = tui::EventBus::new(100);
+        let agent_state = Arc::new(Mutex::new(tui::AgentState::new(
+            hostname,
+            env!("CARGO_PKG_VERSION").to_string(),
+        )));
+
+        // Spawn TUI task
+        match tui::TuiApp::new(agent_state.clone(), event_bus.subscribe()) {
+            Ok(mut tui_app) => {
+                let shutdown_rx_clone = shutdown_rx.clone();
+                let tui_handle = tokio::spawn(async move {
+                    if let Err(e) = tui_app.run(shutdown_rx_clone).await {
+                        eprintln!("TUI task failed: {}", e);
+                    }
+                    // When TUI exits (user presses 'q'), trigger shutdown
+                    let _ = shutdown_tx.send(true);
+                });
+
+                (Some(event_bus), Some(tui_handle))
+            }
+            Err(e) => {
+                eprintln!("Failed to initialize TUI: {}", e);
+                eprintln!("Falling back to log mode");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+
+    #[cfg(not(feature = "tui"))]
+    let event_bus: Option<()> = None;
 
     // Retry loop with exponential backoff
     let mut retry_delay = Duration::from_secs(1);
@@ -216,6 +304,26 @@ async fn async_main() {
         }
 
         // Connect to Towerops server via WebSocket
+        #[cfg(feature = "tui")]
+        let mut client = match AgentClient::connect(&ws_url, &token, event_bus.clone()).await {
+            Ok(client) => {
+                tracing::info!("Successfully connected to server");
+                // Mark as connected for health check
+                connected.store(true, Ordering::Relaxed);
+                // Reset retry delay on successful connection
+                retry_delay = Duration::from_secs(1);
+                attempt = 0;
+                client
+            }
+            Err(e) => {
+                tracing::error!("Failed to connect to server: {}", e);
+                // Mark as disconnected for health check
+                connected.store(false, Ordering::Relaxed);
+                continue;
+            }
+        };
+
+        #[cfg(not(feature = "tui"))]
         let mut client = match AgentClient::connect(&ws_url, &token).await {
             Ok(client) => {
                 tracing::info!("Successfully connected to server");
