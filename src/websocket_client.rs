@@ -365,7 +365,7 @@ impl AgentClient {
             version: env!("CARGO_PKG_VERSION").to_string(),
             hostname: self.cached_hostname.clone(),
             uptime_seconds: get_uptime_seconds(),
-            ip_address: get_local_ip().unwrap_or_else(|| "unknown".to_string()),
+            ip_address: get_local_ip().unwrap_or_else(|| "".to_string()),
         };
 
         let binary = heartbeat.encode_to_vec();
