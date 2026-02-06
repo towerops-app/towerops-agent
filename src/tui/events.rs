@@ -30,11 +30,11 @@ pub enum AgentEvent {
         sentence_count: usize,
     },
     PollerCreated {
-        device_id: String,
+        device_ip: String,
         total_count: usize,
     },
     PollerRemoved {
-        device_id: String,
+        device_ip: String,
         total_count: usize,
     },
     HeartbeatSent,
