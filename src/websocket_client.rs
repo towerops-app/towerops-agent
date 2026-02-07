@@ -512,7 +512,8 @@ impl AgentClient {
                     tokio::spawn(async move {
                         let start_time = std::time::Instant::now();
                         match execute_mikrotik_job(job, mikrotik_result_tx).await {
-                            Ok(_) => {
+                            Ok(_) =>
+                            {
                                 #[cfg(feature = "tui")]
                                 if let Some(ref bus) = event_bus {
                                     let _ = bus.send(crate::tui::AgentEvent::JobCompleted {
@@ -547,7 +548,8 @@ impl AgentClient {
                     tokio::spawn(async move {
                         let start_time = std::time::Instant::now();
                         match execute_credential_test(job, credential_test_tx).await {
-                            Ok(_) => {
+                            Ok(_) =>
+                            {
                                 #[cfg(feature = "tui")]
                                 if let Some(ref bus) = event_bus {
                                     let _ = bus.send(crate::tui::AgentEvent::JobCompleted {
@@ -585,12 +587,15 @@ impl AgentClient {
                     tokio::spawn(async move {
                         let start_time = std::time::Instant::now();
                         #[cfg(feature = "tui")]
-                        let result = execute_snmp_job(job, result_tx, poller_registry, event_bus_for_task).await;
+                        let result =
+                            execute_snmp_job(job, result_tx, poller_registry, event_bus_for_task)
+                                .await;
                         #[cfg(not(feature = "tui"))]
                         let result = execute_snmp_job(job, result_tx, poller_registry).await;
 
                         match result {
-                            Ok(_) => {
+                            Ok(_) =>
+                            {
                                 #[cfg(feature = "tui")]
                                 if let Some(ref bus) = event_bus {
                                     let _ = bus.send(crate::tui::AgentEvent::JobCompleted {
