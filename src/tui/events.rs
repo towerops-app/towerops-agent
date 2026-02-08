@@ -29,6 +29,10 @@ pub enum AgentEvent {
         device_id: String,
         sentence_count: usize,
     },
+    MonitoringCheckSent {
+        device_id: String,
+        status: String,
+    },
     PollerCreated {
         device_ip: String,
         total_count: usize,

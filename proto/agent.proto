@@ -115,6 +115,7 @@ enum JobType {
   POLL = 1;
   MIKROTIK = 2;
   TEST_CREDENTIALS = 3;
+  PING = 4;
 }
 
 enum QueryType {

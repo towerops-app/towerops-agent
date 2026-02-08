@@ -23,6 +23,8 @@ home = "=0.5.12"
 zeroize = { version = "1", features = ["derive"] }
 hostname = "0.4"
 anyhow = "1.0"
+surge-ping = "0.8"
+rand = "0.8"
 
 # TUI dependencies (optional feature)
 ratatui = { version = "0.30", optional = true }
