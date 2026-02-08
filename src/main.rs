@@ -1,4 +1,5 @@
 mod mikrotik;
+mod ping;
 mod proto;
 pub mod secret;
 mod snmp;

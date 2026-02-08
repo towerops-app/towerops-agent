@@ -26,7 +26,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 
 use crate::proto::agent::{
     AgentHeartbeat, AgentJob, AgentJobList, CredentialTestResult, JobType, MikrotikResult,
-    MikrotikSentence, QueryType, SnmpResult,
+    MikrotikSentence, MonitoringCheck, QueryType, SnmpResult,
 };
 use crate::snmp::{DeviceConfig, PollerRegistry, SnmpValue};
 
@@ -62,6 +62,8 @@ pub struct AgentClient {
     mikrotik_result_rx: mpsc::Receiver<MikrotikResult>,
     credential_test_tx: mpsc::Sender<CredentialTestResult>,
     credential_test_rx: mpsc::Receiver<CredentialTestResult>,
+    monitoring_check_tx: mpsc::Sender<MonitoringCheck>,
+    monitoring_check_rx: mpsc::Receiver<MonitoringCheck>,
     poller_registry: PollerRegistry,
     /// Counter for Phoenix transport heartbeat refs
     phx_heartbeat_ref: u64,
@@ -139,6 +141,7 @@ impl AgentClient {
         let (result_tx, result_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
         let (mikrotik_result_tx, mikrotik_result_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
         let (credential_test_tx, credential_test_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
+        let (monitoring_check_tx, monitoring_check_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
 
         // Split the WebSocket stream so reads and writes can proceed concurrently.
         // The write half is owned by a dedicated writer task.
@@ -175,6 +178,8 @@ impl AgentClient {
             mikrotik_result_rx,
             credential_test_tx,
             credential_test_rx,
+            monitoring_check_tx,
+            monitoring_check_rx,
             poller_registry: PollerRegistry::new(),
             phx_heartbeat_ref: 0,
             cached_hostname: get_hostname(),
@@ -228,6 +233,7 @@ impl AgentClient {
         let (result_tx, result_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
         let (mikrotik_result_tx, mikrotik_result_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
         let (credential_test_tx, credential_test_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
+        let (monitoring_check_tx, monitoring_check_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
 
         // Split the WebSocket stream so reads and writes can proceed concurrently.
         // The write half is owned by a dedicated writer task.
@@ -264,6 +270,8 @@ impl AgentClient {
             mikrotik_result_rx,
             credential_test_tx,
             credential_test_rx,
+            monitoring_check_tx,
+            monitoring_check_rx,
             poller_registry: PollerRegistry::new(),
             phx_heartbeat_ref: 0,
             cached_hostname: get_hostname(),
@@ -377,6 +385,20 @@ impl AgentClient {
                 Some(credential_test_result) = self.credential_test_rx.recv() => {
                     if let Err(e) = self.send_credential_test_result(credential_test_result).await {
                         tracing::error!("Error sending credential test result: {}", e);
+                    }
+                }
+
+                // Receive monitoring check results from job tasks
+                Some(monitoring_check) = self.monitoring_check_rx.recv() => {
+                    #[cfg(feature = "tui")]
+                    let device_id = monitoring_check.device_id.clone();
+
+                    if let Err(e) = self.send_monitoring_check(monitoring_check).await {
+                        tracing::error!("Error sending monitoring check: {}", e);
+                        #[cfg(feature = "tui")]
+                        self.publish_event(crate::tui::AgentEvent::Error {
+                            message: format!("Monitoring check send failed for {}: {}", device_id, e),
+                        });
                     }
                 }
 
@@ -561,6 +583,42 @@ impl AgentClient {
                             }
                             Err(e) => {
                                 tracing::error!("Credential test execution failed: {}", e);
+                                #[cfg(feature = "tui")]
+                                if let Some(ref bus) = event_bus {
+                                    let _ = bus.send(crate::tui::AgentEvent::JobFailed {
+                                        job_id,
+                                        device_id,
+                                        error: e.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    });
+                }
+                JobType::Ping => {
+                    // Execute ICMP ping health check
+                    let monitoring_check_tx = self.monitoring_check_tx.clone();
+                    #[cfg(feature = "tui")]
+                    let event_bus = self.event_bus.clone();
+                    let job_id = job.job_id.clone();
+                    let device_id = job.device_id.clone();
+
+                    tokio::spawn(async move {
+                        let start_time = std::time::Instant::now();
+                        match execute_ping_job(job, monitoring_check_tx).await {
+                            Ok(_) =>
+                            {
+                                #[cfg(feature = "tui")]
+                                if let Some(ref bus) = event_bus {
+                                    let _ = bus.send(crate::tui::AgentEvent::JobCompleted {
+                                        job_id,
+                                        device_id,
+                                        duration_ms: start_time.elapsed().as_millis() as u64,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Ping job execution failed: {}", e);
                                 #[cfg(feature = "tui")]
                                 if let Some(ref bus) = event_bus {
                                     let _ = bus.send(crate::tui::AgentEvent::JobFailed {
@@ -763,6 +821,38 @@ impl AgentClient {
             result.test_id,
             result.success
         );
+        Ok(())
+    }
+
+    /// Send monitoring check result to server.
+    async fn send_monitoring_check(&mut self, result: MonitoringCheck) -> Result<()> {
+        let binary = result.encode_to_vec();
+
+        let msg = PhoenixMessage {
+            topic: format!("agent:{}", self.agent_id),
+            event: "monitoring_check".to_string(),
+            payload: serde_json::json!({"binary": base64_encode(&binary)}),
+            reference: None,
+        };
+
+        let text = serde_json::to_string(&msg)?;
+        self.ws_write_tx
+            .send(WsMessage::Text(text.into()))
+            .await
+            .map_err(|e| format!("Writer task closed: {}", e))?;
+
+        tracing::debug!(
+            "Sent monitoring check for device {} (status: {})",
+            result.device_id,
+            result.status
+        );
+
+        #[cfg(feature = "tui")]
+        self.publish_event(crate::tui::AgentEvent::MonitoringCheckSent {
+            device_id: result.device_id.clone(),
+            status: result.status.clone(),
+        });
+
         Ok(())
     }
 }
@@ -1075,6 +1165,64 @@ async fn execute_credential_test(
         tracing::warn!(
             "Failed to send credential test result for job {}: channel closed",
             job.job_id
+        );
+        return Err(format!("Result channel closed: {}", e).into());
+    }
+
+    Ok(())
+}
+
+/// Execute a ping job using ICMP ping to check device health.
+async fn execute_ping_job(
+    job: AgentJob,
+    result_tx: mpsc::Sender<MonitoringCheck>,
+) -> Result<()> {
+    let device_id = job.device_id.clone();
+    let snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
+    let ip_address = &snmp_device.ip;
+
+    // Use 5-second timeout for pings (same as Phoenix DeviceMonitorWorker)
+    let timeout_ms = 5000;
+
+    tracing::debug!("Executing health check for device {} at {}", device_id, ip_address);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+
+    // Execute ping
+    let result = match crate::ping::ping_device(ip_address, timeout_ms).await {
+        Ok(response_time_ms) => {
+            tracing::info!(
+                "✓ Device {} is up (response time: {:.1}ms)",
+                device_id,
+                response_time_ms
+            );
+
+            MonitoringCheck {
+                device_id: device_id.clone(),
+                status: "success".to_string(),
+                response_time_ms,
+                timestamp,
+            }
+        }
+        Err(e) => {
+            tracing::warn!("✗ Device {} is down: {}", device_id, e);
+
+            MonitoringCheck {
+                device_id: device_id.clone(),
+                status: "failure".to_string(),
+                response_time_ms: 0.0,
+                timestamp,
+            }
+        }
+    };
+
+    // Send result back to main client task
+    if let Err(e) = result_tx.send(result).await {
+        tracing::warn!(
+            "Failed to send monitoring check for device {}: channel closed",
+            device_id
         );
         return Err(format!("Result channel closed: {}", e).into());
     }
