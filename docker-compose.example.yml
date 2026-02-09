@@ -5,9 +5,6 @@ services:
     restart: unless-stopped
 
     environment:
-      # Required: Your Towerops API URL
-      - TOWEROPS_API_URL=https://towerops.net
-
       # Required: Agent authentication token (from Towerops web UI)
       # Get this from: Organization > Agents > Create New Agent
       - TOWEROPS_AGENT_TOKEN=your-agent-token-here
