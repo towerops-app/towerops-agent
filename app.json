@@ -1,5 +1,0 @@
-{
-  "name": "towerops-agent",
-  "description": "Towerops SNMP polling agent",
-  "healthchecks": []
-}
