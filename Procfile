@@ -1,1 +1,1 @@
-worker: towerops-agent
+worker: towerops-agent --no-tui
