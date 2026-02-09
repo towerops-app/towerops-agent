@@ -1,1 +1,1 @@
-worker: towerops-agent --no-tui
+worker: /usr/local/bin/towerops-agent --no-tui
