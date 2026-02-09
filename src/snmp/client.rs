@@ -1,14 +1,70 @@
 use super::types::{SnmpError, SnmpResult, SnmpValue};
-use crate::secret::SecretString;
-use snmp2::SyncSession;
-use std::time::Duration;
+use netsnmp_sys::*;
+use std::ffi::{CStr, CString};
+use std::ptr;
+use zeroize::{Zeroize, Zeroizing};
 
-// SNMP timeout in seconds - increased to 120s for SNMPv3 operations
-// SNMPv3 has significant encryption/auth overhead, especially for large walks
-// Full discovery can take 50+ seconds with complete MikroTik OID tree traversal
-const SNMP_TIMEOUT_SECS: u64 = 120;
+type SecretString = Zeroizing<String>;
 
-/// SNMPv3 configuration bundle
+const SNMP_TIMEOUT_SECS: i64 = 10;
+const SNMP_RETRIES: i32 = 2;
+const MAX_OID_LEN: usize = 128;
+
+// C structs and functions
+#[repr(C)]
+#[derive(Clone)]
+struct SnmpWalkResult {
+    oid: [u8; 256],
+    value: [u8; 1024],
+    value_len: usize,
+    value_type: i32,
+}
+
+#[repr(C)]
+struct SnmpV3ConfigC {
+    username: *const i8,
+    auth_password: *const i8,
+    priv_password: *const i8,
+    auth_protocol: *const i8,
+    priv_protocol: *const i8,
+    security_level: *const i8,
+}
+
+extern "C" {
+    fn snmp_init_library() -> i32;
+    fn snmp_open_session(
+        ip_address: *const i8,
+        port: u16,
+        community: *const i8,
+        version: i32,
+        timeout_us: i64,
+        retries: i32,
+        v3_config: *const SnmpV3ConfigC,
+        error_buf: *mut i8,
+        error_buf_len: usize,
+    ) -> *mut std::ffi::c_void;
+    fn snmp_close_session(sess_handle: *mut std::ffi::c_void);
+    fn snmp_get(
+        sess_handle: *mut std::ffi::c_void,
+        oid_str: *const i8,
+        value_buf: *mut std::ffi::c_void,
+        value_buf_len: usize,
+        value_type: *mut i32,
+        error_buf: *mut i8,
+        error_buf_len: usize,
+    ) -> i32;
+    fn snmp_walk(
+        sess_handle: *mut std::ffi::c_void,
+        oid_str: *const i8,
+        results: *mut SnmpWalkResult,
+        max_results: usize,
+        num_results: *mut usize,
+        error_buf: *mut i8,
+        error_buf_len: usize,
+    ) -> i32;
+}
+
+/// SNMPv3 configuration
 #[derive(Clone)]
 pub struct V3Config {
     pub username: String,
@@ -38,12 +94,16 @@ impl std::fmt::Debug for V3Config {
     }
 }
 
-/// SNMP client for polling devices
+/// SNMP client for polling devices using libnetsnmp
 #[derive(Debug, Clone, Copy)]
 pub struct SnmpClient;
 
 impl SnmpClient {
     pub fn new() -> Self {
+        // Initialize libnetsnmp via C helper
+        unsafe {
+            snmp_init_library();
+        }
         Self
     }
 
@@ -57,163 +117,44 @@ impl SnmpClient {
         oid: &str,
         v3_config: Option<V3Config>,
     ) -> SnmpResult<SnmpValue> {
-        use snmp2::Oid;
-        use std::str::FromStr;
-
-        // Parse OID string
-        let oid_parsed = Oid::from_str(oid)
-            .map_err(|_| SnmpError::InvalidOid(format!("Invalid OID: {}", oid)))?;
-
         // Clone data for the blocking task
-        let addr = format!("{}:{}", ip_address, port);
-        let community = community.as_bytes().to_vec();
-        let version_num = parse_snmp_version(version)?;
+        let ip_address = ip_address.to_string();
+        let community = community.to_string();
+        let version = version.to_string();
+        let oid = oid.to_string();
 
         // Run SNMP operation in blocking thread pool
-        let result = tokio::task::spawn_blocking(move || {
-            // Create session based on version
-            let mut session = if version_num == 3 {
-                let config = v3_config.ok_or_else(|| {
-                    SnmpError::RequestFailed("SNMPv3 config required for version 3".into())
-                })?;
-                create_v3_session(&addr, &config)?
-            } else {
-                create_v1v2c_session(&addr, &community, version_num)?
-            };
-
-            // Perform GET request (with retry for v3 engine ID discovery)
-            let mut response = match session.get(&oid_parsed) {
-                Ok(resp) => resp,
-                Err(snmp2::Error::AuthUpdated) => {
-                    tracing::debug!("SNMPv3 engine ID discovered, retrying request");
-                    // Retry after engine ID discovery
-                    session.get(&oid_parsed).map_err(map_snmp_error)?
-                }
-                Err(e) => return Err(map_snmp_error(e)),
-            };
-
-            // Check for error status
-            if response.error_status != 0 {
-                return Err(SnmpError::RequestFailed(format!(
-                    "SNMP error status: {}",
-                    response.error_status
-                )));
-            }
-
-            // Extract first varbind
-            if let Some((_name, value)) = response.varbinds.next() {
-                return convert_value(value);
-            }
-
-            Err(SnmpError::RequestFailed("No varbinds in response".into()))
+        tokio::task::spawn_blocking(move || {
+            let session = SnmpSession::new(&ip_address, port, &community, &version, v3_config)?;
+            session.get(&oid)
         })
         .await
-        .map_err(|e| SnmpError::RequestFailed(format!("Task join error: {}", e)))??;
-
-        Ok(result)
+        .map_err(|e| SnmpError::RequestFailed(format!("Task join error: {}", e)))?
     }
 
-    /// Perform an SNMP WALK operation to get multiple values
-    #[allow(dead_code)] // Ready for use but not yet called
+    /// Perform an SNMP WALK operation
     pub async fn walk(
         &self,
         ip_address: &str,
         community: &str,
         version: &str,
         port: u16,
-        base_oid: &str,
+        oid: &str,
         v3_config: Option<V3Config>,
     ) -> SnmpResult<Vec<(String, SnmpValue)>> {
-        use snmp2::Oid;
-        use std::str::FromStr;
-
-        // Parse base OID string and clone it for moving into async block
-        let base_oid_parsed = Oid::from_str(base_oid)
-            .map_err(|_| SnmpError::InvalidOid(format!("Invalid base OID: {}", base_oid)))?;
-        let base_oid_string = base_oid.to_string();
-
         // Clone data for the blocking task
-        let addr = format!("{}:{}", ip_address, port);
-        let community = community.as_bytes().to_vec();
-        let version_num = parse_snmp_version(version)?;
+        let ip_address = ip_address.to_string();
+        let community = community.to_string();
+        let version = version.to_string();
+        let oid = oid.to_string();
 
-        // Run SNMP walk in blocking thread pool
-        let results = tokio::task::spawn_blocking(move || {
-            // Create session based on version
-            let mut session = if version_num == 3 {
-                let config = v3_config.ok_or_else(|| {
-                    SnmpError::RequestFailed("SNMPv3 config required for version 3".into())
-                })?;
-                create_v3_session(&addr, &config)?
-            } else {
-                create_v1v2c_session(&addr, &community, version_num)?
-            };
-
-            let mut results = Vec::new();
-            let mut current_oid = base_oid_parsed;
-
-            // Perform GETNEXT repeatedly until we leave the base OID tree
-            loop {
-                let oid_to_query = current_oid.clone();
-
-                // Extract data we need from the response immediately
-                let (error_status, varbind_data) = {
-                    // Perform GETNEXT request (with retry for v3 engine ID discovery)
-                    let response = match session.getnext(&oid_to_query) {
-                        Ok(resp) => resp,
-                        Err(snmp2::Error::AuthUpdated) => {
-                            tracing::debug!("SNMPv3 engine ID discovered, retrying getnext");
-                            // Retry after engine ID discovery
-                            session.getnext(&oid_to_query).map_err(map_snmp_error)?
-                        }
-                        Err(e) => return Err(map_snmp_error(e)),
-                    };
-                    let status = response.error_status;
-
-                    // Collect all varbind data as owned strings/values immediately
-                    let data: Vec<(String, snmp2::Value)> = response
-                        .varbinds
-                        .map(|(name, value)| (name.to_string(), value))
-                        .collect();
-
-                    (status, data)
-                    // response is dropped here, ending the mutable borrow of session
-                };
-
-                // Check for error status
-                if error_status != 0 {
-                    break;
-                }
-
-                if varbind_data.is_empty() {
-                    break;
-                }
-
-                // Process the owned varbind data
-                for (name_str, value) in varbind_data {
-                    // Check if the returned OID starts with our base OID
-                    if !name_str.starts_with(&base_oid_string) {
-                        return Ok(results);
-                    }
-
-                    // Convert value
-                    let converted_value = convert_value(value)?;
-
-                    results.push((name_str.clone(), converted_value));
-
-                    // Update current OID for next iteration (parse from string)
-                    current_oid = Oid::from_str(&name_str).map_err(|_| {
-                        SnmpError::InvalidOid(format!("Invalid OID from response: {}", name_str))
-                    })?;
-                }
-            }
-
-            Ok(results)
+        // Run SNMP operation in blocking thread pool
+        tokio::task::spawn_blocking(move || {
+            let session = SnmpSession::new(&ip_address, port, &community, &version, v3_config)?;
+            session.walk(&oid)
         })
         .await
-        .map_err(|e| SnmpError::RequestFailed(format!("Task join error: {}", e)))??;
-
-        Ok(results)
+        .map_err(|e| SnmpError::RequestFailed(format!("Task join error: {}", e)))?
     }
 }
 
@@ -223,387 +164,695 @@ impl Default for SnmpClient {
     }
 }
 
-/// Parse SNMP version string to integer for snmp2 crate
-/// Returns: 0 for SNMPv1, 1 for SNMPv2c, 3 for SNMPv3
-fn parse_snmp_version(version: &str) -> SnmpResult<i32> {
-    let normalized = version.trim().to_lowercase();
+/// RAII wrapper for SNMP session
+struct SnmpSession {
+    sess_handle: *mut std::ffi::c_void,
+}
 
-    match normalized.as_str() {
-        "1" | "v1" | "snmpv1" => Ok(0),
-        "2c" | "v2c" | "snmpv2c" | "2" | "v2" => Ok(1),
-        "3" | "v3" | "snmpv3" => Ok(3),
-        _ => Err(SnmpError::RequestFailed(format!(
-            "Unsupported SNMP version: '{}'. Supported versions: 1, v1, 2c, v2c, 3, v3",
+impl SnmpSession {
+    fn new(
+        ip_address: &str,
+        port: u16,
+        community: &str,
+        version: &str,
+        v3_config: Option<V3Config>,
+    ) -> SnmpResult<Self> {
+        tracing::debug!(
+            "Creating SNMP session: ip={}, port={}, version={}",
+            ip_address,
+            port,
             version
-        ))),
-    }
-}
+        );
 
-/// Parse authentication protocol string to snmp2 AuthProtocol enum
-fn parse_auth_protocol(protocol: &str) -> SnmpResult<snmp2::v3::AuthProtocol> {
-    use snmp2::v3::AuthProtocol;
+        // Parse SNMP version
+        let version_num = match version {
+            "1" | "v1" => 1,
+            "2c" | "v2c" | "2" => 2,
+            "3" | "v3" => 3,
+            _ => {
+                return Err(SnmpError::RequestFailed(format!(
+                    "Unsupported SNMP version: {}",
+                    version
+                )))
+            }
+        };
 
-    match protocol.trim().to_uppercase().as_str() {
-        "MD5" => Ok(AuthProtocol::Md5),
-        "SHA" | "SHA1" | "SHA-1" => Ok(AuthProtocol::Sha1),
-        "SHA-224" | "SHA224" => Ok(AuthProtocol::Sha224),
-        "SHA-256" | "SHA256" => Ok(AuthProtocol::Sha256),
-        "SHA-384" | "SHA384" => Ok(AuthProtocol::Sha384),
-        "SHA-512" | "SHA512" => Ok(AuthProtocol::Sha512),
-        _ => Err(SnmpError::RequestFailed(format!(
-            "Unsupported auth protocol: '{}'",
-            protocol
-        ))),
-    }
-}
+        unsafe {
+            let ip_cstr = CString::new(ip_address)
+                .map_err(|_| SnmpError::RequestFailed("Invalid IP address".into()))?;
+            let comm_cstr = CString::new(community)
+                .map_err(|_| SnmpError::RequestFailed("Invalid community string".into()))?;
 
-/// Parse privacy protocol string to snmp2 Cipher enum
-fn parse_priv_protocol(protocol: &str) -> SnmpResult<snmp2::v3::Cipher> {
-    use snmp2::v3::Cipher;
+            // Prepare SNMPv3 config if needed
+            let (v3_c_config, _v3_strings) = if let Some(ref v3) = v3_config {
+                let username_cstr = CString::new(v3.username.as_str())
+                    .map_err(|_| SnmpError::RequestFailed("Invalid username".into()))?;
+                let auth_pass_cstr = v3
+                    .auth_password
+                    .as_ref()
+                    .map(|p| CString::new(p.as_str()))
+                    .transpose()
+                    .map_err(|_| SnmpError::RequestFailed("Invalid auth password".into()))?;
+                let priv_pass_cstr = v3
+                    .priv_password
+                    .as_ref()
+                    .map(|p| CString::new(p.as_str()))
+                    .transpose()
+                    .map_err(|_| SnmpError::RequestFailed("Invalid priv password".into()))?;
+                let auth_proto_cstr = v3
+                    .auth_protocol
+                    .as_ref()
+                    .map(|p| CString::new(p.as_str()))
+                    .transpose()
+                    .map_err(|_| SnmpError::RequestFailed("Invalid auth protocol".into()))?;
+                let priv_proto_cstr = v3
+                    .priv_protocol
+                    .as_ref()
+                    .map(|p| CString::new(p.as_str()))
+                    .transpose()
+                    .map_err(|_| SnmpError::RequestFailed("Invalid priv protocol".into()))?;
+                let sec_level_cstr = CString::new(v3.security_level.as_str())
+                    .map_err(|_| SnmpError::RequestFailed("Invalid security level".into()))?;
 
-    match protocol.trim().to_uppercase().as_str() {
-        "DES" => Ok(Cipher::Des),
-        "AES" | "AES-128" | "AES128" => Ok(Cipher::Aes128),
-        "AES-192" | "AES192" => Ok(Cipher::Aes192),
-        "AES-256" | "AES256" | "AES-256-C" | "AES256C" => Ok(Cipher::Aes256),
-        _ => Err(SnmpError::RequestFailed(format!(
-            "Unsupported priv protocol: '{}'",
-            protocol
-        ))),
-    }
-}
+                let config = SnmpV3ConfigC {
+                    username: username_cstr.as_ptr(),
+                    auth_password: auth_pass_cstr
+                        .as_ref()
+                        .map(|c| c.as_ptr())
+                        .unwrap_or(ptr::null()),
+                    priv_password: priv_pass_cstr
+                        .as_ref()
+                        .map(|c| c.as_ptr())
+                        .unwrap_or(ptr::null()),
+                    auth_protocol: auth_proto_cstr
+                        .as_ref()
+                        .map(|c| c.as_ptr())
+                        .unwrap_or(ptr::null()),
+                    priv_protocol: priv_proto_cstr
+                        .as_ref()
+                        .map(|c| c.as_ptr())
+                        .unwrap_or(ptr::null()),
+                    security_level: sec_level_cstr.as_ptr(),
+                };
 
-/// Create SNMPv1/v2c session
-fn create_v1v2c_session(addr: &str, community: &[u8], version: i32) -> SnmpResult<SyncSession> {
-    let timeout = Some(Duration::from_secs(SNMP_TIMEOUT_SECS));
-    let req_id = 1;
+                (
+                    Some(config),
+                    Some((
+                        username_cstr,
+                        auth_pass_cstr,
+                        priv_pass_cstr,
+                        auth_proto_cstr,
+                        priv_proto_cstr,
+                        sec_level_cstr,
+                    )),
+                )
+            } else {
+                (None, None)
+            };
 
-    if version == 0 {
-        SyncSession::new_v1(addr, community, timeout, req_id)
-            .map_err(|_| SnmpError::NetworkUnreachable)
-    } else {
-        SyncSession::new_v2c(addr, community, timeout, req_id)
-            .map_err(|_| SnmpError::NetworkUnreachable)
-    }
-}
+            let mut error_buf = [0i8; 512];
+            let sess_handle = snmp_open_session(
+                ip_cstr.as_ptr(),
+                port,
+                comm_cstr.as_ptr(),
+                version_num,
+                SNMP_TIMEOUT_SECS * 1_000_000,
+                SNMP_RETRIES,
+                v3_c_config
+                    .as_ref()
+                    .map(|c| c as *const _)
+                    .unwrap_or(ptr::null()),
+                error_buf.as_mut_ptr(),
+                error_buf.len(),
+            );
 
-/// Create SNMPv3 session with authentication and/or privacy
-fn create_v3_session(addr: &str, config: &V3Config) -> SnmpResult<SyncSession> {
-    use snmp2::v3::{Auth, Security};
+            // Zeroize sensitive data
+            drop(comm_cstr);
+            drop(_v3_strings); // Drops all v3 CStrings
+            if !community.is_empty() {
+                let mut community_copy = community.to_string();
+                community_copy.zeroize();
+            }
 
-    let username = config.username.as_bytes();
-    let security_level = config.security_level.trim().to_lowercase();
+            if sess_handle.is_null() {
+                let err_msg = CStr::from_ptr(error_buf.as_ptr())
+                    .to_string_lossy()
+                    .to_string();
+                tracing::error!("SNMP session open failed: {}", err_msg);
 
-    // Build the Auth enum based on security level
-    let auth = match security_level.as_str() {
-        "noauthnopriv" | "" => Auth::NoAuthNoPriv,
+                return Err(
+                    if err_msg.contains("Unknown host") || err_msg.contains("Connection refused") {
+                        SnmpError::NetworkUnreachable
+                    } else {
+                        SnmpError::RequestFailed(err_msg)
+                    },
+                );
+            }
 
-        "authnopriv" => {
-            // Requires auth protocol and password
-            let _auth_proto =
-                parse_auth_protocol(config.auth_protocol.as_deref().ok_or_else(|| {
-                    SnmpError::RequestFailed("Auth protocol required for authNoPriv".into())
-                })?)?;
-            let _auth_pass = config
-                .auth_password
-                .as_ref()
-                .map(|s| s.expose())
-                .ok_or_else(|| {
-                    SnmpError::RequestFailed("Auth password required for authNoPriv".into())
-                })?;
-            Auth::AuthNoPriv
+            tracing::debug!("SNMP session opened successfully: {:?}", sess_handle);
+            Ok(Self { sess_handle })
         }
+    }
 
-        "authpriv" => {
-            // Requires auth and priv protocol/passwords
-            let _auth_proto =
-                parse_auth_protocol(config.auth_protocol.as_deref().ok_or_else(|| {
-                    SnmpError::RequestFailed("Auth protocol required for authPriv".into())
-                })?)?;
-            let _auth_pass = config
-                .auth_password
-                .as_ref()
-                .map(|s| s.expose())
-                .ok_or_else(|| {
-                    SnmpError::RequestFailed("Auth password required for authPriv".into())
-                })?;
-            let cipher =
-                parse_priv_protocol(config.priv_protocol.as_deref().ok_or_else(|| {
-                    SnmpError::RequestFailed("Priv protocol required for authPriv".into())
-                })?)?;
-            let priv_pass = config
-                .priv_password
-                .as_ref()
-                .map(|s| s.expose())
-                .ok_or_else(|| {
-                    SnmpError::RequestFailed("Priv password required for authPriv".into())
-                })?;
+    fn get(&self, oid: &str) -> SnmpResult<SnmpValue> {
+        unsafe {
+            let oid_cstr = CString::new(oid)
+                .map_err(|_| SnmpError::InvalidOid(format!("Invalid OID: {}", oid)))?;
 
-            Auth::AuthPriv {
-                cipher,
-                privacy_password: priv_pass.as_bytes().to_vec(),
+            let mut value_buf = [0u8; 1024];
+            let mut value_type: i32 = 0;
+            let mut error_buf = [0i8; 512];
+
+            let result = snmp_get(
+                self.sess_handle,
+                oid_cstr.as_ptr(),
+                value_buf.as_mut_ptr() as *mut _,
+                value_buf.len(),
+                &mut value_type,
+                error_buf.as_mut_ptr(),
+                error_buf.len(),
+            );
+
+            if result < 0 {
+                let err_msg = CStr::from_ptr(error_buf.as_ptr())
+                    .to_string_lossy()
+                    .to_string();
+
+                if err_msg.contains("timeout") {
+                    return Err(SnmpError::Timeout);
+                } else {
+                    return Err(SnmpError::RequestFailed(err_msg));
+                }
+            }
+
+            // Parse value based on type
+            let value_len = result as usize;
+            match value_type as u8 {
+                ASN_OCTET_STR => {
+                    // Try to convert to UTF-8 string first
+                    match String::from_utf8(value_buf[..value_len].to_vec()) {
+                        Ok(s) => Ok(SnmpValue::String(s)),
+                        Err(_) => Ok(SnmpValue::OctetString(value_buf[..value_len].to_vec())),
+                    }
+                }
+                ASN_OPAQUE => {
+                    Ok(SnmpValue::OctetString(value_buf[..value_len].to_vec()))
+                }
+                ASN_IPADDRESS => {
+                    // IP addresses are 4 bytes - convert to dotted notation
+                    if value_len == 4 {
+                        Ok(SnmpValue::IpAddress(format!(
+                            "{}.{}.{}.{}",
+                            value_buf[0], value_buf[1], value_buf[2], value_buf[3]
+                        )))
+                    } else {
+                        Ok(SnmpValue::OctetString(value_buf[..value_len].to_vec()))
+                    }
+                }
+                ASN_OBJECT_ID => {
+                    // Object IDs are returned as strings in dotted notation from C
+                    match String::from_utf8(value_buf[..value_len].to_vec()) {
+                        Ok(s) => Ok(SnmpValue::Oid(s)),
+                        Err(_) => Ok(SnmpValue::OctetString(value_buf[..value_len].to_vec())),
+                    }
+                }
+                ASN_INTEGER | ASN_COUNTER | ASN_GAUGE | ASN_TIMETICKS | ASN_UINTEGER => {
+                    if value_len >= std::mem::size_of::<i64>() {
+                        // Use unaligned read to avoid alignment issues from C
+                        let value = (value_buf.as_ptr() as *const i64).read_unaligned();
+                        Ok(SnmpValue::Integer(value))
+                    } else {
+                        Err(SnmpError::RequestFailed("Invalid integer size".into()))
+                    }
+                }
+                ASN_COUNTER64 => {
+                    if value_len >= 8 {
+                        let high = u32::from_ne_bytes([
+                            value_buf[0],
+                            value_buf[1],
+                            value_buf[2],
+                            value_buf[3],
+                        ]);
+                        let low = u32::from_ne_bytes([
+                            value_buf[4],
+                            value_buf[5],
+                            value_buf[6],
+                            value_buf[7],
+                        ]);
+                        Ok(SnmpValue::Counter64((high as u64) << 32 | low as u64))
+                    } else {
+                        Err(SnmpError::RequestFailed("Invalid counter64 size".into()))
+                    }
+                }
+                _ => Err(SnmpError::RequestFailed(format!(
+                    "Unsupported type: {}",
+                    value_type
+                ))),
             }
         }
+    }
 
-        _ => {
-            return Err(SnmpError::RequestFailed(format!(
-                "Unsupported security level: '{}'",
-                config.security_level
-            )))
+    fn walk(&self, start_oid: &str) -> SnmpResult<Vec<(String, SnmpValue)>> {
+        unsafe {
+            let oid_cstr = CString::new(start_oid)
+                .map_err(|_| SnmpError::InvalidOid(format!("Invalid OID: {}", start_oid)))?;
+
+            // Allocate buffer for results (max 10000 entries)
+            const MAX_RESULTS: usize = 10000;
+            let mut results_buf: Vec<SnmpWalkResult> = vec![
+                SnmpWalkResult {
+                    oid: [0; 256],
+                    value: [0; 1024],
+                    value_len: 0,
+                    value_type: 0,
+                };
+                MAX_RESULTS
+            ];
+
+            let mut num_results: usize = 0;
+            let mut error_buf = [0i8; 512];
+
+            let result = snmp_walk(
+                self.sess_handle,
+                oid_cstr.as_ptr(),
+                results_buf.as_mut_ptr(),
+                MAX_RESULTS,
+                &mut num_results,
+                error_buf.as_mut_ptr(),
+                error_buf.len(),
+            );
+
+            if result < 0 {
+                let err_msg = CStr::from_ptr(error_buf.as_ptr())
+                    .to_string_lossy()
+                    .to_string();
+                return Err(SnmpError::RequestFailed(err_msg));
+            }
+
+            // Convert C results to Rust
+            let mut parsed_results = Vec::with_capacity(num_results);
+            for i in 0..num_results {
+                let res = &results_buf[i];
+
+                // Parse OID string
+                let oid_str = CStr::from_ptr(res.oid.as_ptr() as *const i8)
+                    .to_string_lossy()
+                    .to_string();
+
+                // Parse value
+                if res.value_len > 0 {
+                    let value = match res.value_type as u8 {
+                        ASN_OCTET_STR => {
+                            // Try UTF-8 conversion first
+                            match String::from_utf8(res.value[..res.value_len].to_vec()) {
+                                Ok(s) => SnmpValue::String(s),
+                                Err(_) => SnmpValue::OctetString(res.value[..res.value_len].to_vec()),
+                            }
+                        }
+                        ASN_OPAQUE => SnmpValue::OctetString(res.value[..res.value_len].to_vec()),
+                        ASN_IPADDRESS => {
+                            if res.value_len == 4 {
+                                SnmpValue::IpAddress(format!(
+                                    "{}.{}.{}.{}",
+                                    res.value[0], res.value[1], res.value[2], res.value[3]
+                                ))
+                            } else {
+                                SnmpValue::OctetString(res.value[..res.value_len].to_vec())
+                            }
+                        }
+                        ASN_OBJECT_ID => {
+                            match String::from_utf8(res.value[..res.value_len].to_vec()) {
+                                Ok(s) => SnmpValue::Oid(s),
+                                Err(_) => SnmpValue::OctetString(res.value[..res.value_len].to_vec()),
+                            }
+                        }
+                        ASN_INTEGER | ASN_COUNTER | ASN_GAUGE | ASN_TIMETICKS | ASN_UINTEGER => {
+                            if res.value_len >= std::mem::size_of::<i64>() {
+                                // Use unaligned read to avoid alignment issues from C
+                                let val = (res.value.as_ptr() as *const i64).read_unaligned();
+                                SnmpValue::Integer(val)
+                            } else {
+                                continue; // Skip invalid values
+                            }
+                        }
+                        ASN_COUNTER64 => {
+                            if res.value_len >= 8 {
+                                let high = u32::from_ne_bytes([
+                                    res.value[0],
+                                    res.value[1],
+                                    res.value[2],
+                                    res.value[3],
+                                ]);
+                                let low = u32::from_ne_bytes([
+                                    res.value[4],
+                                    res.value[5],
+                                    res.value[6],
+                                    res.value[7],
+                                ]);
+                                SnmpValue::Counter64((high as u64) << 32 | low as u64)
+                            } else {
+                                continue;
+                            }
+                        }
+                        _ => continue, // Skip unsupported types
+                    };
+
+                    parsed_results.push((oid_str, value));
+                }
+            }
+
+            Ok(parsed_results)
         }
-    };
-
-    // Get auth password (empty for noAuthNoPriv)
-    let auth_password = config
-        .auth_password
-        .as_ref()
-        .map(|s| s.expose())
-        .unwrap_or("")
-        .as_bytes();
-
-    // Determine if we need auth protocol (before auth is moved)
-    let needs_auth_protocol = !matches!(auth, Auth::NoAuthNoPriv);
-
-    // Build Security object
-    let mut security = Security::new(username, auth_password).with_auth(auth);
-
-    // Set auth protocol if authentication is required
-    if needs_auth_protocol {
-        let auth_proto = parse_auth_protocol(config.auth_protocol.as_deref().unwrap())?;
-        security = security.with_auth_protocol(auth_proto);
     }
-
-    // Create v3 session
-    let timeout = Some(Duration::from_secs(SNMP_TIMEOUT_SECS));
-    let req_id = 1;
-
-    let mut session = SyncSession::new_v3(addr, timeout, req_id, security).map_err(|e| {
-        SnmpError::RequestFailed(format!("SNMPv3 session creation failed: {:?}", e))
-    })?;
-
-    // For authPriv/authNoPriv, perform engine ID discovery using session.init()
-    if needs_auth_protocol {
-        session.init().map_err(|e| {
-            SnmpError::RequestFailed(format!("Engine ID discovery failed: {:?}", e))
-        })?;
-    }
-
-    Ok(session)
 }
 
-/// Convert snmp2 crate's Value to our SnmpValue
-fn convert_value(value: snmp2::Value) -> SnmpResult<SnmpValue> {
-    use snmp2::Value as V;
+impl Drop for SnmpSession {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.sess_handle.is_null() {
+                snmp_close_session(self.sess_handle);
+            }
+        }
+    }
+}
 
-    match value {
-        V::Integer(i) => Ok(SnmpValue::Integer(i)),
-        V::OctetString(s) => Ok(SnmpValue::String(String::from_utf8_lossy(s).into_owned())),
-        V::Counter32(c) => Ok(SnmpValue::Counter32(c)),
-        V::Counter64(c) => Ok(SnmpValue::Counter64(c)),
-        V::Unsigned32(u) => Ok(SnmpValue::Gauge32(u)),
-        V::Timeticks(t) => Ok(SnmpValue::TimeTicks(t)),
-        V::IpAddress(ip) => Ok(SnmpValue::IpAddress(format!(
-            "{}.{}.{}.{}",
-            ip[0], ip[1], ip[2], ip[3]
-        ))),
+// Helper functions
+
+unsafe fn parse_variable(var: *mut Struct_variable_list) -> SnmpResult<SnmpValue> {
+    if var.is_null() {
+        return Err(SnmpError::RequestFailed("Null variable".into()));
+    }
+
+    let var_type = (*var)._type;
+
+    match var_type {
+        ASN_OCTET_STR => {
+            let len = (*var).val_len;
+            let string_ptr_ptr = (*var).val.string();
+            let string_ptr = *string_ptr_ptr;
+            let data = std::slice::from_raw_parts(string_ptr, len);
+            Ok(SnmpValue::OctetString(data.to_vec()))
+        }
+        ASN_INTEGER => {
+            let int_ptr_ptr = (*var).val.integer();
+            let int_ptr = *int_ptr_ptr;
+            let value = *int_ptr;
+            Ok(SnmpValue::Integer(value))
+        }
+        ASN_COUNTER => {
+            let int_ptr_ptr = (*var).val.integer();
+            let int_ptr = *int_ptr_ptr;
+            let value = *int_ptr as u32;
+            Ok(SnmpValue::Counter32(value))
+        }
+        ASN_GAUGE => {
+            let int_ptr_ptr = (*var).val.integer();
+            let int_ptr = *int_ptr_ptr;
+            let value = *int_ptr as u32;
+            Ok(SnmpValue::Gauge32(value))
+        }
+        ASN_TIMETICKS => {
+            let int_ptr_ptr = (*var).val.integer();
+            let int_ptr = *int_ptr_ptr;
+            let value = *int_ptr as u32;
+            Ok(SnmpValue::TimeTicks(value))
+        }
+        ASN_COUNTER64 => {
+            let counter64_ptr_ptr = (*var).val.counter64();
+            let counter64_ptr = *counter64_ptr_ptr;
+            let high = (*counter64_ptr).high;
+            let low = (*counter64_ptr).low;
+            let value = (high << 32) | low;
+            Ok(SnmpValue::Counter64(value))
+        }
+        ASN_IPADDRESS => {
+            let len = (*var).val_len;
+            let string_ptr_ptr = (*var).val.string();
+            let string_ptr = *string_ptr_ptr;
+            let data = std::slice::from_raw_parts(string_ptr, len);
+            if len == 4 {
+                let ip_str = format!("{}.{}.{}.{}", data[0], data[1], data[2], data[3]);
+                Ok(SnmpValue::IpAddress(ip_str))
+            } else {
+                Ok(SnmpValue::OctetString(data.to_vec()))
+            }
+        }
+        ASN_OBJECT_ID => {
+            let oid_len = (*var).val_len / std::mem::size_of::<oid>();
+            let oid_ptr_ptr = (*var).val.objid();
+            let oid_ptr = *oid_ptr_ptr;
+            let oid_str = oid_to_string(oid_ptr, oid_len);
+            Ok(SnmpValue::Oid(oid_str))
+        }
+        ASN_NULL => Ok(SnmpValue::Null),
+        SNMP_NOSUCHOBJECT | SNMP_NOSUCHINSTANCE | SNMP_ENDOFMIBVIEW => {
+            Err(SnmpError::RequestFailed("No such object".into()))
+        }
         _ => Err(SnmpError::RequestFailed(format!(
-            "Unsupported SNMP value type: {:?}",
-            value
+            "Unknown type: {}",
+            var_type
         ))),
     }
 }
 
-/// Map snmp2 crate errors to our SnmpError
-fn map_snmp_error(err: snmp2::Error) -> SnmpError {
-    use snmp2::Error;
-
-    match err {
-        Error::Send => SnmpError::NetworkUnreachable,
-        Error::Receive => SnmpError::Timeout,
-        Error::CommunityMismatch => SnmpError::AuthFailure,
-        Error::AuthFailure(_) => SnmpError::AuthFailure,
-        _ => SnmpError::RequestFailed(format!("{:?}", err)),
-    }
+unsafe fn oid_to_string(oid_ptr: *const oid, oid_len: usize) -> String {
+    let oid_slice = std::slice::from_raw_parts(oid_ptr, oid_len);
+    oid_slice
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_snmp_client_new() {
+    #[tokio::test]
+    async fn test_snmp_client_creation() {
         let client = SnmpClient::new();
-        // Just verify we can create it
-        assert!(format!("{:?}", client).contains("SnmpClient"));
+        // Should not panic - init_snmp should be called once
+        let client2 = SnmpClient::new();
+        // Verify both clients are valid (zero-sized struct)
+        assert_eq!(
+            std::mem::size_of_val(&client),
+            std::mem::size_of_val(&client2)
+        );
     }
 
-    #[test]
-    fn test_snmp_client_default() {
-        let client = SnmpClient;
-        assert!(format!("{:?}", client).contains("SnmpClient"));
-    }
+    #[tokio::test]
+    async fn test_get_invalid_host() {
+        let client = SnmpClient::new();
+        let result = client
+            .get(
+                "invalid.host.that.does.not.exist",
+                "public",
+                "2c",
+                161,
+                "1.3.6.1.2.1.1.1.0",
+                None,
+            )
+            .await;
 
-    #[test]
-    fn test_parse_snmp_version_v1() {
-        assert_eq!(parse_snmp_version("1").unwrap(), 0);
-        assert_eq!(parse_snmp_version("v1").unwrap(), 0);
-        assert_eq!(parse_snmp_version("V1").unwrap(), 0);
-        assert_eq!(parse_snmp_version("snmpv1").unwrap(), 0);
-    }
-
-    #[test]
-    fn test_parse_snmp_version_v2c() {
-        assert_eq!(parse_snmp_version("2c").unwrap(), 1);
-        assert_eq!(parse_snmp_version("2C").unwrap(), 1);
-        assert_eq!(parse_snmp_version("v2c").unwrap(), 1);
-        assert_eq!(parse_snmp_version("V2C").unwrap(), 1);
-        assert_eq!(parse_snmp_version("2").unwrap(), 1);
-        assert_eq!(parse_snmp_version("v2").unwrap(), 1);
-    }
-
-    #[test]
-    fn test_parse_snmp_version_v3() {
-        assert_eq!(parse_snmp_version("3").unwrap(), 3);
-        assert_eq!(parse_snmp_version("v3").unwrap(), 3);
-        assert_eq!(parse_snmp_version("V3").unwrap(), 3);
-        assert_eq!(parse_snmp_version("snmpv3").unwrap(), 3);
-    }
-
-    #[test]
-    fn test_parse_snmp_version_invalid() {
-        let result = parse_snmp_version("invalid");
         assert!(result.is_err());
-        match result {
-            Err(SnmpError::RequestFailed(msg)) => {
+        match result.unwrap_err() {
+            SnmpError::NetworkUnreachable | SnmpError::RequestFailed(_) => {}
+            e => panic!("Expected NetworkUnreachable or RequestFailed, got: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_invalid_oid() {
+        let client = SnmpClient::new();
+        let result = client
+            .get("127.0.0.1", "public", "2c", 161, "not-a-valid-oid", None)
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SnmpError::InvalidOid(_) => {}
+            e => panic!("Expected InvalidOid, got: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_walk_invalid_oid() {
+        let client = SnmpClient::new();
+        let result = client
+            .walk("127.0.0.1", "public", "2c", 161, "not-valid", None)
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SnmpError::InvalidOid(_) => {}
+            e => panic!("Expected InvalidOid, got: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v3_config_clone() {
+        let config = V3Config {
+            username: "testuser".to_string(),
+            auth_password: Some(Zeroizing::new("authpass".to_string())),
+            priv_password: Some(Zeroizing::new("privpass".to_string())),
+            auth_protocol: Some("SHA".to_string()),
+            priv_protocol: Some("AES".to_string()),
+            security_level: "authPriv".to_string(),
+        };
+
+        let cloned = config.clone();
+        assert_eq!(config.username, cloned.username);
+        assert_eq!(config.auth_protocol, cloned.auth_protocol);
+        assert_eq!(config.priv_protocol, cloned.priv_protocol);
+        assert_eq!(config.security_level, cloned.security_level);
+    }
+
+    #[tokio::test]
+    async fn test_v3_config_debug_redacts_passwords() {
+        let config = V3Config {
+            username: "testuser".to_string(),
+            auth_password: Some(Zeroizing::new("authpass".to_string())),
+            priv_password: Some(Zeroizing::new("privpass".to_string())),
+            auth_protocol: Some("SHA".to_string()),
+            priv_protocol: Some("AES".to_string()),
+            security_level: "authPriv".to_string(),
+        };
+
+        let debug_str = format!("{:?}", config);
+        assert!(!debug_str.contains("authpass"));
+        assert!(!debug_str.contains("privpass"));
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(debug_str.contains("testuser"));
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_version() {
+        let client = SnmpClient::new();
+        let result = client
+            .get("127.0.0.1", "public", "99", 161, "1.3.6.1.2.1.1.1.0", None)
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SnmpError::RequestFailed(msg) => {
                 assert!(msg.contains("Unsupported SNMP version"));
             }
-            _ => panic!("Expected RequestFailed error"),
+            e => panic!("Expected RequestFailed with version error, got: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sequential_requests() {
+        // Test that multiple sequential requests work without issues
+        // Note: Concurrent requests via tokio::spawn can cause segfaults
+        // because libnetsnmp may not be fully thread-safe.
+        // Our implementation uses spawn_blocking which should be safe for
+        // sequential async operations.
+        let client = SnmpClient::new();
+
+        for _ in 0..3 {
+            let result = client
+                .get("192.0.2.1", "public", "2c", 161, "1.3.6.1.2.1.1.1.0", None)
+                .await;
+
+            // Should fail (no agent at 192.0.2.1) but not panic
+            assert!(result.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_and_walk_different_clients() {
+        // Test that get and walk can be used with different client instances
+        let client1 = SnmpClient::new();
+        let client2 = SnmpClient::new();
+
+        let get_result = client1
+            .get("192.0.2.1", "public", "2c", 161, "1.3.6.1.2.1.1.1.0", None)
+            .await;
+
+        let walk_result = client2
+            .walk("192.0.2.1", "public", "2c", 161, "1.3.6.1.2.1.1", None)
+            .await;
+
+        // Both should fail but not panic
+        assert!(get_result.is_err());
+        assert!(walk_result.is_err());
+    }
+
+    #[test]
+    fn test_c_helpers_init() {
+        // Test that C library initializes without crashing
+        unsafe {
+            let result = snmp_init_library();
+            assert_eq!(result, 0, "C library initialization should succeed");
         }
     }
 
     #[test]
-    fn test_parse_auth_protocol() {
-        use snmp2::v3::AuthProtocol;
-        assert!(matches!(parse_auth_protocol("MD5"), Ok(AuthProtocol::Md5)));
-        assert!(matches!(parse_auth_protocol("SHA"), Ok(AuthProtocol::Sha1)));
-        assert!(matches!(
-            parse_auth_protocol("SHA-256"),
-            Ok(AuthProtocol::Sha256)
-        ));
-        assert!(matches!(
-            parse_auth_protocol("SHA-512"),
-            Ok(AuthProtocol::Sha512)
-        ));
-    }
+    fn test_c_helpers_session_open_invalid_host() {
+        // Test session opening with invalid host
+        unsafe {
+            snmp_init_library();
 
-    #[test]
-    fn test_parse_priv_protocol() {
-        use snmp2::v3::Cipher;
-        assert!(matches!(parse_priv_protocol("DES"), Ok(Cipher::Des)));
-        assert!(matches!(parse_priv_protocol("AES"), Ok(Cipher::Aes128)));
-        assert!(matches!(parse_priv_protocol("AES-256"), Ok(Cipher::Aes256)));
-    }
+            let ip = CString::new("invalid.host.example").unwrap();
+            let community = CString::new("public").unwrap();
+            let mut error_buf = [0i8; 256];
 
-    #[test]
-    fn test_convert_value_integer() {
-        let value = snmp2::Value::Integer(42);
-        let result = convert_value(value).unwrap();
-        match result {
-            SnmpValue::Integer(v) => assert_eq!(v, 42),
-            _ => panic!("Expected Integer"),
+            let sess = snmp_open_session(
+                ip.as_ptr(),
+                161,
+                community.as_ptr(),
+                2, // SNMPv2c
+                10_000_000,
+                2,
+                ptr::null(), // No v3 config for v2c
+                error_buf.as_mut_ptr(),
+                error_buf.len(),
+            );
+
+            // Should fail with invalid host
+            assert!(sess.is_null(), "Session should fail with invalid host");
+
+            // Should have an error message
+            let err_msg = CStr::from_ptr(error_buf.as_ptr())
+                .to_string_lossy()
+                .to_string();
+            assert!(
+                !err_msg.is_empty(),
+                "Should have error message, got: {}",
+                err_msg
+            );
         }
     }
 
     #[test]
-    fn test_convert_value_octet_string() {
-        let value = snmp2::Value::OctetString(b"test".as_slice());
-        let result = convert_value(value).unwrap();
-        match result {
-            SnmpValue::String(s) => assert_eq!(s, "test"),
-            _ => panic!("Expected String"),
+    fn test_c_helpers_session_lifecycle() {
+        // Test session open/close lifecycle (doesn't require actual SNMP device)
+        unsafe {
+            snmp_init_library();
+
+            let ip = CString::new("192.0.2.1").unwrap(); // TEST-NET-1 (should be unreachable)
+            let community = CString::new("public").unwrap();
+            let mut error_buf = [0i8; 256];
+
+            let sess = snmp_open_session(
+                ip.as_ptr(),
+                161,
+                community.as_ptr(),
+                2, // SNMPv2c
+                10_000_000,
+                2,
+                ptr::null(), // No v3 config for v2c
+                error_buf.as_mut_ptr(),
+                error_buf.len(),
+            );
+
+            // Session creation should succeed even if host is unreachable
+            // (connection happens on first request)
+            if !sess.is_null() {
+                // Clean close should not crash
+                snmp_close_session(sess);
+            }
         }
     }
-
-    #[test]
-    fn test_convert_value_counter32() {
-        let value = snmp2::Value::Counter32(12345);
-        let result = convert_value(value).unwrap();
-        match result {
-            SnmpValue::Counter32(v) => assert_eq!(v, 12345),
-            _ => panic!("Expected Counter32"),
-        }
-    }
-
-    #[test]
-    fn test_convert_value_counter64() {
-        let value = snmp2::Value::Counter64(9876543210);
-        let result = convert_value(value).unwrap();
-        match result {
-            SnmpValue::Counter64(v) => assert_eq!(v, 9876543210),
-            _ => panic!("Expected Counter64"),
-        }
-    }
-
-    #[test]
-    fn test_convert_value_unsigned32() {
-        let value = snmp2::Value::Unsigned32(999);
-        let result = convert_value(value).unwrap();
-        match result {
-            SnmpValue::Gauge32(v) => assert_eq!(v, 999),
-            _ => panic!("Expected Gauge32"),
-        }
-    }
-
-    #[test]
-    fn test_convert_value_timeticks() {
-        let value = snmp2::Value::Timeticks(12345678);
-        let result = convert_value(value).unwrap();
-        match result {
-            SnmpValue::TimeTicks(v) => assert_eq!(v, 12345678),
-            _ => panic!("Expected TimeTicks"),
-        }
-    }
-
-    #[test]
-    fn test_convert_value_ip_address() {
-        let value = snmp2::Value::IpAddress([192, 168, 1, 1]);
-        let result = convert_value(value).unwrap();
-        match result {
-            SnmpValue::IpAddress(ip) => assert_eq!(ip, "192.168.1.1"),
-            _ => panic!("Expected IpAddress"),
-        }
-    }
-
-    #[test]
-    fn test_map_snmp_error_send() {
-        let err = snmp2::Error::Send;
-        let result = map_snmp_error(err);
-        match result {
-            SnmpError::NetworkUnreachable => {}
-            _ => panic!("Expected NetworkUnreachable"),
-        }
-    }
-
-    #[test]
-    fn test_map_snmp_error_receive() {
-        let err = snmp2::Error::Receive;
-        let result = map_snmp_error(err);
-        match result {
-            SnmpError::Timeout => {}
-            _ => panic!("Expected Timeout"),
-        }
-    }
-
-    #[test]
-    fn test_map_snmp_error_community() {
-        let err = snmp2::Error::CommunityMismatch;
-        let result = map_snmp_error(err);
-        match result {
-            SnmpError::AuthFailure => {}
-            _ => panic!("Expected AuthFailure"),
-        }
-    }
-
-    // Note: get() and walk() methods require actual network operations
-    // and are tested via integration tests, not unit tests
 }

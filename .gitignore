@@ -23,5 +23,9 @@ data/
 .DS_Store
 Thumbs.db
 
+# Nix
+.direnv/
+result
+
 # Local scripts
 monitor-deploy.sh

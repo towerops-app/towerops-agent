@@ -4,6 +4,15 @@ fn main() {
     // Compile protobuf definitions
     prost_build::compile_protos(&["proto/agent.proto"], &["proto/"]).unwrap();
 
+    // Compile C helper for SNMP
+    cc::Build::new()
+        .file("native/snmp_helper.c")
+        .include("native")
+        .compile("snmp_helper");
+
+    // Link against netsnmp library
+    println!("cargo:rustc-link-lib=netsnmp");
+
     // Inject git-based version if available, otherwise use Cargo.toml version
     // This ensures the binary version matches the Docker image tag
     let version = get_version();

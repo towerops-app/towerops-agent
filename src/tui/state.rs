@@ -106,7 +106,10 @@ impl AgentState {
                 )
             }
             AgentEvent::MonitoringCheckSent { device_id, status } => {
-                format!("Monitoring check sent for {} (status: {})", device_id, status)
+                format!(
+                    "Monitoring check sent for {} (status: {})",
+                    device_id, status
+                )
             }
             AgentEvent::PollerCreated {
                 device_ip,

@@ -367,7 +367,6 @@ async fn async_main() {
 
 /// Run SNMPv3 test
 async fn run_snmpv3_test(args: &Args) {
-    use secret::SecretString;
     use snmp::V3Config;
 
     let ip = args.snmpv3_ip.as_ref().expect("--snmpv3-ip required");
@@ -397,12 +396,12 @@ async fn run_snmpv3_test(args: &Args) {
     let v3_config = V3Config {
         username: username.clone(),
         auth_password: if !auth_pass.is_empty() {
-            Some(SecretString::new(auth_pass.clone()))
+            Some(zeroize::Zeroizing::new(auth_pass.clone()))
         } else {
             None
         },
         priv_password: if !priv_pass.is_empty() {
-            Some(SecretString::new(priv_pass.clone()))
+            Some(zeroize::Zeroizing::new(priv_pass.clone()))
         } else {
             None
         },
