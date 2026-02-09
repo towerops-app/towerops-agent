@@ -686,7 +686,7 @@ impl AgentClient {
     /// Send heartbeat to server.
     async fn send_heartbeat(&mut self) -> Result<()> {
         let heartbeat = AgentHeartbeat {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::version::current_version().to_string(),
             hostname: self.cached_hostname.clone(),
             uptime_seconds: get_uptime_seconds(),
             ip_address: get_local_ip().unwrap_or_default(),
