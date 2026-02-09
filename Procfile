@@ -1,1 +1,1 @@
-worker: /app/towerops-agent
+worker: towerops-agent
