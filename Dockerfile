@@ -69,4 +69,4 @@ RUN addgroup -g 1000 towerops && \
 
 USER towerops
 
-ENTRYPOINT ["towerops-agent"]
+CMD ["towerops-agent"]

@@ -1,1 +1,1 @@
-worker: exec towerops-agent
+worker: towerops-agent
