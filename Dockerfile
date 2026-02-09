@@ -9,8 +9,8 @@ ARG VERSION=0.1.0-unknown
 
 WORKDIR /app
 
-# Install build dependencies
-RUN apk add --no-cache musl-dev protobuf-dev openssl-dev openssl-libs-static cmake perl g++
+# Install build dependencies (net-snmp-dev required for C FFI)
+RUN apk add --no-cache musl-dev protobuf-dev openssl-dev openssl-libs-static net-snmp-dev cmake perl g++
 
 # Determine Rust target based on platform and add it
 RUN case "$TARGETPLATFORM" in \
@@ -56,7 +56,8 @@ FROM alpine:3.19
 
 # Install runtime dependencies
 # iputils provides ping with setuid root (doesn't require CAP_NET_RAW)
-RUN apk add --no-cache ca-certificates iputils openssl
+# net-snmp-libs required for C FFI to libnetsnmp
+RUN apk add --no-cache ca-certificates iputils openssl net-snmp-libs
 
 # Copy binary from builder
 COPY --from=builder /tmp/towerops-agent /usr/local/bin/towerops-agent

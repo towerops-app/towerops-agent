@@ -901,12 +901,16 @@ async fn execute_snmp_job(
         let config = crate::snmp::V3Config {
             username: snmp_device.v3_username.clone(),
             auth_password: if !snmp_device.v3_auth_password.is_empty() {
-                Some(SecretString::new(snmp_device.v3_auth_password.clone()))
+                Some(zeroize::Zeroizing::new(
+                    snmp_device.v3_auth_password.clone(),
+                ))
             } else {
                 None
             },
             priv_password: if !snmp_device.v3_priv_password.is_empty() {
-                Some(SecretString::new(snmp_device.v3_priv_password.clone()))
+                Some(zeroize::Zeroizing::new(
+                    snmp_device.v3_priv_password.clone(),
+                ))
             } else {
                 None
             },
@@ -1087,12 +1091,16 @@ async fn execute_credential_test(
         Some(crate::snmp::V3Config {
             username: snmp_device.v3_username.clone(),
             auth_password: if !snmp_device.v3_auth_password.is_empty() {
-                Some(SecretString::new(snmp_device.v3_auth_password.clone()))
+                Some(zeroize::Zeroizing::new(
+                    snmp_device.v3_auth_password.clone(),
+                ))
             } else {
                 None
             },
             priv_password: if !snmp_device.v3_priv_password.is_empty() {
-                Some(SecretString::new(snmp_device.v3_priv_password.clone()))
+                Some(zeroize::Zeroizing::new(
+                    snmp_device.v3_priv_password.clone(),
+                ))
             } else {
                 None
             },
@@ -1173,10 +1181,7 @@ async fn execute_credential_test(
 }
 
 /// Execute a ping job using ICMP ping to check device health.
-async fn execute_ping_job(
-    job: AgentJob,
-    result_tx: mpsc::Sender<MonitoringCheck>,
-) -> Result<()> {
+async fn execute_ping_job(job: AgentJob, result_tx: mpsc::Sender<MonitoringCheck>) -> Result<()> {
     let device_id = job.device_id.clone();
     let snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
     let ip_address = &snmp_device.ip;
@@ -1184,7 +1189,11 @@ async fn execute_ping_job(
     // Use 5-second timeout for pings (same as Phoenix DeviceMonitorWorker)
     let timeout_ms = 5000;
 
-    tracing::debug!("Executing health check for device {} at {}", device_id, ip_address);
+    tracing::debug!(
+        "Executing health check for device {} at {}",
+        device_id,
+        ip_address
+    );
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?

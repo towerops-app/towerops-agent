@@ -1,15 +1,8 @@
+use super::client::SnmpClient;
 use super::types::{SnmpError, SnmpResult, SnmpValue};
 use super::V3Config;
 use crate::secret::SecretString;
-use snmp2::{Oid, SyncSession};
-use std::str::FromStr;
-use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-
-// SNMP timeout in seconds - increased to 120s for SNMPv3 operations
-// SNMPv3 has significant encryption/auth overhead
-// Full discovery can take 50+ seconds with complete MikroTik OID tree traversal
-const SNMP_TIMEOUT_SECS: u64 = 120;
 
 /// Request to perform an SNMP operation
 #[derive(Debug)]
@@ -49,7 +42,7 @@ impl std::fmt::Debug for DeviceConfig {
     }
 }
 
-/// Per-device polling thread that maintains a persistent SNMP session
+/// Per-device polling thread that uses C FFI to libnetsnmp
 pub struct DevicePoller {
     device_id: String,
     config: DeviceConfig,
@@ -65,17 +58,20 @@ impl DevicePoller {
         let config_clone = config.clone();
 
         // Spawn the polling thread with 8MB stack for SNMPv3 crypto operations
+        tracing::info!("Spawning device poller thread for {} at {}:{}", device_id, config.ip, config.port);
         std::thread::Builder::new()
             .name(format!("poller-{}", device_id))
             .stack_size(8 * 1024 * 1024) // 8MB stack (default is 2MB)
             .spawn(move || {
-                if let Err(e) = run_poller_thread(device_id_clone, config_clone, request_rx) {
-                    tracing::error!("Device poller thread failed: {}", e);
+                tracing::info!("Device poller thread starting for {}", device_id_clone);
+                if let Err(e) = run_poller_thread(device_id_clone.clone(), config_clone, request_rx) {
+                    tracing::error!("Device poller thread failed for {}: {}", device_id_clone, e);
                 }
+                tracing::info!("Device poller thread exited for {}", device_id_clone);
             })
             .expect("Failed to spawn device poller thread");
 
-        tracing::info!("Spawned device poller thread for {}", device_id);
+        tracing::info!("Successfully spawned device poller thread for {}", device_id);
 
         Self {
             device_id,
@@ -128,21 +124,23 @@ impl DevicePoller {
         &self.config
     }
 
-    /// Log device poller status using accessor methods
+    /// Update the device configuration
+    pub fn update_config(&mut self, new_config: DeviceConfig) {
+        self.config = new_config;
+    }
+
+    /// Log the status of this poller (for debugging)
     pub fn log_status(&self) {
-        let id = self.device_id();
-        let cfg = self.config();
         tracing::debug!(
-            "Device poller {} at {}:{} (version: {})",
-            id,
-            cfg.ip,
-            cfg.port,
-            cfg.version
+            "Poller status: device_id={}, ip={}:{}",
+            self.device_id,
+            self.config.ip,
+            self.config.port
         );
     }
 }
 
-/// Run the device poller thread (blocking)
+/// Run the poller thread using C FFI to libnetsnmp
 fn run_poller_thread(
     device_id: String,
     config: DeviceConfig,
@@ -155,34 +153,79 @@ fn run_poller_thread(
         config.port
     );
 
-    // Create persistent session
-    let addr = format!("{}:{}", config.ip, config.port);
-    let mut session = create_session(&addr, &config)?;
+    // Create a tokio runtime for this thread (SnmpClient uses async)
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
 
-    tracing::info!(
-        "Created persistent SNMP session for device {} (version: {})",
-        device_id,
-        config.version
-    );
+    // Create SNMP client (stateless, uses C FFI)
+    let client = SnmpClient::new();
 
     // Process requests until shutdown
     while let Some(request) = request_rx.blocking_recv() {
-        match request {
-            SnmpRequest::Get { oid, response_tx } => {
-                let result = perform_get(&mut session, &oid);
-                let _ = response_tx.send(result);
+        let is_shutdown = matches!(request, SnmpRequest::Shutdown);
+
+        // Log what request we're processing
+        match &request {
+            SnmpRequest::Get { oid, .. } => {
+                tracing::debug!("Poller thread {} processing GET {}", device_id, oid);
             }
-            SnmpRequest::Walk {
-                base_oid,
-                response_tx,
-            } => {
-                let result = perform_walk(&mut session, &base_oid);
-                let _ = response_tx.send(result);
+            SnmpRequest::Walk { base_oid, .. } => {
+                tracing::debug!("Poller thread {} processing WALK {}", device_id, base_oid);
             }
             SnmpRequest::Shutdown => {
-                tracing::info!("Device poller thread shutting down for {}", device_id);
-                break;
+                tracing::info!("Poller thread {} received shutdown signal", device_id);
             }
+        }
+
+        let panic_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
+                SnmpRequest::Get { oid, response_tx } => {
+                    tracing::debug!("Poller thread {} executing GET", device_id);
+                    let result = perform_get(&runtime, &client, &config, &oid);
+                    tracing::debug!("Poller thread {} GET result: {:?}", device_id, result.is_ok());
+                    let _ = response_tx.send(result);
+                }
+                SnmpRequest::Walk {
+                    base_oid,
+                    response_tx,
+                } => {
+                    tracing::debug!("Poller thread {} executing WALK", device_id);
+                    let result = perform_walk(&runtime, &client, &config, &base_oid);
+                    tracing::debug!(
+                        "Poller thread {} WALK result: {:?}",
+                        device_id,
+                        result.as_ref().map(|v| v.len())
+                    );
+                    let _ = response_tx.send(result);
+                }
+                SnmpRequest::Shutdown => {
+                    tracing::info!("Device poller thread shutting down for {}", device_id);
+                }
+            }));
+
+        if let Err(panic_err) = panic_result {
+            let panic_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "Unknown panic".to_string()
+            };
+            tracing::error!(
+                "Panic in device poller thread for {}: {}",
+                device_id,
+                panic_msg
+            );
+            // Don't break - keep the thread alive for future requests
+        } else {
+            tracing::debug!("Poller thread {} completed request successfully", device_id);
+        }
+
+        if is_shutdown {
+            tracing::info!("Poller thread {} exiting due to shutdown", device_id);
+            break;
         }
     }
 
@@ -190,296 +233,48 @@ fn run_poller_thread(
     Ok(())
 }
 
-/// Create an SNMP session based on version and transport
-fn create_session(addr: &str, config: &DeviceConfig) -> Result<SyncSession, String> {
-    let timeout = Some(Duration::from_secs(SNMP_TIMEOUT_SECS));
-    let version_num = parse_snmp_version(&config.version)?;
-    let transport = config.transport.to_lowercase();
-
-    // TCP transport warning - not yet implemented
-    // TODO: Implement SNMP-over-TCP (RFC 3430) - requires low-level PDU handling
-    // since snmp2 crate doesn't expose internal types needed for TCP framing
-    if transport == "tcp" {
-        tracing::warn!(
-            "TCP transport requested for {} but not yet implemented. \
-             Falling back to UDP. TCP support requires custom PDU encoder/decoder \
-             since snmp2 crate doesn't expose necessary internal types.",
-            addr
-        );
-    }
-
-    // UDP transport (default, also used as fallback for TCP)
-    if config.version == "3" {
-        let v3_config = config
-            .v3_config
-            .as_ref()
-            .ok_or("v3_config required for SNMPv3")?;
-        create_v3_session(addr, timeout, v3_config)
-    } else {
-        create_v1v2c_session(
-            addr,
-            config.community.expose().as_bytes(),
-            timeout,
-            version_num,
-        )
-    }
+/// Perform SNMP GET using C FFI
+fn perform_get(
+    runtime: &tokio::runtime::Runtime,
+    client: &SnmpClient,
+    config: &DeviceConfig,
+    oid: &str,
+) -> SnmpResult<SnmpValue> {
+    // Use the thread-local runtime to execute async C FFI call
+    runtime.block_on(async {
+        client
+            .get(
+                &config.ip,
+                config.community.expose(),
+                &config.version,
+                config.port,
+                oid,
+                config.v3_config.clone(),
+            )
+            .await
+    })
 }
 
-/// Create v1/v2c session
-fn create_v1v2c_session(
-    addr: &str,
-    community: &[u8],
-    timeout: Option<Duration>,
-    version: i32,
-) -> Result<SyncSession, String> {
-    let req_id = 1;
-
-    let result = match version {
-        0 => SyncSession::new_v1(addr, community, timeout, req_id),
-        1 => SyncSession::new_v2c(addr, community, timeout, req_id),
-        _ => return Err(format!("Unsupported SNMP version: {}", version)),
-    };
-
-    result.map_err(|e| format!("Failed to create v1/v2c session: {:?}", e))
-}
-
-/// Create v3 session
-fn create_v3_session(
-    addr: &str,
-    timeout: Option<Duration>,
-    config: &V3Config,
-) -> Result<SyncSession, String> {
-    use snmp2::v3::{Auth, Security};
-
-    // Parse security level and build Auth enum
-    let auth = match config.security_level.trim().to_lowercase().as_str() {
-        "noauthnopriv" | "" => Auth::NoAuthNoPriv,
-        "authnopriv" => Auth::AuthNoPriv,
-        "authpriv" => {
-            let cipher = parse_priv_protocol(
-                config
-                    .priv_protocol
-                    .as_deref()
-                    .ok_or("Priv protocol required for authPriv")?,
-            )?;
-            let priv_pass = config
-                .priv_password
-                .as_ref()
-                .map(|s| s.expose())
-                .ok_or("Priv password required for authPriv")?;
-
-            Auth::AuthPriv {
-                cipher,
-                privacy_password: priv_pass.as_bytes().to_vec(),
-            }
-        }
-        _ => {
-            return Err(format!(
-                "Unsupported security level: '{}'",
-                config.security_level
-            ))
-        }
-    };
-
-    let username = config.username.as_bytes();
-    let auth_password = config
-        .auth_password
-        .as_ref()
-        .map(|s| s.expose())
-        .unwrap_or("")
-        .as_bytes();
-    let needs_auth_protocol = !matches!(auth, Auth::NoAuthNoPriv);
-
-    let mut security = Security::new(username, auth_password).with_auth(auth);
-
-    if needs_auth_protocol {
-        let auth_proto = parse_auth_protocol(config.auth_protocol.as_deref().unwrap())?;
-        security = security.with_auth_protocol(auth_proto);
-    }
-
-    let req_id = 1;
-    let mut session = SyncSession::new_v3(addr, timeout, req_id, security)
-        .map_err(|e| format!("Failed to create v3 session: {:?}", e))?;
-
-    // For authPriv/authNoPriv, perform engine ID discovery using session.init()
-    if needs_auth_protocol {
-        session
-            .init()
-            .map_err(|e| format!("Engine ID discovery failed: {:?}", e))?;
-    }
-
-    Ok(session)
-}
-
-/// Perform SNMP GET on existing session (with retry for v3 engine ID discovery)
-fn perform_get(session: &mut SyncSession, oid: &str) -> SnmpResult<SnmpValue> {
-    let oid_parsed =
-        Oid::from_str(oid).map_err(|_| SnmpError::InvalidOid(format!("Invalid OID: {}", oid)))?;
-
-    // First attempt (may fail with AuthUpdated for v3 engine ID discovery)
-    let mut response = match session.get(&oid_parsed) {
-        Ok(resp) => resp,
-        Err(snmp2::Error::AuthUpdated) => {
-            tracing::debug!("SNMPv3 engine ID discovered, retrying request");
-            // Retry after engine ID discovery
-            session.get(&oid_parsed).map_err(map_snmp_error)?
-        }
-        Err(e) => return Err(map_snmp_error(e)),
-    };
-
-    if response.error_status != 0 {
-        return Err(SnmpError::RequestFailed(format!(
-            "SNMP error status: {}",
-            response.error_status
-        )));
-    }
-
-    let (_, value) = response
-        .varbinds
-        .next()
-        .ok_or(SnmpError::RequestFailed("No varbinds in response".into()))?;
-
-    convert_value(value)
-}
-
-/// Perform SNMP WALK on existing session (with retry for v3 engine ID discovery)
-fn perform_walk(session: &mut SyncSession, base_oid: &str) -> SnmpResult<Vec<(String, SnmpValue)>> {
-    let base_oid_parsed = Oid::from_str(base_oid)
-        .map_err(|_| SnmpError::InvalidOid(format!("Invalid OID: {}", base_oid)))?;
-    let base_oid_string = base_oid.to_string();
-
-    let mut results = Vec::new();
-    let mut current_oid = base_oid_parsed;
-    let mut first_request = true;
-
-    loop {
-        let oid_to_query = current_oid.clone();
-
-        let (error_status, varbind_data) = {
-            // First request may fail with AuthUpdated for v3 engine ID discovery
-            let response = match session.getnext(&oid_to_query) {
-                Ok(resp) => resp,
-                Err(snmp2::Error::AuthUpdated) if first_request => {
-                    tracing::debug!("SNMPv3 engine ID discovered, retrying WALK request");
-                    // Retry after engine ID discovery
-                    session.getnext(&oid_to_query).map_err(map_snmp_error)?
-                }
-                Err(e) => return Err(map_snmp_error(e)),
-            };
-
-            // After first request, don't retry on AuthUpdated
-            first_request = false;
-            let status = response.error_status;
-
-            let data: Vec<(String, snmp2::Value)> = response
-                .varbinds
-                .map(|(name, value)| (name.to_string(), value))
-                .collect();
-
-            (status, data)
-        };
-
-        if error_status != 0 {
-            break;
-        }
-
-        if varbind_data.is_empty() {
-            break;
-        }
-
-        for (name_str, value) in varbind_data {
-            if !name_str.starts_with(&base_oid_string) {
-                return Ok(results);
-            }
-
-            let converted_value = convert_value(value)?;
-            results.push((name_str.clone(), converted_value));
-
-            current_oid = Oid::from_str(&name_str).map_err(|_| {
-                SnmpError::InvalidOid(format!("Invalid OID from response: {}", name_str))
-            })?;
-        }
-    }
-
-    Ok(results)
-}
-
-/// Parse SNMP version string to integer
-fn parse_snmp_version(version: &str) -> Result<i32, String> {
-    match version.trim().to_lowercase().as_str() {
-        "1" | "v1" | "snmpv1" => Ok(0),
-        "2c" | "v2c" | "snmpv2c" | "2" | "v2" => Ok(1),
-        "3" | "v3" | "snmpv3" => Ok(3),
-        _ => Err(format!("Unsupported SNMP version: '{}'", version)),
-    }
-}
-
-/// Parse authentication protocol
-fn parse_auth_protocol(protocol: &str) -> Result<snmp2::v3::AuthProtocol, String> {
-    use snmp2::v3::AuthProtocol;
-
-    match protocol.trim().to_uppercase().as_str() {
-        "MD5" => Ok(AuthProtocol::Md5),
-        "SHA" | "SHA1" | "SHA-1" => Ok(AuthProtocol::Sha1),
-        "SHA224" | "SHA-224" => Ok(AuthProtocol::Sha224),
-        "SHA256" | "SHA-256" => Ok(AuthProtocol::Sha256),
-        "SHA384" | "SHA-384" => Ok(AuthProtocol::Sha384),
-        "SHA512" | "SHA-512" => Ok(AuthProtocol::Sha512),
-        _ => Err(format!("Unsupported auth protocol: '{}'", protocol)),
-    }
-}
-
-/// Parse privacy protocol
-fn parse_priv_protocol(protocol: &str) -> Result<snmp2::v3::Cipher, String> {
-    use snmp2::v3::Cipher;
-
-    match protocol.trim().to_uppercase().as_str() {
-        "DES" => Ok(Cipher::Des),
-        "AES" | "AES128" | "AES-128" => Ok(Cipher::Aes128),
-        "AES192" | "AES-192" => Ok(Cipher::Aes192),
-        "AES256" | "AES-256" | "AES-256-C" => Ok(Cipher::Aes256),
-        _ => Err(format!("Unsupported priv protocol: '{}'", protocol)),
-    }
-}
-
-/// Map snmp2 errors to our error type
-fn map_snmp_error(err: snmp2::Error) -> SnmpError {
-    match &err {
-        snmp2::Error::AuthFailure(kind) => {
-            tracing::error!("SNMPv3 AuthFailure: {:?}", kind);
-            SnmpError::AuthFailure
-        }
-        snmp2::Error::AuthUpdated => {
-            tracing::info!("SNMPv3 engine ID discovered, caller should retry");
-            SnmpError::RequestFailed("Authentication context updated, need to retry".into())
-        }
-        snmp2::Error::CommunityMismatch => SnmpError::AuthFailure,
-        _ => {
-            tracing::error!("SNMP error: {:?}", err);
-            SnmpError::RequestFailed(format!("SNMP request failed: {:?}", err))
-        }
-    }
-}
-
-/// Convert snmp2::Value to our SnmpValue
-fn convert_value(value: snmp2::Value) -> SnmpResult<SnmpValue> {
-    match value {
-        snmp2::Value::Integer(i) => Ok(SnmpValue::Integer(i)),
-        snmp2::Value::OctetString(bytes) => Ok(String::from_utf8(bytes.to_vec())
-            .map(SnmpValue::String)
-            .unwrap_or_else(|_| SnmpValue::OctetString(bytes.to_vec()))),
-        snmp2::Value::ObjectIdentifier(oid) => Ok(SnmpValue::Oid(oid.to_string())),
-        snmp2::Value::Counter32(c) => Ok(SnmpValue::Counter32(c)),
-        snmp2::Value::Counter64(c) => Ok(SnmpValue::Counter64(c)),
-        snmp2::Value::Unsigned32(g) => Ok(SnmpValue::Gauge32(g)),
-        snmp2::Value::Timeticks(t) => Ok(SnmpValue::TimeTicks(t)),
-        snmp2::Value::IpAddress(ip) => Ok(SnmpValue::IpAddress(format!(
-            "{}.{}.{}.{}",
-            ip[0], ip[1], ip[2], ip[3]
-        ))),
-        snmp2::Value::Null => Ok(SnmpValue::Null),
-        _ => Ok(SnmpValue::Unsupported(format!("{:?}", value))),
-    }
+/// Perform SNMP WALK using C FFI
+fn perform_walk(
+    runtime: &tokio::runtime::Runtime,
+    client: &SnmpClient,
+    config: &DeviceConfig,
+    base_oid: &str,
+) -> SnmpResult<Vec<(String, SnmpValue)>> {
+    // Use the thread-local runtime to execute async C FFI call
+    runtime.block_on(async {
+        client
+            .walk(
+                &config.ip,
+                config.community.expose(),
+                &config.version,
+                config.port,
+                base_oid,
+                config.v3_config.clone(),
+            )
+            .await
+    })
 }
 
 #[cfg(test)]
@@ -487,92 +282,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_auth_protocol_standard() {
-        use snmp2::v3::AuthProtocol;
-        assert!(matches!(parse_auth_protocol("MD5"), Ok(AuthProtocol::Md5)));
-        assert!(matches!(parse_auth_protocol("SHA"), Ok(AuthProtocol::Sha1)));
-        assert!(matches!(
-            parse_auth_protocol("SHA1"),
-            Ok(AuthProtocol::Sha1)
-        ));
-        assert!(matches!(
-            parse_auth_protocol("SHA256"),
-            Ok(AuthProtocol::Sha256)
-        ));
-        assert!(matches!(
-            parse_auth_protocol("SHA384"),
-            Ok(AuthProtocol::Sha384)
-        ));
-        assert!(matches!(
-            parse_auth_protocol("SHA512"),
-            Ok(AuthProtocol::Sha512)
-        ));
-    }
+    fn test_device_config_debug() {
+        let config = DeviceConfig {
+            ip: "192.168.1.1".to_string(),
+            port: 161,
+            version: "2c".to_string(),
+            community: SecretString::new("public"),
+            v3_config: None,
+            transport: "udp".to_string(),
+        };
 
-    #[test]
-    fn test_parse_auth_protocol_hyphenated() {
-        use snmp2::v3::AuthProtocol;
-        assert!(matches!(
-            parse_auth_protocol("SHA-1"),
-            Ok(AuthProtocol::Sha1)
-        ));
-        assert!(matches!(
-            parse_auth_protocol("SHA-224"),
-            Ok(AuthProtocol::Sha224)
-        ));
-        assert!(matches!(
-            parse_auth_protocol("SHA-256"),
-            Ok(AuthProtocol::Sha256)
-        ));
-        assert!(matches!(
-            parse_auth_protocol("SHA-384"),
-            Ok(AuthProtocol::Sha384)
-        ));
-        assert!(matches!(
-            parse_auth_protocol("SHA-512"),
-            Ok(AuthProtocol::Sha512)
-        ));
-    }
-
-    #[test]
-    fn test_parse_auth_protocol_case_insensitive() {
-        use snmp2::v3::AuthProtocol;
-        assert!(matches!(
-            parse_auth_protocol("sha-256"),
-            Ok(AuthProtocol::Sha256)
-        ));
-        assert!(matches!(parse_auth_protocol("md5"), Ok(AuthProtocol::Md5)));
-    }
-
-    #[test]
-    fn test_parse_auth_protocol_invalid() {
-        assert!(parse_auth_protocol("INVALID").is_err());
-    }
-
-    #[test]
-    fn test_parse_priv_protocol_standard() {
-        use snmp2::v3::Cipher;
-        assert!(matches!(parse_priv_protocol("DES"), Ok(Cipher::Des)));
-        assert!(matches!(parse_priv_protocol("AES"), Ok(Cipher::Aes128)));
-        assert!(matches!(parse_priv_protocol("AES128"), Ok(Cipher::Aes128)));
-        assert!(matches!(parse_priv_protocol("AES192"), Ok(Cipher::Aes192)));
-        assert!(matches!(parse_priv_protocol("AES256"), Ok(Cipher::Aes256)));
-    }
-
-    #[test]
-    fn test_parse_priv_protocol_hyphenated() {
-        use snmp2::v3::Cipher;
-        assert!(matches!(parse_priv_protocol("AES-128"), Ok(Cipher::Aes128)));
-        assert!(matches!(parse_priv_protocol("AES-192"), Ok(Cipher::Aes192)));
-        assert!(matches!(parse_priv_protocol("AES-256"), Ok(Cipher::Aes256)));
-        assert!(matches!(
-            parse_priv_protocol("AES-256-C"),
-            Ok(Cipher::Aes256)
-        ));
-    }
-
-    #[test]
-    fn test_parse_priv_protocol_invalid() {
-        assert!(parse_priv_protocol("INVALID").is_err());
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(!debug_str.contains("public"));
     }
 }
