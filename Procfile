@@ -1,1 +1,1 @@
-worker: towerops-agent
+worker: true
