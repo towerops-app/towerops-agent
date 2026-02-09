@@ -1,0 +1,9 @@
+{
+  "name": "towerops-agent",
+  "description": "Towerops SNMP polling agent",
+  "healthchecks": {
+    "worker": {
+      "type": "startup"
+    }
+  }
+}
