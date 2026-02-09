@@ -1,4 +1,5 @@
-/// Get version at runtime - prefers BUILD_VERSION from build.rs, falls back to Cargo.toml
+/// Get compile timestamp at runtime - returns RFC 3339 formatted timestamp from build.rs
+/// Format: YYYY-MM-DDTHH:MM:SSZ (e.g., "2025-02-09T15:30:45Z")
 pub fn current_version() -> &'static str {
     option_env!("BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
@@ -25,9 +26,14 @@ mod tests {
     #[test]
     fn test_current_version_format() {
         let version = current_version();
-        // Version should be in semver-like format (e.g., "0.1.0" or custom BUILD_VERSION)
-        // At minimum, should have some content
-        assert!(!version.is_empty());
+        // Version should be RFC 3339 timestamp format (YYYY-MM-DDTHH:MM:SSZ)
+        // Regex: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$
+        let rfc3339_pattern = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$").unwrap();
+        assert!(
+            rfc3339_pattern.is_match(version),
+            "Version should be RFC 3339 timestamp, got: {}",
+            version
+        );
     }
 
     #[test]

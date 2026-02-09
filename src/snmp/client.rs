@@ -355,9 +355,7 @@ impl SnmpSession {
                         Err(_) => Ok(SnmpValue::OctetString(value_buf[..value_len].to_vec())),
                     }
                 }
-                ASN_OPAQUE => {
-                    Ok(SnmpValue::OctetString(value_buf[..value_len].to_vec()))
-                }
+                ASN_OPAQUE => Ok(SnmpValue::OctetString(value_buf[..value_len].to_vec())),
                 ASN_IPADDRESS => {
                     // IP addresses are 4 bytes - convert to dotted notation
                     if value_len == 4 {
@@ -466,7 +464,9 @@ impl SnmpSession {
                             // Try UTF-8 conversion first
                             match String::from_utf8(res.value[..res.value_len].to_vec()) {
                                 Ok(s) => SnmpValue::String(s),
-                                Err(_) => SnmpValue::OctetString(res.value[..res.value_len].to_vec()),
+                                Err(_) => {
+                                    SnmpValue::OctetString(res.value[..res.value_len].to_vec())
+                                }
                             }
                         }
                         ASN_OPAQUE => SnmpValue::OctetString(res.value[..res.value_len].to_vec()),
@@ -483,7 +483,9 @@ impl SnmpSession {
                         ASN_OBJECT_ID => {
                             match String::from_utf8(res.value[..res.value_len].to_vec()) {
                                 Ok(s) => SnmpValue::Oid(s),
-                                Err(_) => SnmpValue::OctetString(res.value[..res.value_len].to_vec()),
+                                Err(_) => {
+                                    SnmpValue::OctetString(res.value[..res.value_len].to_vec())
+                                }
                             }
                         }
                         ASN_INTEGER | ASN_COUNTER | ASN_GAUGE | ASN_TIMETICKS | ASN_UINTEGER => {

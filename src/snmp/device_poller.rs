@@ -58,20 +58,29 @@ impl DevicePoller {
         let config_clone = config.clone();
 
         // Spawn the polling thread with 8MB stack for SNMPv3 crypto operations
-        tracing::info!("Spawning device poller thread for {} at {}:{}", device_id, config.ip, config.port);
+        tracing::info!(
+            "Spawning device poller thread for {} at {}:{}",
+            device_id,
+            config.ip,
+            config.port
+        );
         std::thread::Builder::new()
             .name(format!("poller-{}", device_id))
             .stack_size(8 * 1024 * 1024) // 8MB stack (default is 2MB)
             .spawn(move || {
                 tracing::info!("Device poller thread starting for {}", device_id_clone);
-                if let Err(e) = run_poller_thread(device_id_clone.clone(), config_clone, request_rx) {
+                if let Err(e) = run_poller_thread(device_id_clone.clone(), config_clone, request_rx)
+                {
                     tracing::error!("Device poller thread failed for {}: {}", device_id_clone, e);
                 }
                 tracing::info!("Device poller thread exited for {}", device_id_clone);
             })
             .expect("Failed to spawn device poller thread");
 
-        tracing::info!("Successfully spawned device poller thread for {}", device_id);
+        tracing::info!(
+            "Successfully spawned device poller thread for {}",
+            device_id
+        );
 
         Self {
             device_id,
@@ -184,7 +193,11 @@ fn run_poller_thread(
                 SnmpRequest::Get { oid, response_tx } => {
                     tracing::debug!("Poller thread {} executing GET", device_id);
                     let result = perform_get(&runtime, &client, &config, &oid);
-                    tracing::debug!("Poller thread {} GET result: {:?}", device_id, result.is_ok());
+                    tracing::debug!(
+                        "Poller thread {} GET result: {:?}",
+                        device_id,
+                        result.is_ok()
+                    );
                     let _ = response_tx.send(result);
                 }
                 SnmpRequest::Walk {

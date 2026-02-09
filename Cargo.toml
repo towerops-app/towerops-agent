@@ -31,6 +31,9 @@ rand = "0.8"
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.28", optional = true }
 
+[dev-dependencies]
+regex = "1"
+
 [features]
 default = ["tui"]
 tui = ["ratatui", "crossterm"]
@@ -38,6 +41,7 @@ tui = ["ratatui", "crossterm"]
 [build-dependencies]
 prost-build = "0.14"
 cc = "1.0"
+chrono = "0.4"
 
 [profile.release]
 opt-level = "z"
