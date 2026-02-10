@@ -1,4 +1,8 @@
 # syntax=docker/dockerfile:1.4
+# Pre-built net-snmp 5.9.5.2 (fixes segfaults in Alpine's 5.9.4)
+# Built from Dockerfile.netsnmp via .github/workflows/netsnmp-base.yml
+FROM ghcr.io/towerops-app/netsnmp-alpine:5.9.5.2 AS netsnmp
+
 # Build stage
 FROM rust:1.93-alpine AS builder
 
@@ -9,8 +13,11 @@ ARG VERSION=0.1.0-unknown
 
 WORKDIR /app
 
-# Install build dependencies (net-snmp-dev required for C FFI)
-RUN apk add --no-cache musl-dev protobuf-dev openssl-dev openssl-libs-static net-snmp-dev cmake perl g++
+# Install build dependencies (net-snmp headers/libs from pre-built image)
+RUN apk add --no-cache musl-dev protobuf-dev openssl-dev openssl-libs-static cmake perl g++
+COPY --from=netsnmp /usr/include/net-snmp /usr/include/net-snmp
+COPY --from=netsnmp /usr/lib/libnetsnmp* /usr/lib/
+COPY --from=netsnmp /usr/lib/libsnmp* /usr/lib/
 
 # Determine Rust target based on platform and add it
 RUN case "$TARGETPLATFORM" in \
@@ -58,8 +65,10 @@ FROM alpine:3.23
 
 # Install runtime dependencies
 # iputils provides ping with setuid root (doesn't require CAP_NET_RAW)
-# net-snmp-libs required for C FFI to libnetsnmp
-RUN apk add --no-cache ca-certificates iputils openssl net-snmp-libs
+RUN apk add --no-cache ca-certificates iputils openssl
+
+# Copy net-snmp 5.9.5.2 shared libraries from pre-built image
+COPY --from=netsnmp /usr/lib/libnetsnmp.so* /usr/lib/
 
 # Copy binary from builder
 COPY --from=builder /tmp/towerops-agent /usr/local/bin/towerops-agent

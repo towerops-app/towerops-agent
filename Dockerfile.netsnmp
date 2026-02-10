@@ -1,0 +1,66 @@
+# syntax=docker/dockerfile:1.4
+# Base image with net-snmp 5.9.5.2 compiled from source
+# Alpine 3.23 ships 5.9.4 which has segfault bugs in varbind construction
+# and buffer overflows in octet string handling.
+#
+# Build and push with:
+#   docker buildx build -f Dockerfile.netsnmp --platform linux/amd64,linux/arm64 \
+#     -t ghcr.io/towerops-app/netsnmp-alpine:5.9.5.2 --push .
+#
+# Or use the GitHub Actions workflow: .github/workflows/netsnmp-base.yml
+
+FROM alpine:3.23 AS builder
+
+ARG NETSNMP_VERSION=5.9.5.2
+
+# Install build dependencies
+RUN apk add --no-cache \
+    gcc \
+    g++ \
+    make \
+    musl-dev \
+    openssl-dev \
+    linux-headers \
+    perl \
+    curl
+
+# Download and extract net-snmp source
+RUN curl -fsSL "https://downloads.sourceforge.net/project/net-snmp/net-snmp/${NETSNMP_VERSION}/net-snmp-${NETSNMP_VERSION}.tar.gz" \
+    -o /tmp/net-snmp.tar.gz && \
+    tar xzf /tmp/net-snmp.tar.gz -C /tmp && \
+    rm /tmp/net-snmp.tar.gz
+
+WORKDIR /tmp/net-snmp-${NETSNMP_VERSION}
+
+# Configure with minimal features (we only need libnetsnmp)
+RUN ./configure \
+    --prefix=/usr \
+    --sysconfdir=/etc \
+    --with-defaults \
+    --with-openssl \
+    --enable-shared \
+    --enable-static \
+    --disable-applications \
+    --disable-manuals \
+    --disable-scripts \
+    --without-perl-modules \
+    --without-python-modules \
+    --with-default-snmp-version=3
+
+# Build and install
+RUN make -j$(nproc) && \
+    make install DESTDIR=/netsnmp-install
+
+# Final stage: slim image with just the compiled artifacts
+FROM alpine:3.23
+
+# Install runtime dependency (OpenSSL) that net-snmp links against
+RUN apk add --no-cache openssl-dev musl-dev
+
+# Copy compiled net-snmp (headers, static libs, shared libs)
+COPY --from=builder /netsnmp-install/usr/include/net-snmp /usr/include/net-snmp
+COPY --from=builder /netsnmp-install/usr/lib/libnetsnmp* /usr/lib/
+COPY --from=builder /netsnmp-install/usr/lib/libsnmp* /usr/lib/
+
+# Ensure shared library cache is updated
+RUN ldconfig /usr/lib 2>/dev/null || true
