@@ -4,6 +4,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <stdlib.h>
 
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 
@@ -476,3 +481,415 @@ int snmp_walk(
 
     return 0;
 }
+
+/* --- Process-isolated (fork-based) operations --- */
+
+/**
+ * Write exactly `len` bytes to fd, retrying on EINTR.
+ * Returns 0 on success, -1 on error.
+ */
+static int write_full(int fd, const void* buf, size_t len) {
+    const uint8_t* p = (const uint8_t*)buf;
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = write(fd, p, remaining);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += n;
+        remaining -= (size_t)n;
+    }
+    return 0;
+}
+
+/**
+ * Read exactly `len` bytes from fd, retrying on EINTR.
+ * Returns 0 on success, -1 on error/EOF.
+ */
+static int read_full(int fd, void* buf, size_t len) {
+    uint8_t* p = (uint8_t*)buf;
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = read(fd, p, remaining);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1; /* unexpected EOF */
+        p += n;
+        remaining -= (size_t)n;
+    }
+    return 0;
+}
+
+/**
+ * Reset signal handlers to defaults in the child process.
+ * This ensures any crash handler installed by the parent doesn't interfere.
+ */
+static void child_reset_signals(void) {
+    signal(SIGSEGV, SIG_DFL);
+    signal(SIGBUS, SIG_DFL);
+    signal(SIGABRT, SIG_DFL);
+    signal(SIGPIPE, SIG_DFL);
+}
+
+/*
+ * Serialize fork operations to avoid issues with concurrent forks
+ * in multi-threaded processes. On macOS, concurrent fork() from
+ * multiple threads can trigger Objective-C runtime crashes (SIGKILL).
+ * On Linux this is still beneficial as it prevents resource exhaustion.
+ */
+static pthread_mutex_t fork_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#ifdef __APPLE__
+/*
+ * On macOS, the Objective-C runtime kills forked children from
+ * multi-threaded parents by default. Our children never use Objective-C
+ * and _exit() after SNMP work, so this is safe to disable.
+ * Set before main() to ensure it's in place before any threads start.
+ */
+__attribute__((constructor))
+static void disable_objc_fork_safety(void) {
+    setenv("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES", 0);
+}
+#endif
+
+void snmp_get_isolated(
+    const char* ip_address,
+    uint16_t port,
+    const char* community,
+    int version,
+    int64_t timeout_us,
+    int retries,
+    const snmp_v3_config_t* v3_config,
+    const char* oid_str,
+    snmp_isolated_get_result_t* result
+) {
+    /* Initialize result to error state */
+    memset(result, 0, sizeof(*result));
+    result->status = -1;
+
+    pthread_mutex_lock(&fork_mutex);
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        snprintf(result->error_buf, sizeof(result->error_buf),
+                 "pipe() failed: %s", strerror(errno));
+        pthread_mutex_unlock(&fork_mutex);
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        snprintf(result->error_buf, sizeof(result->error_buf),
+                 "fork() failed: %s", strerror(errno));
+        pthread_mutex_unlock(&fork_mutex);
+        return;
+    }
+
+    if (pid == 0) {
+        /* === CHILD PROCESS === */
+        close(pipefd[0]); /* close read end */
+        child_reset_signals();
+        alarm(60); /* watchdog: kill child if stuck */
+
+        /* Initialize net-snmp fresh in child */
+        init_snmp("towerops-child");
+        netsnmp_ds_set_int(NETSNMP_DS_LIBRARY_ID,
+                           NETSNMP_DS_LIB_OID_OUTPUT_FORMAT,
+                           NETSNMP_OID_OUTPUT_NUMERIC);
+
+        snmp_isolated_get_result_t child_result;
+        memset(&child_result, 0, sizeof(child_result));
+        child_result.status = -1;
+
+        /* Open session */
+        char error_buf[512] = {0};
+        void* sess = snmp_open_session(ip_address, port, community, version,
+                                       timeout_us, retries, v3_config,
+                                       error_buf, sizeof(error_buf));
+        if (!sess) {
+            snprintf(child_result.error_buf, sizeof(child_result.error_buf),
+                     "%s", error_buf);
+            write_full(pipefd[1], &child_result, sizeof(child_result));
+            close(pipefd[1]);
+            _exit(1);
+        }
+
+        /* Perform GET */
+        int value_type = 0;
+        int ret = snmp_get(sess, oid_str,
+                          child_result.value_buf, sizeof(child_result.value_buf),
+                          &value_type, child_result.error_buf,
+                          sizeof(child_result.error_buf));
+        snmp_close_session(sess);
+
+        child_result.status = ret;
+        child_result.value_type = value_type;
+        write_full(pipefd[1], &child_result, sizeof(child_result));
+        close(pipefd[1]);
+        _exit(0);
+    }
+
+    /* === PARENT PROCESS === */
+    close(pipefd[1]); /* close write end */
+
+    /* Unlock after fork so other threads can proceed */
+    pthread_mutex_unlock(&fork_mutex);
+
+    /* Try to read the result from the child */
+    snmp_isolated_get_result_t pipe_result;
+    memset(&pipe_result, 0, sizeof(pipe_result));
+    int read_ok = read_full(pipefd[0], &pipe_result, sizeof(pipe_result));
+    close(pipefd[0]);
+
+    /* Wait for child to exit */
+    int wstatus = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &wstatus, 0);
+    } while (waited < 0 && errno == EINTR);
+
+    if (waited < 0) {
+        snprintf(result->error_buf, sizeof(result->error_buf),
+                 "waitpid() failed: %s", strerror(errno));
+        result->status = -1;
+        return;
+    }
+
+    if (WIFSIGNALED(wstatus)) {
+        /* Child was killed by a signal (crash) */
+        result->status = -2;
+        result->child_signal = WTERMSIG(wstatus);
+        snprintf(result->error_buf, sizeof(result->error_buf),
+                 "SNMP child process killed by signal %d", result->child_signal);
+        return;
+    }
+
+    if (read_ok != 0) {
+        /* Could not read from pipe but child exited normally - unexpected */
+        result->status = -1;
+        snprintf(result->error_buf, sizeof(result->error_buf),
+                 "Failed to read result from child (exit code %d)",
+                 WEXITSTATUS(wstatus));
+        return;
+    }
+
+    /* Successfully read result from child */
+    memcpy(result, &pipe_result, sizeof(*result));
+}
+
+void snmp_walk_isolated(
+    const char* ip_address,
+    uint16_t port,
+    const char* community,
+    int version,
+    int64_t timeout_us,
+    int retries,
+    const snmp_v3_config_t* v3_config,
+    const char* oid_str,
+    snmp_isolated_walk_header_t* header,
+    snmp_walk_result_t* results,
+    size_t max_results
+) {
+    /* Initialize header to error state */
+    memset(header, 0, sizeof(*header));
+    header->status = -1;
+
+    pthread_mutex_lock(&fork_mutex);
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        snprintf(header->error_buf, sizeof(header->error_buf),
+                 "pipe() failed: %s", strerror(errno));
+        pthread_mutex_unlock(&fork_mutex);
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        snprintf(header->error_buf, sizeof(header->error_buf),
+                 "fork() failed: %s", strerror(errno));
+        pthread_mutex_unlock(&fork_mutex);
+        return;
+    }
+
+    if (pid == 0) {
+        /* === CHILD PROCESS === */
+        close(pipefd[0]); /* close read end */
+        child_reset_signals();
+        alarm(60); /* watchdog */
+
+        /* Initialize net-snmp fresh in child */
+        init_snmp("towerops-child");
+        netsnmp_ds_set_int(NETSNMP_DS_LIBRARY_ID,
+                           NETSNMP_DS_LIB_OID_OUTPUT_FORMAT,
+                           NETSNMP_OID_OUTPUT_NUMERIC);
+
+        snmp_isolated_walk_header_t child_header;
+        memset(&child_header, 0, sizeof(child_header));
+        child_header.status = -1;
+
+        /* Open session */
+        char error_buf[512] = {0};
+        void* sess = snmp_open_session(ip_address, port, community, version,
+                                       timeout_us, retries, v3_config,
+                                       error_buf, sizeof(error_buf));
+        if (!sess) {
+            snprintf(child_header.error_buf, sizeof(child_header.error_buf),
+                     "%s", error_buf);
+            write_full(pipefd[1], &child_header, sizeof(child_header));
+            close(pipefd[1]);
+            _exit(1);
+        }
+
+        /* Allocate results buffer in child */
+        snmp_walk_result_t* child_results = (snmp_walk_result_t*)calloc(
+            max_results, sizeof(snmp_walk_result_t));
+        if (!child_results) {
+            snprintf(child_header.error_buf, sizeof(child_header.error_buf),
+                     "Failed to allocate walk results buffer");
+            snmp_close_session(sess);
+            write_full(pipefd[1], &child_header, sizeof(child_header));
+            close(pipefd[1]);
+            _exit(1);
+        }
+
+        /* Perform WALK */
+        size_t num_results = 0;
+        int ret = snmp_walk(sess, oid_str, child_results, max_results,
+                           &num_results, child_header.error_buf,
+                           sizeof(child_header.error_buf));
+        snmp_close_session(sess);
+
+        child_header.status = ret;
+        child_header.num_results = (uint32_t)num_results;
+
+        /* Write header first */
+        write_full(pipefd[1], &child_header, sizeof(child_header));
+
+        /* Write each result individually (each < PIPE_BUF) */
+        for (size_t i = 0; i < num_results; i++) {
+            write_full(pipefd[1], &child_results[i], sizeof(snmp_walk_result_t));
+        }
+
+        free(child_results);
+        close(pipefd[1]);
+        _exit(0);
+    }
+
+    /* === PARENT PROCESS === */
+    close(pipefd[1]); /* close write end */
+
+    /* Unlock after fork so other threads can proceed */
+    pthread_mutex_unlock(&fork_mutex);
+
+    /* Read header from child */
+    snmp_isolated_walk_header_t pipe_header;
+    memset(&pipe_header, 0, sizeof(pipe_header));
+    int read_ok = read_full(pipefd[0], &pipe_header, sizeof(pipe_header));
+
+    uint32_t results_read = 0;
+    if (read_ok == 0 && pipe_header.status >= 0 && pipe_header.num_results > 0) {
+        /* Read individual results, capping at max_results */
+        uint32_t to_read = pipe_header.num_results;
+        if (to_read > (uint32_t)max_results) {
+            to_read = (uint32_t)max_results;
+        }
+        for (uint32_t i = 0; i < to_read; i++) {
+            if (read_full(pipefd[0], &results[i], sizeof(snmp_walk_result_t)) != 0) {
+                break;
+            }
+            results_read++;
+        }
+    }
+    close(pipefd[0]);
+
+    /* Wait for child to exit */
+    int wstatus = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &wstatus, 0);
+    } while (waited < 0 && errno == EINTR);
+
+    if (waited < 0) {
+        snprintf(header->error_buf, sizeof(header->error_buf),
+                 "waitpid() failed: %s", strerror(errno));
+        header->status = -1;
+        return;
+    }
+
+    if (WIFSIGNALED(wstatus)) {
+        /* Child was killed by a signal (crash) */
+        header->status = -2;
+        header->child_signal = WTERMSIG(wstatus);
+        snprintf(header->error_buf, sizeof(header->error_buf),
+                 "SNMP child process killed by signal %d", header->child_signal);
+        return;
+    }
+
+    if (read_ok != 0) {
+        header->status = -1;
+        snprintf(header->error_buf, sizeof(header->error_buf),
+                 "Failed to read header from child (exit code %d)",
+                 WEXITSTATUS(wstatus));
+        return;
+    }
+
+    /* Successfully read from child */
+    memcpy(header, &pipe_header, sizeof(*header));
+    header->num_results = results_read;
+}
+
+#ifdef SNMP_HELPER_TEST
+int snmp_test_crash_in_child(int* child_signal) {
+    if (!child_signal) return -1;
+    *child_signal = 0;
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* Child: close pipe ends and deliberately crash */
+        close(pipefd[0]);
+        close(pipefd[1]);
+        child_reset_signals();
+
+        /* Trigger SIGSEGV by writing to a null pointer */
+        volatile int* null_ptr = NULL;
+        *null_ptr = 42;
+        _exit(99); /* should not reach here */
+    }
+
+    /* Parent */
+    close(pipefd[0]);
+    close(pipefd[1]);
+
+    int wstatus = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &wstatus, 0);
+    } while (waited < 0 && errno == EINTR);
+
+    if (waited < 0) return -1;
+
+    if (WIFSIGNALED(wstatus)) {
+        *child_signal = WTERMSIG(wstatus);
+        return 0;
+    }
+
+    return -1; /* child didn't crash as expected */
+}
+#endif

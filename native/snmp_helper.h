@@ -108,4 +108,90 @@ int snmp_walk(
     size_t error_buf_len
 );
 
+/**
+ * Result from isolated (fork-based) SNMP GET operation.
+ * status >= 0: value_len (success), -1: error, -2: child crash
+ */
+typedef struct {
+    int status;
+    int value_type;
+    int child_signal;
+    char error_buf[512];
+    uint8_t value_buf[1024];
+} snmp_isolated_get_result_t;
+
+/**
+ * Header for isolated SNMP WALK result stream.
+ * status 0: success, -1: error, -2: child crash
+ */
+typedef struct {
+    int status;
+    uint32_t num_results;
+    int child_signal;
+    char error_buf[512];
+} snmp_isolated_walk_header_t;
+
+/**
+ * Perform an SNMP GET in a forked child process for crash isolation.
+ *
+ * @param ip_address IP address of the device
+ * @param port UDP port (usually 161)
+ * @param community Community string for SNMPv1/v2c
+ * @param version SNMP version: 1 (SNMPv1), 2 (SNMPv2c), 3 (SNMPv3)
+ * @param timeout_us Timeout in microseconds
+ * @param retries Number of retries
+ * @param v3_config SNMPv3 configuration (NULL for v1/v2c)
+ * @param oid_str OID string to GET
+ * @param result Output result structure
+ */
+void snmp_get_isolated(
+    const char* ip_address,
+    uint16_t port,
+    const char* community,
+    int version,
+    int64_t timeout_us,
+    int retries,
+    const snmp_v3_config_t* v3_config,
+    const char* oid_str,
+    snmp_isolated_get_result_t* result
+);
+
+/**
+ * Perform an SNMP WALK in a forked child process for crash isolation.
+ *
+ * @param ip_address IP address of the device
+ * @param port UDP port (usually 161)
+ * @param community Community string for SNMPv1/v2c
+ * @param version SNMP version: 1 (SNMPv1), 2 (SNMPv2c), 3 (SNMPv3)
+ * @param timeout_us Timeout in microseconds
+ * @param retries Number of retries
+ * @param v3_config SNMPv3 configuration (NULL for v1/v2c)
+ * @param oid_str Starting OID string to WALK
+ * @param header Output header (status, num_results, error)
+ * @param results Output buffer for walk results
+ * @param max_results Maximum number of results
+ */
+void snmp_walk_isolated(
+    const char* ip_address,
+    uint16_t port,
+    const char* community,
+    int version,
+    int64_t timeout_us,
+    int retries,
+    const snmp_v3_config_t* v3_config,
+    const char* oid_str,
+    snmp_isolated_walk_header_t* header,
+    snmp_walk_result_t* results,
+    size_t max_results
+);
+
+#ifdef SNMP_HELPER_TEST
+/**
+ * Test helper: deliberately crashes (SIGSEGV) in a forked child.
+ * Returns 0 on success (child crashed as expected), -1 on error.
+ * child_signal receives the signal that killed the child.
+ */
+int snmp_test_crash_in_child(int* child_signal);
+#endif
+
 #endif // SNMP_HELPER_H

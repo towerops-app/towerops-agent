@@ -6,6 +6,7 @@ fn main() {
     cc::Build::new()
         .file("native/snmp_helper.c")
         .include("native")
+        .define("SNMP_HELPER_TEST", None)
         .compile("snmp_helper");
 
     // Link against netsnmp library
