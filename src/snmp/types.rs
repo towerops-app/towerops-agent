@@ -3,7 +3,6 @@ pub enum SnmpError {
     RequestFailed(String),
     InvalidOid(String),
     Timeout,
-    AuthFailure,
     NetworkUnreachable,
 }
 
@@ -13,7 +12,6 @@ impl std::fmt::Display for SnmpError {
             Self::RequestFailed(msg) => write!(f, "SNMP request failed: {}", msg),
             Self::InvalidOid(oid) => write!(f, "Invalid OID: {}", oid),
             Self::Timeout => write!(f, "Timeout"),
-            Self::AuthFailure => write!(f, "Authentication failure"),
             Self::NetworkUnreachable => write!(f, "Network unreachable"),
         }
     }
@@ -74,10 +72,6 @@ mod tests {
             "Invalid OID: 1.2.3"
         );
         assert_eq!(format!("{}", SnmpError::Timeout), "Timeout");
-        assert_eq!(
-            format!("{}", SnmpError::AuthFailure),
-            "Authentication failure"
-        );
         assert_eq!(
             format!("{}", SnmpError::NetworkUnreachable),
             "Network unreachable"
