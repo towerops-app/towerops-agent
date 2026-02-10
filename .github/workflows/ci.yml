@@ -21,6 +21,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  DOCKERHUB_IMAGE: gmcintire/towerops-agent
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -C link-arg=-fuse-ld=lld
 
@@ -186,6 +187,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: gmcintire
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Build and push
         uses: useblacksmith/build-push-action@v2
         with:
@@ -198,6 +205,7 @@ jobs:
             BUILDKIT_INLINE_CACHE=1
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
+            docker.io/${{ env.DOCKERHUB_IMAGE }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
 
   # Create multi-arch manifest after both builds complete
   manifest:
@@ -216,32 +224,50 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: gmcintire
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Create and push manifests
         run: |
           VERSION="${{ needs.version.outputs.version }}"
           SHORT_SHA="${{ needs.version.outputs.short_sha }}"
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          DH_IMAGE="docker.io/${{ env.DOCKERHUB_IMAGE }}"
 
-          # Create manifest for version tag
+          # Create GHCR manifests
           docker buildx imagetools create -t ${IMAGE}:${VERSION} \
             ${IMAGE}:${VERSION}-amd64 \
             ${IMAGE}:${VERSION}-arm64
 
-          # Create manifest for latest
           docker buildx imagetools create -t ${IMAGE}:latest \
             ${IMAGE}:${VERSION}-amd64 \
             ${IMAGE}:${VERSION}-arm64
 
-          # Create manifest for sha tag
           docker buildx imagetools create -t ${IMAGE}:sha-${SHORT_SHA} \
             ${IMAGE}:${VERSION}-amd64 \
             ${IMAGE}:${VERSION}-arm64
+
+          # Create Docker Hub manifests
+          docker buildx imagetools create -t ${DH_IMAGE}:${VERSION} \
+            ${DH_IMAGE}:${VERSION}-amd64 \
+            ${DH_IMAGE}:${VERSION}-arm64
+
+          docker buildx imagetools create -t ${DH_IMAGE}:latest \
+            ${DH_IMAGE}:${VERSION}-amd64 \
+            ${DH_IMAGE}:${VERSION}-arm64
+
+          docker buildx imagetools create -t ${DH_IMAGE}:sha-${SHORT_SHA} \
+            ${DH_IMAGE}:${VERSION}-amd64 \
+            ${DH_IMAGE}:${VERSION}-arm64
 
       - name: Summary
         run: |
           echo "### Released version: ${{ needs.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "Multi-architecture build (amd64, arm64) - built in parallel" >> $GITHUB_STEP_SUMMARY
-          echo "Tags pushed:" >> $GITHUB_STEP_SUMMARY
+          echo "Tags pushed to GHCR and Docker Hub:" >> $GITHUB_STEP_SUMMARY
           echo "- \`latest\`" >> $GITHUB_STEP_SUMMARY
           echo "- \`${{ needs.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- \`sha-${{ needs.version.outputs.short_sha }}\`" >> $GITHUB_STEP_SUMMARY
