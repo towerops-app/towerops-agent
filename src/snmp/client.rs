@@ -8,7 +8,6 @@ type SecretString = Zeroizing<String>;
 
 const SNMP_TIMEOUT_SECS: i64 = 10;
 const SNMP_RETRIES: i32 = 2;
-const MAX_OID_LEN: usize = 128;
 
 // C structs and functions
 #[repr(C)]
@@ -541,94 +540,6 @@ impl Drop for SnmpSession {
             }
         }
     }
-}
-
-// Helper functions
-
-unsafe fn parse_variable(var: *mut Struct_variable_list) -> SnmpResult<SnmpValue> {
-    if var.is_null() {
-        return Err(SnmpError::RequestFailed("Null variable".into()));
-    }
-
-    let var_type = (*var)._type;
-
-    match var_type {
-        ASN_OCTET_STR => {
-            let len = (*var).val_len;
-            let string_ptr_ptr = (*var).val.string();
-            let string_ptr = *string_ptr_ptr;
-            let data = std::slice::from_raw_parts(string_ptr, len);
-            Ok(SnmpValue::OctetString(data.to_vec()))
-        }
-        ASN_INTEGER => {
-            let int_ptr_ptr = (*var).val.integer();
-            let int_ptr = *int_ptr_ptr;
-            let value = *int_ptr;
-            Ok(SnmpValue::Integer(value))
-        }
-        ASN_COUNTER => {
-            let int_ptr_ptr = (*var).val.integer();
-            let int_ptr = *int_ptr_ptr;
-            let value = *int_ptr as u32;
-            Ok(SnmpValue::Counter32(value))
-        }
-        ASN_GAUGE => {
-            let int_ptr_ptr = (*var).val.integer();
-            let int_ptr = *int_ptr_ptr;
-            let value = *int_ptr as u32;
-            Ok(SnmpValue::Gauge32(value))
-        }
-        ASN_TIMETICKS => {
-            let int_ptr_ptr = (*var).val.integer();
-            let int_ptr = *int_ptr_ptr;
-            let value = *int_ptr as u32;
-            Ok(SnmpValue::TimeTicks(value))
-        }
-        ASN_COUNTER64 => {
-            let counter64_ptr_ptr = (*var).val.counter64();
-            let counter64_ptr = *counter64_ptr_ptr;
-            let high = (*counter64_ptr).high;
-            let low = (*counter64_ptr).low;
-            let value = (high << 32) | low;
-            Ok(SnmpValue::Counter64(value))
-        }
-        ASN_IPADDRESS => {
-            let len = (*var).val_len;
-            let string_ptr_ptr = (*var).val.string();
-            let string_ptr = *string_ptr_ptr;
-            let data = std::slice::from_raw_parts(string_ptr, len);
-            if len == 4 {
-                let ip_str = format!("{}.{}.{}.{}", data[0], data[1], data[2], data[3]);
-                Ok(SnmpValue::IpAddress(ip_str))
-            } else {
-                Ok(SnmpValue::OctetString(data.to_vec()))
-            }
-        }
-        ASN_OBJECT_ID => {
-            let oid_len = (*var).val_len / std::mem::size_of::<oid>();
-            let oid_ptr_ptr = (*var).val.objid();
-            let oid_ptr = *oid_ptr_ptr;
-            let oid_str = oid_to_string(oid_ptr, oid_len);
-            Ok(SnmpValue::Oid(oid_str))
-        }
-        ASN_NULL => Ok(SnmpValue::Null),
-        SNMP_NOSUCHOBJECT | SNMP_NOSUCHINSTANCE | SNMP_ENDOFMIBVIEW => {
-            Err(SnmpError::RequestFailed("No such object".into()))
-        }
-        _ => Err(SnmpError::RequestFailed(format!(
-            "Unknown type: {}",
-            var_type
-        ))),
-    }
-}
-
-unsafe fn oid_to_string(oid_ptr: *const oid, oid_len: usize) -> String {
-    let oid_slice = std::slice::from_raw_parts(oid_ptr, oid_len);
-    oid_slice
-        .iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(".")
 }
 
 #[cfg(test)]

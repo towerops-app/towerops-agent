@@ -123,19 +123,9 @@ impl DevicePoller {
         let _ = self.request_tx.send(SnmpRequest::Shutdown);
     }
 
-    /// Get the device ID
-    pub fn device_id(&self) -> &str {
-        &self.device_id
-    }
-
     /// Get the device config
     pub fn config(&self) -> &DeviceConfig {
         &self.config
-    }
-
-    /// Update the device configuration
-    pub fn update_config(&mut self, new_config: DeviceConfig) {
-        self.config = new_config;
     }
 
     /// Log the status of this poller (for debugging)
