@@ -69,9 +69,6 @@ pub struct AgentClient {
     phx_heartbeat_ref: u64,
     /// Cached hostname (computed once at startup, avoids blocking /proc reads)
     cached_hostname: String,
-    /// Optional event bus for TUI updates
-    #[cfg(feature = "tui")]
-    event_bus: Option<crate::tui::EventBus>,
 }
 
 impl AgentClient {
@@ -80,124 +77,7 @@ impl AgentClient {
     /// # Arguments
     /// * `url` - Server URL (e.g., "wss://towerops.net")
     /// * `token` - Agent authentication token
-    /// * `event_bus` - Optional event bus for TUI updates
-    ///
-    /// # Example
-    /// ```no_run
-    /// let client = AgentClient::connect("wss://towerops.net", "token123", None).await?;
-    /// ```
-    #[cfg(feature = "tui")]
-    pub async fn connect(
-        url: &str,
-        token: &SecretString,
-        event_bus: Option<crate::tui::EventBus>,
-    ) -> Result<Self> {
-        Self::connect_internal(url, token, event_bus).await
-    }
-
-    #[cfg(not(feature = "tui"))]
     pub async fn connect(url: &str, token: &SecretString) -> Result<Self> {
-        Self::connect_internal(url, token).await
-    }
-
-    #[cfg(feature = "tui")]
-    async fn connect_internal(
-        url: &str,
-        token: &SecretString,
-        event_bus: Option<crate::tui::EventBus>,
-    ) -> Result<Self> {
-        // Strip trailing slash from base URL to avoid double slashes
-        let base_url = url.trim_end_matches('/');
-        let ws_url = format!("{}/socket/agent/websocket", base_url);
-        tracing::info!(
-            "Connecting to WebSocket: {} (timeout: {}s)",
-            ws_url,
-            CONNECTION_TIMEOUT.as_secs()
-        );
-
-        // Wrap connection in timeout to avoid hanging indefinitely on bad network
-        let (ws_stream, _) = match timeout(CONNECTION_TIMEOUT, connect_async(&ws_url)).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => {
-                tracing::error!("WebSocket connection failed: {}", e);
-                return Err(format!("Failed to connect to WebSocket: {}", e).into());
-            }
-            Err(_) => {
-                tracing::error!(
-                    "WebSocket connection timed out after {}s",
-                    CONNECTION_TIMEOUT.as_secs()
-                );
-                return Err(format!(
-                    "Connection timed out after {}s",
-                    CONNECTION_TIMEOUT.as_secs()
-                )
-                .into());
-            }
-        };
-
-        tracing::info!("Connected to Towerops server at {}", url);
-
-        let agent_id = generate_agent_id();
-        let (result_tx, result_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
-        let (mikrotik_result_tx, mikrotik_result_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
-        let (credential_test_tx, credential_test_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
-        let (monitoring_check_tx, monitoring_check_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
-
-        // Split the WebSocket stream so reads and writes can proceed concurrently.
-        // The write half is owned by a dedicated writer task.
-        let (ws_write, ws_read) = ws_stream.split();
-        let (ws_write_tx, ws_write_rx) = mpsc::channel::<WsMessage>(WS_WRITE_CHANNEL_CAPACITY);
-
-        tokio::spawn(ws_writer_task(ws_write, ws_write_rx));
-
-        // Join Phoenix channel with token in payload
-        let join_msg = PhoenixMessage {
-            topic: format!("agent:{}", agent_id),
-            event: "phx_join".to_string(),
-            payload: serde_json::json!({"token": token.expose()}),
-            reference: Some("1".to_string()),
-        };
-
-        let join_text = serde_json::to_string(&join_msg)?;
-        ws_write_tx
-            .send(WsMessage::Text(join_text.into()))
-            .await
-            .map_err(|e| format!("Failed to send join message: {}", e))?;
-        tracing::info!(
-            "Sent channel join request with token for agent:{}",
-            agent_id
-        );
-
-        let client = Self {
-            ws_read,
-            ws_write_tx,
-            agent_id: agent_id.clone(),
-            result_tx,
-            result_rx,
-            mikrotik_result_tx,
-            mikrotik_result_rx,
-            credential_test_tx,
-            credential_test_rx,
-            monitoring_check_tx,
-            monitoring_check_rx,
-            poller_registry: PollerRegistry::new(),
-            phx_heartbeat_ref: 0,
-            cached_hostname: get_hostname(),
-            #[cfg(feature = "tui")]
-            event_bus: event_bus.clone(),
-        };
-
-        // Publish connected event
-        #[cfg(feature = "tui")]
-        client.publish_event(crate::tui::AgentEvent::Connected {
-            agent_id: agent_id.clone(),
-        });
-
-        Ok(client)
-    }
-
-    #[cfg(not(feature = "tui"))]
-    async fn connect_internal(url: &str, token: &SecretString) -> Result<Self> {
         // Strip trailing slash from base URL to avoid double slashes
         let base_url = url.trim_end_matches('/');
         let ws_url = format!("{}/socket/agent/websocket", base_url);
@@ -278,19 +158,6 @@ impl AgentClient {
         })
     }
 
-    /// Publish an event to the TUI event bus (if enabled).
-    #[cfg(feature = "tui")]
-    fn publish_event(&self, event: crate::tui::AgentEvent) {
-        if let Some(bus) = &self.event_bus {
-            let _ = bus.send(event); // Fire-and-forget
-        }
-    }
-
-    #[cfg(not(feature = "tui"))]
-    fn publish_event(&self, _event: ()) {
-        // No-op when TUI is disabled
-    }
-
     /// Main event loop for agent operation.
     ///
     /// Handles:
@@ -330,22 +197,16 @@ impl AgentClient {
                         }
                         Some(Ok(WsMessage::Close(_))) => {
                             tracing::info!("Server closed connection");
-                            #[cfg(feature = "tui")]
-                            self.publish_event(crate::tui::AgentEvent::Disconnected);
                             self.poller_registry.shutdown_all();
                             break Ok(());
                         }
                         Some(Err(e)) => {
                             tracing::error!("WebSocket error: {}", e);
-                            #[cfg(feature = "tui")]
-                            self.publish_event(crate::tui::AgentEvent::Disconnected);
                             self.poller_registry.shutdown_all();
                             break Err(e.into());
                         }
                         None => {
                             tracing::info!("Connection closed");
-                            #[cfg(feature = "tui")]
-                            self.publish_event(crate::tui::AgentEvent::Disconnected);
                             self.poller_registry.shutdown_all();
                             break Ok(());
                         }
@@ -355,29 +216,15 @@ impl AgentClient {
 
                 // Receive SNMP results from job tasks
                 Some(snmp_result) = self.result_rx.recv() => {
-                    #[cfg(feature = "tui")]
-                    let device_id = snmp_result.device_id.clone();
-
                     if let Err(e) = self.send_snmp_result(snmp_result).await {
                         tracing::error!("Error sending SNMP result: {}", e);
-                        #[cfg(feature = "tui")]
-                        self.publish_event(crate::tui::AgentEvent::Error {
-                            message: format!("SNMP result send failed for {}: {}", device_id, e),
-                        });
                     }
                 }
 
                 // Receive MikroTik results from job tasks
                 Some(mikrotik_result) = self.mikrotik_result_rx.recv() => {
-                    #[cfg(feature = "tui")]
-                    let device_id = mikrotik_result.device_id.clone();
-
                     if let Err(e) = self.send_mikrotik_result(mikrotik_result).await {
                         tracing::error!("Error sending MikroTik result: {}", e);
-                        #[cfg(feature = "tui")]
-                        self.publish_event(crate::tui::AgentEvent::Error {
-                            message: format!("MikroTik result send failed for {}: {}", device_id, e),
-                        });
                     }
                 }
 
@@ -390,15 +237,8 @@ impl AgentClient {
 
                 // Receive monitoring check results from job tasks
                 Some(monitoring_check) = self.monitoring_check_rx.recv() => {
-                    #[cfg(feature = "tui")]
-                    let device_id = monitoring_check.device_id.clone();
-
                     if let Err(e) = self.send_monitoring_check(monitoring_check).await {
                         tracing::error!("Error sending monitoring check: {}", e);
-                        #[cfg(feature = "tui")]
-                        self.publish_event(crate::tui::AgentEvent::Error {
-                            message: format!("Monitoring check send failed for {}: {}", device_id, e),
-                        });
                     }
                 }
 
@@ -406,13 +246,6 @@ impl AgentClient {
                 _ = heartbeat_interval.tick() => {
                     if let Err(e) = self.send_heartbeat().await {
                         tracing::error!("Error sending heartbeat: {}", e);
-                        #[cfg(feature = "tui")]
-                        self.publish_event(crate::tui::AgentEvent::Error {
-                            message: format!("Heartbeat failed: {}", e),
-                        });
-                    } else {
-                        #[cfg(feature = "tui")]
-                        self.publish_event(crate::tui::AgentEvent::HeartbeatSent);
                     }
                     // Log active poller count
                     let count = self.poller_registry.count();
@@ -425,9 +258,6 @@ impl AgentClient {
                 _ = phx_heartbeat_interval.tick() => {
                     if let Err(e) = self.send_phx_heartbeat().await {
                         tracing::error!("Error sending Phoenix heartbeat: {}", e);
-                    } else {
-                        #[cfg(feature = "tui")]
-                        self.publish_event(crate::tui::AgentEvent::PhxHeartbeatSent);
                     }
                 }
             }
@@ -493,17 +323,7 @@ impl AgentClient {
                     "Removing poller for device no longer in job list: {}",
                     device_id
                 );
-                let device_ip = self.poller_registry.remove(&device_id);
-
-                #[cfg(feature = "tui")]
-                if let Some(ref bus) = self.event_bus {
-                    if let Some(ip) = device_ip {
-                        let _ = bus.send(crate::tui::AgentEvent::PollerRemoved {
-                            device_ip: ip,
-                            total_count: self.poller_registry.count(),
-                        });
-                    }
-                }
+                self.poller_registry.remove(&device_id);
             }
         }
 
@@ -511,123 +331,34 @@ impl AgentClient {
             let job_type = JobType::try_from(job.job_type).unwrap_or(JobType::Poll);
             tracing::info!("Executing job: {} (type: {:?})", job.job_id, job_type);
 
-            #[cfg(feature = "tui")]
-            {
-                if let Some(ref bus) = self.event_bus {
-                    let _ = bus.send(crate::tui::AgentEvent::JobReceived {
-                        job_id: job.job_id.clone(),
-                        device_id: job.device_id.clone(),
-                        job_type: format!("{:?}", job_type),
-                    });
-                }
-            }
-
             match job_type {
                 JobType::Mikrotik => {
                     // Execute MikroTik API job
                     let mikrotik_result_tx = self.mikrotik_result_tx.clone();
-                    #[cfg(feature = "tui")]
-                    let event_bus = self.event_bus.clone();
-                    let job_id = job.job_id.clone();
-                    let device_id = job.device_id.clone();
 
                     tokio::spawn(async move {
-                        let start_time = std::time::Instant::now();
-                        match execute_mikrotik_job(job, mikrotik_result_tx).await {
-                            Ok(_) =>
-                            {
-                                #[cfg(feature = "tui")]
-                                if let Some(ref bus) = event_bus {
-                                    let _ = bus.send(crate::tui::AgentEvent::JobCompleted {
-                                        job_id,
-                                        device_id,
-                                        duration_ms: start_time.elapsed().as_millis() as u64,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("MikroTik job execution failed: {}", e);
-                                #[cfg(feature = "tui")]
-                                if let Some(ref bus) = event_bus {
-                                    let _ = bus.send(crate::tui::AgentEvent::JobFailed {
-                                        job_id,
-                                        device_id,
-                                        error: e.to_string(),
-                                    });
-                                }
-                            }
+                        if let Err(e) = execute_mikrotik_job(job, mikrotik_result_tx).await {
+                            tracing::error!("MikroTik job execution failed: {}", e);
                         }
                     });
                 }
                 JobType::TestCredentials => {
                     // Execute credential test
                     let credential_test_tx = self.credential_test_tx.clone();
-                    #[cfg(feature = "tui")]
-                    let event_bus = self.event_bus.clone();
-                    let job_id = job.job_id.clone();
-                    let device_id = job.device_id.clone();
 
                     tokio::spawn(async move {
-                        let start_time = std::time::Instant::now();
-                        match execute_credential_test(job, credential_test_tx).await {
-                            Ok(_) =>
-                            {
-                                #[cfg(feature = "tui")]
-                                if let Some(ref bus) = event_bus {
-                                    let _ = bus.send(crate::tui::AgentEvent::JobCompleted {
-                                        job_id,
-                                        device_id,
-                                        duration_ms: start_time.elapsed().as_millis() as u64,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Credential test execution failed: {}", e);
-                                #[cfg(feature = "tui")]
-                                if let Some(ref bus) = event_bus {
-                                    let _ = bus.send(crate::tui::AgentEvent::JobFailed {
-                                        job_id,
-                                        device_id,
-                                        error: e.to_string(),
-                                    });
-                                }
-                            }
+                        if let Err(e) = execute_credential_test(job, credential_test_tx).await {
+                            tracing::error!("Credential test execution failed: {}", e);
                         }
                     });
                 }
                 JobType::Ping => {
                     // Execute ICMP ping health check
                     let monitoring_check_tx = self.monitoring_check_tx.clone();
-                    #[cfg(feature = "tui")]
-                    let event_bus = self.event_bus.clone();
-                    let job_id = job.job_id.clone();
-                    let device_id = job.device_id.clone();
 
                     tokio::spawn(async move {
-                        let start_time = std::time::Instant::now();
-                        match execute_ping_job(job, monitoring_check_tx).await {
-                            Ok(_) =>
-                            {
-                                #[cfg(feature = "tui")]
-                                if let Some(ref bus) = event_bus {
-                                    let _ = bus.send(crate::tui::AgentEvent::JobCompleted {
-                                        job_id,
-                                        device_id,
-                                        duration_ms: start_time.elapsed().as_millis() as u64,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Ping job execution failed: {}", e);
-                                #[cfg(feature = "tui")]
-                                if let Some(ref bus) = event_bus {
-                                    let _ = bus.send(crate::tui::AgentEvent::JobFailed {
-                                        job_id,
-                                        device_id,
-                                        error: e.to_string(),
-                                    });
-                                }
-                            }
+                        if let Err(e) = execute_ping_job(job, monitoring_check_tx).await {
+                            tracing::error!("Ping job execution failed: {}", e);
                         }
                     });
                 }
@@ -635,45 +366,10 @@ impl AgentClient {
                     // Execute SNMP job (discovery or polling)
                     let result_tx = self.result_tx.clone();
                     let poller_registry = self.poller_registry.clone();
-                    #[cfg(feature = "tui")]
-                    let event_bus = self.event_bus.clone();
-                    #[cfg(feature = "tui")]
-                    let event_bus_for_task = event_bus.clone();
-                    let job_id = job.job_id.clone();
-                    let device_id = job.device_id.clone();
 
                     tokio::spawn(async move {
-                        let start_time = std::time::Instant::now();
-                        #[cfg(feature = "tui")]
-                        let result =
-                            execute_snmp_job(job, result_tx, poller_registry, event_bus_for_task)
-                                .await;
-                        #[cfg(not(feature = "tui"))]
-                        let result = execute_snmp_job(job, result_tx, poller_registry).await;
-
-                        match result {
-                            Ok(_) =>
-                            {
-                                #[cfg(feature = "tui")]
-                                if let Some(ref bus) = event_bus {
-                                    let _ = bus.send(crate::tui::AgentEvent::JobCompleted {
-                                        job_id,
-                                        device_id,
-                                        duration_ms: start_time.elapsed().as_millis() as u64,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("SNMP job execution failed: {}", e);
-                                #[cfg(feature = "tui")]
-                                if let Some(ref bus) = event_bus {
-                                    let _ = bus.send(crate::tui::AgentEvent::JobFailed {
-                                        job_id,
-                                        device_id,
-                                        error: e.to_string(),
-                                    });
-                                }
-                            }
+                        if let Err(e) = execute_snmp_job(job, result_tx, poller_registry).await {
+                            tracing::error!("SNMP job execution failed: {}", e);
                         }
                     });
                 }
@@ -757,13 +453,6 @@ impl AgentClient {
             .map_err(|e| format!("Writer task closed: {}", e))?;
 
         tracing::debug!("Sent SNMP result for device {}", result.device_id);
-
-        #[cfg(feature = "tui")]
-        self.publish_event(crate::tui::AgentEvent::SnmpResultSent {
-            device_id: result.device_id.clone(),
-            oid_count: result.oid_values.len(),
-        });
-
         Ok(())
     }
 
@@ -789,13 +478,6 @@ impl AgentClient {
             result.device_id,
             result.job_id
         );
-
-        #[cfg(feature = "tui")]
-        self.publish_event(crate::tui::AgentEvent::MikrotikResultSent {
-            device_id: result.device_id.clone(),
-            sentence_count: result.sentences.len(),
-        });
-
         Ok(())
     }
 
@@ -846,13 +528,6 @@ impl AgentClient {
             result.device_id,
             result.status
         );
-
-        #[cfg(feature = "tui")]
-        self.publish_event(crate::tui::AgentEvent::MonitoringCheckSent {
-            device_id: result.device_id.clone(),
-            status: result.status.clone(),
-        });
-
         Ok(())
     }
 }
@@ -892,7 +567,6 @@ async fn execute_snmp_job(
     job: AgentJob,
     result_tx: mpsc::Sender<SnmpResult>,
     poller_registry: PollerRegistry,
-    #[cfg(feature = "tui")] event_bus: Option<crate::tui::EventBus>,
 ) -> Result<()> {
     let mut snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
 
@@ -963,23 +637,7 @@ async fn execute_snmp_job(
     snmp_device.v3_auth_password.zeroize();
     snmp_device.v3_priv_password.zeroize();
 
-    #[cfg(feature = "tui")]
-    let count_before = poller_registry.count();
-
     let poller = poller_registry.get_or_create(job.device_id.clone(), device_config);
-
-    #[cfg(feature = "tui")]
-    {
-        let count_after = poller_registry.count();
-        if count_after > count_before {
-            if let Some(ref bus) = event_bus {
-                let _ = bus.send(crate::tui::AgentEvent::PollerCreated {
-                    device_ip: snmp_device.ip.clone(),
-                    total_count: count_after,
-                });
-            }
-        }
-    }
 
     let mut oid_values: HashMap<String, String> = HashMap::new();
 
