@@ -38,6 +38,9 @@ services:
   towerops-agent:
     image: ghcr.io/towerops-app/towerops-agent:latest
     restart: unless-stopped
+    # Required for ICMP ping health checks
+    cap_add:
+      - NET_RAW
     environment:
       - TOWEROPS_API_URL=https://towerops.net
       - TOWEROPS_AGENT_TOKEN=your-agent-token-here
@@ -121,6 +124,17 @@ docker build -t towerops-agent .
 ```
 
 ## Troubleshooting
+
+### Agent Crashes with Segmentation Fault (Exit Code 139)
+
+This typically occurs when the container doesn't have the `NET_RAW` capability required for ICMP ping:
+
+```yaml
+cap_add:
+  - NET_RAW
+```
+
+Add this to your `docker-compose.yml` under the agent service. Without this capability, the agent will crash when attempting health checks.
 
 ### Agent Not Connecting
 
