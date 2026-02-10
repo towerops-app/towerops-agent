@@ -67,6 +67,9 @@ COPY --from=builder /tmp/towerops-agent /usr/local/bin/towerops-agent
 RUN addgroup -g 1000 towerops && \
     adduser -D -u 1000 -G towerops towerops
 
+# Allow non-root user to overwrite binary during self-update
+RUN chown towerops /usr/local/bin/towerops-agent
+
 USER towerops
 
 CMD ["towerops-agent"]
