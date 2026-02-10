@@ -382,7 +382,7 @@ impl AgentClient {
             version: crate::version::current_version().to_string(),
             hostname: String::new(),
             uptime_seconds: get_uptime_seconds(),
-            ip_address: get_local_ip().unwrap_or_default(),
+            ip_address: String::new(),
         };
 
         let binary = heartbeat.encode_to_vec();
@@ -1311,15 +1311,6 @@ fn get_uptime_seconds() -> u64 {
     0
 }
 
-/// Get local IP address by connecting a UDP socket to a public address.
-/// No data is sent; the OS resolves which local interface would be used.
-fn get_local_ip() -> Option<String> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:53").ok()?;
-    let addr = socket.local_addr().ok()?;
-    Some(addr.ip().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1416,16 +1407,6 @@ mod tests {
         let encoded = base64_encode(data);
         let decoded = base64_decode(&encoded).unwrap();
         assert_eq!(decoded, data);
-    }
-
-    #[test]
-    fn test_get_local_ip() {
-        let ip = get_local_ip();
-        // Should resolve to a valid local IP via UDP socket trick
-        assert!(ip.is_some(), "Expected a local IP address");
-        let ip_str = ip.unwrap();
-        assert!(!ip_str.is_empty());
-        assert_ne!(ip_str, "0.0.0.0");
     }
 
     #[test]
