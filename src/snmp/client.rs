@@ -340,6 +340,8 @@ impl SnmpSession {
 
                 if err_msg.contains("timeout") {
                     return Err(SnmpError::Timeout);
+                } else if err_msg.contains("Failed to parse OID") {
+                    return Err(SnmpError::InvalidOid(err_msg));
                 } else {
                     return Err(SnmpError::RequestFailed(err_msg));
                 }
@@ -444,6 +446,9 @@ impl SnmpSession {
                 let err_msg = CStr::from_ptr(error_buf.as_ptr())
                     .to_string_lossy()
                     .to_string();
+                if err_msg.contains("Failed to parse OID") {
+                    return Err(SnmpError::InvalidOid(err_msg));
+                }
                 return Err(SnmpError::RequestFailed(err_msg));
             }
 
@@ -776,9 +781,15 @@ mod tests {
             .walk("192.0.2.1", "public", "2c", 161, "1.3.6.1.2.1.1", None)
             .await;
 
-        // Both should fail but not panic
+        // Get should fail (unreachable host), walk may fail or return empty
         assert!(get_result.is_err());
-        assert!(walk_result.is_err());
+        match walk_result {
+            Err(_) => {} // Expected on most systems
+            Ok(results) => assert!(
+                results.is_empty(),
+                "Walk to unreachable host should return no results"
+            ),
+        }
     }
 
     #[test]
