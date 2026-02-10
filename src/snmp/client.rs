@@ -6,8 +6,16 @@ use zeroize::{Zeroize, Zeroizing};
 
 type SecretString = Zeroizing<String>;
 
+#[cfg(not(test))]
 const SNMP_TIMEOUT_SECS: i64 = 10;
+#[cfg(not(test))]
 const SNMP_RETRIES: i32 = 2;
+
+// Use short timeouts in tests to avoid 90+ second waits on unreachable hosts
+#[cfg(test)]
+const SNMP_TIMEOUT_SECS: i64 = 1;
+#[cfg(test)]
+const SNMP_RETRIES: i32 = 0;
 
 // C structs and functions
 #[repr(C)]
