@@ -317,3 +317,11 @@ jobs:
             towerops-agent-linux-amd64.sha256
             towerops-agent-linux-arm64
             towerops-agent-linux-arm64.sha256
+
+      - name: Notify agents of new release
+        if: success()
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ secrets.AGENT_WEBHOOK_SECRET }}" \
+            https://towerops.net/api/v1/webhooks/agent-release
+        continue-on-error: true
