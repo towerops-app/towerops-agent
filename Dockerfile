@@ -52,8 +52,9 @@ RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/r
     BUILD_VERSION="$VERSION" cargo build --release --target "$RUST_TARGET" && \
     cp "target/$RUST_TARGET/release/towerops-agent" /tmp/towerops-agent
 
-# Runtime stage
-FROM alpine:3.19
+# Runtime stage - must match builder's Alpine version for ABI compatibility
+# (rust:1.93-alpine uses Alpine 3.23)
+FROM alpine:3.23
 
 # Install runtime dependencies
 # iputils provides ping with setuid root (doesn't require CAP_NET_RAW)

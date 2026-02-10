@@ -116,7 +116,40 @@ struct Args {
     snmpv3_priv_pass: String,
 }
 
+fn install_crash_handler() {
+    unsafe {
+        // Install a signal handler for SIGSEGV/SIGBUS/SIGABRT so we get
+        // diagnostic output instead of a silent exit code 139.
+        extern "C" fn crash_handler(sig: libc::c_int) {
+            let name = match sig {
+                libc::SIGSEGV => "SIGSEGV (segmentation fault)",
+                libc::SIGBUS => "SIGBUS (bus error)",
+                libc::SIGABRT => "SIGABRT (abort)",
+                _ => "unknown signal",
+            };
+            let msg = format!(
+                "\n*** FATAL: {} (signal {})\n\
+                 *** This is likely a bug in C FFI code (libnetsnmp).\n\
+                 *** Set RUST_BACKTRACE=1 for more info.\n",
+                name, sig
+            );
+            unsafe {
+                libc::write(libc::STDERR_FILENO, msg.as_ptr() as _, msg.len());
+                // Re-raise with default handler to get the correct exit code
+                libc::signal(sig, libc::SIG_DFL);
+                libc::raise(sig);
+            }
+        }
+
+        libc::signal(libc::SIGSEGV, crash_handler as libc::sighandler_t);
+        libc::signal(libc::SIGBUS, crash_handler as libc::sighandler_t);
+        libc::signal(libc::SIGABRT, crash_handler as libc::sighandler_t);
+    }
+}
+
 fn main() {
+    install_crash_handler();
+
     // Install ring as the default TLS crypto provider. Required because both
     // ring and aws-lc-rs features are enabled transitively, so rustls can't
     // auto-detect which one to use.
