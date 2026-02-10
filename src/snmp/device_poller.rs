@@ -58,7 +58,7 @@ impl DevicePoller {
         let config_clone = config.clone();
 
         // Spawn the polling thread with 8MB stack for SNMPv3 crypto operations
-        tracing::info!(
+        tracing::debug!(
             "Spawning device poller thread for {} at {}:{}",
             device_id,
             config.ip,
@@ -68,16 +68,16 @@ impl DevicePoller {
             .name(format!("poller-{}", device_id))
             .stack_size(8 * 1024 * 1024) // 8MB stack (default is 2MB)
             .spawn(move || {
-                tracing::info!("Device poller thread starting for {}", device_id_clone);
+                tracing::debug!("Device poller thread starting for {}", device_id_clone);
                 if let Err(e) = run_poller_thread(device_id_clone.clone(), config_clone, request_rx)
                 {
                     tracing::error!("Device poller thread failed for {}: {}", device_id_clone, e);
                 }
-                tracing::info!("Device poller thread exited for {}", device_id_clone);
+                tracing::debug!("Device poller thread exited for {}", device_id_clone);
             })
             .expect("Failed to spawn device poller thread");
 
-        tracing::info!(
+        tracing::debug!(
             "Successfully spawned device poller thread for {}",
             device_id
         );
@@ -145,7 +145,7 @@ fn run_poller_thread(
     config: DeviceConfig,
     mut request_rx: mpsc::UnboundedReceiver<SnmpRequest>,
 ) -> Result<(), String> {
-    tracing::info!(
+    tracing::debug!(
         "Device poller thread started for {} at {}:{}",
         device_id,
         config.ip,
@@ -174,7 +174,7 @@ fn run_poller_thread(
                 tracing::debug!("Poller thread {} processing WALK {}", device_id, base_oid);
             }
             SnmpRequest::Shutdown => {
-                tracing::info!("Poller thread {} received shutdown signal", device_id);
+                tracing::debug!("Poller thread {} received shutdown signal", device_id);
             }
         }
 
@@ -204,7 +204,7 @@ fn run_poller_thread(
                     let _ = response_tx.send(result);
                 }
                 SnmpRequest::Shutdown => {
-                    tracing::info!("Device poller thread shutting down for {}", device_id);
+                    tracing::debug!("Device poller thread shutting down for {}", device_id);
                 }
             }));
 
@@ -227,12 +227,12 @@ fn run_poller_thread(
         }
 
         if is_shutdown {
-            tracing::info!("Poller thread {} exiting due to shutdown", device_id);
+            tracing::debug!("Poller thread {} exiting due to shutdown", device_id);
             break;
         }
     }
 
-    tracing::info!("Device poller thread stopped for {}", device_id);
+    tracing::debug!("Device poller thread stopped for {}", device_id);
     Ok(())
 }
 
