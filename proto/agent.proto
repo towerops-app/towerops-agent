@@ -171,6 +171,7 @@ message AgentHeartbeat {
   string hostname = 2;
   uint64 uptime_seconds = 3;
   string ip_address = 4;
+  string arch = 5;
 }
 
 message AgentError {

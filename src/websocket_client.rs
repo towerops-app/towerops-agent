@@ -280,6 +280,32 @@ impl AgentClient {
                     }
                 }
             }
+            "restart" => {
+                tracing::info!("Restart requested by server, exiting for container restart");
+                std::process::exit(0);
+            }
+            "update" => {
+                if let serde_json::Value::Object(map) = phoenix_msg.payload {
+                    let url = map.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    let checksum = map.get("checksum").and_then(|v| v.as_str()).unwrap_or("");
+
+                    if url.is_empty() {
+                        tracing::error!("Update requested but no URL provided");
+                    } else {
+                        tracing::info!("Update requested, downloading from: {}", url);
+                        match self_update(url, checksum).await {
+                            Ok(()) => {
+                                // self_update calls exec() which replaces the process
+                                // If we get here, something went wrong
+                                tracing::error!("Self-update returned unexpectedly");
+                            }
+                            Err(e) => {
+                                tracing::error!("Self-update failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
             _ => {
                 tracing::debug!("Ignoring unknown event: {}", phoenix_msg.event);
             }
@@ -383,6 +409,7 @@ impl AgentClient {
             hostname: String::new(),
             uptime_seconds: get_uptime_seconds(),
             ip_address: String::new(),
+            arch: std::env::consts::ARCH.to_string(),
         };
 
         let binary = heartbeat.encode_to_vec();
@@ -1309,6 +1336,81 @@ fn get_uptime_seconds() -> u64 {
 
     // Fallback
     0
+}
+
+/// Download a new binary from the given URL, verify its SHA256 checksum,
+/// and replace the current process via exec().
+async fn self_update(url: &str, expected_checksum: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    // Download binary to temp file
+    tracing::info!("Downloading update binary...");
+    let response = reqwest::get(url).await?;
+
+    if !response.status().is_success() {
+        return Err(format!("Download failed with status: {}", response.status()).into());
+    }
+
+    let bytes = response.bytes().await?;
+    tracing::info!("Downloaded {} bytes", bytes.len());
+
+    // Verify SHA256 checksum
+    if !expected_checksum.is_empty() {
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let actual_checksum = format!("{:x}", hasher.finalize());
+
+        if actual_checksum != expected_checksum {
+            return Err(format!(
+                "Checksum mismatch: expected {}, got {}",
+                expected_checksum, actual_checksum
+            )
+            .into());
+        }
+        tracing::info!("Checksum verified");
+    }
+
+    // Write to temp file
+    let current_exe = std::env::current_exe()?;
+    let temp_path = current_exe.with_extension("update");
+
+    {
+        let mut file = std::fs::File::create(&temp_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+
+    // Make executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Replace current binary
+    std::fs::rename(&temp_path, &current_exe)?;
+    tracing::info!("Binary replaced at {:?}", current_exe);
+
+    // Re-exec with same arguments
+    let args: Vec<String> = std::env::args().collect();
+    tracing::info!("Re-executing with args: {:?}", &args[..]);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&current_exe)
+            .args(&args[1..])
+            .exec();
+        // exec() only returns on error
+        return Err(format!("exec() failed: {}", err).into());
+    }
+
+    #[cfg(not(unix))]
+    {
+        tracing::error!("Self-update exec() not supported on this platform, exiting for restart");
+        std::process::exit(0);
+    }
 }
 
 #[cfg(test)]
