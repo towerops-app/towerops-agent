@@ -453,9 +453,7 @@ impl SnmpSession {
 
             // Convert C results to Rust
             let mut parsed_results = Vec::with_capacity(num_results);
-            for i in 0..num_results {
-                let res = &results_buf[i];
-
+            for res in results_buf.iter().take(num_results) {
                 // Parse OID string
                 let oid_str = CStr::from_ptr(res.oid.as_ptr() as *const i8)
                     .to_string_lossy()
