@@ -246,7 +246,7 @@ async fn async_main() {
         let event_bus = tui::EventBus::new(100);
         let agent_state = Arc::new(Mutex::new(tui::AgentState::new(
             hostname,
-            env!("CARGO_PKG_VERSION").to_string(),
+            version::current_version().to_string(),
         )));
 
         // Spawn TUI task
