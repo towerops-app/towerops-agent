@@ -1,6 +1,6 @@
 use super::types::{SnmpError, SnmpResult, SnmpValue};
 use netsnmp_sys::*;
-use std::ffi::{CStr, CString};
+use std::ffi::{c_char, CStr, CString};
 use std::ptr;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -21,44 +21,44 @@ struct SnmpWalkResult {
 
 #[repr(C)]
 struct SnmpV3ConfigC {
-    username: *const i8,
-    auth_password: *const i8,
-    priv_password: *const i8,
-    auth_protocol: *const i8,
-    priv_protocol: *const i8,
-    security_level: *const i8,
+    username: *const c_char,
+    auth_password: *const c_char,
+    priv_password: *const c_char,
+    auth_protocol: *const c_char,
+    priv_protocol: *const c_char,
+    security_level: *const c_char,
 }
 
 extern "C" {
     fn snmp_init_library() -> i32;
     fn snmp_open_session(
-        ip_address: *const i8,
+        ip_address: *const c_char,
         port: u16,
-        community: *const i8,
+        community: *const c_char,
         version: i32,
         timeout_us: i64,
         retries: i32,
         v3_config: *const SnmpV3ConfigC,
-        error_buf: *mut i8,
+        error_buf: *mut c_char,
         error_buf_len: usize,
     ) -> *mut std::ffi::c_void;
     fn snmp_close_session(sess_handle: *mut std::ffi::c_void);
     fn snmp_get(
         sess_handle: *mut std::ffi::c_void,
-        oid_str: *const i8,
+        oid_str: *const c_char,
         value_buf: *mut std::ffi::c_void,
         value_buf_len: usize,
         value_type: *mut i32,
-        error_buf: *mut i8,
+        error_buf: *mut c_char,
         error_buf_len: usize,
     ) -> i32;
     fn snmp_walk(
         sess_handle: *mut std::ffi::c_void,
-        oid_str: *const i8,
+        oid_str: *const c_char,
         results: *mut SnmpWalkResult,
         max_results: usize,
         num_results: *mut usize,
-        error_buf: *mut i8,
+        error_buf: *mut c_char,
         error_buf_len: usize,
     ) -> i32;
 }
@@ -269,7 +269,7 @@ impl SnmpSession {
                 (None, None)
             };
 
-            let mut error_buf = [0i8; 512];
+            let mut error_buf = [0 as c_char; 512];
             let sess_handle = snmp_open_session(
                 ip_cstr.as_ptr(),
                 port,
@@ -320,7 +320,7 @@ impl SnmpSession {
 
             let mut value_buf = [0u8; 1024];
             let mut value_type: i32 = 0;
-            let mut error_buf = [0i8; 512];
+            let mut error_buf = [0 as c_char; 512];
 
             let result = snmp_get(
                 self.sess_handle,
@@ -429,7 +429,7 @@ impl SnmpSession {
             ];
 
             let mut num_results: usize = 0;
-            let mut error_buf = [0i8; 512];
+            let mut error_buf = [0 as c_char; 512];
 
             let result = snmp_walk(
                 self.sess_handle,
@@ -455,7 +455,7 @@ impl SnmpSession {
             let mut parsed_results = Vec::with_capacity(num_results);
             for res in results_buf.iter().take(num_results) {
                 // Parse OID string
-                let oid_str = CStr::from_ptr(res.oid.as_ptr() as *const i8)
+                let oid_str = CStr::from_ptr(res.oid.as_ptr() as *const c_char)
                     .to_string_lossy()
                     .to_string();
 
