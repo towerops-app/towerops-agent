@@ -133,7 +133,7 @@ impl AgentClient {
             .send(WsMessage::Text(join_text.into()))
             .await
             .map_err(|e| format!("Failed to send join message: {}", e))?;
-        tracing::info!(
+        tracing::debug!(
             "Sent channel join request with token for agent:{}",
             agent_id
         );
@@ -267,7 +267,7 @@ impl AgentClient {
 
         match phoenix_msg.event.as_str() {
             "phx_reply" => {
-                tracing::info!("Channel join reply: {:?}", phoenix_msg.payload);
+                tracing::debug!("Channel join reply: {:?}", phoenix_msg.payload);
             }
             // Handle all job events the same way - agent doesn't care about the context
             "jobs" | "discovery_job" | "backup_job" => {
@@ -330,7 +330,7 @@ impl AgentClient {
     /// No long-running tasks are spawned - the agent is stateless.
     /// Server handles all scheduling and retries via Oban.
     async fn handle_jobs(&self, job_list: AgentJobList) -> Result<()> {
-        tracing::info!("Received {} jobs from server", job_list.jobs.len());
+        tracing::debug!("Received {} jobs from server", job_list.jobs.len());
 
         // Collect device IDs from current jobs
         let mut current_device_ids = std::collections::HashSet::new();
@@ -352,7 +352,7 @@ impl AgentClient {
 
         for job in job_list.jobs {
             let job_type = JobType::try_from(job.job_type).unwrap_or(JobType::Poll);
-            tracing::info!("Executing job: {} (type: {:?})", job.job_id, job_type);
+            tracing::debug!("Executing job: {} (type: {:?})", job.job_id, job_type);
 
             match job_type {
                 JobType::Mikrotik => {
@@ -522,7 +522,7 @@ impl AgentClient {
             .await
             .map_err(|e| format!("Writer task closed: {}", e))?;
 
-        tracing::info!(
+        tracing::debug!(
             "Sent credential test result (test_id: {}, success: {})",
             result.test_id,
             result.success
@@ -633,7 +633,7 @@ async fn execute_snmp_job(
     // Log SNMP connection parameters for debugging (mask community for security)
     let community_masked = redact_community(&snmp_device.community);
 
-    tracing::info!(
+    tracing::debug!(
         "Executing SNMP job for device {} at {}:{} (community: {}, version: {})",
         job.device_id,
         snmp_device.ip,
@@ -729,7 +729,7 @@ async fn execute_snmp_job(
             .as_secs() as i64,
     };
 
-    tracing::info!(
+    tracing::debug!(
         "Collected {} OID values for job {}",
         result.oid_values.len(),
         job.job_id
@@ -757,7 +757,7 @@ async fn execute_credential_test(
 ) -> Result<()> {
     let mut snmp_device = job.snmp_device.ok_or("Job missing SNMP device info")?;
 
-    tracing::info!(
+    tracing::debug!(
         "Testing SNMP credentials for {}:{} (version: {})",
         snmp_device.ip,
         snmp_device.port,
@@ -826,7 +826,7 @@ async fn execute_credential_test(
     {
         Ok(value) => {
             let sys_descr = value_to_string(value);
-            tracing::info!("✓ Credential test succeeded: {}", sys_descr);
+            tracing::debug!("✓ Credential test succeeded: {}", sys_descr);
 
             CredentialTestResult {
                 test_id: job.job_id.clone(),
@@ -884,7 +884,7 @@ async fn execute_ping_job(job: AgentJob, result_tx: mpsc::Sender<MonitoringCheck
     // Execute ping
     let result = match crate::ping::ping_device(ip_address, timeout_ms).await {
         Ok(response_time_ms) => {
-            tracing::info!(
+            tracing::debug!(
                 "✓ Device {} is up (response time: {:.1}ms)",
                 device_id,
                 response_time_ms
@@ -946,7 +946,7 @@ async fn execute_mikrotik_job(
         .mikrotik_device
         .ok_or("Job missing MikroTik device info")?;
 
-    tracing::info!(
+    tracing::debug!(
         "Executing MikroTik job {} for device {} at {}:{} (ssl: {})",
         job.job_id,
         job.device_id,
@@ -1093,7 +1093,7 @@ async fn execute_mikrotik_job(
         timestamp,
     };
 
-    tracing::info!(
+    tracing::debug!(
         "MikroTik job {} completed with {} sentences",
         result.job_id,
         result.sentences.len()
@@ -1120,7 +1120,7 @@ async fn execute_mikrotik_backup_via_ssh(
 ) -> Result<()> {
     use crate::ssh::SshClient;
 
-    tracing::info!(
+    tracing::debug!(
         "Executing backup via SSH for device {} at {}:{} (job: {})",
         job.device_id,
         mikrotik_device.ip,
@@ -1180,7 +1180,7 @@ async fn execute_mikrotik_backup_via_ssh(
     // Zeroize credentials in protobuf message after use
     mikrotik_device.password.zeroize();
 
-    tracing::info!(
+    tracing::debug!(
         "Backup completed: {} bytes, {} lines",
         config.len(),
         config.lines().count()
@@ -1200,7 +1200,7 @@ async fn execute_mikrotik_backup_via_ssh(
         timestamp,
     };
 
-    tracing::info!(
+    tracing::debug!(
         "MikroTik backup job {} completed successfully",
         result.job_id
     );

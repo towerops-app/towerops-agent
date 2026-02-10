@@ -43,7 +43,7 @@ impl PollerRegistry {
         // Release write lock before logging
         drop(pollers);
 
-        tracing::info!("Created new device poller (total: {})", self.count());
+        tracing::debug!("Created new device poller (total: {})", self.count());
         poller.log_status();
 
         poller
@@ -57,7 +57,7 @@ impl PollerRegistry {
         if let Some(poller) = pollers.remove(device_id) {
             let ip = poller.config().ip.clone();
             poller.shutdown();
-            tracing::info!(
+            tracing::debug!(
                 "Removed device poller for {} (remaining: {})",
                 device_id,
                 pollers.len()
