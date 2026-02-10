@@ -141,9 +141,9 @@ fn install_crash_handler() {
             }
         }
 
-        libc::signal(libc::SIGSEGV, crash_handler as libc::sighandler_t);
-        libc::signal(libc::SIGBUS, crash_handler as libc::sighandler_t);
-        libc::signal(libc::SIGABRT, crash_handler as libc::sighandler_t);
+        libc::signal(libc::SIGSEGV, crash_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGBUS, crash_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGABRT, crash_handler as *const () as libc::sighandler_t);
     }
 }
 
