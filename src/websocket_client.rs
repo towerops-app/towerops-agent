@@ -67,8 +67,6 @@ pub struct AgentClient {
     poller_registry: PollerRegistry,
     /// Counter for Phoenix transport heartbeat refs
     phx_heartbeat_ref: u64,
-    /// Cached hostname (computed once at startup, avoids blocking /proc reads)
-    cached_hostname: String,
 }
 
 impl AgentClient {
@@ -154,7 +152,6 @@ impl AgentClient {
             monitoring_check_rx,
             poller_registry: PollerRegistry::new(),
             phx_heartbeat_ref: 0,
-            cached_hostname: get_hostname(),
         })
     }
 
@@ -383,7 +380,7 @@ impl AgentClient {
     async fn send_heartbeat(&mut self) -> Result<()> {
         let heartbeat = AgentHeartbeat {
             version: crate::version::current_version().to_string(),
-            hostname: self.cached_hostname.clone(),
+            hostname: String::new(),
             uptime_seconds: get_uptime_seconds(),
             ip_address: get_local_ip().unwrap_or_default(),
         };
@@ -1299,17 +1296,6 @@ fn generate_agent_id() -> String {
     format!("agent-{}", timestamp)
 }
 
-/// Get system hostname.
-fn get_hostname() -> String {
-    // Try reading from /proc on Linux
-    if let Ok(hostname) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
-        return hostname.trim().to_string();
-    }
-
-    // Fallback to "unknown"
-    "unknown".to_string()
-}
-
 /// Get system uptime in seconds.
 fn get_uptime_seconds() -> u64 {
     // Linux: read /proc/uptime (format: "uptime idle")
@@ -1398,13 +1384,6 @@ mod tests {
         // On other platforms or if file doesn't exist, returns 0
         // uptime is u64, so always >= 0 - just verify it's callable
         let _ = uptime;
-    }
-
-    #[test]
-    fn test_get_hostname() {
-        let hostname = get_hostname();
-        // Should return either the system hostname or "unknown"
-        assert!(!hostname.is_empty());
     }
 
     #[test]
