@@ -596,6 +596,11 @@ void snmp_get_isolated(
         child_reset_signals();
         alarm(60); /* watchdog: kill child if stuck */
 
+        /* Disable MIB loading to prevent crashes from missing/corrupt MIB files */
+        setenv("MIBS", "", 1);  /* Don't load any MIBs */
+        setenv("MIBDIRS", "", 1);  /* Don't search for MIB directories */
+        netsnmp_set_mib_directory("");  /* Explicitly set empty MIB directory */
+
         /* Initialize net-snmp fresh in child */
         init_snmp("towerops-child");
         netsnmp_ds_set_int(NETSNMP_DS_LIBRARY_ID,
@@ -724,6 +729,11 @@ void snmp_walk_isolated(
         close(pipefd[0]); /* close read end */
         child_reset_signals();
         alarm(60); /* watchdog */
+
+        /* Disable MIB loading to prevent crashes from missing/corrupt MIB files */
+        setenv("MIBS", "", 1);  /* Don't load any MIBs */
+        setenv("MIBDIRS", "", 1);  /* Don't search for MIB directories */
+        netsnmp_set_mib_directory("");  /* Explicitly set empty MIB directory */
 
         /* Initialize net-snmp fresh in child */
         init_snmp("towerops-child");
