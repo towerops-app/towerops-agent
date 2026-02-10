@@ -44,6 +44,18 @@ jobs:
           key: ${{ github.repository }}-cargo-registry
           path: ~/.cargo/registry
 
+      - name: Mount Cargo git
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-cargo-git
+          path: ~/.cargo/git
+
+      - name: Mount Rust toolchain
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ github.repository }}-rustup
+          path: ~/.rustup
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -56,11 +68,11 @@ jobs:
           packages: protobuf-compiler lld libsnmp-dev
           version: 1.0
 
-      - name: Check
-        run: cargo check --release
-
       - name: Format check
         run: cargo fmt -- --check
+
+      - name: Check
+        run: cargo check --release
 
       - name: Test
         run: cargo test
