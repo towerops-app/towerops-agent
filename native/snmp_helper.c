@@ -596,16 +596,12 @@ void snmp_get_isolated(
         child_reset_signals();
         alarm(60); /* watchdog: kill child if stuck */
 
-        /* Disable MIB loading to prevent crashes from missing/corrupt MIB files */
-        setenv("MIBS", "", 1);  /* Don't load any MIBs */
-        setenv("MIBDIRS", "", 1);  /* Don't search for MIB directories */
-        netsnmp_set_mib_directory("");  /* Explicitly set empty MIB directory */
-
-        /* Initialize net-snmp fresh in child */
-        init_snmp("towerops-child");
-        netsnmp_ds_set_int(NETSNMP_DS_LIBRARY_ID,
-                           NETSNMP_DS_LIB_OID_OUTPUT_FORMAT,
-                           NETSNMP_OID_OUTPUT_NUMERIC);
+        /* Disable MIB loading to prevent crashes from missing/corrupt MIB files.
+         * Set env vars BEFORE init_snmp() runs (via snmp_open_session below).
+         * Do NOT call init_snmp() directly here - snmp_open_session() calls
+         * snmp_init_library() which uses pthread_once to initialize exactly once. */
+        setenv("MIBS", "", 1);
+        setenv("MIBDIRS", "", 1);
 
         snmp_isolated_get_result_t child_result;
         memset(&child_result, 0, sizeof(child_result));
@@ -730,16 +726,12 @@ void snmp_walk_isolated(
         child_reset_signals();
         alarm(60); /* watchdog */
 
-        /* Disable MIB loading to prevent crashes from missing/corrupt MIB files */
-        setenv("MIBS", "", 1);  /* Don't load any MIBs */
-        setenv("MIBDIRS", "", 1);  /* Don't search for MIB directories */
-        netsnmp_set_mib_directory("");  /* Explicitly set empty MIB directory */
-
-        /* Initialize net-snmp fresh in child */
-        init_snmp("towerops-child");
-        netsnmp_ds_set_int(NETSNMP_DS_LIBRARY_ID,
-                           NETSNMP_DS_LIB_OID_OUTPUT_FORMAT,
-                           NETSNMP_OID_OUTPUT_NUMERIC);
+        /* Disable MIB loading to prevent crashes from missing/corrupt MIB files.
+         * Set env vars BEFORE init_snmp() runs (via snmp_open_session below).
+         * Do NOT call init_snmp() directly here - snmp_open_session() calls
+         * snmp_init_library() which uses pthread_once to initialize exactly once. */
+        setenv("MIBS", "", 1);
+        setenv("MIBDIRS", "", 1);
 
         snmp_isolated_walk_header_t child_header;
         memset(&child_header, 0, sizeof(child_header));
