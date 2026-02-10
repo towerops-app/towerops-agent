@@ -117,6 +117,13 @@ struct Args {
 }
 
 fn main() {
+    // Install ring as the default TLS crypto provider. Required because both
+    // ring and aws-lc-rs features are enabled transitively, so rustls can't
+    // auto-detect which one to use.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls CryptoProvider");
+
     // Build Tokio runtime with larger stack size for SNMPv3 crypto operations
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
