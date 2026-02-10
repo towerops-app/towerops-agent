@@ -4,6 +4,10 @@ services:
     container_name: towerops-agent
     restart: unless-stopped
 
+    # Required for ICMP ping health checks
+    cap_add:
+      - NET_RAW
+
     environment:
       # Required: Agent authentication token (from Towerops web UI)
       # Get this from: Organization > Agents > Create New Agent
