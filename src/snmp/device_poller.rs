@@ -44,7 +44,7 @@ impl std::fmt::Debug for DeviceConfig {
 
 /// Per-device polling thread that uses C FFI to libnetsnmp
 pub struct DevicePoller {
-    device_id: String,
+    pub device_id: String,
     config: DeviceConfig,
     request_tx: mpsc::UnboundedSender<SnmpRequest>,
 }
