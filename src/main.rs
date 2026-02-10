@@ -130,6 +130,8 @@ fn install_crash_handler() {
             let msg = format!(
                 "\n*** FATAL: {} (signal {})\n\
                  *** This is likely a bug in C FFI code (libnetsnmp).\n\
+                 *** SNMP process isolation should prevent most crashes from reaching here.\n\
+                 *** If this persists, check TOWEROPS_SNMP_ISOLATION env var.\n\
                  *** Set RUST_BACKTRACE=1 for more info.\n",
                 name, sig
             );
@@ -195,6 +197,7 @@ async fn async_main() {
     }
 
     tracing::info!("Towerops agent starting");
+    tracing::info!("SNMP isolation mode: {:?}", snmp::isolation_mode());
 
     // Check for newer Docker image version
     version::check_for_updates();

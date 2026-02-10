@@ -243,8 +243,7 @@ fn perform_get(
     config: &DeviceConfig,
     oid: &str,
 ) -> SnmpResult<SnmpValue> {
-    // Use the thread-local runtime to execute async C FFI call
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         client
             .get(
                 &config.ip,
@@ -255,7 +254,24 @@ fn perform_get(
                 config.v3_config.clone(),
             )
             .await
-    })
+    });
+
+    if let Err(SnmpError::CrashRecovered {
+        signal,
+        ref message,
+    }) = result
+    {
+        tracing::error!(
+            "SNMP GET crash recovered for {}:{} OID {} (signal {}): {}",
+            config.ip,
+            config.port,
+            oid,
+            signal,
+            message
+        );
+    }
+
+    result
 }
 
 /// Perform SNMP WALK using C FFI
@@ -265,8 +281,7 @@ fn perform_walk(
     config: &DeviceConfig,
     base_oid: &str,
 ) -> SnmpResult<Vec<(String, SnmpValue)>> {
-    // Use the thread-local runtime to execute async C FFI call
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         client
             .walk(
                 &config.ip,
@@ -277,7 +292,24 @@ fn perform_walk(
                 config.v3_config.clone(),
             )
             .await
-    })
+    });
+
+    if let Err(SnmpError::CrashRecovered {
+        signal,
+        ref message,
+    }) = result
+    {
+        tracing::error!(
+            "SNMP WALK crash recovered for {}:{} OID {} (signal {}): {}",
+            config.ip,
+            config.port,
+            base_oid,
+            signal,
+            message
+        );
+    }
+
+    result
 }
 
 #[cfg(test)]

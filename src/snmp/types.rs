@@ -4,6 +4,7 @@ pub enum SnmpError {
     InvalidOid(String),
     Timeout,
     NetworkUnreachable,
+    CrashRecovered { signal: i32, message: String },
 }
 
 impl std::fmt::Display for SnmpError {
@@ -13,6 +14,9 @@ impl std::fmt::Display for SnmpError {
             Self::InvalidOid(oid) => write!(f, "Invalid OID: {}", oid),
             Self::Timeout => write!(f, "Timeout"),
             Self::NetworkUnreachable => write!(f, "Network unreachable"),
+            Self::CrashRecovered { signal, message } => {
+                write!(f, "SNMP crash recovered (signal {}): {}", signal, message)
+            }
         }
     }
 }
@@ -75,6 +79,18 @@ mod tests {
         assert_eq!(
             format!("{}", SnmpError::NetworkUnreachable),
             "Network unreachable"
+        );
+    }
+
+    #[test]
+    fn test_crash_recovered_display() {
+        let err = SnmpError::CrashRecovered {
+            signal: 11,
+            message: "child killed by SIGSEGV".to_string(),
+        };
+        assert_eq!(
+            format!("{}", err),
+            "SNMP crash recovered (signal 11): child killed by SIGSEGV"
         );
     }
 

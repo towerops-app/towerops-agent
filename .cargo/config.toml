@@ -1,0 +1,7 @@
+# Limit test parallelism to avoid macOS fork() issues with Objective-C runtime.
+# Our SNMP isolation uses fork() for crash protection, which conflicts with
+# macOS's multi-threaded fork safety checks when many threads fork concurrently.
+# On Linux (production target), this limit is not needed but is harmless.
+[env]
+OBJC_DISABLE_INITIALIZE_FORK_SAFETY = "YES"
+RUST_TEST_THREADS = "2"

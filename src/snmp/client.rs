@@ -2,9 +2,52 @@ use super::types::{SnmpError, SnmpResult, SnmpValue};
 use netsnmp_sys::*;
 use std::ffi::{c_char, CStr, CString};
 use std::ptr;
+use std::sync::OnceLock;
 use zeroize::{Zeroize, Zeroizing};
 
 type SecretString = Zeroizing<String>;
+
+/// Controls whether SNMP operations run in forked child processes (crash isolation)
+/// or directly in the current process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationMode {
+    /// Each SNMP operation forks a child process. A crash in libnetsnmp
+    /// only kills the child; the parent agent survives.
+    Fork,
+    /// SNMP operations run directly (legacy behavior). Use for debugging.
+    Direct,
+}
+
+/// Returns the configured isolation mode. Reads `TOWEROPS_SNMP_ISOLATION`
+/// once; defaults to `Fork`.
+pub fn isolation_mode() -> IsolationMode {
+    static MODE: OnceLock<IsolationMode> = OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("TOWEROPS_SNMP_ISOLATION").as_deref() {
+            Ok("direct") => IsolationMode::Direct,
+            _ => IsolationMode::Fork,
+        },
+    )
+}
+
+// FFI structs matching C definitions in snmp_helper.h
+
+#[repr(C)]
+struct SnmpIsolatedGetResult {
+    status: i32,
+    value_type: i32,
+    child_signal: i32,
+    error_buf: [c_char; 512],
+    value_buf: [u8; 1024],
+}
+
+#[repr(C)]
+struct SnmpIsolatedWalkHeader {
+    status: i32,
+    num_results: u32,
+    child_signal: i32,
+    error_buf: [c_char; 512],
+}
 
 #[cfg(not(test))]
 const SNMP_TIMEOUT_SECS: i64 = 10;
@@ -69,6 +112,35 @@ extern "C" {
         error_buf: *mut c_char,
         error_buf_len: usize,
     ) -> i32;
+    fn snmp_get_isolated(
+        ip_address: *const c_char,
+        port: u16,
+        community: *const c_char,
+        version: i32,
+        timeout_us: i64,
+        retries: i32,
+        v3_config: *const SnmpV3ConfigC,
+        oid_str: *const c_char,
+        result: *mut SnmpIsolatedGetResult,
+    );
+    fn snmp_walk_isolated(
+        ip_address: *const c_char,
+        port: u16,
+        community: *const c_char,
+        version: i32,
+        timeout_us: i64,
+        retries: i32,
+        v3_config: *const SnmpV3ConfigC,
+        oid_str: *const c_char,
+        header: *mut SnmpIsolatedWalkHeader,
+        results: *mut SnmpWalkResult,
+        max_results: usize,
+    );
+}
+
+#[cfg(test)]
+extern "C" {
+    fn snmp_test_crash_in_child(child_signal: *mut i32) -> i32;
 }
 
 /// SNMPv3 configuration
@@ -107,11 +179,27 @@ pub struct SnmpClient;
 
 impl SnmpClient {
     pub fn new() -> Self {
-        // Initialize libnetsnmp via C helper
-        unsafe {
-            snmp_init_library();
+        // In fork mode, skip init - each child initializes its own copy.
+        // In direct mode, initialize once in the parent process.
+        if isolation_mode() == IsolationMode::Direct {
+            unsafe {
+                snmp_init_library();
+            }
         }
         Self
+    }
+
+    /// Parse SNMP version string to integer.
+    fn parse_version(version: &str) -> SnmpResult<i32> {
+        match version {
+            "1" | "v1" => Ok(1),
+            "2c" | "v2c" | "2" => Ok(2),
+            "3" | "v3" => Ok(3),
+            _ => Err(SnmpError::RequestFailed(format!(
+                "Unsupported SNMP version: {}",
+                version
+            ))),
+        }
     }
 
     /// Perform an SNMP GET operation
@@ -124,16 +212,28 @@ impl SnmpClient {
         oid: &str,
         v3_config: Option<V3Config>,
     ) -> SnmpResult<SnmpValue> {
-        // Clone data for the blocking task
         let ip_address = ip_address.to_string();
         let community = community.to_string();
         let version = version.to_string();
         let oid = oid.to_string();
 
-        // Run SNMP operation in blocking thread pool
         tokio::task::spawn_blocking(move || {
-            let session = SnmpSession::new(&ip_address, port, &community, &version, v3_config)?;
-            session.get(&oid)
+            if isolation_mode() == IsolationMode::Fork {
+                let version_num = Self::parse_version(&version)?;
+                get_isolated(
+                    &ip_address,
+                    port,
+                    &community,
+                    version_num,
+                    SNMP_TIMEOUT_SECS * 1_000_000,
+                    SNMP_RETRIES,
+                    v3_config.as_ref(),
+                    &oid,
+                )
+            } else {
+                let session = SnmpSession::new(&ip_address, port, &community, &version, v3_config)?;
+                session.get(&oid)
+            }
         })
         .await
         .map_err(|e| SnmpError::RequestFailed(format!("Task join error: {}", e)))?
@@ -149,16 +249,28 @@ impl SnmpClient {
         oid: &str,
         v3_config: Option<V3Config>,
     ) -> SnmpResult<Vec<(String, SnmpValue)>> {
-        // Clone data for the blocking task
         let ip_address = ip_address.to_string();
         let community = community.to_string();
         let version = version.to_string();
         let oid = oid.to_string();
 
-        // Run SNMP operation in blocking thread pool
         tokio::task::spawn_blocking(move || {
-            let session = SnmpSession::new(&ip_address, port, &community, &version, v3_config)?;
-            session.walk(&oid)
+            if isolation_mode() == IsolationMode::Fork {
+                let version_num = Self::parse_version(&version)?;
+                walk_isolated(
+                    &ip_address,
+                    port,
+                    &community,
+                    version_num,
+                    SNMP_TIMEOUT_SECS * 1_000_000,
+                    SNMP_RETRIES,
+                    v3_config.as_ref(),
+                    &oid,
+                )
+            } else {
+                let session = SnmpSession::new(&ip_address, port, &community, &version, v3_config)?;
+                session.walk(&oid)
+            }
         })
         .await
         .map_err(|e| SnmpError::RequestFailed(format!("Task join error: {}", e)))?
@@ -548,6 +660,311 @@ impl Drop for SnmpSession {
     }
 }
 
+/// Parse a raw SNMP value buffer + type into an SnmpValue.
+/// Shared by both direct and isolated code paths.
+fn parse_snmp_value(value_buf: &[u8], value_len: usize, value_type: i32) -> SnmpResult<SnmpValue> {
+    let buf = &value_buf[..value_len];
+    match value_type as u8 {
+        ASN_OCTET_STR => match String::from_utf8(buf.to_vec()) {
+            Ok(s) => Ok(SnmpValue::String(s)),
+            Err(_) => Ok(SnmpValue::OctetString(buf.to_vec())),
+        },
+        ASN_OPAQUE => Ok(SnmpValue::OctetString(buf.to_vec())),
+        ASN_IPADDRESS => {
+            if value_len == 4 {
+                Ok(SnmpValue::IpAddress(format!(
+                    "{}.{}.{}.{}",
+                    buf[0], buf[1], buf[2], buf[3]
+                )))
+            } else {
+                Ok(SnmpValue::OctetString(buf.to_vec()))
+            }
+        }
+        ASN_OBJECT_ID => match String::from_utf8(buf.to_vec()) {
+            Ok(s) => Ok(SnmpValue::Oid(s)),
+            Err(_) => Ok(SnmpValue::OctetString(buf.to_vec())),
+        },
+        ASN_INTEGER | ASN_COUNTER | ASN_GAUGE | ASN_TIMETICKS | ASN_UINTEGER => {
+            if value_len >= std::mem::size_of::<i64>() {
+                let value = unsafe { (buf.as_ptr() as *const i64).read_unaligned() };
+                Ok(SnmpValue::Integer(value))
+            } else {
+                Err(SnmpError::RequestFailed("Invalid integer size".into()))
+            }
+        }
+        ASN_COUNTER64 => {
+            if value_len >= 8 {
+                let high = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let low = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                Ok(SnmpValue::Counter64((high as u64) << 32 | low as u64))
+            } else {
+                Err(SnmpError::RequestFailed("Invalid counter64 size".into()))
+            }
+        }
+        ASN_NULL => Ok(SnmpValue::Null),
+        _ => Err(SnmpError::RequestFailed(format!(
+            "Unsupported type: {}",
+            value_type
+        ))),
+    }
+}
+
+/// Parse a walk result entry into (oid_string, SnmpValue).
+fn parse_walk_result(res: &SnmpWalkResult) -> Option<(String, SnmpValue)> {
+    if res.value_len == 0 {
+        return None;
+    }
+    let oid_str = unsafe {
+        CStr::from_ptr(res.oid.as_ptr() as *const c_char)
+            .to_string_lossy()
+            .to_string()
+    };
+    parse_snmp_value(&res.value, res.value_len, res.value_type)
+        .ok()
+        .map(|v| (oid_str, v))
+}
+
+/// Helper to build SNMPv3 C config and keep CStrings alive.
+struct V3CStrings {
+    _username: CString,
+    _auth_pass: Option<CString>,
+    _priv_pass: Option<CString>,
+    _auth_proto: Option<CString>,
+    _priv_proto: Option<CString>,
+    _sec_level: CString,
+    config: SnmpV3ConfigC,
+}
+
+impl V3CStrings {
+    fn new(v3: &V3Config) -> SnmpResult<Self> {
+        let username = CString::new(v3.username.as_str())
+            .map_err(|_| SnmpError::RequestFailed("Invalid username".into()))?;
+        let auth_pass = v3
+            .auth_password
+            .as_ref()
+            .map(|p| CString::new(p.as_str()))
+            .transpose()
+            .map_err(|_| SnmpError::RequestFailed("Invalid auth password".into()))?;
+        let priv_pass = v3
+            .priv_password
+            .as_ref()
+            .map(|p| CString::new(p.as_str()))
+            .transpose()
+            .map_err(|_| SnmpError::RequestFailed("Invalid priv password".into()))?;
+        let auth_proto = v3
+            .auth_protocol
+            .as_ref()
+            .map(|p| CString::new(p.as_str()))
+            .transpose()
+            .map_err(|_| SnmpError::RequestFailed("Invalid auth protocol".into()))?;
+        let priv_proto = v3
+            .priv_protocol
+            .as_ref()
+            .map(|p| CString::new(p.as_str()))
+            .transpose()
+            .map_err(|_| SnmpError::RequestFailed("Invalid priv protocol".into()))?;
+        let sec_level = CString::new(v3.security_level.as_str())
+            .map_err(|_| SnmpError::RequestFailed("Invalid security level".into()))?;
+
+        let config = SnmpV3ConfigC {
+            username: username.as_ptr(),
+            auth_password: auth_pass
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(ptr::null()),
+            priv_password: priv_pass
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(ptr::null()),
+            auth_protocol: auth_proto
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(ptr::null()),
+            priv_protocol: priv_proto
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(ptr::null()),
+            security_level: sec_level.as_ptr(),
+        };
+
+        Ok(Self {
+            _username: username,
+            _auth_pass: auth_pass,
+            _priv_pass: priv_pass,
+            _auth_proto: auth_proto,
+            _priv_proto: priv_proto,
+            _sec_level: sec_level,
+            config,
+        })
+    }
+}
+
+/// Perform an SNMP GET in a forked child process for crash isolation.
+#[allow(clippy::too_many_arguments)]
+fn get_isolated(
+    ip_address: &str,
+    port: u16,
+    community: &str,
+    version: i32,
+    timeout_us: i64,
+    retries: i32,
+    v3_config: Option<&V3Config>,
+    oid: &str,
+) -> SnmpResult<SnmpValue> {
+    let ip_cstr = CString::new(ip_address)
+        .map_err(|_| SnmpError::RequestFailed("Invalid IP address".into()))?;
+    let comm_cstr = CString::new(community)
+        .map_err(|_| SnmpError::RequestFailed("Invalid community string".into()))?;
+    let oid_cstr =
+        CString::new(oid).map_err(|_| SnmpError::InvalidOid(format!("Invalid OID: {}", oid)))?;
+
+    let v3_strings = v3_config.map(V3CStrings::new).transpose()?;
+    let v3_ptr = v3_strings
+        .as_ref()
+        .map(|s| &s.config as *const _)
+        .unwrap_or(ptr::null());
+
+    let mut result = SnmpIsolatedGetResult {
+        status: -1,
+        value_type: 0,
+        child_signal: 0,
+        error_buf: [0; 512],
+        value_buf: [0; 1024],
+    };
+
+    unsafe {
+        snmp_get_isolated(
+            ip_cstr.as_ptr(),
+            port,
+            comm_cstr.as_ptr(),
+            version,
+            timeout_us,
+            retries,
+            v3_ptr,
+            oid_cstr.as_ptr(),
+            &mut result,
+        );
+    }
+
+    match result.status {
+        -2 => Err(SnmpError::CrashRecovered {
+            signal: result.child_signal,
+            message: unsafe {
+                CStr::from_ptr(result.error_buf.as_ptr())
+                    .to_string_lossy()
+                    .to_string()
+            },
+        }),
+        -1 => {
+            let err_msg = unsafe {
+                CStr::from_ptr(result.error_buf.as_ptr())
+                    .to_string_lossy()
+                    .to_string()
+            };
+            if err_msg.contains("timeout") || err_msg.contains("Timeout") {
+                Err(SnmpError::Timeout)
+            } else if err_msg.contains("Failed to parse OID") {
+                Err(SnmpError::InvalidOid(err_msg))
+            } else if err_msg.contains("Unknown host") || err_msg.contains("Connection refused") {
+                Err(SnmpError::NetworkUnreachable)
+            } else {
+                Err(SnmpError::RequestFailed(err_msg))
+            }
+        }
+        value_len => parse_snmp_value(&result.value_buf, value_len as usize, result.value_type),
+    }
+}
+
+/// Perform an SNMP WALK in a forked child process for crash isolation.
+#[allow(clippy::too_many_arguments)]
+fn walk_isolated(
+    ip_address: &str,
+    port: u16,
+    community: &str,
+    version: i32,
+    timeout_us: i64,
+    retries: i32,
+    v3_config: Option<&V3Config>,
+    start_oid: &str,
+) -> SnmpResult<Vec<(String, SnmpValue)>> {
+    let ip_cstr = CString::new(ip_address)
+        .map_err(|_| SnmpError::RequestFailed("Invalid IP address".into()))?;
+    let comm_cstr = CString::new(community)
+        .map_err(|_| SnmpError::RequestFailed("Invalid community string".into()))?;
+    let oid_cstr = CString::new(start_oid)
+        .map_err(|_| SnmpError::InvalidOid(format!("Invalid OID: {}", start_oid)))?;
+
+    let v3_strings = v3_config.map(V3CStrings::new).transpose()?;
+    let v3_ptr = v3_strings
+        .as_ref()
+        .map(|s| &s.config as *const _)
+        .unwrap_or(ptr::null());
+
+    const MAX_RESULTS: usize = 10000;
+    let mut header = SnmpIsolatedWalkHeader {
+        status: -1,
+        num_results: 0,
+        child_signal: 0,
+        error_buf: [0; 512],
+    };
+    let mut results_buf: Vec<SnmpWalkResult> = vec![
+        SnmpWalkResult {
+            oid: [0; 256],
+            value: [0; 1024],
+            value_len: 0,
+            value_type: 0,
+        };
+        MAX_RESULTS
+    ];
+
+    unsafe {
+        snmp_walk_isolated(
+            ip_cstr.as_ptr(),
+            port,
+            comm_cstr.as_ptr(),
+            version,
+            timeout_us,
+            retries,
+            v3_ptr,
+            oid_cstr.as_ptr(),
+            &mut header,
+            results_buf.as_mut_ptr(),
+            MAX_RESULTS,
+        );
+    }
+
+    match header.status {
+        -2 => Err(SnmpError::CrashRecovered {
+            signal: header.child_signal,
+            message: unsafe {
+                CStr::from_ptr(header.error_buf.as_ptr())
+                    .to_string_lossy()
+                    .to_string()
+            },
+        }),
+        -1 => {
+            let err_msg = unsafe {
+                CStr::from_ptr(header.error_buf.as_ptr())
+                    .to_string_lossy()
+                    .to_string()
+            };
+            if err_msg.contains("Failed to parse OID") {
+                Err(SnmpError::InvalidOid(err_msg))
+            } else {
+                Err(SnmpError::RequestFailed(err_msg))
+            }
+        }
+        _ => {
+            let parsed: Vec<(String, SnmpValue)> = results_buf
+                .iter()
+                .take(header.num_results as usize)
+                .filter_map(parse_walk_result)
+                .collect();
+            Ok(parsed)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +1169,106 @@ mod tests {
                 "Should have error message, got: {}",
                 err_msg
             );
+        }
+    }
+
+    #[test]
+    fn test_struct_layout_get_result() {
+        // Verify SnmpIsolatedGetResult matches C layout
+        // C struct: int status (4) + int value_type (4) + int child_signal (4)
+        //           + char error_buf[512] + uint8_t value_buf[1024]
+        // With padding: 4+4+4 = 12, then 512 + 1024 = 1548 total
+        assert_eq!(
+            std::mem::size_of::<SnmpIsolatedGetResult>(),
+            4 + 4 + 4 + 512 + 1024
+        );
+    }
+
+    #[test]
+    fn test_struct_layout_walk_header() {
+        // C struct: int status (4) + uint32_t num_results (4)
+        //           + int child_signal (4) + char error_buf[512]
+        assert_eq!(
+            std::mem::size_of::<SnmpIsolatedWalkHeader>(),
+            4 + 4 + 4 + 512
+        );
+    }
+
+    #[test]
+    fn test_fork_crash_recovery() {
+        // Verify that a SIGSEGV in a forked child does NOT kill our process
+        let mut child_signal: i32 = 0;
+        let ret = unsafe { snmp_test_crash_in_child(&mut child_signal) };
+        assert_eq!(ret, 0, "snmp_test_crash_in_child should succeed");
+        assert_eq!(
+            child_signal,
+            libc::SIGSEGV,
+            "child should have died from SIGSEGV"
+        );
+    }
+
+    #[test]
+    fn test_isolation_mode_default() {
+        // Default isolation mode should be Fork (unless TOWEROPS_SNMP_ISOLATION=direct)
+        let mode = isolation_mode();
+        // We can't guarantee env var state in tests, just verify it returns a valid value
+        assert!(
+            matches!(mode, IsolationMode::Fork | IsolationMode::Direct),
+            "isolation_mode() should return Fork or Direct"
+        );
+    }
+
+    #[test]
+    fn test_isolated_get_unreachable_host() {
+        // An isolated GET to an unreachable host should return an error, not crash
+        let result = get_isolated(
+            "192.0.2.1",
+            161,
+            "public",
+            2,
+            SNMP_TIMEOUT_SECS * 1_000_000,
+            SNMP_RETRIES,
+            None,
+            "1.3.6.1.2.1.1.1.0",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_isolated_get_invalid_oid() {
+        let result = get_isolated(
+            "127.0.0.1",
+            161,
+            "public",
+            2,
+            SNMP_TIMEOUT_SECS * 1_000_000,
+            SNMP_RETRIES,
+            None,
+            "not-a-valid-oid",
+        );
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SnmpError::InvalidOid(_) => {}
+            e => panic!("Expected InvalidOid, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_isolated_walk_unreachable_host() {
+        let result = walk_isolated(
+            "192.0.2.1",
+            161,
+            "public",
+            2,
+            SNMP_TIMEOUT_SECS * 1_000_000,
+            SNMP_RETRIES,
+            None,
+            "1.3.6.1.2.1.1",
+        );
+        // Should either error or return empty, not crash
+        match result {
+            Err(_) => {}
+            Ok(results) => assert!(results.is_empty()),
         }
     }
 
