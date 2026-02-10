@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 netsnmp-sys = "0.1"
 libc = "0.2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util", "process"] }
 thiserror = "2"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tokio-rustls = "0.26"
@@ -23,8 +23,6 @@ async-trait = "0.1"
 home = "=0.5.12"
 zeroize = { version = "1", features = ["derive"] }
 anyhow = "1.0"
-surge-ping = "0.8"
-rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha2 = "0.10"
 
