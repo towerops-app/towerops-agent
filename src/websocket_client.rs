@@ -1403,7 +1403,7 @@ async fn self_update(url: &str, expected_checksum: &str) -> Result<()> {
             .args(&args[1..])
             .exec();
         // exec() only returns on error
-        return Err(format!("exec() failed: {}", err).into());
+        Err(format!("exec() failed: {}", err).into())
     }
 
     #[cfg(not(unix))]
