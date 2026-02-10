@@ -123,7 +123,7 @@ mod tests {
         // Create a poller
         let poller = registry.get_or_create("test-device".to_string(), config);
         assert_eq!(registry.count(), 1);
-        assert_eq!(poller.device_id(), "test-device");
+        assert_eq!(poller.device_id, "test-device");
 
         // Remove the poller
         let removed_ip = registry.remove("test-device");
@@ -145,7 +145,7 @@ mod tests {
         let poller = DevicePoller::spawn("test-device".to_string(), config.clone());
 
         // Test accessors
-        assert_eq!(poller.device_id(), "test-device");
+        assert_eq!(poller.device_id, "test-device");
         assert_eq!(poller.config().ip, "192.168.1.1");
         assert_eq!(poller.config().port, 161);
 
