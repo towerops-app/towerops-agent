@@ -169,7 +169,7 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
-            runner: ubuntu-latest  # Use GitHub's native AMD64 runners
+            runner: blacksmith-4vcpu-ubuntu-2404
           - platform: linux/arm64
             arch: arm64
             runner: blacksmith-4vcpu-ubuntu-2404-arm  # Use Blacksmith ARM64 runners
