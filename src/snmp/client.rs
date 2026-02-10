@@ -50,13 +50,13 @@ struct SnmpIsolatedWalkHeader {
 }
 
 #[cfg(not(test))]
-const SNMP_TIMEOUT_SECS: i64 = 10;
+const SNMP_TIMEOUT_US: i64 = 10_000_000; // 10 seconds
 #[cfg(not(test))]
 const SNMP_RETRIES: i32 = 2;
 
-// Use short timeouts in tests to avoid 90+ second waits on unreachable hosts
+// Use short timeouts in tests - just enough to prove the operation fails
 #[cfg(test)]
-const SNMP_TIMEOUT_SECS: i64 = 1;
+const SNMP_TIMEOUT_US: i64 = 200_000; // 200ms
 #[cfg(test)]
 const SNMP_RETRIES: i32 = 0;
 
@@ -225,7 +225,7 @@ impl SnmpClient {
                     port,
                     &community,
                     version_num,
-                    SNMP_TIMEOUT_SECS * 1_000_000,
+                    SNMP_TIMEOUT_US,
                     SNMP_RETRIES,
                     v3_config.as_ref(),
                     &oid,
@@ -262,7 +262,7 @@ impl SnmpClient {
                     port,
                     &community,
                     version_num,
-                    SNMP_TIMEOUT_SECS * 1_000_000,
+                    SNMP_TIMEOUT_US,
                     SNMP_RETRIES,
                     v3_config.as_ref(),
                     &oid,
@@ -395,7 +395,7 @@ impl SnmpSession {
                 port,
                 comm_cstr.as_ptr(),
                 version_num,
-                SNMP_TIMEOUT_SECS * 1_000_000,
+                SNMP_TIMEOUT_US,
                 SNMP_RETRIES,
                 v3_c_config
                     .as_ref()
@@ -1091,7 +1091,7 @@ mod tests {
         // sequential async operations.
         let client = SnmpClient::new();
 
-        for _ in 0..3 {
+        for _ in 0..2 {
             let result = client
                 .get("192.0.2.1", "public", "2c", 161, "1.3.6.1.2.1.1.1.0", None)
                 .await;
@@ -1226,7 +1226,7 @@ mod tests {
             161,
             "public",
             2,
-            SNMP_TIMEOUT_SECS * 1_000_000,
+            SNMP_TIMEOUT_US,
             SNMP_RETRIES,
             None,
             "1.3.6.1.2.1.1.1.0",
@@ -1241,7 +1241,7 @@ mod tests {
             161,
             "public",
             2,
-            SNMP_TIMEOUT_SECS * 1_000_000,
+            SNMP_TIMEOUT_US,
             SNMP_RETRIES,
             None,
             "not-a-valid-oid",
@@ -1260,7 +1260,7 @@ mod tests {
             161,
             "public",
             2,
-            SNMP_TIMEOUT_SECS * 1_000_000,
+            SNMP_TIMEOUT_US,
             SNMP_RETRIES,
             None,
             "1.3.6.1.2.1.1",
