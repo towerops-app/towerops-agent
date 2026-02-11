@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -42,7 +43,7 @@ func mikrotikConnect(ip string, port uint32, username, password string, useSSL b
 			NetDialer: &net.Dialer{Timeout: mikrotikConnTimeout},
 			Config:    &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
 		}
-		conn, err = dialer.DialContext(nil, "tcp", addr)
+		conn, err = dialer.DialContext(context.Background(), "tcp", addr)
 	} else {
 		conn, err = net.DialTimeout("tcp", addr, mikrotikConnTimeout)
 	}
@@ -55,11 +56,11 @@ func mikrotikConnect(ip string, port uint32, username, password string, useSSL b
 	// Authenticate
 	resp, err := c.execute("/login", map[string]string{"name": username, "password": password})
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("auth: %w", err)
 	}
 	if resp.err != "" {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("auth failed: %s", resp.err)
 	}
 
@@ -85,7 +86,7 @@ func (c *mikrotikClient) execute(command string, args map[string]string) (*mikro
 }
 
 func (c *mikrotikClient) close() error {
-	c.execute("/quit", nil) // best-effort
+	_, _ = c.execute("/quit", nil) // best-effort
 	return c.conn.Close()
 }
 
@@ -145,7 +146,7 @@ func (c *mikrotikClient) readSentence() ([]string, error) {
 	var words []string
 	for {
 		if tc, ok := c.conn.(net.Conn); ok {
-			tc.SetReadDeadline(time.Now().Add(mikrotikReadTimeout))
+			_ = tc.SetReadDeadline(time.Now().Add(mikrotikReadTimeout))
 		}
 		word, err := c.readWord()
 		if err != nil {
@@ -268,7 +269,7 @@ func executeMikrotikJob(job *pb.AgentJob, resultCh chan<- *pb.MikrotikResult) {
 		}
 		return
 	}
-	defer client.close()
+	defer func() { _ = client.close() }()
 
 	var allSentences []*pb.MikrotikSentence
 	var errorMessage string

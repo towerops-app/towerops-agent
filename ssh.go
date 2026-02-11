@@ -23,13 +23,13 @@ func executeMikrotikBackup(ip string, port uint16, username, password string) (s
 	if err != nil {
 		return "", fmt.Errorf("ssh dial %s: %w", addr, err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	session, err := conn.NewSession()
 	if err != nil {
 		return "", fmt.Errorf("ssh session: %w", err)
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 
 	output, err := session.CombinedOutput("/export compact")
 	if err != nil {

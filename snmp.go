@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gosnmp/gosnmp"
 	"github.com/towerops-app/towerops-agent/pb"
@@ -22,7 +23,7 @@ func executeSnmpJob(job *pb.AgentJob, resultCh chan<- *pb.SnmpResult) {
 		slog.Error("snmp connect", "job_id", job.JobId, "device", dev.Ip, "error", err)
 		return
 	}
-	defer conn.Conn.Close()
+	defer func() { _ = conn.Conn.Close() }()
 
 	oidValues := make(map[string]string)
 
@@ -96,7 +97,7 @@ func executeCredentialTest(job *pb.AgentJob, resultCh chan<- *pb.CredentialTestR
 		}
 		return
 	}
-	defer conn.Conn.Close()
+	defer func() { _ = conn.Conn.Close() }()
 
 	result, err := conn.Get([]string{"1.3.6.1.2.1.1.1.0"})
 	if err != nil {
@@ -221,10 +222,12 @@ func snmpValueToString(pdu gosnmp.SnmpPDU) string {
 		return fmt.Sprintf("%d", gosnmp.ToBigInt(pdu.Value).Int64())
 	case gosnmp.OctetString:
 		b := pdu.Value.([]byte)
-		// Try UTF-8 first
+		if !utf8.Valid(b) {
+			return formatHex(b)
+		}
+		// Check for non-printable control chars
 		for _, c := range b {
 			if c < 0x20 && c != '\n' && c != '\r' && c != '\t' {
-				// Non-printable - return hex
 				return formatHex(b)
 			}
 		}

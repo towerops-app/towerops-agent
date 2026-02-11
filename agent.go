@@ -65,7 +65,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	agentID := fmt.Sprintf("agent-%d", time.Now().Unix())
 	topic := "agent:" + agentID

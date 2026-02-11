@@ -15,6 +15,7 @@
         devShells.default = pkgs.mkShell {
           buildInputs = [
             pkgs.go
+            pkgs.golangci-lint
             pkgs.protobuf
             pkgs.protoc-gen-go
             pkgs.git

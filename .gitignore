@@ -1,6 +1,7 @@
 # Go
 towerops-agent
 *.test
+cover.out
 
 # Database files
 *.db

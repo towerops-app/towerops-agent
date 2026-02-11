@@ -18,7 +18,7 @@ func selfUpdate(downloadURL, expectedChecksum string) error {
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download failed: status %d", resp.StatusCode)
@@ -52,7 +52,7 @@ func selfUpdate(downloadURL, expectedChecksum string) error {
 
 	// Replace current binary
 	if err := os.Rename(tempPath, currentExe); err != nil {
-		os.Remove(tempPath)
+		_ = os.Remove(tempPath)
 		return fmt.Errorf("rename: %w", err)
 	}
 	slog.Info("binary replaced", "path", currentExe)
