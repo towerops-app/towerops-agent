@@ -131,6 +131,9 @@ type captureWriter struct {
 	written []byte
 }
 
-func (c *captureWriter) Read(p []byte) (int, error)  { return c.Reader.Read(p) }
-func (c *captureWriter) Write(p []byte) (int, error) { c.written = append(c.written, p...); return len(p), nil }
-func (c *captureWriter) Close() error                { return nil }
+func (c *captureWriter) Read(p []byte) (int, error) { return c.Reader.Read(p) }
+func (c *captureWriter) Write(p []byte) (int, error) {
+	c.written = append(c.written, p...)
+	return len(p), nil
+}
+func (c *captureWriter) Close() error { return nil }

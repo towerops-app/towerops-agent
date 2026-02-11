@@ -67,6 +67,11 @@ func TestSnmpValueToString(t *testing.T) {
 			pdu:  gosnmp.SnmpPDU{Type: gosnmp.NoSuchObject, Value: nil},
 			want: "null",
 		},
+		{
+			name: "invalid utf8",
+			pdu:  gosnmp.SnmpPDU{Type: gosnmp.OctetString, Value: []byte{0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x80, 0xFE}},
+			want: "48:65:6c:6c:6f:80:fe",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

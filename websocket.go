@@ -57,7 +57,7 @@ func WSDial(rawURL string) (*WSConn, error) {
 	// Generate random key for Sec-WebSocket-Key
 	keyBytes := make([]byte, 16)
 	if _, err := rand.Read(keyBytes); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("generate key: %w", err)
 	}
 	key := base64.StdEncoding.EncodeToString(keyBytes)
@@ -67,7 +67,7 @@ func WSDial(rawURL string) (*WSConn, error) {
 		path, u.Host, key)
 
 	if _, err := conn.Write([]byte(req)); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("write handshake: %w", err)
 	}
 
@@ -75,12 +75,12 @@ func WSDial(rawURL string) (*WSConn, error) {
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("read handshake: %w", err)
 	}
 	resp := string(buf[:n])
 	if !strings.Contains(resp, "101") {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("handshake failed: %s", strings.SplitN(resp, "\r\n", 2)[0])
 	}
 
@@ -102,7 +102,7 @@ func (ws *WSConn) ReadMessage() ([]byte, int, error) {
 				return nil, 0, fmt.Errorf("pong: %w", err)
 			}
 		case opClose:
-			ws.writeFrame(opClose, nil) // best-effort close reply
+			_ = ws.writeFrame(opClose, nil) // best-effort close reply
 			return nil, opClose, io.EOF
 		}
 	}
@@ -115,7 +115,7 @@ func (ws *WSConn) WriteText(data []byte) error {
 
 // Close sends a close frame and closes the underlying connection.
 func (ws *WSConn) Close() error {
-	ws.writeFrame(opClose, nil) // best-effort
+	_ = ws.writeFrame(opClose, nil) // best-effort
 	return ws.conn.Close()
 }
 
@@ -175,7 +175,7 @@ func (ws *WSConn) writeFrame(opcode int, payload []byte) error {
 	// Max header: 2 + 8 + 4 (mask) = 14 bytes
 	header := make([]byte, 2, 14)
 	header[0] = 0x80 | byte(opcode) // FIN + opcode
-	header[1] = 0x80               // masked (client must mask)
+	header[1] = 0x80                // masked (client must mask)
 
 	switch {
 	case length <= 125:
@@ -194,7 +194,7 @@ func (ws *WSConn) writeFrame(opcode int, payload []byte) error {
 
 	// Generate mask key
 	maskKey := make([]byte, 4)
-	rand.Read(maskKey)
+	_, _ = rand.Read(maskKey)
 	header = append(header, maskKey...)
 
 	// Mask payload

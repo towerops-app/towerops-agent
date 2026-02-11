@@ -17,7 +17,7 @@ func TestSelfUpdateBadURL(t *testing.T) {
 
 func TestSelfUpdateChecksumMismatch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("fake binary"))
+		_, _ = w.Write([]byte("fake binary"))
 	}))
 	defer srv.Close()
 
@@ -32,7 +32,7 @@ func TestSelfUpdateChecksumMatch(t *testing.T) {
 	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
