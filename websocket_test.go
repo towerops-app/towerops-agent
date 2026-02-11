@@ -518,7 +518,7 @@ func TestWSDialGenerateKeyError(t *testing.T) {
 	go func() {
 		conn, _ := ln.Accept()
 		if conn != nil {
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
