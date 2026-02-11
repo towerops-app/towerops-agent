@@ -3,6 +3,8 @@ services:
     image: ghcr.io/towerops-app/towerops-agent:latest
     container_name: towerops-agent
     restart: unless-stopped
+    cap_add:
+      - NET_RAW
 
     environment:
       # Required: Agent authentication token (from Towerops web UI)
