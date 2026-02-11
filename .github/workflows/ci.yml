@@ -86,8 +86,8 @@ jobs:
           context: .
           push: true
           provenance: false
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.branch.outputs.name }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
@@ -170,7 +170,8 @@ jobs:
           provenance: false
           build-args: |
             VERSION=${{ needs.version.outputs.version }}
-            BUILDKIT_INLINE_CACHE=1
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }},mode=max
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
             docker.io/${{ env.DOCKERHUB_IMAGE }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
