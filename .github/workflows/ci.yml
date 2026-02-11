@@ -184,7 +184,7 @@ jobs:
           sha256sum towerops-agent-linux-${{ matrix.arch }} > towerops-agent-linux-${{ matrix.arch }}.sha256
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: binary-${{ matrix.arch }}
           path: |
