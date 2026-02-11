@@ -115,7 +115,7 @@ jobs:
             VERSION=${TAG#v}
             echo "is_tag=true" >> $GITHUB_OUTPUT
           else
-            VERSION=$(git describe --tags --always --dirty=-modified | sed 's/^v//')
+            VERSION=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
             echo "is_tag=false" >> $GITHUB_OUTPUT
           fi
           SHORT_SHA=${GITHUB_SHA::7}
