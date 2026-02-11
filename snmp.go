@@ -10,6 +10,21 @@ import (
 	"github.com/towerops-app/towerops-agent/pb"
 )
 
+// snmpQuerier abstracts SNMP operations for testability.
+type snmpQuerier interface {
+	Get(oids []string) (*gosnmp.SnmpPacket, error)
+	BulkWalkAll(rootOid string) ([]gosnmp.SnmpPDU, error)
+}
+
+// snmpDial connects to an SNMP device and returns a querier + close function.
+var snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+	conn, err := newSnmpConn(dev)
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, func() { _ = conn.Conn.Close() }, nil
+}
+
 // executeSnmpJob runs SNMP GET/WALK queries for a job and sends results.
 func executeSnmpJob(job *pb.AgentJob, resultCh chan<- *pb.SnmpResult) {
 	dev := job.SnmpDevice
@@ -18,12 +33,12 @@ func executeSnmpJob(job *pb.AgentJob, resultCh chan<- *pb.SnmpResult) {
 		return
 	}
 
-	conn, err := newSnmpConn(dev)
+	conn, closeFn, err := snmpDial(dev)
 	if err != nil {
 		slog.Error("snmp connect", "job_id", job.JobId, "device", dev.Ip, "error", err)
 		return
 	}
-	defer func() { _ = conn.Conn.Close() }()
+	defer closeFn()
 
 	oidValues := make(map[string]string)
 
@@ -85,7 +100,7 @@ func executeCredentialTest(job *pb.AgentJob, resultCh chan<- *pb.CredentialTestR
 		return
 	}
 
-	conn, err := newSnmpConn(dev)
+	conn, closeFn, err := snmpDial(dev)
 	timestamp := time.Now().Unix()
 
 	if err != nil {
@@ -97,7 +112,7 @@ func executeCredentialTest(job *pb.AgentJob, resultCh chan<- *pb.CredentialTestR
 		}
 		return
 	}
-	defer func() { _ = conn.Conn.Close() }()
+	defer closeFn()
 
 	result, err := conn.Get([]string{"1.3.6.1.2.1.1.1.0"})
 	if err != nil {
@@ -126,10 +141,11 @@ func executeCredentialTest(job *pb.AgentJob, resultCh chan<- *pb.CredentialTestR
 // newSnmpConn creates a gosnmp.GoSNMP connection from protobuf device config.
 func newSnmpConn(dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error) {
 	conn := &gosnmp.GoSNMP{
-		Target:  dev.Ip,
-		Port:    uint16(dev.Port),
-		Timeout: 10 * time.Second,
-		Retries: 2,
+		Target:         dev.Ip,
+		Port:           uint16(dev.Port),
+		Timeout:        10 * time.Second,
+		Retries:        2,
+		MaxRepetitions: 10,
 	}
 
 	// Transport
