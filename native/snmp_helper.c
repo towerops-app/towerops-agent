@@ -282,13 +282,30 @@ int snmp_get(
         struct variable_list *var = response->variables;
         *value_type = var->type;
 
+        // Handle SNMP exception types (NoSuchObject, NoSuchInstance, EndOfMibView)
+        if (var->type == SNMP_NOSUCHOBJECT ||
+            var->type == SNMP_NOSUCHINSTANCE ||
+            var->type == SNMP_ENDOFMIBVIEW) {
+            if (error_buf && error_buf_len > 0) {
+                const char *label = var->type == SNMP_NOSUCHOBJECT ? "noSuchObject" :
+                                    var->type == SNMP_NOSUCHINSTANCE ? "noSuchInstance" :
+                                    "endOfMibView";
+                snprintf(error_buf, error_buf_len, "%s", label);
+            }
+            snmp_free_pdu(response);
+            return -1;
+        }
+
         switch (var->type) {
             case ASN_OCTET_STR:
             case ASN_OPAQUE:
             case ASN_IPADDRESS:
-                if (var->val_len <= value_buf_len) {
+                if (var->val.string && var->val_len > 0 &&
+                    var->val_len <= value_buf_len) {
                     memcpy(value_buf, var->val.string, var->val_len);
                     result = (int)var->val_len;
+                } else if (!var->val.string || var->val_len == 0) {
+                    result = 0; // Empty string
                 } else {
                     if (error_buf && error_buf_len > 0) {
                         snprintf(error_buf, error_buf_len, "Buffer too small");
@@ -301,31 +318,33 @@ int snmp_get(
             case ASN_GAUGE:
             case ASN_TIMETICKS:
             case ASN_UINTEGER:
-                if (sizeof(long) <= value_buf_len) {
+                if (var->val.integer && sizeof(long) <= value_buf_len) {
                     *((long*)value_buf) = *var->val.integer;
                     result = sizeof(long);
                 }
                 break;
 
             case ASN_COUNTER64:
-                if (sizeof(struct counter64) <= value_buf_len) {
+                if (var->val.counter64 &&
+                    sizeof(struct counter64) <= value_buf_len) {
                     memcpy(value_buf, var->val.counter64, sizeof(struct counter64));
                     result = sizeof(struct counter64);
                 }
                 break;
 
             case ASN_OBJECT_ID:
-                // Convert OID to string representation
-                {
+                if (var->val.objid && var->val_len > 0) {
                     char oid_buf[256];
-                    snprint_objid(oid_buf, sizeof(oid_buf), var->val.objid, var->val_len / sizeof(oid));
+                    snprint_objid(oid_buf, sizeof(oid_buf), var->val.objid,
+                                  var->val_len / sizeof(oid));
                     size_t oid_str_len = strlen(oid_buf);
                     if (oid_str_len <= value_buf_len) {
                         memcpy(value_buf, oid_buf, oid_str_len);
                         result = (int)oid_str_len;
                     } else {
                         if (error_buf && error_buf_len > 0) {
-                            snprintf(error_buf, error_buf_len, "Buffer too small for OID string");
+                            snprintf(error_buf, error_buf_len,
+                                     "Buffer too small for OID string");
                         }
                     }
                 }
@@ -339,7 +358,8 @@ int snmp_get(
             default:
                 // Unknown type
                 if (error_buf && error_buf_len > 0) {
-                    snprintf(error_buf, error_buf_len, "Unsupported type: %d", var->type);
+                    snprintf(error_buf, error_buf_len,
+                             "Unsupported type: %d", var->type);
                 }
                 break;
         }
@@ -412,13 +432,39 @@ int snmp_walk(
             break;
         }
 
+        // Handle SNMP exception types that indicate end-of-data or missing values.
+        // These have type 0x80 (NoSuchObject), 0x81 (NoSuchInstance),
+        // 0x82 (EndOfMibView) and their val pointers may be NULL.
+        if (var->type == SNMP_NOSUCHOBJECT ||
+            var->type == SNMP_NOSUCHINSTANCE) {
+            // Object/instance doesn't exist at this index - skip and continue walk
+            // Update OID for next iteration
+            if (var->name_length <= MAX_OID_LEN) {
+                memcpy(name, var->name, var->name_length * sizeof(oid));
+                name_length = var->name_length;
+            } else {
+                running = 0;
+            }
+            snmp_free_pdu(response);
+            continue;
+        }
+
+        if (var->type == SNMP_ENDOFMIBVIEW) {
+            // No more data available - terminate the walk
+            snmp_free_pdu(response);
+            break;
+        }
+
         // Store result
         snmp_walk_result_t *res = &results[*num_results];
 
         // Convert OID to string
         snprint_objid(res->oid, sizeof(res->oid), var->name, var->name_length);
 
-        // Store value
+        // Store value - check for NULL val pointers before every dereference.
+        // After fork() from a multi-threaded process, net-snmp's internal state
+        // can be inconsistent, potentially leaving val pointers NULL even for
+        // standard types.
         res->value_type = var->type;
         res->value_len = 0;
 
@@ -426,17 +472,18 @@ int snmp_walk(
             case ASN_OCTET_STR:
             case ASN_OPAQUE:
             case ASN_IPADDRESS:
-                if (var->val_len <= sizeof(res->value)) {
+                if (var->val.string && var->val_len > 0 &&
+                    var->val_len <= sizeof(res->value)) {
                     memcpy(res->value, var->val.string, var->val_len);
                     res->value_len = var->val_len;
                 }
                 break;
 
             case ASN_OBJECT_ID:
-                // Convert OID to string representation
-                {
+                if (var->val.objid && var->val_len > 0) {
                     char oid_buf[256];
-                    snprint_objid(oid_buf, sizeof(oid_buf), var->val.objid, var->val_len / sizeof(oid));
+                    snprint_objid(oid_buf, sizeof(oid_buf), var->val.objid,
+                                  var->val_len / sizeof(oid));
                     size_t oid_str_len = strlen(oid_buf);
                     if (oid_str_len < sizeof(res->value)) {
                         memcpy(res->value, oid_buf, oid_str_len);
@@ -450,17 +497,26 @@ int snmp_walk(
             case ASN_GAUGE:
             case ASN_TIMETICKS:
             case ASN_UINTEGER:
-                if (sizeof(long) <= sizeof(res->value)) {
+                if (var->val.integer && sizeof(long) <= sizeof(res->value)) {
                     *((long*)res->value) = *var->val.integer;
                     res->value_len = sizeof(long);
                 }
                 break;
 
             case ASN_COUNTER64:
-                if (sizeof(struct counter64) <= sizeof(res->value)) {
+                if (var->val.counter64 &&
+                    sizeof(struct counter64) <= sizeof(res->value)) {
                     memcpy(res->value, var->val.counter64, sizeof(struct counter64));
                     res->value_len = sizeof(struct counter64);
                 }
+                break;
+
+            case ASN_NULL:
+                // NULL values are valid but contain no data - skip
+                break;
+
+            default:
+                // Unknown or unsupported type - skip silently
                 break;
         }
 
