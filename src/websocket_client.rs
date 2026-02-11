@@ -330,7 +330,7 @@ impl AgentClient {
     /// No long-running tasks are spawned - the agent is stateless.
     /// Server handles all scheduling and retries via Oban.
     async fn handle_jobs(&self, job_list: AgentJobList) -> Result<()> {
-        tracing::debug!("Received {} jobs from server", job_list.jobs.len());
+        tracing::info!("Received {} jobs from server", job_list.jobs.len());
 
         // Collect device IDs from current jobs
         let mut current_device_ids = std::collections::HashSet::new();
@@ -352,7 +352,7 @@ impl AgentClient {
 
         for job in job_list.jobs {
             let job_type = JobType::try_from(job.job_type).unwrap_or(JobType::Poll);
-            tracing::debug!("Executing job: {} (type: {:?})", job.job_id, job_type);
+            tracing::info!("Starting job: {} (type: {:?})", job.job_id, job_type);
 
             match job_type {
                 JobType::Mikrotik => {
@@ -476,7 +476,7 @@ impl AgentClient {
             .await
             .map_err(|e| format!("Writer task closed: {}", e))?;
 
-        tracing::debug!("Sent SNMP result for device {}", result.device_id);
+        tracing::info!("Completed SNMP job for device {}", result.device_id);
         Ok(())
     }
 
@@ -497,8 +497,8 @@ impl AgentClient {
             .await
             .map_err(|e| format!("Writer task closed: {}", e))?;
 
-        tracing::debug!(
-            "Sent MikroTik result for device {} (job: {})",
+        tracing::info!(
+            "Completed MikroTik job for device {} (job: {})",
             result.device_id,
             result.job_id
         );
@@ -522,8 +522,8 @@ impl AgentClient {
             .await
             .map_err(|e| format!("Writer task closed: {}", e))?;
 
-        tracing::debug!(
-            "Sent credential test result (test_id: {}, success: {})",
+        tracing::info!(
+            "Completed credential test (test_id: {}, success: {})",
             result.test_id,
             result.success
         );
@@ -547,8 +547,8 @@ impl AgentClient {
             .await
             .map_err(|e| format!("Writer task closed: {}", e))?;
 
-        tracing::debug!(
-            "Sent monitoring check for device {} (status: {})",
+        tracing::info!(
+            "Completed ping check for device {} (status: {})",
             result.device_id,
             result.status
         );
