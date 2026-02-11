@@ -476,7 +476,11 @@ impl AgentClient {
             .await
             .map_err(|e| format!("Writer task closed: {}", e))?;
 
-        tracing::info!("Completed SNMP job for device {}", result.device_id);
+        tracing::info!(
+            "Completed SNMP job for device {} ({} OIDs)",
+            result.device_id,
+            result.oid_values.len()
+        );
         Ok(())
     }
 
@@ -729,7 +733,7 @@ async fn execute_snmp_job(
             .as_secs() as i64,
     };
 
-    tracing::debug!(
+    tracing::info!(
         "Collected {} OID values for job {}",
         result.oid_values.len(),
         job.job_id
