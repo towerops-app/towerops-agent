@@ -22,7 +22,8 @@ RUN apk add --no-cache \
     openssl-dev \
     linux-headers \
     perl \
-    curl
+    curl \
+    file
 
 # Download and extract net-snmp source
 RUN curl -fsSL "https://downloads.sourceforge.net/project/net-snmp/net-snmp/${NETSNMP_VERSION}/net-snmp-${NETSNMP_VERSION}.tar.gz" \
