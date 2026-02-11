@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-func TestPhoenixMsgSerialization(t *testing.T) {
-	msg := phoenixMsg{
+func TestChannelMsgSerialization(t *testing.T) {
+	msg := channelMsg{
 		Topic:   "agent:123",
 		Event:   "phx_join",
 		Payload: json.RawMessage(`{"token":"test"}`),
@@ -27,9 +27,9 @@ func TestPhoenixMsgSerialization(t *testing.T) {
 	}
 }
 
-func TestPhoenixMsgDeserialization(t *testing.T) {
+func TestChannelMsgDeserialization(t *testing.T) {
 	raw := `{"topic":"agent:123","event":"phx_reply","payload":{"status":"ok"},"ref":"1"}`
-	var msg phoenixMsg
+	var msg channelMsg
 	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
 		t.Fatal(err)
 	}
@@ -44,9 +44,9 @@ func TestPhoenixMsgDeserialization(t *testing.T) {
 	}
 }
 
-func TestPhoenixMsgNullRef(t *testing.T) {
+func TestChannelMsgNullRef(t *testing.T) {
 	raw := `{"topic":"agent:123","event":"job","payload":{},"ref":null}`
-	var msg phoenixMsg
+	var msg channelMsg
 	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
 		t.Fatal(err)
 	}

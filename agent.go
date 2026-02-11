@@ -17,15 +17,15 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// phoenixMsg is the Phoenix channel message format (JSON wrapper around binary protobuf).
-type phoenixMsg struct {
+// channelMsg is the WebSocket channel message format (JSON wrapper around binary protobuf).
+type channelMsg struct {
 	Topic   string          `json:"topic"`
 	Event   string          `json:"event"`
 	Payload json.RawMessage `json:"payload"`
 	Ref     *string         `json:"ref"`
 }
 
-// runAgent connects to the Phoenix server and runs the event loop with reconnect.
+// runAgent connects to the server and runs the event loop with reconnect.
 func runAgent(ctx context.Context, wsURL, token string) {
 	baseURL := strings.TrimRight(wsURL, "/")
 	retryDelay := time.Second
@@ -91,7 +91,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	}
 
 	sendMsg := func(event string, payload json.RawMessage) {
-		msg := phoenixMsg{
+		msg := channelMsg{
 			Topic:   topic,
 			Event:   event,
 			Payload: payload,
@@ -120,7 +120,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 
 	// Join channel
 	joinPayload, _ := json.Marshal(map[string]string{"token": token})
-	joinMsg := phoenixMsg{
+	joinMsg := channelMsg{
 		Topic:   topic,
 		Event:   "phx_join",
 		Payload: joinPayload,
@@ -161,8 +161,8 @@ func runSession(ctx context.Context, baseURL, token string) error {
 
 	heartbeatTicker := time.NewTicker(60 * time.Second)
 	defer heartbeatTicker.Stop()
-	phxHeartbeatTicker := time.NewTicker(25 * time.Second)
-	defer phxHeartbeatTicker.Stop()
+	channelHeartbeatTicker := time.NewTicker(25 * time.Second)
+	defer channelHeartbeatTicker.Stop()
 	startTime := time.Now()
 
 	defer func() {
@@ -180,7 +180,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 			return fmt.Errorf("read: %w", err)
 
 		case data := <-msgCh:
-			var msg phoenixMsg
+			var msg channelMsg
 			if err := json.Unmarshal(data, &msg); err != nil {
 				slog.Warn("invalid message", "error", err)
 				continue
@@ -212,9 +212,9 @@ func runSession(ctx context.Context, baseURL, token string) error {
 			sendBinaryResult("heartbeat", hb)
 			slog.Debug("sent heartbeat")
 
-		case <-phxHeartbeatTicker.C:
+		case <-channelHeartbeatTicker.C:
 			ref := nextRef()
-			msg := phoenixMsg{
+			msg := channelMsg{
 				Topic:   "phoenix",
 				Event:   "heartbeat",
 				Payload: json.RawMessage(`{}`),
@@ -225,14 +225,14 @@ func runSession(ctx context.Context, baseURL, token string) error {
 			case writeCh <- data:
 			default:
 			}
-			slog.Debug("sent phoenix heartbeat", "ref", ref)
+			slog.Debug("sent channel heartbeat", "ref", ref)
 		}
 	}
 }
 
-// handleMessage dispatches incoming Phoenix channel messages.
+// handleMessage dispatches incoming channel messages.
 func handleMessage(
-	msg phoenixMsg,
+	msg channelMsg,
 	snmpResultCh chan<- *pb.SnmpResult,
 	mikrotikResultCh chan<- *pb.MikrotikResult,
 	credTestResultCh chan<- *pb.CredentialTestResult,
