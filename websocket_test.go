@@ -415,25 +415,25 @@ func TestWSDial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		buf := make([]byte, 4096)
 		n, _ := conn.Read(buf)
 		_ = string(buf[:n]) // Read the request
 
 		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
-		conn.Write([]byte(resp))
+		_, _ = conn.Write([]byte(resp))
 
 		// Keep connection open briefly for the test
 		buf2 := make([]byte, 1)
-		conn.Read(buf2)
+		_, _ = conn.Read(buf2)
 	}()
 
 	addr := ln.Addr().String()
@@ -450,20 +450,20 @@ func TestWSDialHandshakeFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		buf := make([]byte, 4096)
-		conn.Read(buf)
+		_, _ = conn.Read(buf)
 
 		resp := "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
-		conn.Write([]byte(resp))
+		_, _ = conn.Write([]byte(resp))
 	}()
 
 	addr := ln.Addr().String()
@@ -482,15 +482,15 @@ func TestWSDialReadHandshakeError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		conn, _ := ln.Accept()
 		if conn != nil {
 			// Read the request then close immediately
 			buf := make([]byte, 4096)
-			conn.Read(buf)
-			conn.Close()
+			_, _ = conn.Read(buf)
+			_ = conn.Close()
 		}
 	}()
 
@@ -513,7 +513,7 @@ func TestWSDialGenerateKeyError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		conn, _ := ln.Accept()
@@ -539,7 +539,7 @@ func TestWSDialWriteHandshakeError(t *testing.T) {
 	netDial = func(network, addr string) (net.Conn, error) {
 		// Return a connection whose Write always fails
 		client, _ := net.Pipe()
-		client.Close() // Close immediately so Write fails
+		_ = client.Close() // Close immediately so Write fails
 		return client, nil
 	}
 
@@ -583,16 +583,16 @@ func TestWSDialRealHTTPServer(t *testing.T) {
 			return
 		}
 		conn, brw, _ := hj.Hijack()
-		defer conn.Close()
-		brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-		brw.Flush()
+		defer func() { _ = conn.Close() }()
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = brw.Flush()
 		// Keep alive briefly
 		buf := make([]byte, 1)
-		conn.Read(buf)
+		_, _ = conn.Read(buf)
 	})
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
-	defer ln.Close()
-	go http.Serve(ln, mux)
+	defer func() { _ = ln.Close() }()
+	go func() { _ = http.Serve(ln, mux) }()
 
 	addr := ln.Addr().String()
 	ws, err := WSDial("ws://" + addr + "/ws")

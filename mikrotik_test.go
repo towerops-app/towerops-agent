@@ -262,7 +262,7 @@ func TestExecute(t *testing.T) {
 
 	// Server goroutine: read command, write response
 	go func() {
-		defer serverW.Close()
+		defer func() { _ = serverW.Close() }()
 		sc := &mikrotikClient{conn: &readWriteCloser{r: serverR, w: serverW}}
 		// Read the command sentence
 		_, _ = sc.readSentence()
@@ -294,7 +294,7 @@ func TestExecuteWithArgs(t *testing.T) {
 
 	var receivedWords []string
 	go func() {
-		defer serverW.Close()
+		defer func() { _ = serverW.Close() }()
 		sc := &mikrotikClient{conn: &readWriteCloser{r: serverR, w: serverW}}
 		receivedWords, _ = sc.readSentence()
 		_ = sc.writeSentence([]string{"!done"})
@@ -342,7 +342,7 @@ func TestMikrotikClose(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		defer serverW.Close()
+		defer func() { _ = serverW.Close() }()
 		sc := &mikrotikClient{conn: &readWriteCloser{r: serverR, w: serverW}}
 		receivedWords, _ = sc.readSentence()
 		_ = sc.writeSentence([]string{"!fatal"})
@@ -362,14 +362,14 @@ func TestMikrotikConnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sc := &mikrotikClient{conn: conn}
 		// Read the /login command
 		_, _ = sc.readSentence()
@@ -383,7 +383,7 @@ func TestMikrotikConnect(t *testing.T) {
 
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
 	var portNum uint32
-	fmt.Sscanf(port, "%d", &portNum)
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
 	client, err := mikrotikConnect("127.0.0.1", portNum, "admin", "pass", false)
 	if err != nil {
@@ -397,14 +397,14 @@ func TestMikrotikConnectAuthError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sc := &mikrotikClient{conn: conn}
 		_, _ = sc.readSentence()
 		// Respond with trap error + done
@@ -414,7 +414,7 @@ func TestMikrotikConnectAuthError(t *testing.T) {
 
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
 	var portNum uint32
-	fmt.Sscanf(port, "%d", &portNum)
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
 	_, err = mikrotikConnect("127.0.0.1", portNum, "admin", "wrong", false)
 	if err == nil {
@@ -427,14 +427,14 @@ func TestMikrotikConnectFatalError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sc := &mikrotikClient{conn: conn}
 		_, _ = sc.readSentence()
 		// Respond with fatal error
@@ -443,7 +443,7 @@ func TestMikrotikConnectFatalError(t *testing.T) {
 
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
 	var portNum uint32
-	fmt.Sscanf(port, "%d", &portNum)
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
 	_, err = mikrotikConnect("127.0.0.1", portNum, "admin", "pass", false)
 	if err == nil {
@@ -485,11 +485,11 @@ func TestReadResponseEmptySentence(t *testing.T) {
 func TestReadSentenceWithNetConn(t *testing.T) {
 	// Test readSentence with a real net.Conn to trigger SetReadDeadline path
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
 
 	go func() {
-		server.Write(encodeSentence([]string{"!done"}))
+		_, _ = server.Write(encodeSentence([]string{"!done"}))
 	}()
 
 	c := &mikrotikClient{conn: client}
