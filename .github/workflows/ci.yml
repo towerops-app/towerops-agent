@@ -99,6 +99,7 @@ jobs:
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     outputs:
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
       short_sha: ${{ steps.version.outputs.short_sha }}
       is_tag: ${{ steps.version.outputs.is_tag }}
     steps:
@@ -118,8 +119,11 @@ jobs:
             VERSION=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
             echo "is_tag=false" >> $GITHUB_OUTPUT
           fi
+          # Docker tags can't contain colons, so create a tag-safe version
+          TAG=$(echo "$VERSION" | tr ':' '-')
           SHORT_SHA=${GITHUB_SHA::7}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
 
   # Build architecture-specific images in parallel (native runners)
@@ -173,12 +177,12 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }},mode=max
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
-            docker.io/${{ env.DOCKERHUB_IMAGE }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+            docker.io/${{ env.DOCKERHUB_IMAGE }}:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
 
       - name: Extract standalone binary
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}-${{ matrix.arch }}"
           CONTAINER=$(docker create $IMAGE)
           docker cp $CONTAINER:/usr/local/bin/towerops-agent ./towerops-agent-linux-${{ matrix.arch }}
           docker rm $CONTAINER
@@ -217,36 +221,36 @@ jobs:
 
       - name: Create and push manifests
         run: |
-          VERSION="${{ needs.version.outputs.version }}"
+          TAG="${{ needs.version.outputs.tag }}"
           SHORT_SHA="${{ needs.version.outputs.short_sha }}"
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           DH_IMAGE="docker.io/${{ env.DOCKERHUB_IMAGE }}"
 
           # Create GHCR manifests
-          docker buildx imagetools create -t ${IMAGE}:${VERSION} \
-            ${IMAGE}:${VERSION}-amd64 \
-            ${IMAGE}:${VERSION}-arm64
+          docker buildx imagetools create -t ${IMAGE}:${TAG} \
+            ${IMAGE}:${TAG}-amd64 \
+            ${IMAGE}:${TAG}-arm64
 
           docker buildx imagetools create -t ${IMAGE}:latest \
-            ${IMAGE}:${VERSION}-amd64 \
-            ${IMAGE}:${VERSION}-arm64
+            ${IMAGE}:${TAG}-amd64 \
+            ${IMAGE}:${TAG}-arm64
 
           docker buildx imagetools create -t ${IMAGE}:sha-${SHORT_SHA} \
-            ${IMAGE}:${VERSION}-amd64 \
-            ${IMAGE}:${VERSION}-arm64
+            ${IMAGE}:${TAG}-amd64 \
+            ${IMAGE}:${TAG}-arm64
 
           # Create Docker Hub manifests
-          docker buildx imagetools create -t ${DH_IMAGE}:${VERSION} \
-            ${DH_IMAGE}:${VERSION}-amd64 \
-            ${DH_IMAGE}:${VERSION}-arm64
+          docker buildx imagetools create -t ${DH_IMAGE}:${TAG} \
+            ${DH_IMAGE}:${TAG}-amd64 \
+            ${DH_IMAGE}:${TAG}-arm64
 
           docker buildx imagetools create -t ${DH_IMAGE}:latest \
-            ${DH_IMAGE}:${VERSION}-amd64 \
-            ${DH_IMAGE}:${VERSION}-arm64
+            ${DH_IMAGE}:${TAG}-amd64 \
+            ${DH_IMAGE}:${TAG}-arm64
 
           docker buildx imagetools create -t ${DH_IMAGE}:sha-${SHORT_SHA} \
-            ${DH_IMAGE}:${VERSION}-amd64 \
-            ${DH_IMAGE}:${VERSION}-arm64
+            ${DH_IMAGE}:${TAG}-amd64 \
+            ${DH_IMAGE}:${TAG}-arm64
 
       - name: Summary
         run: |
@@ -254,7 +258,7 @@ jobs:
           echo "Multi-architecture build (amd64, arm64) - built in parallel" >> $GITHUB_STEP_SUMMARY
           echo "Tags pushed to GHCR and Docker Hub:" >> $GITHUB_STEP_SUMMARY
           echo "- \`latest\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ needs.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ needs.version.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- \`sha-${{ needs.version.outputs.short_sha }}\`" >> $GITHUB_STEP_SUMMARY
 
   # Create GitHub Release with standalone binaries (only on tags)
