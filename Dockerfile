@@ -1,10 +1,6 @@
 # syntax=docker/dockerfile:1.4
-# Pre-built net-snmp 5.9.5.2 (fixes segfaults in Alpine's 5.9.4)
-# Built from Dockerfile.netsnmp via .github/workflows/netsnmp-base.yml
-FROM ghcr.io/towerops-app/netsnmp-alpine:5.9.5.2 AS netsnmp
-
-# Build stage
-FROM rust:1.93-alpine AS builder
+# Build stage - Debian bookworm with glibc (fixes musl fork-safety SIGSEGV)
+FROM rust:1.93-bookworm AS builder
 
 # Build arguments provided by Docker buildx
 ARG TARGETPLATFORM
@@ -13,20 +9,23 @@ ARG VERSION=0.1.0-unknown
 
 WORKDIR /app
 
-# Install build dependencies (net-snmp headers/libs from pre-built image)
-RUN apk add --no-cache musl-dev protobuf-dev openssl-dev openssl-libs-static cmake perl g++
-COPY --from=netsnmp /usr/include/net-snmp /usr/include/net-snmp
-COPY --from=netsnmp /usr/lib/libnetsnmp* /usr/lib/
-COPY --from=netsnmp /usr/lib/libsnmp* /usr/lib/
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    protobuf-compiler \
+    libsnmp-dev \
+    cmake \
+    g++ \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Determine Rust target based on platform and add it
+# Determine Rust target based on platform
 RUN case "$TARGETPLATFORM" in \
-    "linux/amd64") RUST_TARGET="x86_64-unknown-linux-musl" ;; \
-    "linux/arm64") RUST_TARGET="aarch64-unknown-linux-musl" ;; \
+    "linux/amd64") RUST_TARGET="x86_64-unknown-linux-gnu" ;; \
+    "linux/arm64") RUST_TARGET="aarch64-unknown-linux-gnu" ;; \
     *) echo "Unsupported platform: $TARGETPLATFORM" && exit 1 ;; \
     esac && \
-    echo "$RUST_TARGET" > /tmp/rust-target && \
-    rustup target add "$RUST_TARGET"
+    echo "$RUST_TARGET" > /tmp/rust-target
 
 # Copy manifests and build files
 COPY Cargo.toml Cargo.lock build.rs ./
@@ -59,23 +58,24 @@ RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/r
     BUILD_VERSION="$VERSION" cargo build --release --target "$RUST_TARGET" && \
     cp "target/$RUST_TARGET/release/towerops-agent" /tmp/towerops-agent
 
-# Runtime stage - must match builder's Alpine version for ABI compatibility
-# (rust:1.93-alpine uses Alpine 3.23)
-FROM alpine:3.23
+# Runtime stage - Debian slim with glibc
+FROM debian:12-slim
 
 # Install runtime dependencies
-# iputils provides ping with setuid root (doesn't require CAP_NET_RAW)
-RUN apk add --no-cache ca-certificates iputils openssl
-
-# Copy net-snmp 5.9.5.2 shared libraries from pre-built image
-COPY --from=netsnmp /usr/lib/libnetsnmp.so* /usr/lib/
+# iputils-ping provides ping with setuid root (doesn't require CAP_NET_RAW)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    iputils-ping \
+    libsnmp40 \
+    openssl \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy binary from builder
 COPY --from=builder /tmp/towerops-agent /usr/local/bin/towerops-agent
 
 # Create non-root user
-RUN addgroup -g 1000 towerops && \
-    adduser -D -u 1000 -G towerops towerops
+RUN groupadd -g 1000 towerops && \
+    useradd -u 1000 -g towerops -s /bin/false towerops
 
 # Allow non-root user to overwrite binary during self-update
 RUN chown towerops /usr/local/bin/towerops-agent

@@ -22,93 +22,10 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   DOCKERHUB_IMAGE: gmcintire/towerops-agent
-  NETSNMP_IMAGE: ghcr.io/towerops-app/netsnmp-alpine:5.9.5.2
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -C link-arg=-fuse-ld=lld
 
 jobs:
-  # Ensure the pre-built net-snmp base image exists in GHCR.
-  # First run: builds from source (~5 min per arch). After that: skips (~5s check).
-  ensure-netsnmp-base:
-    name: Ensure net-snmp base (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: blacksmith-4vcpu-ubuntu-2404
-          - arch: arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
-    steps:
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Check if base image exists
-        id: check
-        run: |
-          if docker buildx imagetools inspect ${{ env.NETSNMP_IMAGE }}-${{ matrix.arch }} > /dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Checkout
-        if: steps.check.outputs.exists == 'false'
-        uses: actions/checkout@v4
-
-      - name: Setup Blacksmith Builder
-        if: steps.check.outputs.exists == 'false'
-        uses: useblacksmith/setup-docker-builder@v1
-
-      - name: Build and push base image
-        if: steps.check.outputs.exists == 'false'
-        uses: useblacksmith/build-push-action@v2
-        with:
-          context: .
-          file: Dockerfile.netsnmp
-          push: true
-          provenance: false
-          tags: ${{ env.NETSNMP_IMAGE }}-${{ matrix.arch }}
-
-  ensure-netsnmp-manifest:
-    name: Ensure net-snmp manifest
-    needs: ensure-netsnmp-base
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    permissions:
-      packages: write
-    steps:
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Check if manifest exists
-        id: check
-        run: |
-          if docker buildx imagetools inspect ${{ env.NETSNMP_IMAGE }} > /dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create multi-arch manifest
-        if: steps.check.outputs.exists == 'false'
-        run: |
-          docker buildx imagetools create \
-            -t ${{ env.NETSNMP_IMAGE }} \
-            ${{ env.NETSNMP_IMAGE }}-amd64 \
-            ${{ env.NETSNMP_IMAGE }}-arm64
-
   test:
     name: Test
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -167,7 +84,7 @@ jobs:
 
   build-branch:
     name: Build (Branch)
-    needs: [test, ensure-netsnmp-manifest]
+    needs: [test]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.event_name == 'push' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/')
     permissions:
@@ -240,7 +157,7 @@ jobs:
   # Build architecture-specific images in parallel (native runners)
   build-release:
     name: Build (${{ matrix.arch }})
-    needs: [test, version, ensure-netsnmp-manifest]
+    needs: [test, version]
     runs-on: ${{ matrix.runner }}
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     permissions:
