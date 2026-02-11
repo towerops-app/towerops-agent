@@ -31,7 +31,7 @@ func main() {
 	default:
 		level = slog.LevelInfo
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	slog.SetDefault(slog.New(newColorHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
 	if *apiURL == "" || *token == "" {
 		fmt.Fprintln(os.Stderr, "error: --api-url and --token are required (or set TOWEROPS_API_URL and TOWEROPS_AGENT_TOKEN)")

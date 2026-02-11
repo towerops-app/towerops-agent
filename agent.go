@@ -17,6 +17,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+var osExit = os.Exit
+var doSelfUpdate = selfUpdate
+
 // channelMsg is the WebSocket channel message format (JSON wrapper around binary protobuf).
 type channelMsg struct {
 	Topic   string          `json:"topic"`
@@ -267,7 +270,7 @@ func handleMessage(
 
 	case "restart":
 		slog.Info("restart requested by server, exiting")
-		os.Exit(0)
+		osExit(0)
 
 	case "update":
 		var payload struct {
@@ -279,7 +282,7 @@ func handleMessage(
 			return
 		}
 		slog.Info("update requested", "url", payload.URL)
-		if err := selfUpdate(payload.URL, payload.Checksum); err != nil {
+		if err := doSelfUpdate(payload.URL, payload.Checksum); err != nil {
 			slog.Error("self-update failed", "error", err)
 		}
 

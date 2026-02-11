@@ -2,6 +2,7 @@
 towerops-agent
 *.test
 cover.out
+cover.html
 
 # Database files
 *.db

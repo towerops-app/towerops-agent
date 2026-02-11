@@ -1,6 +1,26 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
+
+func TestEnvOrDefault(t *testing.T) {
+	key := "TOWEROPS_TEST_ENV_OR_DEFAULT"
+
+	// Unset case
+	os.Unsetenv(key)
+	if got := envOrDefault(key, "fallback"); got != "fallback" {
+		t.Errorf("unset: got %q, want %q", got, "fallback")
+	}
+
+	// Set case
+	os.Setenv(key, "custom")
+	defer os.Unsetenv(key)
+	if got := envOrDefault(key, "fallback"); got != "custom" {
+		t.Errorf("set: got %q, want %q", got, "custom")
+	}
+}
 
 func TestToWebSocketURL(t *testing.T) {
 	tests := []struct {

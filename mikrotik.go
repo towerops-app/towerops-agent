@@ -18,6 +18,8 @@ const (
 	mikrotikReadTimeout = 30 * time.Second
 )
 
+var mikrotikDial = mikrotikConnect
+
 // mikrotikClient is a RouterOS binary API client.
 type mikrotikClient struct {
 	conn io.ReadWriteCloser
@@ -259,7 +261,7 @@ func executeMikrotikJob(job *pb.AgentJob, resultCh chan<- *pb.MikrotikResult) {
 
 	slog.Debug("executing mikrotik job", "job_id", job.JobId, "device", dev.Ip, "port", dev.Port, "ssl", dev.UseSsl)
 
-	client, err := mikrotikConnect(dev.Ip, dev.Port, dev.Username, dev.Password, dev.UseSsl)
+	client, err := mikrotikDial(dev.Ip, dev.Port, dev.Username, dev.Password, dev.UseSsl)
 	if err != nil {
 		resultCh <- &pb.MikrotikResult{
 			DeviceId:  job.DeviceId,
@@ -307,7 +309,7 @@ func executeMikrotikJob(job *pb.AgentJob, resultCh chan<- *pb.MikrotikResult) {
 func executeMikrotikBackupViaSSH(job *pb.AgentJob, dev *pb.MikrotikDevice, resultCh chan<- *pb.MikrotikResult, timestamp int64) {
 	slog.Debug("executing backup via ssh", "device", job.DeviceId, "ip", dev.Ip, "ssh_port", dev.SshPort)
 
-	config, err := executeMikrotikBackup(dev.Ip, uint16(dev.SshPort), dev.Username, dev.Password)
+	config, err := sshBackup(dev.Ip, uint16(dev.SshPort), dev.Username, dev.Password)
 	if err != nil {
 		resultCh <- &pb.MikrotikResult{
 			DeviceId:  job.DeviceId,

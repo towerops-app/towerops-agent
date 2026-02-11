@@ -27,6 +27,12 @@ type WSConn struct {
 	mu   sync.Mutex // serializes writes
 }
 
+var randRead = rand.Read
+var netDial = net.Dial
+var tlsDial = func(network, addr string) (net.Conn, error) {
+	return tls.Dial(network, addr, &tls.Config{MinVersion: tls.VersionTLS12})
+}
+
 // WSDial connects to a WebSocket endpoint and performs the HTTP upgrade handshake.
 func WSDial(rawURL string) (*WSConn, error) {
 	u, err := url.Parse(rawURL)
@@ -46,9 +52,9 @@ func WSDial(rawURL string) (*WSConn, error) {
 
 	var conn net.Conn
 	if useTLS {
-		conn, err = tls.Dial("tcp", host, &tls.Config{MinVersion: tls.VersionTLS12})
+		conn, err = tlsDial("tcp", host)
 	} else {
-		conn, err = net.Dial("tcp", host)
+		conn, err = netDial("tcp", host)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", host, err)
@@ -56,7 +62,7 @@ func WSDial(rawURL string) (*WSConn, error) {
 
 	// Generate random key for Sec-WebSocket-Key
 	keyBytes := make([]byte, 16)
-	if _, err := rand.Read(keyBytes); err != nil {
+	if _, err := randRead(keyBytes); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("generate key: %w", err)
 	}
