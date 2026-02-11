@@ -13,6 +13,7 @@ import (
 // snmpQuerier abstracts SNMP operations for testability.
 type snmpQuerier interface {
 	Get(oids []string) (*gosnmp.SnmpPacket, error)
+	WalkAll(rootOid string) ([]gosnmp.SnmpPDU, error)
 	BulkWalkAll(rootOid string) ([]gosnmp.SnmpPDU, error)
 }
 
@@ -59,8 +60,15 @@ func executeSnmpJob(job *pb.AgentJob, resultCh chan<- *pb.SnmpResult) {
 				}
 			}
 		case pb.QueryType_WALK:
+			// SNMPv1 doesn't support GETBULK, use GETNEXT-based WalkAll instead
+			useV1Walk := dev.Version == "1" || dev.Version == "v1"
 			for _, baseOID := range q.Oids {
-				results, err := conn.BulkWalkAll(baseOID)
+				var results []gosnmp.SnmpPDU
+				if useV1Walk {
+					results, err = conn.WalkAll(baseOID)
+				} else {
+					results, err = conn.BulkWalkAll(baseOID)
+				}
 				if err != nil {
 					slog.Warn("snmp walk failed", "device", dev.Ip, "oid", baseOID, "error", err)
 					continue
