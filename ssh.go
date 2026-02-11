@@ -9,6 +9,9 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+var sshBackup = executeMikrotikBackup
+var doPing = pingDevice
+
 // executeMikrotikBackup connects via SSH and runs /export compact.
 func executeMikrotikBackup(ip string, port uint16, username, password string) (string, error) {
 	config := &ssh.ClientConfig{
@@ -52,7 +55,7 @@ func executePingJob(job *pb.AgentJob, resultCh chan<- *pb.MonitoringCheck) {
 	}
 
 	timestamp := time.Now().Unix()
-	responseTime, err := pingDevice(dev.Ip, 5000)
+	responseTime, err := doPing(dev.Ip, 5000)
 
 	if err != nil {
 		slog.Warn("device down", "device", job.DeviceId, "error", err)

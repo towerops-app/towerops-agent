@@ -1,8 +1,15 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"testing"
+	"time"
+
+	"github.com/gosnmp/gosnmp"
+	"github.com/towerops-app/towerops-agent/pb"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestChannelMsgSerialization(t *testing.T) {
@@ -66,4 +73,346 @@ func searchString(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// makeJobPayload creates a base64-encoded protobuf job list payload.
+func makeJobPayload(jobs ...*pb.AgentJob) json.RawMessage {
+	list := &pb.AgentJobList{Jobs: jobs}
+	bin, _ := proto.Marshal(list)
+	payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString(bin)})
+	return payload
+}
+
+func TestHandleMessage(t *testing.T) {
+	t.Run("phx_reply", func(t *testing.T) {
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		handleMessage(channelMsg{Event: "phx_reply", Payload: json.RawMessage(`{}`)}, snmpCh, mtCh, credCh, monCh)
+		// Just verify it doesn't panic
+	})
+
+	t.Run("jobs valid protobuf", func(t *testing.T) {
+		origDial := snmpDial
+		defer func() { snmpDial = origDial }()
+
+		snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			return &mockSnmpQuerier{
+				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+					return &gosnmp.SnmpPacket{}, nil
+				},
+			}, func() {}, nil
+		}
+
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+
+		payload := makeJobPayload(&pb.AgentJob{
+			JobId:      "j1",
+			JobType:    pb.JobType_POLL,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+		})
+
+		handleMessage(channelMsg{Event: "jobs", Payload: payload}, snmpCh, mtCh, credCh, monCh)
+		// Wait for goroutine to finish
+		select {
+		case <-snmpCh:
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for snmp result")
+		}
+	})
+
+	t.Run("invalid payload json", func(t *testing.T) {
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		handleMessage(channelMsg{Event: "jobs", Payload: json.RawMessage(`not json`)}, snmpCh, mtCh, credCh, monCh)
+		// Should log error but not panic
+	})
+
+	t.Run("invalid base64", func(t *testing.T) {
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		payload, _ := json.Marshal(map[string]string{"binary": "not-base64!!!"})
+		handleMessage(channelMsg{Event: "jobs", Payload: payload}, snmpCh, mtCh, credCh, monCh)
+	})
+
+	t.Run("invalid protobuf", func(t *testing.T) {
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString([]byte{0xFF, 0xFF, 0xFF})})
+		handleMessage(channelMsg{Event: "jobs", Payload: payload}, snmpCh, mtCh, credCh, monCh)
+	})
+
+	t.Run("restart", func(t *testing.T) {
+		origExit := osExit
+		defer func() { osExit = origExit }()
+
+		var exitCode int
+		osExit = func(code int) { exitCode = code }
+
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		handleMessage(channelMsg{Event: "restart", Payload: json.RawMessage(`{}`)}, snmpCh, mtCh, credCh, monCh)
+
+		if exitCode != 0 {
+			t.Errorf("expected exit code 0, got %d", exitCode)
+		}
+	})
+
+	t.Run("update success", func(t *testing.T) {
+		origUpdate := doSelfUpdate
+		defer func() { doSelfUpdate = origUpdate }()
+
+		var calledURL string
+		doSelfUpdate = func(url, checksum string) error {
+			calledURL = url
+			return nil
+		}
+
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent", "checksum": "abc123"})
+		handleMessage(channelMsg{Event: "update", Payload: payload}, snmpCh, mtCh, credCh, monCh)
+
+		if calledURL != "https://example.com/agent" {
+			t.Errorf("expected update URL %q, got %q", "https://example.com/agent", calledURL)
+		}
+	})
+
+	t.Run("update invalid payload", func(t *testing.T) {
+		origUpdate := doSelfUpdate
+		defer func() { doSelfUpdate = origUpdate }()
+
+		called := false
+		doSelfUpdate = func(url, checksum string) error {
+			called = true
+			return nil
+		}
+
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		// Missing URL field
+		payload, _ := json.Marshal(map[string]string{"checksum": "abc123"})
+		handleMessage(channelMsg{Event: "update", Payload: payload}, snmpCh, mtCh, credCh, monCh)
+
+		if called {
+			t.Error("selfUpdate should not be called with empty URL")
+		}
+	})
+
+	t.Run("update error", func(t *testing.T) {
+		origUpdate := doSelfUpdate
+		defer func() { doSelfUpdate = origUpdate }()
+
+		doSelfUpdate = func(url, checksum string) error {
+			return fmt.Errorf("download failed")
+		}
+
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent"})
+		handleMessage(channelMsg{Event: "update", Payload: payload}, snmpCh, mtCh, credCh, monCh)
+		// Should log error but not panic
+	})
+
+	t.Run("unknown event", func(t *testing.T) {
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		handleMessage(channelMsg{Event: "some_unknown_event", Payload: json.RawMessage(`{}`)}, snmpCh, mtCh, credCh, monCh)
+		// Should just log and not panic
+	})
+
+	t.Run("discovery_job event", func(t *testing.T) {
+		origDial := snmpDial
+		defer func() { snmpDial = origDial }()
+
+		snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			return &mockSnmpQuerier{
+				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+					return &gosnmp.SnmpPacket{}, nil
+				},
+			}, func() {}, nil
+		}
+
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+
+		payload := makeJobPayload(&pb.AgentJob{
+			JobId:      "d1",
+			JobType:    pb.JobType_DISCOVER,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+		})
+		handleMessage(channelMsg{Event: "discovery_job", Payload: payload}, snmpCh, mtCh, credCh, monCh)
+		select {
+		case <-snmpCh:
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for discovery result")
+		}
+	})
+
+	t.Run("backup_job event", func(t *testing.T) {
+		origDial := mikrotikDial
+		origSSH := sshBackup
+		defer func() { mikrotikDial = origDial; sshBackup = origSSH }()
+
+		sshBackup = func(ip string, port uint16, username, password string) (string, error) {
+			return "/ip address\nadd address=10.0.0.1/24", nil
+		}
+
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+
+		payload := makeJobPayload(&pb.AgentJob{
+			JobId:          "backup:dev1",
+			JobType:        pb.JobType_MIKROTIK,
+			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", SshPort: 22, Username: "admin", Password: "pass"},
+		})
+		handleMessage(channelMsg{Event: "backup_job", Payload: payload}, snmpCh, mtCh, credCh, monCh)
+		select {
+		case result := <-mtCh:
+			if result.Error != "" {
+				t.Errorf("unexpected error: %s", result.Error)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for backup result")
+		}
+	})
+}
+
+func TestDispatchJob(t *testing.T) {
+	t.Run("MIKROTIK", func(t *testing.T) {
+		origDial := mikrotikDial
+		defer func() { mikrotikDial = origDial }()
+		mikrotikDial = func(ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
+			return nil, fmt.Errorf("not reachable")
+		}
+
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+
+		dispatchJob(&pb.AgentJob{
+			JobId:          "mt1",
+			JobType:        pb.JobType_MIKROTIK,
+			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
+		}, snmpCh, mtCh, credCh, monCh)
+
+		select {
+		case result := <-mtCh:
+			if result.Error == "" {
+				t.Error("expected error from unreachable device")
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out")
+		}
+	})
+
+	t.Run("TEST_CREDENTIALS", func(t *testing.T) {
+		origDial := snmpDial
+		defer func() { snmpDial = origDial }()
+		snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			return nil, nil, fmt.Errorf("refused")
+		}
+
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+
+		dispatchJob(&pb.AgentJob{
+			JobId:      "tc1",
+			JobType:    pb.JobType_TEST_CREDENTIALS,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+		}, snmpCh, mtCh, credCh, monCh)
+
+		select {
+		case result := <-credCh:
+			if result.Success {
+				t.Error("expected failure")
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out")
+		}
+	})
+
+	t.Run("PING", func(t *testing.T) {
+		origPing := doPing
+		defer func() { doPing = origPing }()
+		doPing = func(ip string, timeoutMs int) (float64, error) {
+			return 5.5, nil
+		}
+
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+
+		dispatchJob(&pb.AgentJob{
+			JobId:      "p1",
+			JobType:    pb.JobType_PING,
+			SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1"},
+		}, snmpCh, mtCh, credCh, monCh)
+
+		select {
+		case result := <-monCh:
+			if result.Status != "success" {
+				t.Errorf("expected success, got %q", result.Status)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out")
+		}
+	})
+
+	t.Run("default SNMP", func(t *testing.T) {
+		origDial := snmpDial
+		defer func() { snmpDial = origDial }()
+		snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			return &mockSnmpQuerier{
+				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+					return &gosnmp.SnmpPacket{}, nil
+				},
+			}, func() {}, nil
+		}
+
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+
+		dispatchJob(&pb.AgentJob{
+			JobId:      "s1",
+			JobType:    pb.JobType_POLL,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+		}, snmpCh, mtCh, credCh, monCh)
+
+		select {
+		case <-snmpCh:
+		case <-time.After(2 * time.Second):
+			t.Error("timed out")
+		}
+	})
 }

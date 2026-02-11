@@ -1,6 +1,42 @@
 package main
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
+
+func TestPingDeviceLocalhost(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping ping test on windows")
+	}
+	ms, err := pingDevice("127.0.0.1", 5000)
+	if err != nil {
+		t.Fatalf("ping localhost failed: %v", err)
+	}
+	if ms <= 0 {
+		t.Errorf("expected positive response time, got %v", ms)
+	}
+}
+
+func TestPingDeviceInvalidIP(t *testing.T) {
+	_, err := pingDevice("not-an-ip", 5000)
+	if err == nil {
+		t.Error("expected error for invalid IP")
+	}
+}
+
+func TestPingDeviceIPv6(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping ping test on windows")
+	}
+	ms, err := pingDevice("::1", 5000)
+	if err != nil {
+		t.Skipf("IPv6 not available: %v", err)
+	}
+	if ms <= 0 {
+		t.Errorf("expected positive response time, got %v", ms)
+	}
+}
 
 func TestParsePingTime(t *testing.T) {
 	tests := []struct {
@@ -33,6 +69,11 @@ func TestParsePingTime(t *testing.T) {
 			name:    "empty",
 			output:  "",
 			wantErr: true,
+		},
+		{
+			name:   "time= without ms suffix",
+			output: "64 bytes from 10.0.0.1: icmp_seq=1 ttl=64 time=1.234\n",
+			want:   1.234,
 		},
 	}
 	for _, tt := range tests {

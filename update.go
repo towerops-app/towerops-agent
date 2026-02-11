@@ -10,6 +10,10 @@ import (
 	"syscall"
 )
 
+var osExecutable = os.Executable
+var osWriteFile = os.WriteFile
+var osRename = os.Rename
+
 // selfUpdate downloads a new binary, verifies its checksum, replaces the current binary, and re-execs.
 func selfUpdate(downloadURL, expectedChecksum string) error {
 	slog.Info("downloading update", "url", downloadURL)
@@ -40,18 +44,18 @@ func selfUpdate(downloadURL, expectedChecksum string) error {
 	}
 
 	// Write to temp file next to current binary
-	currentExe, err := os.Executable()
+	currentExe, err := osExecutable()
 	if err != nil {
 		return fmt.Errorf("get executable path: %w", err)
 	}
 	tempPath := currentExe + ".update"
 
-	if err := os.WriteFile(tempPath, body, 0755); err != nil {
+	if err := osWriteFile(tempPath, body, 0755); err != nil {
 		return fmt.Errorf("write temp: %w", err)
 	}
 
 	// Replace current binary
-	if err := os.Rename(tempPath, currentExe); err != nil {
+	if err := osRename(tempPath, currentExe); err != nil {
 		_ = os.Remove(tempPath)
 		return fmt.Errorf("rename: %w", err)
 	}
