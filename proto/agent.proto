@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package towerops.agent;
 
+option go_package = "github.com/towerops-app/towerops-agent/pb";
+
 // Configuration received from the API
 message AgentConfig {
   string version = 1;
