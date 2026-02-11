@@ -271,16 +271,28 @@ func TestSnmpDialDefault(t *testing.T) {
 
 // mockSnmpQuerier implements snmpQuerier for testing.
 type mockSnmpQuerier struct {
-	getFunc     func(oids []string) (*gosnmp.SnmpPacket, error)
-	walkFunc    func(rootOid string) ([]gosnmp.SnmpPDU, error)
-	closeCalled bool
+	getFunc        func(oids []string) (*gosnmp.SnmpPacket, error)
+	walkFunc       func(rootOid string) ([]gosnmp.SnmpPDU, error)
+	bulkWalkFunc   func(rootOid string) ([]gosnmp.SnmpPDU, error)
+	closeCalled    bool
+	walkAllCalled  bool
+	bulkWalkCalled bool
 }
 
 func (m *mockSnmpQuerier) Get(oids []string) (*gosnmp.SnmpPacket, error) {
 	return m.getFunc(oids)
 }
 
+func (m *mockSnmpQuerier) WalkAll(rootOid string) ([]gosnmp.SnmpPDU, error) {
+	m.walkAllCalled = true
+	return m.walkFunc(rootOid)
+}
+
 func (m *mockSnmpQuerier) BulkWalkAll(rootOid string) ([]gosnmp.SnmpPDU, error) {
+	m.bulkWalkCalled = true
+	if m.bulkWalkFunc != nil {
+		return m.bulkWalkFunc(rootOid)
+	}
 	return m.walkFunc(rootOid)
 }
 
@@ -497,6 +509,78 @@ func TestExecuteSnmpJob(t *testing.T) {
 		result := <-ch
 		if len(result.OidValues) != 1 {
 			t.Errorf("expected 1 value (others skipped), got %d", len(result.OidValues))
+		}
+	})
+
+	t.Run("WALK v1 uses WalkAll", func(t *testing.T) {
+		orig := snmpDial
+		defer func() { snmpDial = orig }()
+
+		mock := &mockSnmpQuerier{
+			walkFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
+				return []gosnmp.SnmpPDU{
+					{Name: ".1.3.6.1.2.1.2.2.1.1.1", Type: gosnmp.Integer, Value: 1},
+				}, nil
+			},
+		}
+		snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			return mock, func() {}, nil
+		}
+
+		ch := make(chan *pb.SnmpResult, 1)
+		executeSnmpJob(&pb.AgentJob{
+			JobId:      "1",
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: "1"},
+			Queries: []*pb.SnmpQuery{
+				{QueryType: pb.QueryType_WALK, Oids: []string{".1.3.6.1.2.1.2.2.1.1"}},
+			},
+		}, ch)
+
+		result := <-ch
+		if len(result.OidValues) != 1 {
+			t.Errorf("got %d oid values, want 1", len(result.OidValues))
+		}
+		if !mock.walkAllCalled {
+			t.Error("expected WalkAll to be called for v1")
+		}
+		if mock.bulkWalkCalled {
+			t.Error("BulkWalkAll should not be called for v1")
+		}
+	})
+
+	t.Run("WALK v2c uses BulkWalkAll", func(t *testing.T) {
+		orig := snmpDial
+		defer func() { snmpDial = orig }()
+
+		mock := &mockSnmpQuerier{
+			walkFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
+				return []gosnmp.SnmpPDU{
+					{Name: ".1.3.6.1.2.1.2.2.1.1.1", Type: gosnmp.Integer, Value: 1},
+				}, nil
+			},
+		}
+		snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			return mock, func() {}, nil
+		}
+
+		ch := make(chan *pb.SnmpResult, 1)
+		executeSnmpJob(&pb.AgentJob{
+			JobId:      "1",
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: "2c"},
+			Queries: []*pb.SnmpQuery{
+				{QueryType: pb.QueryType_WALK, Oids: []string{".1.3.6.1.2.1.2.2.1.1"}},
+			},
+		}, ch)
+
+		result := <-ch
+		if len(result.OidValues) != 1 {
+			t.Errorf("got %d oid values, want 1", len(result.OidValues))
+		}
+		if !mock.bulkWalkCalled {
+			t.Error("expected BulkWalkAll to be called for v2c")
+		}
+		if mock.walkAllCalled {
+			t.Error("WalkAll should not be called for v2c")
 		}
 	})
 
