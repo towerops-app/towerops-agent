@@ -49,7 +49,7 @@ func TestSelfUpdateReadBodyError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "99999")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("partial"))
+		_, _ = w.Write([]byte("partial"))
 		// Connection closes without sending the full body
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
@@ -71,7 +71,7 @@ func TestSelfUpdateOsExecutableError(t *testing.T) {
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("binary data"))
+		_, _ = w.Write([]byte("binary data"))
 	}))
 	defer srv.Close()
 
@@ -97,7 +97,7 @@ func TestSelfUpdateWriteFileError(t *testing.T) {
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("binary data"))
+		_, _ = w.Write([]byte("binary data"))
 	}))
 	defer srv.Close()
 
@@ -126,7 +126,7 @@ func TestSelfUpdateRenameError(t *testing.T) {
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("binary data"))
+		_, _ = w.Write([]byte("binary data"))
 	}))
 	defer srv.Close()
 

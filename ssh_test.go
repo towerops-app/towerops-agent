@@ -278,17 +278,17 @@ func TestExecuteMikrotikBackupDialError(t *testing.T) {
 
 func TestExecuteMikrotikBackupSuccess(t *testing.T) {
 	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
-		ch.Write([]byte("# RouterOS config\n/ip address\nadd address=10.0.0.1/24\n"))
-		ch.CloseWrite()
+		_, _ = ch.Write([]byte("# RouterOS config\n/ip address\nadd address=10.0.0.1/24\n"))
+		_ = ch.CloseWrite()
 		// Send exit-status 0
-		ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
-		ch.Close()
+		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+		_ = ch.Close()
 	})
 	defer cleanup()
 
 	_, port, _ := net.SplitHostPort(addr)
 	var portNum uint16
-	fmt.Sscanf(port, "%d", &portNum)
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
 	config, err := executeMikrotikBackup("127.0.0.1", portNum, "admin", "pass")
 	if err != nil {
@@ -302,14 +302,14 @@ func TestExecuteMikrotikBackupSuccess(t *testing.T) {
 func TestExecuteMikrotikBackupCommandError(t *testing.T) {
 	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
 		// Send exit-status 1 with no output (simulates command failure)
-		ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{1}))
-		ch.Close()
+		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{1}))
+		_ = ch.Close()
 	})
 	defer cleanup()
 
 	_, port, _ := net.SplitHostPort(addr)
 	var portNum uint16
-	fmt.Sscanf(port, "%d", &portNum)
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
 	_, err := executeMikrotikBackup("127.0.0.1", portNum, "admin", "pass")
 	if err == nil {
@@ -320,16 +320,16 @@ func TestExecuteMikrotikBackupCommandError(t *testing.T) {
 func TestExecuteMikrotikBackupWithOutput(t *testing.T) {
 	// MikroTik SSH returns output even with non-zero exit code
 	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
-		ch.Write([]byte("# partial config\n"))
-		ch.CloseWrite()
-		ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{1}))
-		ch.Close()
+		_, _ = ch.Write([]byte("# partial config\n"))
+		_ = ch.CloseWrite()
+		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{1}))
+		_ = ch.Close()
 	})
 	defer cleanup()
 
 	_, port, _ := net.SplitHostPort(addr)
 	var portNum uint16
-	fmt.Sscanf(port, "%d", &portNum)
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
 	config, err := executeMikrotikBackup("127.0.0.1", portNum, "admin", "pass")
 	if err != nil {
@@ -362,31 +362,31 @@ func TestExecuteMikrotikBackupSessionError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		sconn, chans, reqs, err := ssh.NewServerConn(conn, config)
 		if err != nil {
 			return
 		}
-		defer sconn.Close()
+		defer func() { _ = sconn.Close() }()
 		go ssh.DiscardRequests(reqs)
 
 		// Reject all channel requests to trigger NewSession error
 		for newChannel := range chans {
-			newChannel.Reject(ssh.Prohibited, "no sessions allowed")
+			_ = newChannel.Reject(ssh.Prohibited, "no sessions allowed")
 		}
 	}()
 
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
 	var portNum uint16
-	fmt.Sscanf(port, "%d", &portNum)
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
 	_, err = executeMikrotikBackup("127.0.0.1", portNum, "admin", "pass")
 	if err == nil {
@@ -427,18 +427,18 @@ func startTestSSHServer(t *testing.T, handler func(ch ssh.Channel)) (string, fun
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		sconn, chans, reqs, err := ssh.NewServerConn(conn, config)
 		if err != nil {
 			return
 		}
-		defer sconn.Close()
+		defer func() { _ = sconn.Close() }()
 		go ssh.DiscardRequests(reqs)
 
 		for newChannel := range chans {
 			if newChannel.ChannelType() != "session" {
-				newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
+				_ = newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
 				continue
 			}
 			ch, requests, err := newChannel.Accept()
@@ -448,17 +448,17 @@ func startTestSSHServer(t *testing.T, handler func(ch ssh.Channel)) (string, fun
 			go func() {
 				for req := range requests {
 					if req.Type == "exec" {
-						req.Reply(true, nil)
+						_ = req.Reply(true, nil)
 						handler(ch)
 						return
 					}
-					req.Reply(false, nil)
+					_ = req.Reply(false, nil)
 				}
 			}()
 		}
 	}()
 
-	return ln.Addr().String(), func() { ln.Close() }
+	return ln.Addr().String(), func() { _ = ln.Close() }
 }
 
 // mockMikrotikResponse pairs a response with an optional error for mock execute calls.
