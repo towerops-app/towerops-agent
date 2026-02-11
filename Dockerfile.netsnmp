@@ -46,6 +46,7 @@ RUN ./configure \
     --disable-scripts \
     --without-perl-modules \
     --without-python-modules \
+    --disable-embedded-perl \
     --with-default-snmp-version=3
 
 # Build and install
