@@ -1,8 +1,6 @@
-# Rust
-/target/
-Cargo.lock
-**/*.rs.bk
-*.pdb
+# Go
+towerops-agent
+*.test
 
 # Database files
 *.db
@@ -23,9 +21,15 @@ data/
 .DS_Store
 Thumbs.db
 
+# Rust (legacy)
+target/
+
 # Nix
 .direnv/
 result
 
 # Local scripts
 monitor-deploy.sh
+
+# Claude
+CLAUDE.md

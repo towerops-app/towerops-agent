@@ -22,8 +22,6 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   DOCKERHUB_IMAGE: gmcintire/towerops-agent
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: -C link-arg=-fuse-ld=lld
 
 jobs:
   test:
@@ -33,54 +31,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Mount Cargo target
-        uses: useblacksmith/stickydisk@v1
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          key: ${{ github.repository }}-cargo-target
-          path: ./target
+          go-version: "1.25"
 
-      - name: Mount Cargo registry
-        uses: useblacksmith/stickydisk@v1
-        with:
-          key: ${{ github.repository }}-cargo-registry
-          path: ~/.cargo/registry
-
-      - name: Mount Cargo git
-        uses: useblacksmith/stickydisk@v1
-        with:
-          key: ${{ github.repository }}-cargo-git
-          path: ~/.cargo/git
-
-      - name: Mount Rust toolchain
-        uses: useblacksmith/stickydisk@v1
-        with:
-          key: ${{ github.repository }}-rustup
-          path: ~/.rustup
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.93"
-          components: rustfmt, clippy
-
-      - name: Cache apt packages
-        uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: protobuf-compiler lld libsnmp-dev
-          version: 1.0
-
-      - name: Format check
-        run: cargo fmt -- --check
-
-      - name: Check
-        run: cargo check --release
+      - name: Vet
+        run: go vet ./...
 
       - name: Test
-        run: cargo test
+        run: go test -v ./...
 
-      # Temporarily disabled:
-      # - name: Clippy
-      #   run: cargo clippy -- -D warnings
+      - name: Build
+        run: CGO_ENABLED=0 go build -o /dev/null .
 
   build-branch:
     name: Build (Branch)
@@ -172,7 +135,7 @@ jobs:
             runner: blacksmith-4vcpu-ubuntu-2404
           - platform: linux/arm64
             arch: arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm  # Use Blacksmith ARM64 runners
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
