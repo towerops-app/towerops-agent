@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -100,7 +101,7 @@ func TestHandleMessage(t *testing.T) {
 		mtCh := make(chan *pb.MikrotikResult, 1)
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
-		handleMessage(channelMsg{Event: "phx_reply", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		handleMessage(context.Background(), channelMsg{Event: "phx_reply", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh)
 		// Just verify it doesn't panic
 	})
 
@@ -127,7 +128,7 @@ func TestHandleMessage(t *testing.T) {
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		})
 
-		handleMessage(channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
 		// Wait for goroutine to finish
 		select {
 		case <-snmpCh:
@@ -141,7 +142,7 @@ func TestHandleMessage(t *testing.T) {
 		mtCh := make(chan *pb.MikrotikResult, 1)
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
-		handleMessage(channelMsg{Event: "jobs", Payload: json.RawMessage(`not json`)}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: json.RawMessage(`not json`)}, testPools(t), snmpCh, mtCh, credCh, monCh)
 		// Should log error but not panic
 	})
 
@@ -151,7 +152,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": "not-base64!!!"})
-		handleMessage(channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
 	})
 
 	t.Run("invalid protobuf", func(t *testing.T) {
@@ -160,7 +161,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString([]byte{0xFF, 0xFF, 0xFF})})
-		handleMessage(channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
 	})
 
 	t.Run("restart", func(t *testing.T) {
@@ -174,7 +175,7 @@ func TestHandleMessage(t *testing.T) {
 		mtCh := make(chan *pb.MikrotikResult, 1)
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
-		handleMessage(channelMsg{Event: "restart", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		handleMessage(context.Background(), channelMsg{Event: "restart", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh)
 
 		if exitCode != 0 {
 			t.Errorf("expected exit code 0, got %d", exitCode)
@@ -196,7 +197,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent", "checksum": "abc123"})
-		handleMessage(channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
 
 		if calledURL != "https://example.com/agent" {
 			t.Errorf("expected update URL %q, got %q", "https://example.com/agent", calledURL)
@@ -219,7 +220,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		// Missing URL field
 		payload, _ := json.Marshal(map[string]string{"checksum": "abc123"})
-		handleMessage(channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
 
 		if called {
 			t.Error("selfUpdate should not be called with empty URL")
@@ -239,7 +240,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent"})
-		handleMessage(channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
 		// Should log error but not panic
 	})
 
@@ -248,7 +249,7 @@ func TestHandleMessage(t *testing.T) {
 		mtCh := make(chan *pb.MikrotikResult, 1)
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
-		handleMessage(channelMsg{Event: "some_unknown_event", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		handleMessage(context.Background(), channelMsg{Event: "some_unknown_event", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh)
 		// Should just log and not panic
 	})
 
@@ -274,7 +275,7 @@ func TestHandleMessage(t *testing.T) {
 			JobType:    pb.JobType_DISCOVER,
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		})
-		handleMessage(channelMsg{Event: "discovery_job", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		handleMessage(context.Background(), channelMsg{Event: "discovery_job", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
 		select {
 		case <-snmpCh:
 		case <-time.After(2 * time.Second):
@@ -301,7 +302,7 @@ func TestHandleMessage(t *testing.T) {
 			JobType:        pb.JobType_MIKROTIK,
 			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", SshPort: 22, Username: "admin", Password: "pass"},
 		})
-		handleMessage(channelMsg{Event: "backup_job", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		handleMessage(context.Background(), channelMsg{Event: "backup_job", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
 		select {
 		case result := <-mtCh:
 			if result.Error != "" {
@@ -326,7 +327,7 @@ func TestDispatchJob(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 
-		dispatchJob(&pb.AgentJob{
+		dispatchJob(context.Background(), &pb.AgentJob{
 			JobId:          "mt1",
 			JobType:        pb.JobType_MIKROTIK,
 			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
@@ -354,7 +355,7 @@ func TestDispatchJob(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 
-		dispatchJob(&pb.AgentJob{
+		dispatchJob(context.Background(), &pb.AgentJob{
 			JobId:      "tc1",
 			JobType:    pb.JobType_TEST_CREDENTIALS,
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
@@ -382,7 +383,7 @@ func TestDispatchJob(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 
-		dispatchJob(&pb.AgentJob{
+		dispatchJob(context.Background(), &pb.AgentJob{
 			JobId:      "p1",
 			JobType:    pb.JobType_PING,
 			SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1"},
@@ -414,7 +415,7 @@ func TestDispatchJob(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 
-		dispatchJob(&pb.AgentJob{
+		dispatchJob(context.Background(), &pb.AgentJob{
 			JobId:      "s1",
 			JobType:    pb.JobType_POLL,
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},

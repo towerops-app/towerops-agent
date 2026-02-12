@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -32,7 +33,7 @@ var snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
 }
 
 // executeSnmpJob runs SNMP GET/WALK queries for a job and sends results.
-func executeSnmpJob(job *pb.AgentJob, resultCh chan<- *pb.SnmpResult) {
+func executeSnmpJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.SnmpResult) {
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing snmp device", "job_id", job.JobId)
@@ -53,6 +54,9 @@ func executeSnmpJob(job *pb.AgentJob, resultCh chan<- *pb.SnmpResult) {
 	oidValues := make(map[string]string, totalOIDs)
 
 	for _, q := range job.Queries {
+		if ctx.Err() != nil {
+			return
+		}
 		switch q.QueryType {
 		case pb.QueryType_GET:
 			for i := 0; i < len(q.Oids); i += snmpMaxOIDsPerGet {
@@ -115,7 +119,7 @@ func executeSnmpJob(job *pb.AgentJob, resultCh chan<- *pb.SnmpResult) {
 }
 
 // executeCredentialTest tests SNMP credentials by reading sysDescr.0.
-func executeCredentialTest(job *pb.AgentJob, resultCh chan<- *pb.CredentialTestResult) {
+func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.CredentialTestResult) {
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing snmp device", "job_id", job.JobId)
