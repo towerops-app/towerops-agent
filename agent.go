@@ -77,7 +77,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	slog.Info("connected", "agent_id", agentID)
 
 	// Channel for serializing WebSocket writes
-	writeCh := make(chan []byte, 500)
+	writeCh := make(chan []byte, 10000)
 
 	// Worker pools — bounded concurrency for each job type
 	pools := &jobPools{
@@ -87,10 +87,10 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	}
 
 	// Result channels
-	snmpResultCh := make(chan *pb.SnmpResult, 1000)
-	mikrotikResultCh := make(chan *pb.MikrotikResult, 1000)
-	credTestResultCh := make(chan *pb.CredentialTestResult, 1000)
-	monitoringCheckCh := make(chan *pb.MonitoringCheck, 1000)
+	snmpResultCh := make(chan *pb.SnmpResult, 10000)
+	mikrotikResultCh := make(chan *pb.MikrotikResult, 5000)
+	credTestResultCh := make(chan *pb.CredentialTestResult, 5000)
+	monitoringCheckCh := make(chan *pb.MonitoringCheck, 10000)
 
 	// Ref counter for outbound messages
 	var refCounter atomic.Uint64
