@@ -336,6 +336,20 @@ func TestHandleMessage(t *testing.T) {
 	})
 }
 
+func TestZeroBytes(t *testing.T) {
+	b := []byte{1, 2, 3, 4, 5}
+	zeroBytes(b)
+	for i, v := range b {
+		if v != 0 {
+			t.Errorf("byte[%d] = %d, want 0", i, v)
+		}
+	}
+
+	// Nil/empty should not panic
+	zeroBytes(nil)
+	zeroBytes([]byte{})
+}
+
 func TestNextBackoff(t *testing.T) {
 	maxDelay := 60 * time.Second
 

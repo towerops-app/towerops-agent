@@ -15,6 +15,10 @@ var doPing = pingDevice
 
 // executeMikrotikBackup connects via SSH and runs /export compact.
 func executeMikrotikBackup(ip string, port uint16, username, password string) (string, error) {
+	// SECURITY: InsecureIgnoreHostKey is used because the agent connects to
+	// customer network devices with unknown host keys. These are typically
+	// MikroTik routers on private networks where host key pinning is not
+	// feasible due to dynamic device provisioning.
 	config := &ssh.ClientConfig{
 		User:            username,
 		Auth:            []ssh.AuthMethod{ssh.Password(password)},

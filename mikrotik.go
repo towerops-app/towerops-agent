@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	mikrotikConnTimeout    = 30 * time.Second
-	mikrotikReadTimeout    = 30 * time.Second
-	maxMikrotikWordSize    = 10 << 20 // 10 MB
+	mikrotikConnTimeout = 30 * time.Second
+	mikrotikReadTimeout = 30 * time.Second
+	maxMikrotikWordSize = 10 << 20 // 10 MB
 )
 
 var mikrotikDial = mikrotikConnect
@@ -42,6 +42,9 @@ func mikrotikConnect(ip string, port uint32, username, password string, useSSL b
 	var err error
 
 	if useSSL {
+		// SECURITY: InsecureSkipVerify is required because MikroTik devices use
+		// self-signed certificates. The agent connects to customer-configured IPs
+		// on private networks where CA-signed certs are not available.
 		dialer := &tls.Dialer{
 			NetDialer: &net.Dialer{Timeout: mikrotikConnTimeout},
 			Config:    &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},

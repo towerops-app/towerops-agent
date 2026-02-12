@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -43,7 +44,7 @@ func main() {
 
 	// Convert HTTP(S) to WebSocket URL
 	wsURL := toWebSocketURL(*apiURL)
-	slog.Info("websocket url", "url", wsURL)
+	slog.Info("websocket url", "url", sanitizeURL(wsURL))
 
 	// Signal handling
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -67,6 +68,21 @@ func toWebSocketURL(url string) string {
 	default:
 		return "wss://" + url
 	}
+}
+
+// sanitizeURL masks query parameters to prevent credential leakage in logs.
+func sanitizeURL(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "[invalid URL]"
+	}
+	if u.RawQuery != "" {
+		u.RawQuery = "***"
+	}
+	return u.String()
 }
 
 func envOrDefault(key, fallback string) string {
