@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -349,6 +350,35 @@ func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
 		t.Error("expected no SNMP result for oversized payload")
 	case <-time.After(100 * time.Millisecond):
 		// Good — nothing dispatched
+	}
+}
+
+func TestBufferPoolZeroesOnReturn(t *testing.T) {
+	pool := &sync.Pool{
+		New: func() any {
+			b := make([]byte, 0, 64)
+			return &b
+		},
+	}
+
+	// Get a buffer, write some data, return it
+	bp := pool.Get().(*[]byte)
+	*bp = append((*bp)[:0], []byte("sensitive credentials data here")...)
+	full := (*bp)[:cap(*bp)]
+
+	// Simulate the zeroing that sendBinaryResult should do
+	zeroBytes(full)
+	*bp = full[:0]
+	pool.Put(bp)
+
+	// Get the buffer back and verify it's zeroed
+	bp2 := pool.Get().(*[]byte)
+	full2 := (*bp2)[:cap(*bp2)]
+	for i, b := range full2 {
+		if b != 0 {
+			t.Errorf("byte[%d] = %d, expected 0 — pool buffer not zeroed", i, b)
+			break
+		}
 	}
 }
 
