@@ -307,6 +307,25 @@ func TestReadMessagePongError(t *testing.T) {
 	}
 }
 
+func TestReadFrameExceedsMaxSize(t *testing.T) {
+	var buf bytes.Buffer
+	buf.WriteByte(0x82) // FIN + binary
+	buf.WriteByte(127)  // 64-bit extended length
+	var extLen [8]byte
+	binary.BigEndian.PutUint64(extLen[:], uint64(maxFrameSize+1))
+	buf.Write(extLen[:])
+	// Don't need to write the payload — should reject before reading it
+
+	ws := testWSConn(&nopCloser{readWriter: &buf})
+	_, _, err := ws.readFrame()
+	if err == nil {
+		t.Error("expected error for frame exceeding max size")
+	}
+	if !strings.Contains(err.Error(), "exceeds max") {
+		t.Errorf("expected 'exceeds max' in error, got: %v", err)
+	}
+}
+
 func TestReadFrameEmptyPayload(t *testing.T) {
 	var buf bytes.Buffer
 	buf.WriteByte(0x82) // FIN + binary

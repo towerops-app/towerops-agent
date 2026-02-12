@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	mikrotikConnTimeout = 30 * time.Second
-	mikrotikReadTimeout = 30 * time.Second
+	mikrotikConnTimeout    = 30 * time.Second
+	mikrotikReadTimeout    = 30 * time.Second
+	maxMikrotikWordSize    = 10 << 20 // 10 MB
 )
 
 var mikrotikDial = mikrotikConnect
@@ -169,6 +170,9 @@ func (c *mikrotikClient) readWord() (string, error) {
 	}
 	if length == 0 {
 		return "", nil
+	}
+	if length > maxMikrotikWordSize {
+		return "", fmt.Errorf("word size %d exceeds max %d", length, maxMikrotikWordSize)
 	}
 	buf := make([]byte, length)
 	if _, err := io.ReadFull(c.conn, buf); err != nil {

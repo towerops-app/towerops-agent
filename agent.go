@@ -318,7 +318,7 @@ func handleMessage(
 			URL      string `json:"url"`
 			Checksum string `json:"checksum"`
 		}
-		if err := json.Unmarshal(msg.Payload, &payload); err != nil || payload.URL == "" {
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil || payload.URL == "" || payload.Checksum == "" {
 			slog.Error("invalid update payload")
 			return
 		}

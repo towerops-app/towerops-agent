@@ -239,9 +239,31 @@ func TestHandleMessage(t *testing.T) {
 		mtCh := make(chan *pb.MikrotikResult, 1)
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
-		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent"})
+		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent", "checksum": "abc123"})
 		handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
 		// Should log error but not panic
+	})
+
+	t.Run("update missing checksum", func(t *testing.T) {
+		origUpdate := doSelfUpdate
+		defer func() { doSelfUpdate = origUpdate }()
+
+		called := false
+		doSelfUpdate = func(url, checksum string) error {
+			called = true
+			return nil
+		}
+
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent"})
+		handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
+
+		if called {
+			t.Error("selfUpdate should not be called with empty checksum")
+		}
 	})
 
 	t.Run("unknown event", func(t *testing.T) {

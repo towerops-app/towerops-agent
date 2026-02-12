@@ -20,6 +20,8 @@ const (
 	opClose  = 8
 	opPing   = 9
 	opPong   = 10
+
+	maxFrameSize = 16 << 20 // 16 MB
 )
 
 // WSConn is a minimal RFC 6455 WebSocket client.
@@ -150,6 +152,10 @@ func (ws *WSConn) readFrame() (opcode int, payload []byte, err error) {
 			return 0, nil, err
 		}
 		length = binary.BigEndian.Uint64(ext[:])
+	}
+
+	if length > maxFrameSize {
+		return 0, nil, fmt.Errorf("frame size %d exceeds max %d", length, maxFrameSize)
 	}
 
 	var maskKey [4]byte
