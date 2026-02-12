@@ -23,9 +23,6 @@ data/
 .DS_Store
 Thumbs.db
 
-# Rust (legacy)
-target/
-
 # Nix
 .direnv/
 result
