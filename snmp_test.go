@@ -606,6 +606,58 @@ func TestExecuteSnmpJob(t *testing.T) {
 	})
 }
 
+func TestExecuteSnmpJobBatchesGets(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	var getCalls [][]string
+	mock := &mockSnmpQuerier{
+		getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+			getCalls = append(getCalls, oids)
+			var vars []gosnmp.SnmpPDU
+			for _, oid := range oids {
+				vars = append(vars, gosnmp.SnmpPDU{Name: oid, Type: gosnmp.Integer, Value: 42})
+			}
+			return &gosnmp.SnmpPacket{Variables: vars}, nil
+		},
+	}
+	snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		return mock, func() {}, nil
+	}
+
+	// Create 150 OIDs — should be split into 3 batches of 60, 60, 30
+	oids := make([]string, 150)
+	for i := range oids {
+		oids[i] = fmt.Sprintf(".1.3.6.1.2.1.1.%d.0", i)
+	}
+
+	ch := make(chan *pb.SnmpResult, 1)
+	executeSnmpJob(&pb.AgentJob{
+		JobId:      "batch-test",
+		DeviceId:   "dev-1",
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+		Queries: []*pb.SnmpQuery{
+			{QueryType: pb.QueryType_GET, Oids: oids},
+		},
+	}, ch)
+
+	result := <-ch
+	if len(result.OidValues) != 150 {
+		t.Errorf("got %d oid values, want 150", len(result.OidValues))
+	}
+	if len(getCalls) != 3 {
+		t.Errorf("got %d GET calls, want 3 (batches of 60)", len(getCalls))
+	}
+	for i, call := range getCalls {
+		if i < 2 && len(call) != 60 {
+			t.Errorf("batch %d: got %d oids, want 60", i, len(call))
+		}
+		if i == 2 && len(call) != 30 {
+			t.Errorf("batch %d: got %d oids, want 30", i, len(call))
+		}
+	}
+}
+
 func TestExecuteCredentialTest(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
 		ch := make(chan *pb.CredentialTestResult, 1)

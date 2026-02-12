@@ -10,6 +10,8 @@ import (
 	"github.com/towerops-app/towerops-agent/pb"
 )
 
+const snmpMaxOIDsPerGet = 60
+
 // snmpQuerier abstracts SNMP operations for testability.
 type snmpQuerier interface {
 	Get(oids []string) (*gosnmp.SnmpPacket, error)
@@ -41,15 +43,24 @@ func executeSnmpJob(job *pb.AgentJob, resultCh chan<- *pb.SnmpResult) {
 	}
 	defer closeFn()
 
-	oidValues := make(map[string]string)
+	totalOIDs := 0
+	for _, q := range job.Queries {
+		totalOIDs += len(q.Oids)
+	}
+	oidValues := make(map[string]string, totalOIDs)
 
 	for _, q := range job.Queries {
 		switch q.QueryType {
 		case pb.QueryType_GET:
-			for _, oid := range q.Oids {
-				result, err := conn.Get([]string{oid})
+			for i := 0; i < len(q.Oids); i += snmpMaxOIDsPerGet {
+				end := i + snmpMaxOIDsPerGet
+				if end > len(q.Oids) {
+					end = len(q.Oids)
+				}
+				batch := q.Oids[i:end]
+				result, err := conn.Get(batch)
 				if err != nil {
-					slog.Warn("snmp get failed", "device", dev.Ip, "oid", oid, "error", err)
+					slog.Warn("snmp get failed", "device", dev.Ip, "oids", len(batch), "error", err)
 					continue
 				}
 				for _, v := range result.Variables {
