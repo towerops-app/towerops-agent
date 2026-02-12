@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
@@ -23,8 +24,9 @@ const (
 
 // WSConn is a minimal RFC 6455 WebSocket client.
 type WSConn struct {
-	conn io.ReadWriteCloser
-	mu   sync.Mutex // serializes writes
+	conn   io.ReadWriteCloser
+	reader *bufio.Reader
+	mu     sync.Mutex // serializes writes
 }
 
 var randRead = rand.Read
@@ -90,7 +92,7 @@ func WSDial(rawURL string) (*WSConn, error) {
 		return nil, fmt.Errorf("handshake failed: %s", strings.SplitN(resp, "\r\n", 2)[0])
 	}
 
-	return &WSConn{conn: conn}, nil
+	return &WSConn{conn: conn, reader: bufio.NewReaderSize(conn, 8192)}, nil
 }
 
 // ReadMessage reads the next text or binary message, handling control frames internally.
@@ -127,7 +129,7 @@ func (ws *WSConn) Close() error {
 
 func (ws *WSConn) readFrame() (opcode int, payload []byte, err error) {
 	var header [2]byte
-	if _, err = io.ReadFull(ws.conn, header[:]); err != nil {
+	if _, err = io.ReadFull(ws.reader, header[:]); err != nil {
 		return 0, nil, err
 	}
 
@@ -138,13 +140,13 @@ func (ws *WSConn) readFrame() (opcode int, payload []byte, err error) {
 	switch length {
 	case 126:
 		var ext [2]byte
-		if _, err = io.ReadFull(ws.conn, ext[:]); err != nil {
+		if _, err = io.ReadFull(ws.reader, ext[:]); err != nil {
 			return 0, nil, err
 		}
 		length = uint64(binary.BigEndian.Uint16(ext[:]))
 	case 127:
 		var ext [8]byte
-		if _, err = io.ReadFull(ws.conn, ext[:]); err != nil {
+		if _, err = io.ReadFull(ws.reader, ext[:]); err != nil {
 			return 0, nil, err
 		}
 		length = binary.BigEndian.Uint64(ext[:])
@@ -152,14 +154,14 @@ func (ws *WSConn) readFrame() (opcode int, payload []byte, err error) {
 
 	var maskKey [4]byte
 	if masked {
-		if _, err = io.ReadFull(ws.conn, maskKey[:]); err != nil {
+		if _, err = io.ReadFull(ws.reader, maskKey[:]); err != nil {
 			return 0, nil, err
 		}
 	}
 
 	payload = make([]byte, length)
 	if length > 0 {
-		if _, err = io.ReadFull(ws.conn, payload); err != nil {
+		if _, err = io.ReadFull(ws.reader, payload); err != nil {
 			return 0, nil, err
 		}
 	}
