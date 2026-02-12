@@ -336,6 +336,38 @@ func TestHandleMessage(t *testing.T) {
 	})
 }
 
+func TestNextBackoff(t *testing.T) {
+	maxDelay := 60 * time.Second
+
+	// Test doubling with jitter
+	for i := 0; i < 100; i++ {
+		current := 2 * time.Second
+		next := nextBackoff(current, maxDelay)
+		doubled := current * 2
+		maxWithJitter := doubled + doubled/4
+		if next < doubled || next > maxWithJitter {
+			t.Errorf("nextBackoff(%v) = %v, want in [%v, %v]", current, next, doubled, maxWithJitter)
+		}
+	}
+
+	// Test cap at max
+	for i := 0; i < 100; i++ {
+		next := nextBackoff(30*time.Second, maxDelay)
+		if next > maxDelay+maxDelay/4 {
+			t.Errorf("nextBackoff(30s) = %v, exceeded max+jitter", next)
+		}
+	}
+
+	// Test that already-at-max stays at max (with jitter)
+	for i := 0; i < 100; i++ {
+		next := nextBackoff(maxDelay, maxDelay)
+		maxWithJitter := maxDelay + maxDelay/4
+		if next < maxDelay || next > maxWithJitter {
+			t.Errorf("nextBackoff(max) = %v, want in [%v, %v]", next, maxDelay, maxWithJitter)
+		}
+	}
+}
+
 func TestDispatchJob(t *testing.T) {
 	t.Run("MIKROTIK", func(t *testing.T) {
 		origDial := mikrotikDial

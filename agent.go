@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"runtime"
 	"strconv"
@@ -56,7 +57,7 @@ func runAgent(ctx context.Context, wsURL, token string) {
 			return
 		case <-time.After(retryDelay):
 		}
-		retryDelay = min(retryDelay*2, maxRetry)
+		retryDelay = nextBackoff(retryDelay, maxRetry)
 	}
 }
 
@@ -361,6 +362,16 @@ func dispatchJob(
 	default:
 		pools.snmp.submit(func() { executeSnmpJob(ctx, job, snmpResultCh) })
 	}
+}
+
+// nextBackoff doubles the current delay (capped at max) and adds up to 25% jitter.
+func nextBackoff(current, maxDelay time.Duration) time.Duration {
+	next := current * 2
+	if next > maxDelay {
+		next = maxDelay
+	}
+	jitter := time.Duration(rand.Int64N(int64(next / 4)))
+	return next + jitter
 }
 
 func strPtr(s string) *string { return &s }
