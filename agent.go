@@ -95,6 +95,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		snmp:     newWorkerPool(100),
 		mikrotik: newWorkerPool(20),
 		ping:     newWorkerPool(50),
+		checks:   newWorkerPool(50),
 	}
 
 	// Result channels
@@ -102,6 +103,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	mikrotikResultCh := make(chan *pb.MikrotikResult, 5000)
 	credTestResultCh := make(chan *pb.CredentialTestResult, 5000)
 	monitoringCheckCh := make(chan *pb.MonitoringCheck, 10000)
+	checkResultCh := make(chan *pb.CheckResult, 10000)
 
 	// Ref counter for outbound messages
 	var refCounter atomic.Uint64
@@ -234,6 +236,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		pools.snmp.stop()
 		pools.mikrotik.stop()
 		pools.ping.stop()
+		pools.checks.stop()
 		close(writeCh)
 		writerWg.Wait()
 	}()
@@ -272,7 +275,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 				slog.Warn("invalid message", "error", err)
 				continue
 			}
-			if handleMessage(ctx, msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh) {
+			if handleMessage(ctx, msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh) {
 				flushSnmpBatch()
 				return errRestartRequested
 			}
@@ -294,6 +297,10 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		case result := <-monitoringCheckCh:
 			sendBinaryResult("monitoring_check", result)
 			slog.Info("sent monitoring check", "device", result.DeviceId, "status", result.Status)
+
+		case result := <-checkResultCh:
+			sendBinaryResult("check_result", result)
+			slog.Info("sent check result", "check", result.CheckId, "status", result.Status)
 
 		case <-flushTicker.C:
 			flushSnmpBatch()
@@ -335,6 +342,7 @@ func handleMessage(
 	mikrotikResultCh chan<- *pb.MikrotikResult,
 	credTestResultCh chan<- *pb.CredentialTestResult,
 	monitoringCheckCh chan<- *pb.MonitoringCheck,
+	checkResultCh chan<- *pb.CheckResult,
 ) bool {
 	switch msg.Event {
 	case "phx_reply":
@@ -364,7 +372,30 @@ func handleMessage(
 		}
 		slog.Info("received jobs", "count", len(jobList.Jobs))
 		for _, job := range jobList.Jobs {
-			dispatchJob(ctx, job, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh)
+			dispatchJob(ctx, job, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh)
+		}
+
+	case "check_jobs":
+		var payload struct {
+			Binary string `json:"binary"`
+		}
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			slog.Error("decode check_jobs payload", "error", err)
+			return false
+		}
+		bin, err := base64.StdEncoding.DecodeString(payload.Binary)
+		if err != nil {
+			slog.Error("decode check_jobs base64", "error", err)
+			return false
+		}
+		var checkList pb.CheckList
+		if err := proto.Unmarshal(bin, &checkList); err != nil {
+			slog.Error("unmarshal check list", "error", err)
+			return false
+		}
+		slog.Info("received checks", "count", len(checkList.Checks))
+		for _, check := range checkList.Checks {
+			executeCheck(ctx, check, pools, checkResultCh)
 		}
 
 	case "restart":
@@ -396,6 +427,7 @@ type jobPools struct {
 	snmp     *workerPool
 	mikrotik *workerPool
 	ping     *workerPool
+	checks   *workerPool
 }
 
 // dispatchJob routes a job to the appropriate worker pool.
@@ -407,6 +439,7 @@ func dispatchJob(
 	mikrotikResultCh chan<- *pb.MikrotikResult,
 	credTestResultCh chan<- *pb.CredentialTestResult,
 	monitoringCheckCh chan<- *pb.MonitoringCheck,
+	checkResultCh chan<- *pb.CheckResult,
 ) {
 	slog.Info("starting job", "job_id", job.JobId, "type", job.JobType)
 
@@ -448,3 +481,17 @@ func zeroBytes(b []byte) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// executeCheck dispatches a check to the worker pool.
+func executeCheck(ctx context.Context, check *pb.Check, pools *jobPools, checkResultCh chan<- *pb.CheckResult) {
+	ok := pools.checks.submit(ctx, func() {
+		result := ExecuteCheck(ctx, check)
+		select {
+		case checkResultCh <- result:
+		case <-ctx.Done():
+		}
+	})
+	if !ok {
+		slog.Warn("check rejected (pool full)", "check_id", check.Id, "type", check.CheckType)
+	}
+}
