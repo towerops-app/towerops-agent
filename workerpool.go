@@ -1,6 +1,10 @@
 package main
 
-import "sync"
+import (
+	"context"
+	"log/slog"
+	"sync"
+)
 
 // workerPool is a fixed-size goroutine pool for executing tasks.
 type workerPool struct {
@@ -19,16 +23,28 @@ func newWorkerPool(n int) *workerPool {
 		go func() {
 			defer p.wg.Done()
 			for fn := range p.tasks {
-				fn()
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							slog.Error("worker panic recovered", "error", r)
+						}
+					}()
+					fn()
+				}()
 			}
 		}()
 	}
 	return p
 }
 
-// submit enqueues a task. Blocks if all workers are busy and the queue is full.
-func (p *workerPool) submit(fn func()) {
-	p.tasks <- fn
+// submit enqueues a task. Returns false if the context is cancelled before the task can be queued.
+func (p *workerPool) submit(ctx context.Context, fn func()) bool {
+	select {
+	case p.tasks <- fn:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // stop closes the task channel and waits for all workers to finish.

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWriteFrameMasked(t *testing.T) {
@@ -555,6 +556,44 @@ func TestWSDialBadURL(t *testing.T) {
 	_, err := WSDial("://bad url")
 	if err == nil {
 		t.Error("expected parse error for bad URL")
+	}
+}
+
+func TestWSDialHandshakeTimeout(t *testing.T) {
+	// Server accepts connection but never sends data — should trigger timeout
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		// Read the request but never respond
+		buf := make([]byte, 4096)
+		_, _ = conn.Read(buf)
+		// Hold connection open until test ends
+		<-make(chan struct{})
+		_ = conn.Close()
+	}()
+
+	origTimeout := wsHandshakeTimeout
+	defer func() { wsHandshakeTimeout = origTimeout }()
+	wsHandshakeTimeout = 500 * time.Millisecond // Short timeout for test
+
+	addr := ln.Addr().String()
+	start := time.Now()
+	_, err = WSDial("ws://" + addr + "/socket")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Error("expected timeout error")
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("took too long (%v), timeout didn't work", elapsed)
 	}
 }
 
