@@ -24,6 +24,7 @@ var osExit = os.Exit
 var doSelfUpdate = selfUpdate
 
 var errRestartRequested = fmt.Errorf("restart requested")
+var joinTimeout = 10 * time.Second
 
 const maxJobPayloadBytes = 4 << 20 // 4 MB — well above any legitimate job list
 
@@ -152,6 +153,20 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		sendMsg(event, payload)
 	}
 
+	// Reader goroutine — must start before join so we can receive the reply
+	msgCh := make(chan []byte, 100)
+	errCh := make(chan error, 1)
+	go func() {
+		for {
+			data, _, err := ws.ReadMessage()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			msgCh <- data
+		}
+	}()
+
 	// Join channel
 	joinPayload, _ := json.Marshal(map[string]string{"token": token})
 	joinMsg := channelMsg{
@@ -165,6 +180,29 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		return fmt.Errorf("send join: %w", err)
 	}
 	slog.Debug("sent channel join request")
+
+	// Wait for join reply before entering main loop
+	select {
+	case data := <-msgCh:
+		var reply channelMsg
+		if err := json.Unmarshal(data, &reply); err != nil {
+			return fmt.Errorf("join reply unmarshal: %w", err)
+		}
+		if reply.Event == "phx_reply" {
+			var status struct {
+				Status   string `json:"status"`
+				Response any    `json:"response"`
+			}
+			if err := json.Unmarshal(reply.Payload, &status); err == nil && status.Status != "ok" {
+				return fmt.Errorf("join rejected: %s", status.Status)
+			}
+		}
+		slog.Info("channel joined")
+	case err := <-errCh:
+		return fmt.Errorf("read during join: %w", err)
+	case <-time.After(joinTimeout):
+		return fmt.Errorf("join timeout")
+	}
 
 	// Writer goroutine - serializes all writes to the WebSocket
 	var writerWg sync.WaitGroup
@@ -181,20 +219,6 @@ func runSession(ctx context.Context, baseURL, token string) error {
 				}
 				return
 			}
-		}
-	}()
-
-	// Reader goroutine - reads messages and dispatches
-	msgCh := make(chan []byte, 100)
-	errCh := make(chan error, 1)
-	go func() {
-		for {
-			data, _, err := ws.ReadMessage()
-			if err != nil {
-				errCh <- err
-				return
-			}
-			msgCh <- data
 		}
 	}()
 
