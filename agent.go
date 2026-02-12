@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -21,6 +22,11 @@ import (
 
 var osExit = os.Exit
 var doSelfUpdate = selfUpdate
+
+var errRestartRequested = fmt.Errorf("restart requested")
+var joinTimeout = 10 * time.Second
+
+const maxJobPayloadBytes = 4 << 20 // 4 MB — well above any legitimate job list
 
 // channelMsg is the WebSocket channel message format (JSON wrapper around binary protobuf).
 type channelMsg struct {
@@ -45,6 +51,10 @@ func runAgent(ctx context.Context, wsURL, token string) {
 
 		err := runSession(ctx, baseURL, token)
 		if ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, errRestartRequested) {
+			osExit(0)
 			return
 		}
 		if err != nil {
@@ -135,11 +145,27 @@ func runSession(ctx context.Context, baseURL, token string) error {
 			return
 		}
 		encoded := base64.StdEncoding.EncodeToString(bin)
-		*bp = bin[:0]
+		full := (*bp)[:cap(*bp)]
+		zeroBytes(full)
+		*bp = full[:0]
 		bufPool.Put(bp)
 		payload, _ := json.Marshal(map[string]string{"binary": encoded})
 		sendMsg(event, payload)
 	}
+
+	// Reader goroutine — must start before join so we can receive the reply
+	msgCh := make(chan []byte, 100)
+	errCh := make(chan error, 1)
+	go func() {
+		for {
+			data, _, err := ws.ReadMessage()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			msgCh <- data
+		}
+	}()
 
 	// Join channel
 	joinPayload, _ := json.Marshal(map[string]string{"token": token})
@@ -155,30 +181,44 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	}
 	slog.Debug("sent channel join request")
 
+	// Wait for join reply before entering main loop
+	select {
+	case data := <-msgCh:
+		var reply channelMsg
+		if err := json.Unmarshal(data, &reply); err != nil {
+			return fmt.Errorf("join reply unmarshal: %w", err)
+		}
+		if reply.Event == "phx_reply" {
+			var status struct {
+				Status   string `json:"status"`
+				Response any    `json:"response"`
+			}
+			if err := json.Unmarshal(reply.Payload, &status); err == nil && status.Status != "ok" {
+				return fmt.Errorf("join rejected: %s", status.Status)
+			}
+		}
+		slog.Info("channel joined")
+	case err := <-errCh:
+		return fmt.Errorf("read during join: %w", err)
+	case <-time.After(joinTimeout):
+		return fmt.Errorf("join timeout")
+	}
+
 	// Writer goroutine - serializes all writes to the WebSocket
 	var writerWg sync.WaitGroup
+	writeErrCh := make(chan error, 1)
 	writerWg.Add(1)
 	go func() {
 		defer writerWg.Done()
 		for data := range writeCh {
 			if err := ws.WriteText(data); err != nil {
 				slog.Error("websocket write", "error", err)
+				select {
+				case writeErrCh <- err:
+				default:
+				}
 				return
 			}
-		}
-	}()
-
-	// Reader goroutine - reads messages and dispatches
-	msgCh := make(chan []byte, 100)
-	errCh := make(chan error, 1)
-	go func() {
-		for {
-			data, _, err := ws.ReadMessage()
-			if err != nil {
-				errCh <- err
-				return
-			}
-			msgCh <- data
 		}
 	}()
 
@@ -222,13 +262,20 @@ func runSession(ctx context.Context, baseURL, token string) error {
 			flushSnmpBatch()
 			return fmt.Errorf("read: %w", err)
 
+		case err := <-writeErrCh:
+			flushSnmpBatch()
+			return fmt.Errorf("write: %w", err)
+
 		case data := <-msgCh:
 			var msg channelMsg
 			if err := json.Unmarshal(data, &msg); err != nil {
 				slog.Warn("invalid message", "error", err)
 				continue
 			}
-			handleMessage(ctx, msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh)
+			if handleMessage(ctx, msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh) {
+				flushSnmpBatch()
+				return errRestartRequested
+			}
 
 		case result := <-snmpResultCh:
 			snmpBatch = append(snmpBatch, result)
@@ -279,6 +326,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 }
 
 // handleMessage dispatches incoming channel messages.
+// Returns true if the session should end (e.g. restart requested).
 func handleMessage(
 	ctx context.Context,
 	msg channelMsg,
@@ -287,7 +335,7 @@ func handleMessage(
 	mikrotikResultCh chan<- *pb.MikrotikResult,
 	credTestResultCh chan<- *pb.CredentialTestResult,
 	monitoringCheckCh chan<- *pb.MonitoringCheck,
-) {
+) bool {
 	switch msg.Event {
 	case "phx_reply":
 		slog.Debug("channel reply", "topic", msg.Topic)
@@ -298,17 +346,21 @@ func handleMessage(
 		}
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 			slog.Error("decode job payload", "error", err)
-			return
+			return false
+		}
+		if len(payload.Binary) > maxJobPayloadBytes {
+			slog.Error("job payload too large", "size", len(payload.Binary), "max", maxJobPayloadBytes)
+			return false
 		}
 		bin, err := base64.StdEncoding.DecodeString(payload.Binary)
 		if err != nil {
 			slog.Error("decode base64", "error", err)
-			return
+			return false
 		}
 		var jobList pb.AgentJobList
 		if err := proto.Unmarshal(bin, &jobList); err != nil {
 			slog.Error("unmarshal job list", "error", err)
-			return
+			return false
 		}
 		slog.Info("received jobs", "count", len(jobList.Jobs))
 		for _, job := range jobList.Jobs {
@@ -316,8 +368,8 @@ func handleMessage(
 		}
 
 	case "restart":
-		slog.Info("restart requested by server, exiting")
-		osExit(0)
+		slog.Info("restart requested by server")
+		return true
 
 	case "update":
 		var payload struct {
@@ -326,7 +378,7 @@ func handleMessage(
 		}
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil || payload.URL == "" || payload.Checksum == "" {
 			slog.Error("invalid update payload")
-			return
+			return false
 		}
 		slog.Info("update requested", "url", payload.URL)
 		if err := doSelfUpdate(payload.URL, payload.Checksum); err != nil {
@@ -336,6 +388,7 @@ func handleMessage(
 	default:
 		slog.Debug("ignoring event", "event", msg.Event)
 	}
+	return false
 }
 
 // jobPools holds the worker pools for each job type.
@@ -357,15 +410,19 @@ func dispatchJob(
 ) {
 	slog.Info("starting job", "job_id", job.JobId, "type", job.JobType)
 
+	var ok bool
 	switch job.JobType {
 	case pb.JobType_MIKROTIK:
-		pools.mikrotik.submit(func() { executeMikrotikJob(ctx, job, mikrotikResultCh) })
+		ok = pools.mikrotik.submit(ctx, func() { executeMikrotikJob(ctx, job, mikrotikResultCh) })
 	case pb.JobType_TEST_CREDENTIALS:
-		pools.snmp.submit(func() { executeCredentialTest(ctx, job, credTestResultCh) })
+		ok = pools.snmp.submit(ctx, func() { executeCredentialTest(ctx, job, credTestResultCh) })
 	case pb.JobType_PING:
-		pools.ping.submit(func() { executePingJob(ctx, job, monitoringCheckCh) })
+		ok = pools.ping.submit(ctx, func() { executePingJob(ctx, job, monitoringCheckCh) })
 	default:
-		pools.snmp.submit(func() { executeSnmpJob(ctx, job, snmpResultCh) })
+		ok = pools.snmp.submit(ctx, func() { executeSnmpJob(ctx, job, snmpResultCh) })
+	}
+	if !ok {
+		slog.Warn("job dropped, pool full", "job_id", job.JobId)
 	}
 }
 

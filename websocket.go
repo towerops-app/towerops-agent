@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 )
 
 // websocketGUID is the magic GUID from RFC 6455 Section 4.2.2.
@@ -41,6 +42,8 @@ type WSConn struct {
 	reader *bufio.Reader
 	mu     sync.Mutex // serializes writes
 }
+
+var wsHandshakeTimeout = 30 * time.Second
 
 var randRead = rand.Read
 var netDial = net.Dial
@@ -74,6 +77,9 @@ func WSDial(rawURL string) (*WSConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", host, err)
 	}
+
+	// Set handshake deadline — prevents a slow/malicious server from blocking indefinitely
+	_ = conn.SetDeadline(time.Now().Add(wsHandshakeTimeout))
 
 	// Generate random key for Sec-WebSocket-Key
 	keyBytes := make([]byte, 16)
@@ -123,6 +129,9 @@ func WSDial(rawURL string) (*WSConn, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("missing Sec-WebSocket-Accept header")
 	}
+
+	// Clear handshake deadline — normal operation uses no deadline
+	_ = conn.SetDeadline(time.Time{})
 
 	return &WSConn{conn: conn, reader: bufio.NewReaderSize(conn, 8192)}, nil
 }
