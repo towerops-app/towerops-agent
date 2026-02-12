@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"strconv"
 	"time"
 
 	"github.com/towerops-app/towerops-agent/pb"
@@ -11,6 +13,7 @@ import (
 )
 
 var sshBackup = executeMikrotikBackup
+var sshDial = ssh.Dial
 var doPing = pingDevice
 
 // executeMikrotikBackup connects via SSH and runs /export compact.
@@ -26,8 +29,8 @@ func executeMikrotikBackup(ip string, port uint16, username, password string) (s
 		Timeout:         30 * time.Second,
 	}
 
-	addr := fmt.Sprintf("%s:%d", ip, port)
-	conn, err := ssh.Dial("tcp", addr, config)
+	addr := net.JoinHostPort(ip, strconv.Itoa(int(port)))
+	conn, err := sshDial("tcp", addr, config)
 	if err != nil {
 		return "", fmt.Errorf("ssh dial %s: %w", addr, err)
 	}
