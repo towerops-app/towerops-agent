@@ -9,6 +9,7 @@ message AgentConfig {
   string version = 1;
   uint32 poll_interval_seconds = 2;
   repeated Device devices = 3;
+  repeated Check checks = 4;  // Service checks (HTTP/TCP/DNS)
 }
 
 message Device {
@@ -57,6 +58,7 @@ message Metric {
     InterfaceStat interface_stat = 2;
     NeighborDiscovery neighbor_discovery = 3;
     MonitoringCheck monitoring_check = 4;
+    CheckResult check_result = 5;  // Service check results (HTTP/TCP/DNS)
   }
 }
 
@@ -97,6 +99,59 @@ message MonitoringCheck {
   string status = 2; // "success" or "failure"
   double response_time_ms = 3; // Optional - only present on success
   int64 timestamp = 4; // Unix timestamp in seconds
+}
+
+// Service Checks (HTTP/TCP/DNS)
+
+message Check {
+  string id = 1;
+  string check_type = 2;  // "http", "tcp", "dns"
+  uint32 interval_seconds = 3;
+  uint32 timeout_ms = 4;
+
+  // Type-specific config (JSON from Phoenix config field)
+  oneof config {
+    HttpCheckConfig http = 5;
+    TcpCheckConfig tcp = 6;
+    DnsCheckConfig dns = 7;
+  }
+}
+
+message HttpCheckConfig {
+  string url = 1;
+  string method = 2;  // GET, POST, etc.
+  uint32 expected_status = 3;
+  bool verify_ssl = 4;
+  map<string, string> headers = 5;
+  string body = 6;
+  string regex = 7;  // Content match regex
+  bool follow_redirects = 8;
+}
+
+message TcpCheckConfig {
+  string host = 1;
+  uint32 port = 2;
+  string send = 3;  // Data to send after connection
+  string expect = 4;  // Expected response
+}
+
+message DnsCheckConfig {
+  string hostname = 1;
+  string server = 2;  // DNS server (optional)
+  string record_type = 3;  // A, AAAA, CNAME, MX, TXT
+  string expected = 4;  // Expected result (optional)
+}
+
+message CheckResult {
+  string check_id = 1;
+  uint32 status = 2;  // 0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN
+  string output = 3;
+  double response_time_ms = 4;
+  int64 timestamp = 5;  // Unix timestamp in seconds
+}
+
+message CheckList {
+  repeated Check checks = 1;
 }
 
 // Heartbeat metadata
