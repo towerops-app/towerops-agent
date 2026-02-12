@@ -173,6 +173,8 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	defer heartbeatTicker.Stop()
 	channelHeartbeatTicker := time.NewTicker(25 * time.Second)
 	defer channelHeartbeatTicker.Stop()
+	flushTicker := time.NewTicker(100 * time.Millisecond)
+	defer flushTicker.Stop()
 	startTime := time.Now()
 
 	defer func() {
@@ -183,13 +185,28 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		writerWg.Wait()
 	}()
 
+	var snmpBatch []*pb.SnmpResult
+
+	flushSnmpBatch := func() {
+		if len(snmpBatch) == 0 {
+			return
+		}
+		for _, r := range snmpBatch {
+			sendBinaryResult("result", r)
+		}
+		slog.Info("flushed snmp results", "count", len(snmpBatch))
+		snmpBatch = snmpBatch[:0]
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("shutdown signal, closing connection")
+			flushSnmpBatch()
 			return nil
 
 		case err := <-errCh:
+			flushSnmpBatch()
 			return fmt.Errorf("read: %w", err)
 
 		case data := <-msgCh:
@@ -201,8 +218,10 @@ func runSession(ctx context.Context, baseURL, token string) error {
 			handleMessage(msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh)
 
 		case result := <-snmpResultCh:
-			sendBinaryResult("result", result)
-			slog.Info("sent snmp result", "device", result.DeviceId, "oids", len(result.OidValues))
+			snmpBatch = append(snmpBatch, result)
+			if len(snmpBatch) >= 50 {
+				flushSnmpBatch()
+			}
 
 		case result := <-mikrotikResultCh:
 			sendBinaryResult("mikrotik_result", result)
@@ -215,6 +234,9 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		case result := <-monitoringCheckCh:
 			sendBinaryResult("monitoring_check", result)
 			slog.Info("sent monitoring check", "device", result.DeviceId, "status", result.Status)
+
+		case <-flushTicker.C:
+			flushSnmpBatch()
 
 		case <-heartbeatTicker.C:
 			hb := &pb.AgentHeartbeat{
