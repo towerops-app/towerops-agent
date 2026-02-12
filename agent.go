@@ -79,6 +79,13 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	// Channel for serializing WebSocket writes
 	writeCh := make(chan []byte, 500)
 
+	// Worker pools — bounded concurrency for each job type
+	pools := &jobPools{
+		snmp:     newWorkerPool(100),
+		mikrotik: newWorkerPool(20),
+		ping:     newWorkerPool(50),
+	}
+
 	// Result channels
 	snmpResultCh := make(chan *pb.SnmpResult, 1000)
 	mikrotikResultCh := make(chan *pb.MikrotikResult, 1000)
@@ -169,6 +176,9 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	startTime := time.Now()
 
 	defer func() {
+		pools.snmp.stop()
+		pools.mikrotik.stop()
+		pools.ping.stop()
 		close(writeCh)
 		writerWg.Wait()
 	}()
@@ -188,7 +198,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 				slog.Warn("invalid message", "error", err)
 				continue
 			}
-			handleMessage(msg, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh)
+			handleMessage(msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh)
 
 		case result := <-snmpResultCh:
 			sendBinaryResult("result", result)
@@ -236,6 +246,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 // handleMessage dispatches incoming channel messages.
 func handleMessage(
 	msg channelMsg,
+	pools *jobPools,
 	snmpResultCh chan<- *pb.SnmpResult,
 	mikrotikResultCh chan<- *pb.MikrotikResult,
 	credTestResultCh chan<- *pb.CredentialTestResult,
@@ -265,7 +276,7 @@ func handleMessage(
 		}
 		slog.Info("received jobs", "count", len(jobList.Jobs))
 		for _, job := range jobList.Jobs {
-			dispatchJob(job, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh)
+			dispatchJob(job, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh)
 		}
 
 	case "restart":
@@ -291,9 +302,17 @@ func handleMessage(
 	}
 }
 
-// dispatchJob routes a job to the appropriate handler goroutine.
+// jobPools holds the worker pools for each job type.
+type jobPools struct {
+	snmp     *workerPool
+	mikrotik *workerPool
+	ping     *workerPool
+}
+
+// dispatchJob routes a job to the appropriate worker pool.
 func dispatchJob(
 	job *pb.AgentJob,
+	pools *jobPools,
 	snmpResultCh chan<- *pb.SnmpResult,
 	mikrotikResultCh chan<- *pb.MikrotikResult,
 	credTestResultCh chan<- *pb.CredentialTestResult,
@@ -303,14 +322,13 @@ func dispatchJob(
 
 	switch job.JobType {
 	case pb.JobType_MIKROTIK:
-		go executeMikrotikJob(job, mikrotikResultCh)
+		pools.mikrotik.submit(func() { executeMikrotikJob(job, mikrotikResultCh) })
 	case pb.JobType_TEST_CREDENTIALS:
-		go executeCredentialTest(job, credTestResultCh)
+		pools.snmp.submit(func() { executeCredentialTest(job, credTestResultCh) })
 	case pb.JobType_PING:
-		go executePingJob(job, monitoringCheckCh)
+		pools.ping.submit(func() { executePingJob(job, monitoringCheckCh) })
 	default:
-		// DISCOVER, POLL
-		go executeSnmpJob(job, snmpResultCh)
+		pools.snmp.submit(func() { executeSnmpJob(job, snmpResultCh) })
 	}
 }
 
