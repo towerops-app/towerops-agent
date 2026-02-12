@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -13,7 +14,7 @@ import (
 
 func TestWriteFrameMasked(t *testing.T) {
 	var buf bytes.Buffer
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 
 	payload := []byte("hello")
 	if err := ws.writeFrame(opText, payload); err != nil {
@@ -43,7 +44,7 @@ func TestWriteFrameMasked(t *testing.T) {
 
 func TestWriteFrame16BitLength(t *testing.T) {
 	var buf bytes.Buffer
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 
 	payload := make([]byte, 300)
 	if err := ws.writeFrame(opBinary, payload); err != nil {
@@ -62,7 +63,7 @@ func TestWriteFrame16BitLength(t *testing.T) {
 
 func TestWriteFrame64BitLength(t *testing.T) {
 	var buf bytes.Buffer
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 
 	payload := make([]byte, 70000) // > 65535, uses 8-byte extended
 	if err := ws.writeFrame(opBinary, payload); err != nil {
@@ -86,7 +87,7 @@ func TestReadFrame(t *testing.T) {
 	buf.WriteByte(byte(len(payload)))
 	buf.Write(payload)
 
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 	opcode, data, err := ws.readFrame()
 	if err != nil {
 		t.Fatal(err)
@@ -112,7 +113,7 @@ func TestReadFrame16BitLength(t *testing.T) {
 	buf.Write(extLen[:])
 	buf.Write(payload)
 
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 	opcode, data, err := ws.readFrame()
 	if err != nil {
 		t.Fatal(err)
@@ -135,7 +136,7 @@ func TestReadFrame64BitLength(t *testing.T) {
 	buf.Write(extLen[:])
 	buf.Write(payload)
 
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 	opcode, data, err := ws.readFrame()
 	if err != nil {
 		t.Fatal(err)
@@ -162,7 +163,7 @@ func TestReadFrameMasked(t *testing.T) {
 	buf.Write(maskKey[:])
 	buf.Write(masked)
 
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 	opcode, data, err := ws.readFrame()
 	if err != nil {
 		t.Fatal(err)
@@ -182,7 +183,7 @@ func TestReadMessageClose(t *testing.T) {
 	buf.WriteByte(0) // no payload
 
 	rw := &captureWriter{Reader: &buf}
-	ws := &WSConn{conn: &nopCloser{readWriter: rw}}
+	ws := testWSConn(&nopCloser{readWriter: rw})
 
 	_, opcode, err := ws.ReadMessage()
 	if err != io.EOF {
@@ -211,7 +212,7 @@ func TestReadFramePingPong(t *testing.T) {
 	buf.Write(text)
 
 	rw := &captureWriter{Reader: &buf}
-	ws := &WSConn{conn: &nopCloser{readWriter: rw}}
+	ws := testWSConn(&nopCloser{readWriter: rw})
 
 	data, _, err := ws.ReadMessage()
 	if err != nil {
@@ -231,7 +232,7 @@ func TestReadFrame16BitLengthError(t *testing.T) {
 	buf.WriteByte(0x81) // FIN + text
 	buf.WriteByte(126)  // 16-bit length indicator, but no length bytes follow
 
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 	_, _, err := ws.readFrame()
 	if err == nil {
 		t.Error("expected error for truncated 16-bit length")
@@ -243,7 +244,7 @@ func TestReadFrame64BitLengthError(t *testing.T) {
 	buf.WriteByte(0x81) // FIN + text
 	buf.WriteByte(127)  // 64-bit length indicator, but no length bytes follow
 
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 	_, _, err := ws.readFrame()
 	if err == nil {
 		t.Error("expected error for truncated 64-bit length")
@@ -255,7 +256,7 @@ func TestReadFrameMaskKeyError(t *testing.T) {
 	buf.WriteByte(0x81)        // FIN + text
 	buf.WriteByte(0x80 | 0x01) // masked + length 1, but no mask key or payload
 
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 	_, _, err := ws.readFrame()
 	if err == nil {
 		t.Error("expected error for missing mask key")
@@ -267,7 +268,7 @@ func TestReadFramePayloadError(t *testing.T) {
 	buf.WriteByte(0x81) // FIN + text
 	buf.WriteByte(5)    // length 5, but no payload
 
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 	_, _, err := ws.readFrame()
 	if err == nil {
 		t.Error("expected error for truncated payload")
@@ -275,7 +276,7 @@ func TestReadFramePayloadError(t *testing.T) {
 }
 
 func TestWriteFrameHeaderError(t *testing.T) {
-	ws := &WSConn{conn: &failOnWriteBuffer{Buffer: bytes.NewBuffer(nil)}}
+	ws := testWSConn(&failOnWriteBuffer{Buffer: bytes.NewBuffer(nil)})
 	err := ws.writeFrame(opText, []byte("hello"))
 	if err == nil {
 		t.Error("expected write error")
@@ -284,7 +285,7 @@ func TestWriteFrameHeaderError(t *testing.T) {
 
 func TestWriteFramePayloadError(t *testing.T) {
 	// Writer that succeeds for header but fails for payload
-	ws := &WSConn{conn: &failOnNthWrite{failAfter: 1}}
+	ws := testWSConn(&failOnNthWrite{failAfter: 1})
 	err := ws.writeFrame(opText, []byte("hello"))
 	if err == nil {
 		t.Error("expected write error on payload")
@@ -310,7 +311,7 @@ func (f *failOnNthWrite) Close() error { return nil }
 func TestReadMessageError(t *testing.T) {
 	// Empty buffer causes immediate EOF on readFrame
 	buf := bytes.NewBuffer(nil)
-	ws := &WSConn{conn: &nopCloser{readWriter: buf}}
+	ws := testWSConn(&nopCloser{readWriter: buf})
 	_, _, err := ws.ReadMessage()
 	if err == nil {
 		t.Error("expected error for empty buffer")
@@ -323,7 +324,7 @@ func TestReadMessagePongError(t *testing.T) {
 	buf.WriteByte(0x80 | byte(opPing))
 	buf.WriteByte(0)
 
-	ws := &WSConn{conn: &nopCloser{readWriter: &failOnWriteBuffer{Buffer: &buf}}}
+	ws := testWSConn(&nopCloser{readWriter: &failOnWriteBuffer{Buffer: &buf}})
 	_, _, err := ws.ReadMessage()
 	if err == nil {
 		t.Error("expected pong write error")
@@ -335,7 +336,7 @@ func TestReadFrameEmptyPayload(t *testing.T) {
 	buf.WriteByte(0x82) // FIN + binary
 	buf.WriteByte(0)    // zero length
 
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 	opcode, data, err := ws.readFrame()
 	if err != nil {
 		t.Fatal(err)
@@ -350,7 +351,7 @@ func TestReadFrameEmptyPayload(t *testing.T) {
 
 func TestWriteFrameEmptyPayload(t *testing.T) {
 	var buf bytes.Buffer
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 
 	if err := ws.writeFrame(opClose, nil); err != nil {
 		t.Fatal(err)
@@ -378,7 +379,7 @@ func (f *failOnWriteBuffer) Close() error { return nil }
 
 func TestWriteText(t *testing.T) {
 	var buf bytes.Buffer
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 
 	if err := ws.WriteText([]byte("hello")); err != nil {
 		t.Fatal(err)
@@ -393,7 +394,7 @@ func TestWriteText(t *testing.T) {
 
 func TestClose(t *testing.T) {
 	var buf bytes.Buffer
-	ws := &WSConn{conn: &nopCloser{readWriter: &buf}}
+	ws := testWSConn(&nopCloser{readWriter: &buf})
 
 	if err := ws.Close(); err != nil {
 		t.Fatal(err)
@@ -600,6 +601,10 @@ func TestWSDialRealHTTPServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = ws.Close()
+}
+
+func testWSConn(rw io.ReadWriteCloser) *WSConn {
+	return &WSConn{conn: rw, reader: bufio.NewReader(rw)}
 }
 
 // nopCloser wraps a ReadWriter with a no-op Close.
