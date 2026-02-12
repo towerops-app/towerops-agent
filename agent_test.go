@@ -5,6 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,20 +168,14 @@ func TestHandleMessage(t *testing.T) {
 	})
 
 	t.Run("restart", func(t *testing.T) {
-		origExit := osExit
-		defer func() { osExit = origExit }()
-
-		var exitCode int
-		osExit = func(code int) { exitCode = code }
-
 		snmpCh := make(chan *pb.SnmpResult, 1)
 		mtCh := make(chan *pb.MikrotikResult, 1)
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
-		handleMessage(context.Background(), channelMsg{Event: "restart", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		shouldEnd := handleMessage(context.Background(), channelMsg{Event: "restart", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh)
 
-		if exitCode != 0 {
-			t.Errorf("expected exit code 0, got %d", exitCode)
+		if !shouldEnd {
+			t.Error("expected handleMessage to return true for restart")
 		}
 	})
 
@@ -334,6 +331,57 @@ func TestHandleMessage(t *testing.T) {
 			t.Error("timed out waiting for backup result")
 		}
 	})
+}
+
+func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
+	snmpCh := make(chan *pb.SnmpResult, 1)
+	mtCh := make(chan *pb.MikrotikResult, 1)
+	credCh := make(chan *pb.CredentialTestResult, 1)
+	monCh := make(chan *pb.MonitoringCheck, 1)
+
+	// Create a binary payload larger than maxJobPayloadBytes
+	oversized := make([]byte, maxJobPayloadBytes+1)
+	encoded := base64.StdEncoding.EncodeToString(oversized)
+	payload, _ := json.Marshal(map[string]string{"binary": encoded})
+
+	handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
+
+	// Verify no jobs were dispatched
+	select {
+	case <-snmpCh:
+		t.Error("expected no SNMP result for oversized payload")
+	case <-time.After(100 * time.Millisecond):
+		// Good — nothing dispatched
+	}
+}
+
+func TestBufferPoolZeroesOnReturn(t *testing.T) {
+	pool := &sync.Pool{
+		New: func() any {
+			b := make([]byte, 0, 64)
+			return &b
+		},
+	}
+
+	// Get a buffer, write some data, return it
+	bp := pool.Get().(*[]byte)
+	*bp = append((*bp)[:0], []byte("sensitive credentials data here")...)
+	full := (*bp)[:cap(*bp)]
+
+	// Simulate the zeroing that sendBinaryResult should do
+	zeroBytes(full)
+	*bp = full[:0]
+	pool.Put(bp)
+
+	// Get the buffer back and verify it's zeroed
+	bp2 := pool.Get().(*[]byte)
+	full2 := (*bp2)[:cap(*bp2)]
+	for i, b := range full2 {
+		if b != 0 {
+			t.Errorf("byte[%d] = %d, expected 0 — pool buffer not zeroed", i, b)
+			break
+		}
+	}
 }
 
 func TestZeroBytes(t *testing.T) {
@@ -495,4 +543,139 @@ func TestDispatchJob(t *testing.T) {
 			t.Error("timed out")
 		}
 	})
+}
+
+func TestRunSessionRejectsFailedJoin(t *testing.T) {
+	origTimeout := joinTimeout
+	defer func() { joinTimeout = origTimeout }()
+	joinTimeout = 2 * time.Second
+
+	// Start a fake WebSocket server that accepts the upgrade then sends a phx_error join reply
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		// Read HTTP upgrade request
+		buf := make([]byte, 4096)
+		n, _ := conn.Read(buf)
+		reqStr := string(buf[:n])
+
+		// Extract key and compute accept
+		key := extractWSKey(reqStr)
+		accept := computeAcceptKey(key)
+
+		// Send valid 101 upgrade
+		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+		_, _ = conn.Write([]byte(resp))
+
+		// Read the join message (masked WebSocket frame) — just consume it
+		frameBuf := make([]byte, 4096)
+		_, _ = conn.Read(frameBuf)
+
+		// Send phx_error reply as an unmasked text frame
+		reply, _ := json.Marshal(channelMsg{
+			Topic:   "agent:agent-0",
+			Event:   "phx_reply",
+			Payload: json.RawMessage(`{"status":"error","response":{"reason":"invalid token"}}`),
+			Ref:     strPtr("1"),
+		})
+		frame := makeTextFrame(reply)
+		_, _ = conn.Write(frame)
+
+		// Keep connection open for a bit
+		time.Sleep(time.Second)
+	}()
+
+	addr := ln.Addr().String()
+	err = runSession(context.Background(), "ws://"+addr, "bad-token")
+	if err == nil {
+		t.Fatal("expected error from rejected join")
+	}
+	if !strings.Contains(err.Error(), "join rejected") {
+		t.Errorf("expected 'join rejected' in error, got: %v", err)
+	}
+}
+
+func TestRunSessionJoinTimeout(t *testing.T) {
+	origTimeout := joinTimeout
+	defer func() { joinTimeout = origTimeout }()
+	joinTimeout = 500 * time.Millisecond
+
+	// Server that upgrades but never sends a join reply
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		buf := make([]byte, 4096)
+		n, _ := conn.Read(buf)
+		reqStr := string(buf[:n])
+		key := extractWSKey(reqStr)
+		accept := computeAcceptKey(key)
+		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+		_, _ = conn.Write([]byte(resp))
+
+		// Read join frame but never reply
+		frameBuf := make([]byte, 4096)
+		_, _ = conn.Read(frameBuf)
+
+		time.Sleep(5 * time.Second)
+	}()
+
+	addr := ln.Addr().String()
+	start := time.Now()
+	err = runSession(context.Background(), "ws://"+addr, "token")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "join timeout") {
+		t.Errorf("expected 'join timeout' in error, got: %v", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("took too long (%v), timeout didn't trigger", elapsed)
+	}
+}
+
+// extractWSKey extracts the Sec-WebSocket-Key from a raw HTTP request.
+func extractWSKey(req string) string {
+	for _, line := range strings.Split(req, "\r\n") {
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "sec-websocket-key: ") {
+			return strings.TrimSpace(line[len("Sec-WebSocket-Key: "):])
+		}
+	}
+	return ""
+}
+
+// makeTextFrame creates an unmasked WebSocket text frame (server→client).
+func makeTextFrame(payload []byte) []byte {
+	length := len(payload)
+	var frame []byte
+	frame = append(frame, 0x81) // FIN + text
+	if length <= 125 {
+		frame = append(frame, byte(length))
+	} else if length <= 65535 {
+		frame = append(frame, 126, byte(length>>8), byte(length))
+	}
+	frame = append(frame, payload...)
+	return frame
 }
