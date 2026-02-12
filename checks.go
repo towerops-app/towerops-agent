@@ -105,7 +105,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	if err != nil {
 		return 2, fmt.Sprintf("Request failed: %v", err), responseTime
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Check status code
 	expectedStatus := int(config.ExpectedStatus)
@@ -147,11 +147,11 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 	if err != nil {
 		return 2, fmt.Sprintf("Connection failed: %v", err), responseTime
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// If send/expect strings provided, test them
 	if config.Send != "" {
-		conn.SetDeadline(time.Now().Add(timeout))
+		_ = conn.SetDeadline(time.Now().Add(timeout))
 
 		_, err = conn.Write([]byte(config.Send))
 		if err != nil {
