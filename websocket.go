@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
@@ -13,6 +14,16 @@ import (
 	"strings"
 	"sync"
 )
+
+// websocketGUID is the magic GUID from RFC 6455 Section 4.2.2.
+const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// computeAcceptKey computes the expected Sec-WebSocket-Accept value per RFC 6455.
+func computeAcceptKey(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key + websocketGUID))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
 
 const (
 	opText   = 1
@@ -92,6 +103,25 @@ func WSDial(rawURL string) (*WSConn, error) {
 	if !strings.Contains(resp, "101") {
 		_ = conn.Close()
 		return nil, fmt.Errorf("handshake failed: %s", strings.SplitN(resp, "\r\n", 2)[0])
+	}
+
+	// Verify Sec-WebSocket-Accept per RFC 6455
+	expectedAccept := computeAcceptKey(key)
+	acceptFound := false
+	for _, line := range strings.Split(resp, "\r\n") {
+		if strings.HasPrefix(strings.ToLower(line), "sec-websocket-accept: ") {
+			actual := strings.TrimSpace(line[len("Sec-WebSocket-Accept: "):])
+			if actual != expectedAccept {
+				_ = conn.Close()
+				return nil, fmt.Errorf("invalid accept key: got %q, want %q", actual, expectedAccept)
+			}
+			acceptFound = true
+			break
+		}
+	}
+	if !acceptFound {
+		_ = conn.Close()
+		return nil, fmt.Errorf("missing Sec-WebSocket-Accept header")
 	}
 
 	return &WSConn{conn: conn, reader: bufio.NewReaderSize(conn, 8192)}, nil

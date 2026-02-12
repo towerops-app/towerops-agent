@@ -66,7 +66,7 @@ func selfUpdate(downloadURL, expectedChecksum string) error {
 	}
 	tempPath := currentExe + ".update"
 
-	if err := osWriteFile(tempPath, body, 0755); err != nil {
+	if err := osWriteFile(tempPath, body, 0700); err != nil {
 		return fmt.Errorf("write temp: %w", err)
 	}
 

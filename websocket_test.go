@@ -283,7 +283,6 @@ func TestWriteFrameHeaderError(t *testing.T) {
 	}
 }
 
-
 func TestReadMessageError(t *testing.T) {
 	// Empty buffer causes immediate EOF on readFrame
 	buf := bytes.NewBuffer(nil)
@@ -422,9 +421,13 @@ func TestWSDial(t *testing.T) {
 
 		buf := make([]byte, 4096)
 		n, _ := conn.Read(buf)
-		_ = string(buf[:n]) // Read the request
+		reqStr := string(buf[:n])
 
-		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+		// Extract Sec-WebSocket-Key from request
+		key := extractHeader(reqStr, "Sec-WebSocket-Key")
+		accept := computeAcceptKey(key)
+
+		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
 		_, _ = conn.Write([]byte(resp))
 
 		// Keep connection open briefly for the test
@@ -578,9 +581,11 @@ func TestWSDialRealHTTPServer(t *testing.T) {
 			http.Error(w, "hijack not supported", 500)
 			return
 		}
+		key := r.Header.Get("Sec-WebSocket-Key")
+		accept := computeAcceptKey(key)
 		conn, brw, _ := hj.Hijack()
 		defer func() { _ = conn.Close() }()
-		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n")
 		_ = brw.Flush()
 		// Keep alive briefly
 		buf := make([]byte, 1)
@@ -598,6 +603,47 @@ func TestWSDialRealHTTPServer(t *testing.T) {
 	_ = ws.Close()
 }
 
+func TestComputeAcceptKey(t *testing.T) {
+	// RFC 6455 Section 4.2.2 test vector
+	got := computeAcceptKey("dGhlIHNhbXBsZSBub25jZQ==")
+	want := "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+	if got != want {
+		t.Errorf("computeAcceptKey = %q, want %q", got, want)
+	}
+}
+
+func TestWSDialRejectsInvalidAcceptKey(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		buf := make([]byte, 4096)
+		_, _ = conn.Read(buf)
+
+		// Send 101 with a wrong accept key
+		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: INVALID_KEY\r\n\r\n"
+		_, _ = conn.Write([]byte(resp))
+	}()
+
+	addr := ln.Addr().String()
+	_, err = WSDial("ws://" + addr + "/socket")
+	if err == nil {
+		t.Error("expected error for invalid accept key")
+	}
+	if !strings.Contains(err.Error(), "accept key") {
+		t.Errorf("expected 'accept key' in error, got: %v", err)
+	}
+}
+
 func testWSConn(rw io.ReadWriteCloser) *WSConn {
 	return &WSConn{conn: rw, reader: bufio.NewReader(rw)}
 }
@@ -613,6 +659,16 @@ type nopCloser struct {
 func (n *nopCloser) Read(p []byte) (int, error)  { return n.readWriter.Read(p) }
 func (n *nopCloser) Write(p []byte) (int, error) { return n.readWriter.Write(p) }
 func (n *nopCloser) Close() error                { return nil }
+
+// extractHeader extracts a header value from a raw HTTP request string.
+func extractHeader(req, name string) string {
+	for _, line := range strings.Split(req, "\r\n") {
+		if strings.HasPrefix(strings.ToLower(line), strings.ToLower(name)+": ") {
+			return strings.TrimSpace(line[len(name)+2:])
+		}
+	}
+	return ""
+}
 
 // captureWriter captures written data while reading from a separate Reader.
 type captureWriter struct {

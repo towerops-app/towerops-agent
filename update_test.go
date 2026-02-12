@@ -218,6 +218,45 @@ func TestSelfUpdateChecksumMatch(t *testing.T) {
 	}
 }
 
+func TestSelfUpdateFilePermissions(t *testing.T) {
+	origExe := osExecutable
+	origWrite := osWriteFile
+	origRename := osRename
+	defer func() {
+		osExecutable = origExe
+		osWriteFile = origWrite
+		osRename = origRename
+	}()
+	osExecutable = func() (string, error) { return "/tmp/test-agent", nil }
+	osRename = func(oldpath, newpath string) error {
+		return fmt.Errorf("stop here") // stop before re-exec
+	}
+
+	var capturedPerm os.FileMode
+	osWriteFile = func(name string, data []byte, perm os.FileMode) error {
+		capturedPerm = perm
+		return nil
+	}
+
+	body := []byte("binary data")
+	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	origGet := httpGet
+	defer func() { httpGet = origGet }()
+	httpGet = srv.Client().Get
+
+	_ = selfUpdate(rewriteToHTTPS(srv.URL), checksum)
+
+	if capturedPerm != 0700 {
+		t.Errorf("expected file permissions 0700, got %o", capturedPerm)
+	}
+}
+
 func TestSelfUpdateTooLarge(t *testing.T) {
 	origMax := maxUpdateSize
 	defer func() { maxUpdateSize = origMax }()
