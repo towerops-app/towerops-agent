@@ -144,7 +144,9 @@ func runSession(ctx context.Context, baseURL, token string) error {
 			return
 		}
 		encoded := base64.StdEncoding.EncodeToString(bin)
-		*bp = bin[:0]
+		full := (*bp)[:cap(*bp)]
+		zeroBytes(full)
+		*bp = full[:0]
 		bufPool.Put(bp)
 		payload, _ := json.Marshal(map[string]string{"binary": encoded})
 		sendMsg(event, payload)
