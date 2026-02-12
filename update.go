@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"syscall"
 )
 
@@ -78,6 +79,20 @@ func selfUpdate(downloadURL, expectedChecksum string) error {
 	slog.Info("binary replaced", "path", currentExe)
 
 	// Re-exec with same arguments
-	slog.Info("re-executing", "args", os.Args)
+	slog.Info("re-executing", "args", sanitizeArgs(os.Args))
 	return syscall.Exec(currentExe, os.Args, os.Environ())
+}
+
+// sanitizeArgs returns a copy of args with token values masked.
+func sanitizeArgs(args []string) []string {
+	out := make([]string, len(args))
+	copy(out, args)
+	for i, a := range out {
+		if (a == "--token" || a == "-token") && i+1 < len(out) {
+			out[i+1] = "***"
+		} else if strings.HasPrefix(a, "--token=") || strings.HasPrefix(a, "-token=") {
+			out[i] = a[:strings.Index(a, "=")+1] + "***"
+		}
+	}
+	return out
 }
