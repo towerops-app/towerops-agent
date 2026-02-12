@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -137,7 +138,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 // executeTCPCheck performs a TCP port connectivity check
 func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs uint32) (uint32, string, float64) {
 	timeout := time.Duration(timeoutMs) * time.Millisecond
-	address := fmt.Sprintf("%s:%d", config.Host, config.Port)
+	address := net.JoinHostPort(config.Host, strconv.Itoa(int(config.Port)))
 
 	startTime := time.Now()
 	conn, err := net.DialTimeout("tcp", address, timeout)
