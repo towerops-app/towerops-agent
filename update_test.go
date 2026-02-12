@@ -283,6 +283,45 @@ func TestSelfUpdateTooLarge(t *testing.T) {
 	}
 }
 
+func TestSanitizeArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"flag with separate value", []string{"agent", "--token", "secret"}, []string{"agent", "--token", "***"}},
+		{"no sensitive flags", []string{"agent", "--api-url", "wss://x"}, []string{"agent", "--api-url", "wss://x"}},
+		{"equals syntax", []string{"agent", "--token=secret"}, []string{"agent", "--token=***"}},
+		{"empty args", []string{"agent"}, []string{"agent"}},
+		{"trailing flag no value", []string{"agent", "--token"}, []string{"agent", "--token"}},
+		{"short flag with value", []string{"agent", "-token", "secret"}, []string{"agent", "-token", "***"}},
+		{"short equals syntax", []string{"agent", "-token=secret"}, []string{"agent", "-token=***"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeArgs(tt.in)
+			if len(got) != len(tt.want) {
+				t.Fatalf("length: got %d, want %d", len(got), len(tt.want))
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("arg[%d]: got %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+
+	// Verify original slice is not mutated
+	t.Run("does not mutate input", func(t *testing.T) {
+		orig := []string{"agent", "--token", "secret"}
+		_ = sanitizeArgs(orig)
+		if orig[2] != "secret" {
+			t.Error("sanitizeArgs mutated the input slice")
+		}
+	})
+}
+
 // rewriteToHTTPS converts an httptest TLS server URL to use the https scheme.
 // httptest.NewTLSServer returns URLs with https:// already, but this ensures consistency.
 func rewriteToHTTPS(rawURL string) string {
