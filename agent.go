@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,8 +90,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	refCounter.Store(1)
 
 	nextRef := func() string {
-		r := refCounter.Add(1)
-		return fmt.Sprintf("%d", r)
+		return strconv.FormatUint(refCounter.Add(1), 10)
 	}
 
 	sendMsg := func(event string, payload json.RawMessage) {

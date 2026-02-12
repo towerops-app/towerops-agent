@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -254,13 +257,12 @@ func mapPrivProtocol(p string) gosnmp.SnmpV3PrivProtocol {
 func snmpValueToString(pdu gosnmp.SnmpPDU) string {
 	switch pdu.Type {
 	case gosnmp.Integer:
-		return fmt.Sprintf("%d", gosnmp.ToBigInt(pdu.Value).Int64())
+		return strconv.FormatInt(gosnmp.ToBigInt(pdu.Value).Int64(), 10)
 	case gosnmp.OctetString:
 		b := pdu.Value.([]byte)
 		if !utf8.Valid(b) {
 			return formatHex(b)
 		}
-		// Check for non-printable control chars
 		for _, c := range b {
 			if c < 0x20 && c != '\n' && c != '\r' && c != '\t' {
 				return formatHex(b)
@@ -270,13 +272,13 @@ func snmpValueToString(pdu gosnmp.SnmpPDU) string {
 	case gosnmp.ObjectIdentifier:
 		return pdu.Value.(string)
 	case gosnmp.Counter32:
-		return fmt.Sprintf("%d", pdu.Value.(uint))
+		return strconv.FormatUint(uint64(pdu.Value.(uint)), 10)
 	case gosnmp.Counter64:
-		return fmt.Sprintf("%d", pdu.Value.(uint64))
+		return strconv.FormatUint(pdu.Value.(uint64), 10)
 	case gosnmp.Gauge32:
-		return fmt.Sprintf("%d", pdu.Value.(uint))
+		return strconv.FormatUint(uint64(pdu.Value.(uint)), 10)
 	case gosnmp.TimeTicks:
-		return fmt.Sprintf("%d", pdu.Value.(uint32))
+		return strconv.FormatUint(uint64(pdu.Value.(uint32)), 10)
 	case gosnmp.IPAddress:
 		return pdu.Value.(string)
 	case gosnmp.Null, gosnmp.NoSuchObject, gosnmp.NoSuchInstance, gosnmp.EndOfMibView:
@@ -292,16 +294,15 @@ func formatHex(b []byte) string {
 	if len(b) == 0 {
 		return ""
 	}
-	parts := make([]string, len(b))
-	for i, v := range b {
-		parts[i] = fmt.Sprintf("%02x", v)
-	}
-	result := ""
-	for i, p := range parts {
+	h := hex.EncodeToString(b)
+	var buf strings.Builder
+	buf.Grow(len(h) + len(b) - 1)
+	for i := 0; i < len(h); i += 2 {
 		if i > 0 {
-			result += ":"
+			buf.WriteByte(':')
 		}
-		result += p
+		buf.WriteByte(h[i])
+		buf.WriteByte(h[i+1])
 	}
-	return result
+	return buf.String()
 }
