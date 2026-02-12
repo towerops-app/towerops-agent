@@ -165,20 +165,14 @@ func TestHandleMessage(t *testing.T) {
 	})
 
 	t.Run("restart", func(t *testing.T) {
-		origExit := osExit
-		defer func() { osExit = origExit }()
-
-		var exitCode int
-		osExit = func(code int) { exitCode = code }
-
 		snmpCh := make(chan *pb.SnmpResult, 1)
 		mtCh := make(chan *pb.MikrotikResult, 1)
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
-		handleMessage(context.Background(), channelMsg{Event: "restart", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh)
+		shouldEnd := handleMessage(context.Background(), channelMsg{Event: "restart", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh)
 
-		if exitCode != 0 {
-			t.Errorf("expected exit code 0, got %d", exitCode)
+		if !shouldEnd {
+			t.Error("expected handleMessage to return true for restart")
 		}
 	})
 
