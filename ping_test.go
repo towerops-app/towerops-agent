@@ -38,6 +38,33 @@ func TestPingDeviceIPv6(t *testing.T) {
 	}
 }
 
+func TestIcmpPingLocalhost(t *testing.T) {
+	ms, err := icmpPing("127.0.0.1", 5000)
+	if err != nil {
+		t.Skipf("ICMP not available: %v", err)
+	}
+	if ms <= 0 {
+		t.Errorf("expected positive response time, got %v", ms)
+	}
+}
+
+func TestIcmpPingIPv6(t *testing.T) {
+	ms, err := icmpPing("::1", 5000)
+	if err != nil {
+		t.Skipf("IPv6 ICMP not available: %v", err)
+	}
+	if ms <= 0 {
+		t.Errorf("expected positive response time, got %v", ms)
+	}
+}
+
+func TestIcmpPingInvalidIP(t *testing.T) {
+	_, err := icmpPing("not-an-ip", 5000)
+	if err == nil {
+		t.Error("expected error for invalid IP")
+	}
+}
+
 func TestParsePingTime(t *testing.T) {
 	tests := []struct {
 		name    string
