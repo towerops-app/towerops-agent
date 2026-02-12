@@ -120,18 +120,23 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	}
 
 	bufPool := &sync.Pool{
-		New: func() any { return make([]byte, 0, 4096) },
+		New: func() any {
+			b := make([]byte, 0, 4096)
+			return &b
+		},
 	}
 
 	sendBinaryResult := func(event string, msg proto.Message) {
-		buf := bufPool.Get().([]byte)[:0]
+		bp := bufPool.Get().(*[]byte)
+		buf := (*bp)[:0]
 		bin, err := proto.MarshalOptions{}.MarshalAppend(buf, msg)
 		if err != nil {
 			slog.Error("marshal protobuf", "error", err)
 			return
 		}
 		encoded := base64.StdEncoding.EncodeToString(bin)
-		bufPool.Put(bin[:0])
+		*bp = bin[:0]
+		bufPool.Put(bp)
 		payload, _ := json.Marshal(map[string]string{"binary": encoded})
 		sendMsg(event, payload)
 	}
