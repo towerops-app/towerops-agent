@@ -244,7 +244,7 @@ func parseMikrotikAttrs(words []string) map[string]string {
 }
 
 // executeMikrotikJob handles a MikroTik API job including backup-via-SSH.
-func executeMikrotikJob(job *pb.AgentJob, resultCh chan<- *pb.MikrotikResult) {
+func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.MikrotikResult) {
 	dev := job.MikrotikDevice
 	if dev == nil {
 		slog.Error("job missing mikrotik device", "job_id", job.JobId)

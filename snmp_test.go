@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -299,7 +300,7 @@ func (m *mockSnmpQuerier) BulkWalkAll(rootOid string) ([]gosnmp.SnmpPDU, error) 
 func TestExecuteSnmpJob(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
 		ch := make(chan *pb.SnmpResult, 1)
-		executeSnmpJob(&pb.AgentJob{JobId: "1"}, ch)
+		executeSnmpJob(context.Background(), &pb.AgentJob{JobId: "1"}, ch)
 		if len(ch) != 0 {
 			t.Error("expected no result for nil device")
 		}
@@ -313,7 +314,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.SnmpResult, 1)
-		executeSnmpJob(&pb.AgentJob{
+		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		}, ch)
@@ -340,7 +341,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.SnmpResult, 1)
-		executeSnmpJob(&pb.AgentJob{
+		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			DeviceId:   "dev-1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
@@ -378,7 +379,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.SnmpResult, 1)
-		executeSnmpJob(&pb.AgentJob{
+		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 			Queries: []*pb.SnmpQuery{
@@ -406,7 +407,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.SnmpResult, 1)
-		executeSnmpJob(&pb.AgentJob{
+		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 			Queries: []*pb.SnmpQuery{
@@ -434,7 +435,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.SnmpResult, 1)
-		executeSnmpJob(&pb.AgentJob{
+		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 			Queries: []*pb.SnmpQuery{
@@ -466,7 +467,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.SnmpResult, 1)
-		executeSnmpJob(&pb.AgentJob{
+		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 			Queries: []*pb.SnmpQuery{
@@ -498,7 +499,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.SnmpResult, 1)
-		executeSnmpJob(&pb.AgentJob{
+		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 			Queries: []*pb.SnmpQuery{
@@ -528,7 +529,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.SnmpResult, 1)
-		executeSnmpJob(&pb.AgentJob{
+		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: "1"},
 			Queries: []*pb.SnmpQuery{
@@ -564,7 +565,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.SnmpResult, 1)
-		executeSnmpJob(&pb.AgentJob{
+		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: "2c"},
 			Queries: []*pb.SnmpQuery{
@@ -598,7 +599,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.SnmpResult) // unbuffered, no reader — will be full
-		executeSnmpJob(&pb.AgentJob{
+		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		}, ch)
@@ -632,7 +633,7 @@ func TestExecuteSnmpJobBatchesGets(t *testing.T) {
 	}
 
 	ch := make(chan *pb.SnmpResult, 1)
-	executeSnmpJob(&pb.AgentJob{
+	executeSnmpJob(context.Background(), &pb.AgentJob{
 		JobId:      "batch-test",
 		DeviceId:   "dev-1",
 		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
@@ -661,7 +662,7 @@ func TestExecuteSnmpJobBatchesGets(t *testing.T) {
 func TestExecuteCredentialTest(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
 		ch := make(chan *pb.CredentialTestResult, 1)
-		executeCredentialTest(&pb.AgentJob{JobId: "1"}, ch)
+		executeCredentialTest(context.Background(), &pb.AgentJob{JobId: "1"}, ch)
 		if len(ch) != 0 {
 			t.Error("expected no result for nil device")
 		}
@@ -675,7 +676,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 		}
 
 		ch := make(chan *pb.CredentialTestResult, 1)
-		executeCredentialTest(&pb.AgentJob{
+		executeCredentialTest(context.Background(), &pb.AgentJob{
 			JobId:      "test-1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		}, ch)
@@ -703,7 +704,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 		}
 
 		ch := make(chan *pb.CredentialTestResult, 1)
-		executeCredentialTest(&pb.AgentJob{
+		executeCredentialTest(context.Background(), &pb.AgentJob{
 			JobId:      "test-1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		}, ch)
@@ -732,7 +733,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 		}
 
 		ch := make(chan *pb.CredentialTestResult, 1)
-		executeCredentialTest(&pb.AgentJob{
+		executeCredentialTest(context.Background(), &pb.AgentJob{
 			JobId:      "test-1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		}, ch)
@@ -760,7 +761,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 		}
 
 		ch := make(chan *pb.CredentialTestResult, 1)
-		executeCredentialTest(&pb.AgentJob{
+		executeCredentialTest(context.Background(), &pb.AgentJob{
 			JobId:      "test-1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		}, ch)

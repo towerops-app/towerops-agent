@@ -222,7 +222,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 				slog.Warn("invalid message", "error", err)
 				continue
 			}
-			handleMessage(msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh)
+			handleMessage(ctx, msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh)
 
 		case result := <-snmpResultCh:
 			snmpBatch = append(snmpBatch, result)
@@ -274,6 +274,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 
 // handleMessage dispatches incoming channel messages.
 func handleMessage(
+	ctx context.Context,
 	msg channelMsg,
 	pools *jobPools,
 	snmpResultCh chan<- *pb.SnmpResult,
@@ -305,7 +306,7 @@ func handleMessage(
 		}
 		slog.Info("received jobs", "count", len(jobList.Jobs))
 		for _, job := range jobList.Jobs {
-			dispatchJob(job, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh)
+			dispatchJob(ctx, job, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh)
 		}
 
 	case "restart":
@@ -340,6 +341,7 @@ type jobPools struct {
 
 // dispatchJob routes a job to the appropriate worker pool.
 func dispatchJob(
+	ctx context.Context,
 	job *pb.AgentJob,
 	pools *jobPools,
 	snmpResultCh chan<- *pb.SnmpResult,
@@ -351,13 +353,13 @@ func dispatchJob(
 
 	switch job.JobType {
 	case pb.JobType_MIKROTIK:
-		pools.mikrotik.submit(func() { executeMikrotikJob(job, mikrotikResultCh) })
+		pools.mikrotik.submit(func() { executeMikrotikJob(ctx, job, mikrotikResultCh) })
 	case pb.JobType_TEST_CREDENTIALS:
-		pools.snmp.submit(func() { executeCredentialTest(job, credTestResultCh) })
+		pools.snmp.submit(func() { executeCredentialTest(ctx, job, credTestResultCh) })
 	case pb.JobType_PING:
-		pools.ping.submit(func() { executePingJob(job, monitoringCheckCh) })
+		pools.ping.submit(func() { executePingJob(ctx, job, monitoringCheckCh) })
 	default:
-		pools.snmp.submit(func() { executeSnmpJob(job, snmpResultCh) })
+		pools.snmp.submit(func() { executeSnmpJob(ctx, job, snmpResultCh) })
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
@@ -47,7 +48,7 @@ func executeMikrotikBackup(ip string, port uint16, username, password string) (s
 }
 
 // executePingJob pings a device and sends a monitoring check result.
-func executePingJob(job *pb.AgentJob, resultCh chan<- *pb.MonitoringCheck) {
+func executePingJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.MonitoringCheck) {
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing device info for ping", "job_id", job.JobId)

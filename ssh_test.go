@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -17,7 +18,7 @@ import (
 func TestExecutePingJob(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
 		ch := make(chan *pb.MonitoringCheck, 1)
-		executePingJob(&pb.AgentJob{JobId: "p1"}, ch)
+		executePingJob(context.Background(), &pb.AgentJob{JobId: "p1"}, ch)
 		if len(ch) != 0 {
 			t.Error("expected no result for nil device")
 		}
@@ -31,7 +32,7 @@ func TestExecutePingJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.MonitoringCheck, 1)
-		executePingJob(&pb.AgentJob{
+		executePingJob(context.Background(), &pb.AgentJob{
 			JobId:      "p1",
 			DeviceId:   "dev-1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
@@ -61,7 +62,7 @@ func TestExecutePingJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.MonitoringCheck, 1)
-		executePingJob(&pb.AgentJob{
+		executePingJob(context.Background(), &pb.AgentJob{
 			JobId:      "p2",
 			DeviceId:   "dev-2",
 			SnmpDevice: &pb.SnmpDevice{Ip: "192.168.1.1"},
@@ -81,7 +82,7 @@ func TestExecutePingJob(t *testing.T) {
 func TestExecuteMikrotikJob(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
 		ch := make(chan *pb.MikrotikResult, 1)
-		executeMikrotikJob(&pb.AgentJob{JobId: "m1"}, ch)
+		executeMikrotikJob(context.Background(), &pb.AgentJob{JobId: "m1"}, ch)
 		if len(ch) != 0 {
 			t.Error("expected no result for nil device")
 		}
@@ -95,7 +96,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.MikrotikResult, 1)
-		executeMikrotikJob(&pb.AgentJob{
+		executeMikrotikJob(context.Background(), &pb.AgentJob{
 			JobId:          "m1",
 			DeviceId:       "dev-1",
 			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
@@ -119,7 +120,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.MikrotikResult, 1)
-		executeMikrotikJob(&pb.AgentJob{
+		executeMikrotikJob(context.Background(), &pb.AgentJob{
 			JobId:    "m1",
 			DeviceId: "dev-1",
 			MikrotikDevice: &pb.MikrotikDevice{
@@ -154,7 +155,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.MikrotikResult, 1)
-		executeMikrotikJob(&pb.AgentJob{
+		executeMikrotikJob(context.Background(), &pb.AgentJob{
 			JobId:          "m1",
 			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
 			MikrotikCommands: []*pb.MikrotikCommand{
@@ -180,7 +181,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.MikrotikResult, 1)
-		executeMikrotikJob(&pb.AgentJob{
+		executeMikrotikJob(context.Background(), &pb.AgentJob{
 			JobId:          "m1",
 			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
 			MikrotikCommands: []*pb.MikrotikCommand{
@@ -203,7 +204,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 		}
 
 		ch := make(chan *pb.MikrotikResult, 1)
-		executeMikrotikJob(&pb.AgentJob{
+		executeMikrotikJob(context.Background(), &pb.AgentJob{
 			JobId:          "backup:dev1",
 			DeviceId:       "dev-1",
 			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", SshPort: 22, Username: "admin", Password: "pass"},
