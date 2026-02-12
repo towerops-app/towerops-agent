@@ -21,6 +21,24 @@ func TestEnvOrDefault(t *testing.T) {
 	}
 }
 
+func TestSanitizeURL(t *testing.T) {
+	tests := []struct {
+		input, want string
+	}{
+		{"wss://towerops.net/socket", "wss://towerops.net/socket"},
+		{"wss://towerops.net/socket?token=secret", "wss://towerops.net/socket?***"},
+		{"wss://towerops.net/socket?token=secret&key=abc", "wss://towerops.net/socket?***"},
+		{"://invalid url", "[invalid URL]"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		got := sanitizeURL(tt.input)
+		if got != tt.want {
+			t.Errorf("sanitizeURL(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
 func TestToWebSocketURL(t *testing.T) {
 	tests := []struct {
 		input, want string

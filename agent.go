@@ -64,7 +64,7 @@ func runAgent(ctx context.Context, wsURL, token string) {
 // runSession runs a single WebSocket session. Returns when disconnected or ctx cancelled.
 func runSession(ctx context.Context, baseURL, token string) error {
 	endpoint := baseURL + "/socket/agent/websocket"
-	slog.Info("connecting", "url", endpoint)
+	slog.Info("connecting", "url", sanitizeURL(endpoint))
 
 	ws, err := WSDial(endpoint)
 	if err != nil {
@@ -372,6 +372,17 @@ func nextBackoff(current, maxDelay time.Duration) time.Duration {
 	}
 	jitter := time.Duration(rand.Int64N(int64(next / 4)))
 	return next + jitter
+}
+
+// zeroBytes overwrites a byte slice with zeros.
+// SECURITY: Go strings are immutable and cannot be zeroed in place. This utility
+// is for zeroing byte slices (e.g., password buffers) to limit credential lifetime
+// in memory. Credentials stored as Go strings (ssh.go, snmp.go, mikrotik.go)
+// cannot benefit from this until the protocol layer supports []byte credentials.
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }
 
 func strPtr(s string) *string { return &s }
