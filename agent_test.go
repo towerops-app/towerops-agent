@@ -336,6 +336,28 @@ func TestHandleMessage(t *testing.T) {
 	})
 }
 
+func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
+	snmpCh := make(chan *pb.SnmpResult, 1)
+	mtCh := make(chan *pb.MikrotikResult, 1)
+	credCh := make(chan *pb.CredentialTestResult, 1)
+	monCh := make(chan *pb.MonitoringCheck, 1)
+
+	// Create a binary payload larger than maxJobPayloadBytes
+	oversized := make([]byte, maxJobPayloadBytes+1)
+	encoded := base64.StdEncoding.EncodeToString(oversized)
+	payload, _ := json.Marshal(map[string]string{"binary": encoded})
+
+	handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh)
+
+	// Verify no jobs were dispatched
+	select {
+	case <-snmpCh:
+		t.Error("expected no SNMP result for oversized payload")
+	case <-time.After(100 * time.Millisecond):
+		// Good — nothing dispatched
+	}
+}
+
 func TestZeroBytes(t *testing.T) {
 	b := []byte{1, 2, 3, 4, 5}
 	zeroBytes(b)

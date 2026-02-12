@@ -22,6 +22,8 @@ import (
 var osExit = os.Exit
 var doSelfUpdate = selfUpdate
 
+const maxJobPayloadBytes = 4 << 20 // 4 MB — well above any legitimate job list
+
 // channelMsg is the WebSocket channel message format (JSON wrapper around binary protobuf).
 type channelMsg struct {
 	Topic   string          `json:"topic"`
@@ -157,12 +159,17 @@ func runSession(ctx context.Context, baseURL, token string) error {
 
 	// Writer goroutine - serializes all writes to the WebSocket
 	var writerWg sync.WaitGroup
+	writeErrCh := make(chan error, 1)
 	writerWg.Add(1)
 	go func() {
 		defer writerWg.Done()
 		for data := range writeCh {
 			if err := ws.WriteText(data); err != nil {
 				slog.Error("websocket write", "error", err)
+				select {
+				case writeErrCh <- err:
+				default:
+				}
 				return
 			}
 		}
@@ -221,6 +228,10 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		case err := <-errCh:
 			flushSnmpBatch()
 			return fmt.Errorf("read: %w", err)
+
+		case err := <-writeErrCh:
+			flushSnmpBatch()
+			return fmt.Errorf("write: %w", err)
 
 		case data := <-msgCh:
 			var msg channelMsg
@@ -300,6 +311,10 @@ func handleMessage(
 			slog.Error("decode job payload", "error", err)
 			return
 		}
+		if len(payload.Binary) > maxJobPayloadBytes {
+			slog.Error("job payload too large", "size", len(payload.Binary), "max", maxJobPayloadBytes)
+			return
+		}
 		bin, err := base64.StdEncoding.DecodeString(payload.Binary)
 		if err != nil {
 			slog.Error("decode base64", "error", err)
@@ -357,15 +372,19 @@ func dispatchJob(
 ) {
 	slog.Info("starting job", "job_id", job.JobId, "type", job.JobType)
 
+	var ok bool
 	switch job.JobType {
 	case pb.JobType_MIKROTIK:
-		pools.mikrotik.submit(func() { executeMikrotikJob(ctx, job, mikrotikResultCh) })
+		ok = pools.mikrotik.submit(ctx, func() { executeMikrotikJob(ctx, job, mikrotikResultCh) })
 	case pb.JobType_TEST_CREDENTIALS:
-		pools.snmp.submit(func() { executeCredentialTest(ctx, job, credTestResultCh) })
+		ok = pools.snmp.submit(ctx, func() { executeCredentialTest(ctx, job, credTestResultCh) })
 	case pb.JobType_PING:
-		pools.ping.submit(func() { executePingJob(ctx, job, monitoringCheckCh) })
+		ok = pools.ping.submit(ctx, func() { executePingJob(ctx, job, monitoringCheckCh) })
 	default:
-		pools.snmp.submit(func() { executeSnmpJob(ctx, job, snmpResultCh) })
+		ok = pools.snmp.submit(ctx, func() { executeSnmpJob(ctx, job, snmpResultCh) })
+	}
+	if !ok {
+		slog.Warn("job dropped, pool full", "job_id", job.JobId)
 	}
 }
 
