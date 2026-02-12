@@ -270,6 +270,40 @@ func TestExecuteMikrotikBackupViaSSH(t *testing.T) {
 	})
 }
 
+func TestSSHBackupIPv6Address(t *testing.T) {
+	origDial := sshDial
+	defer func() { sshDial = origDial }()
+
+	var capturedAddr string
+	sshDial = func(network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
+		capturedAddr = addr
+		return nil, fmt.Errorf("mock dial")
+	}
+
+	_, _ = executeMikrotikBackup("::1", 22, "admin", "pass")
+
+	if capturedAddr != "[::1]:22" {
+		t.Errorf("expected [::1]:22, got %q", capturedAddr)
+	}
+}
+
+func TestSSHBackupIPv4Address(t *testing.T) {
+	origDial := sshDial
+	defer func() { sshDial = origDial }()
+
+	var capturedAddr string
+	sshDial = func(network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
+		capturedAddr = addr
+		return nil, fmt.Errorf("mock dial")
+	}
+
+	_, _ = executeMikrotikBackup("10.0.0.1", 22, "admin", "pass")
+
+	if capturedAddr != "10.0.0.1:22" {
+		t.Errorf("expected 10.0.0.1:22, got %q", capturedAddr)
+	}
+}
+
 func TestExecuteMikrotikBackupDialError(t *testing.T) {
 	_, err := executeMikrotikBackup("127.0.0.1", 1, "admin", "pass")
 	if err == nil {
