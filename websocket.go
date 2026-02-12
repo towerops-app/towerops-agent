@@ -180,44 +180,32 @@ func (ws *WSConn) writeFrame(opcode int, payload []byte) error {
 	defer ws.mu.Unlock()
 
 	length := len(payload)
-	// Max header: 2 + 8 + 4 (mask) = 14 bytes
-	header := make([]byte, 2, 14)
-	header[0] = 0x80 | byte(opcode) // FIN + opcode
-	header[1] = 0x80                // masked (client must mask)
+	// Single buffer: max header (2+8+4=14) + payload
+	buf := make([]byte, 0, 14+length)
 
+	// Header
+	buf = append(buf, 0x80|byte(opcode)) // FIN + opcode
 	switch {
 	case length <= 125:
-		header[1] |= byte(length)
+		buf = append(buf, 0x80|byte(length))
 	case length <= 65535:
-		header[1] |= 126
-		ext := make([]byte, 2)
-		binary.BigEndian.PutUint16(ext, uint16(length))
-		header = append(header, ext...)
+		buf = append(buf, 0x80|126, byte(length>>8), byte(length))
 	default:
-		header[1] |= 127
-		ext := make([]byte, 8)
-		binary.BigEndian.PutUint64(ext, uint64(length))
-		header = append(header, ext...)
+		buf = append(buf, 0x80|127,
+			byte(length>>56), byte(length>>48), byte(length>>40), byte(length>>32),
+			byte(length>>24), byte(length>>16), byte(length>>8), byte(length))
 	}
 
-	// Generate mask key
-	maskKey := make([]byte, 4)
-	_, _ = rand.Read(maskKey)
-	header = append(header, maskKey...)
+	// Mask key
+	var maskKey [4]byte
+	_, _ = rand.Read(maskKey[:])
+	buf = append(buf, maskKey[:]...)
 
-	// Mask payload
-	masked := make([]byte, length)
-	for i := range payload {
-		masked[i] = payload[i] ^ maskKey[i%4]
+	// Masked payload
+	for i, b := range payload {
+		buf = append(buf, b^maskKey[i%4])
 	}
 
-	if _, err := ws.conn.Write(header); err != nil {
-		return err
-	}
-	if length > 0 {
-		if _, err := ws.conn.Write(masked); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := ws.conn.Write(buf)
+	return err
 }

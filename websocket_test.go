@@ -283,30 +283,6 @@ func TestWriteFrameHeaderError(t *testing.T) {
 	}
 }
 
-func TestWriteFramePayloadError(t *testing.T) {
-	// Writer that succeeds for header but fails for payload
-	ws := testWSConn(&failOnNthWrite{failAfter: 1})
-	err := ws.writeFrame(opText, []byte("hello"))
-	if err == nil {
-		t.Error("expected write error on payload")
-	}
-}
-
-// failOnNthWrite fails after N successful writes.
-type failOnNthWrite struct {
-	failAfter int
-	count     int
-}
-
-func (f *failOnNthWrite) Read(p []byte) (int, error) { return 0, io.EOF }
-func (f *failOnNthWrite) Write(p []byte) (int, error) {
-	f.count++
-	if f.count > f.failAfter {
-		return 0, fmt.Errorf("write failed")
-	}
-	return len(p), nil
-}
-func (f *failOnNthWrite) Close() error { return nil }
 
 func TestReadMessageError(t *testing.T) {
 	// Empty buffer causes immediate EOF on readFrame
