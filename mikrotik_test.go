@@ -567,6 +567,34 @@ func TestReadLength5ByteError(t *testing.T) {
 	}
 }
 
+func TestReadWordExceedsMaxSize(t *testing.T) {
+	oversize := maxMikrotikWordSize + 1
+	var buf bytes.Buffer
+	buf.Write(encodeLength(oversize))
+	// Don't need to write the payload — should reject before reading it
+	c := &mikrotikClient{conn: &nopCloser{readWriter: &buf}}
+	_, err := c.readWord()
+	if err == nil {
+		t.Error("expected error for word exceeding max size")
+	}
+	if !containsStr(err.Error(), "exceeds max") {
+		t.Errorf("expected 'exceeds max' in error, got: %v", err)
+	}
+}
+
+func containsStr(s, sub string) bool {
+	return len(s) >= len(sub) && searchStr(s, sub)
+}
+
+func searchStr(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
 func TestReadSentenceError(t *testing.T) {
 	// Buffer with valid length byte but truncated word data
 	buf := bytes.NewBuffer([]byte{0x03, 'a'}) // length=3 but only 1 byte of data
