@@ -10,9 +10,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION}" -o towerops-agent .
 
 FROM alpine:3.23
-RUN apk add --no-cache ca-certificates iputils libcap && \
-    setcap cap_net_raw+p /bin/ping
+RUN apk add --no-cache ca-certificates iputils libcap
 COPY --from=builder /app/towerops-agent /usr/local/bin/towerops-agent
-RUN adduser -D -u 1000 towerops && chown towerops /usr/local/bin/towerops-agent
+RUN adduser -D -u 1000 towerops && \
+    chown towerops /usr/local/bin/towerops-agent && \
+    setcap cap_net_raw+ep /usr/local/bin/towerops-agent && \
+    setcap cap_net_raw+p /bin/ping
 USER towerops
 CMD ["towerops-agent"]

@@ -16,7 +16,8 @@ import (
 )
 
 // icmpPing sends a single ICMP echo request and returns the round-trip time in milliseconds.
-// Uses unprivileged UDP sockets where available, falling back to raw sockets.
+// Tries raw ICMP sockets first (requires CAP_NET_RAW or root), then falls back to
+// unprivileged UDP-based ICMP (requires ping_group_range sysctl).
 func icmpPing(ip string, timeoutMs int) (float64, error) {
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil {
@@ -24,25 +25,49 @@ func icmpPing(ip string, timeoutMs int) (float64, error) {
 	}
 
 	isIPv4 := parsedIP.To4() != nil
-	var network string
-	var dst net.Addr
-	var msgType icmp.Type
 
+	// Try raw ICMP first (works with CAP_NET_RAW or as root)
+	var rawNet string
 	if isIPv4 {
-		network = "udp4"
-		dst = &net.UDPAddr{IP: parsedIP}
-		msgType = ipv4.ICMPTypeEcho
+		rawNet = "ip4:icmp"
 	} else {
-		network = "udp6"
-		dst = &net.UDPAddr{IP: parsedIP}
-		msgType = ipv6.ICMPTypeEchoRequest
+		rawNet = "ip6:ipv6-icmp"
+	}
+	ms, err := doICMPPing(parsedIP, rawNet, isIPv4, timeoutMs)
+	if err == nil {
+		return ms, nil
+	}
+	if _, ok := err.(*errICMPUnavailable); !ok {
+		return 0, err
 	}
 
+	// Fall back to unprivileged UDP ICMP (works with ping_group_range sysctl)
+	var udpNet string
+	if isIPv4 {
+		udpNet = "udp4"
+	} else {
+		udpNet = "udp6"
+	}
+	return doICMPPing(parsedIP, udpNet, isIPv4, timeoutMs)
+}
+
+// doICMPPing performs an ICMP ping over the given network type.
+func doICMPPing(ip net.IP, network string, isIPv4 bool, timeoutMs int) (float64, error) {
 	conn, err := icmp.ListenPacket(network, "")
 	if err != nil {
-		return 0, &errICMPUnavailable{err: fmt.Errorf("icmp listen: %w", err)}
+		return 0, &errICMPUnavailable{err: fmt.Errorf("icmp listen %s: %w", network, err)}
 	}
 	defer func() { _ = conn.Close() }()
+
+	var msgType icmp.Type
+	var proto int
+	if isIPv4 {
+		msgType = ipv4.ICMPTypeEcho
+		proto = 1
+	} else {
+		msgType = ipv6.ICMPTypeEchoRequest
+		proto = 58
+	}
 
 	id := os.Getpid() & 0xffff
 	msg := icmp.Message{
@@ -55,16 +80,17 @@ func icmpPing(ip string, timeoutMs int) (float64, error) {
 		},
 	}
 
-	var proto int
-	if isIPv4 {
-		proto = 1 // ICMP
-	} else {
-		proto = 58 // ICMPv6
-	}
-
 	wb, err := msg.Marshal(nil)
 	if err != nil {
 		return 0, fmt.Errorf("icmp marshal: %w", err)
+	}
+
+	// Destination address type depends on network
+	var dst net.Addr
+	if strings.HasPrefix(network, "udp") {
+		dst = &net.UDPAddr{IP: ip}
+	} else {
+		dst = &net.IPAddr{IP: ip}
 	}
 
 	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
