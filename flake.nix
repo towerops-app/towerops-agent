@@ -19,11 +19,20 @@
             pkgs.protobuf
             pkgs.protoc-gen-go
             pkgs.git
+            pkgs.gopls
+            pkgs.delve
           ];
 
           env = {
             PROTOC = "${pkgs.protobuf}/bin/protoc";
           };
+
+          shellHook = ''
+            echo "towerops-agent dev shell"
+            echo "  go test ./...    - run tests"
+            echo "  go build ./...   - build"
+            echo "  make proto       - regenerate protobuf"
+          '';
         };
       });
 }
