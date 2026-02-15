@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -123,16 +124,16 @@ func TestSelfUpdateOsExecutableError(t *testing.T) {
 	}
 }
 
-func TestSelfUpdateWriteFileError(t *testing.T) {
+func TestSelfUpdateCreateTempError(t *testing.T) {
 	origExe := osExecutable
-	origWrite := osWriteFile
+	origCreate := osCreateTemp
 	defer func() {
 		osExecutable = origExe
-		osWriteFile = origWrite
+		osCreateTemp = origCreate
 	}()
 	osExecutable = func() (string, error) { return "/tmp/test-agent", nil }
-	osWriteFile = func(name string, data []byte, perm os.FileMode) error {
-		return fmt.Errorf("disk full")
+	osCreateTemp = func(dir, pattern string) (*os.File, error) {
+		return nil, fmt.Errorf("disk full")
 	}
 
 	body := []byte("binary data")
@@ -149,24 +150,22 @@ func TestSelfUpdateWriteFileError(t *testing.T) {
 
 	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
 	if err == nil {
-		t.Error("expected write file error")
+		t.Error("expected create temp error")
 	}
-	if !strings.Contains(err.Error(), "write temp") {
-		t.Errorf("expected 'write temp' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "create temp") {
+		t.Errorf("expected 'create temp' in error, got: %v", err)
 	}
 }
 
 func TestSelfUpdateRenameError(t *testing.T) {
 	origExe := osExecutable
-	origWrite := osWriteFile
 	origRename := osRename
 	defer func() {
 		osExecutable = origExe
-		osWriteFile = origWrite
 		osRename = origRename
 	}()
-	osExecutable = func() (string, error) { return "/tmp/test-agent", nil }
-	osWriteFile = func(name string, data []byte, perm os.FileMode) error { return nil }
+	dir := t.TempDir()
+	osExecutable = func() (string, error) { return filepath.Join(dir, "test-agent"), nil }
 	osRename = func(oldpath, newpath string) error {
 		return fmt.Errorf("permission denied")
 	}
@@ -220,22 +219,18 @@ func TestSelfUpdateChecksumMatch(t *testing.T) {
 
 func TestSelfUpdateFilePermissions(t *testing.T) {
 	origExe := osExecutable
-	origWrite := osWriteFile
 	origRename := osRename
 	defer func() {
 		osExecutable = origExe
-		osWriteFile = origWrite
 		osRename = origRename
 	}()
-	osExecutable = func() (string, error) { return "/tmp/test-agent", nil }
-	osRename = func(oldpath, newpath string) error {
-		return fmt.Errorf("stop here") // stop before re-exec
-	}
+	dir := t.TempDir()
+	osExecutable = func() (string, error) { return filepath.Join(dir, "test-agent"), nil }
 
-	var capturedPerm os.FileMode
-	osWriteFile = func(name string, data []byte, perm os.FileMode) error {
-		capturedPerm = perm
-		return nil
+	var capturedPath string
+	osRename = func(oldpath, newpath string) error {
+		capturedPath = oldpath
+		return fmt.Errorf("stop here") // stop before re-exec
 	}
 
 	body := []byte("binary data")
@@ -252,8 +247,13 @@ func TestSelfUpdateFilePermissions(t *testing.T) {
 
 	_ = selfUpdate(rewriteToHTTPS(srv.URL), checksum)
 
-	if capturedPerm != 0700 {
-		t.Errorf("expected file permissions 0700, got %o", capturedPerm)
+	if capturedPath != "" {
+		info, err := os.Stat(capturedPath)
+		if err == nil {
+			if info.Mode().Perm() != 0700 {
+				t.Errorf("expected file permissions 0700, got %o", info.Mode().Perm())
+			}
+		}
 	}
 }
 

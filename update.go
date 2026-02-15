@@ -9,12 +9,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 )
 
 var osExecutable = os.Executable
-var osWriteFile = os.WriteFile
+var osCreateTemp = os.CreateTemp
 var osRename = os.Rename
 var httpGet = http.Get
 var maxUpdateSize int64 = 100 << 20 // 100 MB
@@ -60,20 +61,44 @@ func selfUpdate(downloadURL, expectedChecksum string) error {
 	}
 	slog.Info("checksum verified")
 
-	// Write to temp file next to current binary
+	// Write to temp file in same directory as binary (ensures same filesystem for atomic rename)
 	currentExe, err := osExecutable()
 	if err != nil {
 		return fmt.Errorf("get executable path: %w", err)
 	}
-	tempPath := currentExe + ".update"
 
-	if err := osWriteFile(tempPath, body, 0700); err != nil {
+	tempFile, err := osCreateTemp(filepath.Dir(currentExe), ".towerops-update-*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tempPath := tempFile.Name()
+	defer func() { _ = os.Remove(tempPath) }() // cleanup on any failure
+
+	if _, err := tempFile.Write(body); err != nil {
+		_ = tempFile.Close()
 		return fmt.Errorf("write temp: %w", err)
 	}
+	if err := tempFile.Chmod(0700); err != nil {
+		_ = tempFile.Close()
+		return fmt.Errorf("chmod temp: %w", err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("close temp: %w", err)
+	}
 
-	// Replace current binary
+	// Re-verify checksum by reading back the written file
+	written, err := os.ReadFile(tempPath)
+	if err != nil {
+		return fmt.Errorf("re-read temp: %w", err)
+	}
+	recheck := fmt.Sprintf("%x", sha256.Sum256(written))
+	if subtle.ConstantTimeCompare([]byte(recheck), []byte(expectedChecksum)) != 1 {
+		return fmt.Errorf("re-verify checksum mismatch: expected %s, got %s", expectedChecksum, recheck)
+	}
+	slog.Info("re-verified checksum after write")
+
+	// Replace current binary (atomic on same filesystem)
 	if err := osRename(tempPath, currentExe); err != nil {
-		_ = os.Remove(tempPath)
 		return fmt.Errorf("rename: %w", err)
 	}
 	slog.Info("binary replaced", "path", currentExe)

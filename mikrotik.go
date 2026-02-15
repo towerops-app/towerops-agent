@@ -42,14 +42,25 @@ func mikrotikConnect(ip string, port uint32, username, password string, useSSL b
 	var err error
 
 	if useSSL {
-		// SECURITY: InsecureSkipVerify is required because MikroTik devices use
-		// self-signed certificates. The agent connects to customer-configured IPs
-		// on private networks where CA-signed certs are not available.
+		// SECURITY: InsecureSkipVerify is used because MikroTik devices use
+		// self-signed certificates. TOFU verification of the cert fingerprint
+		// is performed after the handshake to detect MITM attacks.
 		dialer := &tls.Dialer{
 			NetDialer: &net.Dialer{Timeout: mikrotikConnTimeout},
 			Config:    &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
 		}
 		conn, err = dialer.DialContext(context.Background(), "tcp", addr)
+		if err == nil {
+			// Verify TLS cert fingerprint via TOFU
+			tlsConn, ok := conn.(*tls.Conn)
+			if ok && len(tlsConn.ConnectionState().PeerCertificates) > 0 {
+				fp := tlsCertFingerprint(tlsConn.ConnectionState().PeerCertificates[0])
+				if verifyErr := getHostKeyStore().verify("tls:"+addr, fp); verifyErr != nil {
+					_ = conn.Close()
+					return nil, fmt.Errorf("TLS TOFU verification failed for %s: %w", addr, verifyErr)
+				}
+			}
+		}
 	} else {
 		conn, err = net.DialTimeout("tcp", addr, mikrotikConnTimeout)
 	}
