@@ -168,7 +168,14 @@ func (ws *WSConn) Close() error {
 	return ws.conn.Close()
 }
 
+const wsReadTimeout = 90 * time.Second
+
 func (ws *WSConn) readFrame() (opcode int, payload []byte, err error) {
+	// Set read deadline to detect dead connections (MEDIUM-4)
+	if nc, ok := ws.conn.(net.Conn); ok {
+		_ = nc.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	}
+
 	var header [2]byte
 	if _, err = io.ReadFull(ws.reader, header[:]); err != nil {
 		return 0, nil, err

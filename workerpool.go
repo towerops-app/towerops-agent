@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 )
 
@@ -26,7 +27,7 @@ func newWorkerPool(n int) *workerPool {
 				func() {
 					defer func() {
 						if r := recover(); r != nil {
-							slog.Error("worker panic recovered", "error", r)
+							slog.Error("worker panic recovered", "error", r, "stack", string(debug.Stack()))
 						}
 					}()
 					fn()

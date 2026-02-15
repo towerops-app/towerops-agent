@@ -40,6 +40,11 @@ func TestSanitizeURL(t *testing.T) {
 }
 
 func TestToWebSocketURL(t *testing.T) {
+	// Enable insecure for testing plaintext conversions
+	origInsecure := insecureFlag
+	defer func() { insecureFlag = origInsecure }()
+	insecureFlag = true
+
 	tests := []struct {
 		input, want string
 	}{
