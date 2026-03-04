@@ -1,7 +1,7 @@
 package main
 
 import (
-	"os"
+	"crypto/x509"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -116,7 +116,20 @@ func TestHostKeyStoreSaveError(t *testing.T) {
 }
 
 func TestTlsCertFingerprint(t *testing.T) {
-	// Just verify it doesn't panic with nil - we test with real certs in integration
-	// The function is simple enough: sha256 of cert.Raw
-	_ = os.Getenv("dummy") // placeholder
+	cert := &x509.Certificate{
+		Raw: []byte("test certificate data"),
+	}
+	fp := tlsCertFingerprint(cert)
+	if fp == "" {
+		t.Error("expected non-empty fingerprint")
+	}
+	// Verify it's a hex-encoded SHA256 (64 chars)
+	if len(fp) != 64 {
+		t.Errorf("expected 64-char hex fingerprint, got %d chars: %s", len(fp), fp)
+	}
+	// Same input should produce same output
+	fp2 := tlsCertFingerprint(cert)
+	if fp != fp2 {
+		t.Error("fingerprint not deterministic")
+	}
 }

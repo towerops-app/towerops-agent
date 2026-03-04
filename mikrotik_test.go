@@ -2,10 +2,21 @@ package main
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
+	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestEncodeLength(t *testing.T) {
@@ -467,6 +478,78 @@ func TestMikrotikConnectSSL(t *testing.T) {
 	}
 }
 
+func TestMikrotikConnectSSLWithServer(t *testing.T) {
+	// Generate a self-signed cert at runtime
+	cert := generateTestCert(t)
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", tlsConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	// Reset host key store for this test
+	origStore := globalHostKeys
+	defer func() {
+		hostKeysOnce = sync.Once{}
+		globalHostKeys = origStore
+	}()
+	hostKeysOnce = sync.Once{}
+	t.Setenv("TOWEROPS_HOST_KEYS_FILE", filepath.Join(t.TempDir(), "hosts.json"))
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		sc := &mikrotikClient{conn: conn}
+		_, _ = sc.readSentence()
+		_ = sc.writeSentence([]string{"!done"})
+		_, _ = sc.readSentence()
+		_ = sc.writeSentence([]string{"!fatal"})
+	}()
+
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	var portNum uint32
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
+
+	client, err := mikrotikConnect("127.0.0.1", portNum, "admin", "pass", true)
+	if err != nil {
+		t.Fatalf("expected TLS connection to succeed: %v", err)
+	}
+	_ = client.close()
+}
+
+func generateTestCert(t *testing.T) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tlsCert
+}
+
 func TestReadResponseEmptySentence(t *testing.T) {
 	// An empty sentence (just the terminator byte) should be skipped
 	var buf bytes.Buffer
@@ -635,4 +718,52 @@ func (rwc *readWriteCloser) Close() error {
 		return c.Close()
 	}
 	return nil
+}
+
+func TestMikrotikConnectSSLTOFUMismatch(t *testing.T) {
+	cert := generateTestCert(t)
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", tlsConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	// Reset host key store and pre-populate with wrong fingerprint
+	origStore := globalHostKeys
+	defer func() {
+		hostKeysOnce = sync.Once{}
+		globalHostKeys = origStore
+	}()
+	hostKeysOnce = sync.Once{}
+	t.Setenv("TOWEROPS_HOST_KEYS_FILE", filepath.Join(t.TempDir(), "hosts.json"))
+
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	var portNum uint32
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
+
+	// Pre-register wrong fingerprint so TOFU verification fails
+	store := getHostKeyStore()
+	store.keys["tls:"+net.JoinHostPort("127.0.0.1", port)] = "wrong_fingerprint"
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		// Complete TLS handshake so client gets peer certificates
+		if tlsConn, ok := conn.(*tls.Conn); ok {
+			_ = tlsConn.Handshake()
+		}
+		time.Sleep(time.Second)
+	}()
+
+	_, err = mikrotikConnect("127.0.0.1", portNum, "admin", "pass", true)
+	if err == nil {
+		t.Error("expected TOFU verification failure")
+	}
+	if !strings.Contains(err.Error(), "TOFU verification failed") {
+		t.Errorf("expected 'TOFU verification failed' in error, got: %v", err)
+	}
 }

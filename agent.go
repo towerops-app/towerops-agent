@@ -25,6 +25,8 @@ var doSelfUpdate = selfUpdate
 
 var errRestartRequested = fmt.Errorf("restart requested")
 var joinTimeout = 10 * time.Second
+var heartbeatInterval = 60 * time.Second
+var channelHeartbeatInterval = 25 * time.Second
 
 const maxJobPayloadBytes = 4 << 20 // 4 MB — well above any legitimate job list
 
@@ -224,9 +226,9 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		}
 	}()
 
-	heartbeatTicker := time.NewTicker(60 * time.Second)
+	heartbeatTicker := time.NewTicker(heartbeatInterval)
 	defer heartbeatTicker.Stop()
-	channelHeartbeatTicker := time.NewTicker(25 * time.Second)
+	channelHeartbeatTicker := time.NewTicker(channelHeartbeatInterval)
 	defer channelHeartbeatTicker.Stop()
 	flushTicker := time.NewTicker(100 * time.Millisecond)
 	defer flushTicker.Stop()
