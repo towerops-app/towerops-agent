@@ -76,10 +76,9 @@ func TestHostKeyStoreConcurrency(t *testing.T) {
 
 func TestGetHostKeyStoreDefault(t *testing.T) {
 	// Reset the once for testing
-	origOnce := hostKeysOnce
 	origStore := globalHostKeys
 	defer func() {
-		hostKeysOnce = origOnce
+		hostKeysOnce = sync.Once{}
 		globalHostKeys = origStore
 	}()
 	hostKeysOnce = sync.Once{}
@@ -93,10 +92,9 @@ func TestGetHostKeyStoreDefault(t *testing.T) {
 
 func TestSSHHostKeyCallback(t *testing.T) {
 	// Reset global state
-	origOnce := hostKeysOnce
 	origStore := globalHostKeys
 	defer func() {
-		hostKeysOnce = origOnce
+		hostKeysOnce = sync.Once{}
 		globalHostKeys = origStore
 	}()
 	hostKeysOnce = sync.Once{}
