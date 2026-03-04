@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"strings"
@@ -52,27 +53,46 @@ var tlsDial = func(network, addr string) (net.Conn, error) {
 }
 
 // WSDial connects to a WebSocket endpoint and performs the HTTP upgrade handshake.
+// If the initial connection attempt fails (e.g. server returns 403 over IPv6),
+// it retries with IPv4 only.
 func WSDial(rawURL string) (*WSConn, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse url: %w", err)
 	}
 
-	useTLS := u.Scheme == "wss"
 	host := u.Host
 	if !strings.Contains(host, ":") {
-		if useTLS {
+		if u.Scheme == "wss" {
 			host += ":443"
 		} else {
 			host += ":80"
 		}
 	}
 
+	ws, err := wsConnect(u, host, "tcp")
+	if err != nil {
+		slog.Warn("connection failed, retrying with IPv4", "error", err)
+		ws, err4 := wsConnect(u, host, "tcp4")
+		if err4 != nil {
+			return nil, err // return original error
+		}
+		return ws, nil
+	}
+	return ws, nil
+}
+
+// wsConnect dials the host using the given network ("tcp", "tcp4", "tcp6")
+// and performs the WebSocket upgrade handshake.
+func wsConnect(u *url.URL, host, network string) (*WSConn, error) {
+	useTLS := u.Scheme == "wss"
+
 	var conn net.Conn
+	var err error
 	if useTLS {
-		conn, err = tlsDial("tcp", host)
+		conn, err = tlsDial(network, host)
 	} else {
-		conn, err = netDial("tcp", host)
+		conn, err = netDial(network, host)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", host, err)
