@@ -755,8 +755,31 @@ func makeTextFrame(payload []byte) []byte {
 }
 
 func TestDispatchJobCancelledContext(t *testing.T) {
-	// submit returns false when context is cancelled, triggering "pool full" log
-	p := testPools(t)
+	// Use pools with size 1 (1 worker + 4 queue slots) and fill them
+	// so that submit reliably fails with cancelled context.
+	p := &jobPools{
+		snmp:     newWorkerPool(1),
+		mikrotik: newWorkerPool(1),
+		ping:     newWorkerPool(1),
+		checks:   newWorkerPool(1),
+	}
+	t.Cleanup(func() { p.snmp.stop(); p.mikrotik.stop(); p.ping.stop(); p.checks.stop() })
+
+	done := make(chan struct{})
+
+	// Block each pool's worker + fill queue slots
+	fillPool := func(pool *workerPool) {
+		started := make(chan struct{})
+		pool.submit(context.Background(), func() { close(started); <-done })
+		<-started
+		for range 4 {
+			pool.submit(context.Background(), func() { <-done })
+		}
+	}
+	fillPool(p.snmp)
+	fillPool(p.mikrotik)
+	fillPool(p.ping)
+
 	snmpCh := make(chan *pb.SnmpResult, 1)
 	mtCh := make(chan *pb.MikrotikResult, 1)
 	credCh := make(chan *pb.CredentialTestResult, 1)
@@ -764,9 +787,9 @@ func TestDispatchJobCancelledContext(t *testing.T) {
 	checkCh := make(chan *pb.CheckResult, 1)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
+	cancel()
 
-	// All dispatch types should handle ctx cancellation gracefully
+	// All dispatch types should hit the "pool full" warning
 	dispatchJob(ctx, &pb.AgentJob{
 		JobId: "s1", JobType: pb.JobType_POLL, SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 	}, p, snmpCh, mtCh, credCh, monCh, checkCh)
@@ -782,6 +805,8 @@ func TestDispatchJobCancelledContext(t *testing.T) {
 	dispatchJob(ctx, &pb.AgentJob{
 		JobId: "p1", JobType: pb.JobType_PING, SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 	}, p, snmpCh, mtCh, credCh, monCh, checkCh)
+
+	close(done)
 }
 
 // fakeWSServer is a test helper that sets up a WebSocket server for runSession tests.
@@ -1392,7 +1417,8 @@ func TestRunSessionSnmpBatchThreshold(t *testing.T) {
 }
 
 func TestExecuteCheckPoolFull(t *testing.T) {
-	// Use a pool with 1 worker and 1 queue slot, then fill both
+	// newWorkerPool(1) creates 1 worker goroutine + queue buffer of 1*4=4
+	// We need to block the worker AND fill all 4 queue slots to make submit block.
 	p := &jobPools{
 		snmp:     newWorkerPool(4),
 		mikrotik: newWorkerPool(4),
@@ -1411,10 +1437,12 @@ func TestExecuteCheckPoolFull(t *testing.T) {
 	})
 	<-started
 
-	// Fill the queue slot
-	p.checks.submit(context.Background(), func() { <-done })
+	// Fill all 4 queue slots
+	for range 4 {
+		p.checks.submit(context.Background(), func() { <-done })
+	}
 
-	// Pool is now full — submit with cancelled ctx will fail
+	// Pool is now truly full — submit with cancelled ctx will reliably fail
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -1514,4 +1542,33 @@ func TestRunAgentCancelDuringRetry(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Error("runAgent did not return after cancel during retry")
 	}
+}
+
+func TestRunSessionWriteError(t *testing.T) {
+	// Server accepts join, drains one frame, then sends a jobs event.
+	// Meanwhile we close the connection from the server side to trigger
+	// a write error in the writer goroutine when it tries to send results.
+	srv := newFakeWSServer(t)
+
+	go func() {
+		srv.acceptAndJoin(t)
+
+		// Send a bulk of events so the client tries to write back
+		time.Sleep(100 * time.Millisecond)
+
+		// Close the connection from the server side — any writes by the
+		// client's writer goroutine will fail, triggering writeErrCh.
+		srv.close()
+	}()
+
+	// Use short heartbeat to generate write traffic
+	origCHB := channelHeartbeatInterval
+	defer func() { channelHeartbeatInterval = origCHB }()
+	channelHeartbeatInterval = 50 * time.Millisecond
+
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	if err == nil {
+		t.Error("expected error from write or read failure")
+	}
+	// Either "read:" or "write:" error is acceptable
 }

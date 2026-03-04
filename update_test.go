@@ -322,6 +322,92 @@ func TestSanitizeArgs(t *testing.T) {
 	})
 }
 
+func TestSelfUpdateInvalidURL(t *testing.T) {
+	err := selfUpdate("://\x7f", "abc123")
+	if err == nil {
+		t.Error("expected error for invalid URL")
+	}
+	if err != nil && !strings.Contains(err.Error(), "parse url") {
+		t.Errorf("expected 'parse url' in error, got: %v", err)
+	}
+}
+
+func TestSelfUpdateFullHappyPath(t *testing.T) {
+	body := []byte("test binary content for full path")
+	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	origGet := httpGet
+	origExe := osExecutable
+	origRename := osRename
+	origExec := syscallExec
+	defer func() {
+		httpGet = origGet
+		osExecutable = origExe
+		osRename = origRename
+		syscallExec = origExec
+	}()
+	httpGet = srv.Client().Get
+
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, "test-agent")
+	osExecutable = func() (string, error) { return exePath, nil }
+	osRename = func(oldpath, newpath string) error {
+		return os.Rename(oldpath, newpath) // real rename within temp dir
+	}
+	syscallExec = func(argv0 string, argv []string, envv []string) error {
+		return nil // success — don't actually re-exec
+	}
+
+	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
+	if err != nil {
+		t.Errorf("expected nil error on full happy path, got: %v", err)
+	}
+}
+
+func TestSelfUpdateWriteError(t *testing.T) {
+	body := []byte("binary")
+	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	origGet := httpGet
+	origExe := osExecutable
+	origCreate := osCreateTemp
+	defer func() {
+		httpGet = origGet
+		osExecutable = origExe
+		osCreateTemp = origCreate
+	}()
+	httpGet = srv.Client().Get
+
+	dir := t.TempDir()
+	osExecutable = func() (string, error) { return filepath.Join(dir, "agent"), nil }
+
+	// Create a temp file that will fail on Write by closing it before selfUpdate tries to write
+	osCreateTemp = func(d, pattern string) (*os.File, error) {
+		f, err := os.CreateTemp(d, pattern)
+		if err != nil {
+			return nil, err
+		}
+		// Close the file so Write will fail
+		_ = f.Close()
+		return f, nil
+	}
+
+	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
+	if err == nil {
+		t.Error("expected write error")
+	}
+}
+
 // rewriteToHTTPS converts an httptest TLS server URL to use the https scheme.
 // httptest.NewTLSServer returns URLs with https:// already, but this ensures consistency.
 func rewriteToHTTPS(rawURL string) string {

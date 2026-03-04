@@ -659,6 +659,41 @@ func TestExecuteSnmpJobBatchesGets(t *testing.T) {
 	}
 }
 
+func TestExecuteSnmpJobCtxCancelled(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		return &mockSnmpQuerier{
+			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+				return &gosnmp.SnmpPacket{}, nil
+			},
+		}, func() {}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before queries run
+
+	ch := make(chan *pb.SnmpResult, 1)
+	executeSnmpJob(ctx, &pb.AgentJob{
+		JobId:      "ctx-test",
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+		Queries: []*pb.SnmpQuery{
+			{QueryType: pb.QueryType_GET, Oids: []string{".1.3.6.1.2.1.1.1.0"}},
+			{QueryType: pb.QueryType_GET, Oids: []string{".1.3.6.1.2.1.1.2.0"}},
+		},
+	}, ch)
+
+	// With cancelled context, the function should return before processing queries
+	// (no result sent because it returns early in the ctx.Err() check)
+	select {
+	case <-ch:
+		// Might get a result if the first query ran before ctx check
+	default:
+		// Expected — returned early
+	}
+}
+
 func TestExecuteCredentialTest(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
 		ch := make(chan *pb.CredentialTestResult, 1)

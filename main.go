@@ -17,26 +17,37 @@ var version = "dev"
 var insecureFlag bool
 
 func main() {
-	apiURL := flag.String("api-url", os.Getenv("TOWEROPS_API_URL"), "API URL (e.g., wss://towerops.net)")
-	token := flag.String("token", os.Getenv("TOWEROPS_AGENT_TOKEN"), "Agent authentication token")
-	tokenFile := flag.String("token-file", "", "Path to file containing agent token (preferred over --token)")
-	logLevel := flag.String("log-level", envOrDefault("LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
-	flag.BoolVar(&insecureFlag, "insecure", false, "Allow plaintext ws:// connections (insecure)")
-	flag.Parse()
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer cancel()
+	os.Exit(runMain(ctx, os.Args[1:]))
+}
+
+// runMain is the testable entry point. Returns an exit code.
+func runMain(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("towerops-agent", flag.ContinueOnError)
+	apiURL := fs.String("api-url", os.Getenv("TOWEROPS_API_URL"), "API URL (e.g., wss://towerops.net)")
+	token := fs.String("token", os.Getenv("TOWEROPS_AGENT_TOKEN"), "Agent authentication token")
+	tokenFile := fs.String("token-file", "", "Path to file containing agent token (preferred over --token)")
+	logLevel := fs.String("log-level", envOrDefault("LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
+	fs.BoolVar(&insecureFlag, "insecure", false, "Allow plaintext ws:// connections (insecure)")
+
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
 
 	// Read token from file if --token-file is provided
 	if *tokenFile != "" {
 		data, err := os.ReadFile(*tokenFile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: cannot read token file: %v\n", err)
-			os.Exit(1)
+			return 1
 		}
 		t := strings.TrimSpace(string(data))
 		token = &t
 	}
 
 	// Warn if --token was used via CLI (visible in /proc/cmdline)
-	if *tokenFile == "" && isFlagSet("token") {
+	if *tokenFile == "" && flagIsSet(fs, "token") {
 		fmt.Fprintln(os.Stderr, "WARNING: --token flag exposes the token in the process table. Use TOWEROPS_AGENT_TOKEN env var or --token-file instead.")
 	}
 
@@ -56,29 +67,30 @@ func main() {
 
 	if *apiURL == "" || *token == "" {
 		fmt.Fprintln(os.Stderr, "error: --api-url and --token are required (or set TOWEROPS_API_URL and TOWEROPS_AGENT_TOKEN)")
-		flag.Usage()
-		os.Exit(1)
+		fs.Usage()
+		return 1
 	}
 
 	slog.Info("towerops agent starting", "version", version)
 
 	// Convert HTTP(S) to WebSocket URL
-	wsURL := toWebSocketURL(*apiURL)
+	wsURL, err := toWebSocketURL(*apiURL)
+	if err != nil {
+		slog.Error(err.Error())
+		return 1
+	}
 	slog.Info("websocket url", "url", sanitizeURL(wsURL))
-
-	// Signal handling
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer cancel()
 
 	// Run agent with reconnect loop
 	runAgent(ctx, wsURL, *token)
 
 	slog.Info("towerops agent stopped")
+	return 0
 }
 
 // toWebSocketURL converts an HTTP(S) URL to a WebSocket URL.
-// Rejects plaintext ws:// unless --insecure is set.
-func toWebSocketURL(rawURL string) string {
+// Returns an error for plaintext ws:// unless insecureFlag is set.
+func toWebSocketURL(rawURL string) (string, error) {
 	var result string
 	switch {
 	case strings.HasPrefix(rawURL, "http://"):
@@ -92,16 +104,15 @@ func toWebSocketURL(rawURL string) string {
 	}
 
 	if strings.HasPrefix(result, "ws://") && !insecureFlag {
-		slog.Error("plaintext ws:// connection rejected — use wss:// or pass --insecure to allow")
-		osExit(1)
+		return "", fmt.Errorf("plaintext ws:// connection rejected — use wss:// or pass --insecure to allow")
 	}
-	return result
+	return result, nil
 }
 
-// isFlagSet returns true if a flag was explicitly set on the command line.
-func isFlagSet(name string) bool {
+// flagIsSet returns true if a flag was explicitly set on the command line.
+func flagIsSet(fs *flag.FlagSet, name string) bool {
 	found := false
-	flag.Visit(func(f *flag.Flag) {
+	fs.Visit(func(f *flag.Flag) {
 		if f.Name == name {
 			found = true
 		}

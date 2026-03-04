@@ -15,6 +15,8 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
+var icmpListenPacket = icmp.ListenPacket
+
 // icmpPing sends a single ICMP echo request and returns the round-trip time in milliseconds.
 // Tries raw ICMP sockets first (requires CAP_NET_RAW or root), then falls back to
 // unprivileged UDP-based ICMP (requires ping_group_range sysctl).
@@ -53,7 +55,7 @@ func icmpPing(ip string, timeoutMs int) (float64, error) {
 
 // doICMPPing performs an ICMP ping over the given network type.
 func doICMPPing(ip net.IP, network string, isIPv4 bool, timeoutMs int) (float64, error) {
-	conn, err := icmp.ListenPacket(network, "")
+	conn, err := icmpListenPacket(network, "")
 	if err != nil {
 		return 0, &errICMPUnavailable{err: fmt.Errorf("icmp listen %s: %w", network, err)}
 	}

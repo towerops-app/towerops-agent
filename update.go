@@ -18,6 +18,7 @@ var osExecutable = os.Executable
 var osCreateTemp = os.CreateTemp
 var osRename = os.Rename
 var httpGet = http.Get
+var syscallExec = syscall.Exec
 var maxUpdateSize int64 = 100 << 20 // 100 MB
 
 // selfUpdate downloads a new binary, verifies its checksum, replaces the current binary, and re-execs.
@@ -105,7 +106,7 @@ func selfUpdate(downloadURL, expectedChecksum string) error {
 
 	// Re-exec with same arguments
 	slog.Info("re-executing", "args", sanitizeArgs(os.Args))
-	return syscall.Exec(currentExe, os.Args, os.Environ())
+	return syscallExec(currentExe, os.Args, os.Environ())
 }
 
 // sanitizeArgs returns a copy of args with token values masked.
