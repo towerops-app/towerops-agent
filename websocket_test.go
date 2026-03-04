@@ -657,6 +657,60 @@ func TestWSDialIPv4Fallback(t *testing.T) {
 	}
 }
 
+func TestWSDialTLSPath(t *testing.T) {
+	// Verify the TLS dial path is exercised (connection will fail, but we hit the code path)
+	origTLS := tlsDial
+	defer func() { tlsDial = origTLS }()
+
+	called := false
+	tlsDial = func(network, addr string) (net.Conn, error) {
+		called = true
+		return nil, fmt.Errorf("tls dial: connection refused")
+	}
+
+	_, err := WSDial("wss://127.0.0.1:9999/path")
+	if err == nil {
+		t.Error("expected TLS dial error")
+	}
+	if !called {
+		t.Error("expected tlsDial to be called for wss:// URL")
+	}
+}
+
+func TestWSDialMissingAcceptHeader(t *testing.T) {
+	// Server sends 101 but without Sec-WebSocket-Accept header
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				buf := make([]byte, 4096)
+				_, _ = c.Read(buf)
+				resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+				_, _ = c.Write([]byte(resp))
+			}(conn)
+		}
+	}()
+
+	addr := ln.Addr().String()
+	_, err = WSDial("ws://" + addr + "/socket")
+	if err == nil {
+		t.Error("expected error for missing accept header")
+	}
+	if !strings.Contains(err.Error(), "missing Sec-WebSocket-Accept") {
+		t.Errorf("expected 'missing Sec-WebSocket-Accept' in error, got: %v", err)
+	}
+}
+
 func TestWSDialDefaultPorts(t *testing.T) {
 	// Test that ws:// defaults to port 80 — will fail to connect but verifies URL parsing
 	_, err := WSDial("ws://127.0.0.1/path")

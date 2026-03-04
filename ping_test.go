@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"runtime"
 	"testing"
 )
@@ -62,6 +63,13 @@ func TestIcmpPingInvalidIP(t *testing.T) {
 	_, err := icmpPing("not-an-ip", 5000)
 	if err == nil {
 		t.Error("expected error for invalid IP")
+	}
+}
+
+func TestErrICMPUnavailableError(t *testing.T) {
+	err := &errICMPUnavailable{err: fmt.Errorf("permission denied")}
+	if err.Error() != "permission denied" {
+		t.Errorf("got %q, want %q", err.Error(), "permission denied")
 	}
 }
 

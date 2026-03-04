@@ -93,7 +93,7 @@ func toWebSocketURL(rawURL string) string {
 
 	if strings.HasPrefix(result, "ws://") && !insecureFlag {
 		slog.Error("plaintext ws:// connection rejected — use wss:// or pass --insecure to allow")
-		os.Exit(1)
+		osExit(1)
 	}
 	return result
 }

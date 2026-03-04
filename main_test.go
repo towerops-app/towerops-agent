@@ -39,6 +39,14 @@ func TestSanitizeURL(t *testing.T) {
 	}
 }
 
+func TestIsFlagSet(t *testing.T) {
+	// In tests, flags are not set via flag.Parse on the default flag set
+	// so isFlagSet should return false for any arbitrary name.
+	if isFlagSet("nonexistent-flag-xyz") {
+		t.Error("expected isFlagSet to return false for unset flag")
+	}
+}
+
 func TestToWebSocketURL(t *testing.T) {
 	// Enable insecure for testing plaintext conversions
 	origInsecure := insecureFlag
@@ -60,5 +68,35 @@ func TestToWebSocketURL(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("toWebSocketURL(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestToWebSocketURLRejectsPlaintext(t *testing.T) {
+	origInsecure := insecureFlag
+	origExit := osExit
+	defer func() {
+		insecureFlag = origInsecure
+		osExit = origExit
+	}()
+
+	insecureFlag = false
+	exitCode := -1
+	osExit = func(code int) { exitCode = code }
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"ws:// scheme", "ws://localhost:4000"},
+		{"http:// converts to ws://", "http://localhost:4000"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			exitCode = -1
+			toWebSocketURL(tt.input)
+			if exitCode != 1 {
+				t.Errorf("expected osExit(1), got %d", exitCode)
+			}
+		})
 	}
 }

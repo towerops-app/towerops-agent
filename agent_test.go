@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -282,6 +284,59 @@ func TestHandleMessage(t *testing.T) {
 		checkCh := make(chan *pb.CheckResult, 1)
 		handleMessage(context.Background(), channelMsg{Event: "some_unknown_event", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh)
 		// Should just log and not panic
+	})
+
+	t.Run("check_jobs valid", func(t *testing.T) {
+		checkList := &pb.CheckList{Checks: []*pb.Check{
+			{Id: "c1", CheckType: "tcp", TimeoutMs: 1000,
+				Config: &pb.Check_Tcp{Tcp: &pb.TcpCheckConfig{Host: "127.0.0.1", Port: 1}}},
+		}}
+		bin, _ := proto.Marshal(checkList)
+		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString(bin)})
+
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		checkCh := make(chan *pb.CheckResult, 1)
+		handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh)
+		select {
+		case <-checkCh:
+		case <-time.After(5 * time.Second):
+			t.Error("timed out waiting for check result")
+		}
+	})
+
+	t.Run("check_jobs invalid json", func(t *testing.T) {
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		checkCh := make(chan *pb.CheckResult, 1)
+		handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: json.RawMessage(`not json`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh)
+		// Should log error but not panic
+	})
+
+	t.Run("check_jobs invalid base64", func(t *testing.T) {
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		checkCh := make(chan *pb.CheckResult, 1)
+		payload, _ := json.Marshal(map[string]string{"binary": "not-base64!!!"})
+		handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh)
+		// Should log error but not panic
+	})
+
+	t.Run("check_jobs invalid protobuf", func(t *testing.T) {
+		snmpCh := make(chan *pb.SnmpResult, 1)
+		mtCh := make(chan *pb.MikrotikResult, 1)
+		credCh := make(chan *pb.CredentialTestResult, 1)
+		monCh := make(chan *pb.MonitoringCheck, 1)
+		checkCh := make(chan *pb.CheckResult, 1)
+		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString([]byte{0xFF, 0xFF, 0xFF})})
+		handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh)
+		// Should log error but not panic
 	})
 
 	t.Run("discovery_job event", func(t *testing.T) {
@@ -697,4 +752,766 @@ func makeTextFrame(payload []byte) []byte {
 	}
 	frame = append(frame, payload...)
 	return frame
+}
+
+func TestDispatchJobCancelledContext(t *testing.T) {
+	// submit returns false when context is cancelled, triggering "pool full" log
+	p := testPools(t)
+	snmpCh := make(chan *pb.SnmpResult, 1)
+	mtCh := make(chan *pb.MikrotikResult, 1)
+	credCh := make(chan *pb.CredentialTestResult, 1)
+	monCh := make(chan *pb.MonitoringCheck, 1)
+	checkCh := make(chan *pb.CheckResult, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	// All dispatch types should handle ctx cancellation gracefully
+	dispatchJob(ctx, &pb.AgentJob{
+		JobId: "s1", JobType: pb.JobType_POLL, SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+	}, p, snmpCh, mtCh, credCh, monCh, checkCh)
+
+	dispatchJob(ctx, &pb.AgentJob{
+		JobId: "m1", JobType: pb.JobType_MIKROTIK, MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1"},
+	}, p, snmpCh, mtCh, credCh, monCh, checkCh)
+
+	dispatchJob(ctx, &pb.AgentJob{
+		JobId: "tc1", JobType: pb.JobType_TEST_CREDENTIALS, SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+	}, p, snmpCh, mtCh, credCh, monCh, checkCh)
+
+	dispatchJob(ctx, &pb.AgentJob{
+		JobId: "p1", JobType: pb.JobType_PING, SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+	}, p, snmpCh, mtCh, credCh, monCh, checkCh)
+}
+
+// fakeWSServer is a test helper that sets up a WebSocket server for runSession tests.
+type fakeWSServer struct {
+	ln   net.Listener
+	conn net.Conn
+}
+
+func newFakeWSServer(t *testing.T) *fakeWSServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	return &fakeWSServer{ln: ln}
+}
+
+func (s *fakeWSServer) addr() string { return s.ln.Addr().String() }
+
+// acceptAndJoin accepts one WS connection and responds with a successful join.
+func (s *fakeWSServer) acceptAndJoin(t *testing.T) {
+	t.Helper()
+	conn, err := s.ln.Accept()
+	if err != nil {
+		t.Logf("accept: %v", err)
+		return
+	}
+	s.conn = conn
+
+	// Read HTTP upgrade
+	buf := make([]byte, 4096)
+	n, _ := conn.Read(buf)
+	key := extractWSKey(string(buf[:n]))
+	accept := computeAcceptKey(key)
+	resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+	_, _ = conn.Write([]byte(resp))
+
+	// Read join frame
+	frameBuf := make([]byte, 4096)
+	_, _ = conn.Read(frameBuf)
+
+	// Send join OK
+	reply, _ := json.Marshal(channelMsg{
+		Topic:   "agent:agent-0",
+		Event:   "phx_reply",
+		Payload: json.RawMessage(`{"status":"ok"}`),
+		Ref:     strPtr("1"),
+	})
+	_, _ = conn.Write(makeTextFrame(reply))
+}
+
+// sendEvent sends a channel message to the connected client.
+func (s *fakeWSServer) sendEvent(event string, payload json.RawMessage) {
+	msg, _ := json.Marshal(channelMsg{
+		Topic:   "agent:agent-0",
+		Event:   event,
+		Payload: payload,
+	})
+	_, _ = s.conn.Write(makeTextFrame(msg))
+}
+
+// close shuts down the server connection.
+func (s *fakeWSServer) close() {
+	if s.conn != nil {
+		_ = s.conn.Close()
+	}
+}
+
+func TestRunSessionCtxCancel(t *testing.T) {
+	srv := newFakeWSServer(t)
+
+	go srv.acceptAndJoin(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		done <- runSession(ctx, "ws://"+srv.addr(), "token")
+	}()
+
+	// Give the session time to enter the main loop
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("expected nil error on ctx cancel, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("runSession did not exit after ctx cancel")
+	}
+	srv.close()
+}
+
+func TestRunSessionReadError(t *testing.T) {
+	srv := newFakeWSServer(t)
+
+	go func() {
+		srv.acceptAndJoin(t)
+		// Small delay, then close to trigger read error
+		time.Sleep(200 * time.Millisecond)
+		srv.close()
+	}()
+
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	if err == nil {
+		t.Error("expected read error")
+	}
+	if !strings.Contains(err.Error(), "read:") {
+		t.Errorf("expected 'read:' in error, got: %v", err)
+	}
+}
+
+func TestRunSessionInvalidMessage(t *testing.T) {
+	srv := newFakeWSServer(t)
+
+	go func() {
+		srv.acceptAndJoin(t)
+		// Send invalid JSON — should be logged but not crash
+		time.Sleep(100 * time.Millisecond)
+		_, _ = srv.conn.Write(makeTextFrame([]byte("not json")))
+		// Then close to end session
+		time.Sleep(100 * time.Millisecond)
+		srv.close()
+	}()
+
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	// Should end with read error from close, not crash
+	if err == nil {
+		t.Error("expected error")
+	}
+}
+
+func TestRunSessionConnectError(t *testing.T) {
+	err := runSession(context.Background(), "ws://127.0.0.1:1", "token")
+	if err == nil {
+		t.Error("expected connect error")
+	}
+	if !strings.Contains(err.Error(), "connect:") {
+		t.Errorf("expected 'connect:' in error, got: %v", err)
+	}
+}
+
+func TestRunSessionJoinWriteError(t *testing.T) {
+	// Server accepts WS upgrade but closes immediately after
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		// Read HTTP upgrade
+		buf := make([]byte, 4096)
+		n, _ := conn.Read(buf)
+		key := extractWSKey(string(buf[:n]))
+		accept := computeAcceptKey(key)
+		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+		_, _ = conn.Write([]byte(resp))
+		// Close immediately so join write may fail
+		_ = conn.Close()
+	}()
+
+	err = runSession(context.Background(), "ws://"+ln.Addr().String(), "token")
+	if err == nil {
+		t.Error("expected error")
+	}
+}
+
+func TestRunSessionJoinUnmarshalError(t *testing.T) {
+	// Server sends binary garbage as join reply
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		buf := make([]byte, 4096)
+		n, _ := conn.Read(buf)
+		key := extractWSKey(string(buf[:n]))
+		accept := computeAcceptKey(key)
+		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+		_, _ = conn.Write([]byte(resp))
+		frameBuf := make([]byte, 4096)
+		_, _ = conn.Read(frameBuf)
+		// Send invalid JSON as reply
+		_, _ = conn.Write(makeTextFrame([]byte("{invalid json")))
+		time.Sleep(time.Second)
+	}()
+
+	err = runSession(context.Background(), "ws://"+ln.Addr().String(), "token")
+	if err == nil {
+		t.Error("expected unmarshal error")
+	}
+	if !strings.Contains(err.Error(), "join reply unmarshal") {
+		t.Errorf("expected 'join reply unmarshal' in error, got: %v", err)
+	}
+}
+
+func TestRunSessionReadErrorDuringJoin(t *testing.T) {
+	// Server sends upgrade then closes before sending join reply
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		buf := make([]byte, 4096)
+		n, _ := conn.Read(buf)
+		key := extractWSKey(string(buf[:n]))
+		accept := computeAcceptKey(key)
+		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+		_, _ = conn.Write([]byte(resp))
+		frameBuf := make([]byte, 4096)
+		_, _ = conn.Read(frameBuf)
+		// Close without sending reply
+		_ = conn.Close()
+	}()
+
+	err = runSession(context.Background(), "ws://"+ln.Addr().String(), "token")
+	if err == nil {
+		t.Error("expected read during join error")
+	}
+	if !strings.Contains(err.Error(), "read during join") {
+		t.Errorf("expected 'read during join' in error, got: %v", err)
+	}
+}
+
+func TestRunAgentReconnectOnError(t *testing.T) {
+	// Server that fails first connection then succeeds, then sends restart
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	connCount := 0
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			connCount++
+			buf := make([]byte, 4096)
+			n, _ := conn.Read(buf)
+			key := extractWSKey(string(buf[:n]))
+			accept := computeAcceptKey(key)
+
+			if connCount == 1 {
+				// First connection: upgrade then close immediately
+				resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+				_, _ = conn.Write([]byte(resp))
+				frameBuf := make([]byte, 4096)
+				_, _ = conn.Read(frameBuf)
+				_ = conn.Close()
+			} else {
+				// Second connection: proper session with restart
+				resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+				_, _ = conn.Write([]byte(resp))
+				frameBuf := make([]byte, 4096)
+				_, _ = conn.Read(frameBuf)
+				reply, _ := json.Marshal(channelMsg{
+					Topic:   "agent:agent-0",
+					Event:   "phx_reply",
+					Payload: json.RawMessage(`{"status":"ok"}`),
+					Ref:     strPtr("1"),
+				})
+				_, _ = conn.Write(makeTextFrame(reply))
+				time.Sleep(50 * time.Millisecond)
+				restart, _ := json.Marshal(channelMsg{
+					Topic:   "agent:agent-0",
+					Event:   "restart",
+					Payload: json.RawMessage(`{}`),
+				})
+				_, _ = conn.Write(makeTextFrame(restart))
+				time.Sleep(time.Second)
+				_ = conn.Close()
+			}
+		}
+	}()
+
+	origExit := osExit
+	defer func() { osExit = origExit }()
+	exitCalled := make(chan int, 1)
+	osExit = func(code int) { exitCalled <- code }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		runAgent(ctx, "ws://"+ln.Addr().String(), "token")
+		close(done)
+	}()
+
+	select {
+	case code := <-exitCalled:
+		if code != 0 {
+			t.Errorf("expected exit code 0, got %d", code)
+		}
+	case <-time.After(10 * time.Second):
+		t.Error("runAgent did not reconnect and restart")
+	}
+}
+
+func TestRunAgentContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	done := make(chan struct{})
+	go func() {
+		runAgent(ctx, "ws://127.0.0.1:1", "token")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// runAgent returned as expected
+	case <-time.After(5 * time.Second):
+		t.Error("runAgent did not return after context cancellation")
+	}
+}
+
+func TestRunAgentRestart(t *testing.T) {
+	origExit := osExit
+	defer func() { osExit = origExit }()
+
+	exitCalled := make(chan int, 1)
+	osExit = func(code int) {
+		exitCalled <- code
+	}
+
+	// Start a fake WebSocket server that accepts the join and sends restart
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		buf := make([]byte, 4096)
+		n, _ := conn.Read(buf)
+		reqStr := string(buf[:n])
+		key := extractWSKey(reqStr)
+		accept := computeAcceptKey(key)
+		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+		_, _ = conn.Write([]byte(resp))
+
+		// Read join frame
+		frameBuf := make([]byte, 4096)
+		_, _ = conn.Read(frameBuf)
+
+		// Send join OK reply
+		reply, _ := json.Marshal(channelMsg{
+			Topic:   "agent:agent-0",
+			Event:   "phx_reply",
+			Payload: json.RawMessage(`{"status":"ok"}`),
+			Ref:     strPtr("1"),
+		})
+		_, _ = conn.Write(makeTextFrame(reply))
+
+		// Small delay then send restart event
+		time.Sleep(50 * time.Millisecond)
+		restart, _ := json.Marshal(channelMsg{
+			Topic:   "agent:agent-0",
+			Event:   "restart",
+			Payload: json.RawMessage(`{}`),
+		})
+		_, _ = conn.Write(makeTextFrame(restart))
+
+		// Keep connection open briefly
+		time.Sleep(2 * time.Second)
+	}()
+
+	addr := ln.Addr().String()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		runAgent(ctx, "ws://"+addr, "test-token")
+		close(done)
+	}()
+
+	select {
+	case code := <-exitCalled:
+		if code != 0 {
+			t.Errorf("expected exit code 0, got %d", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("osExit was not called after restart")
+	}
+}
+
+// readMaskedFrame reads a single masked WebSocket frame from the server side.
+func readMaskedFrame(conn net.Conn) ([]byte, error) {
+	var header [2]byte
+	if _, err := io.ReadFull(conn, header[:]); err != nil {
+		return nil, err
+	}
+	masked := header[1]&0x80 != 0
+	length := uint64(header[1] & 0x7F)
+	switch length {
+	case 126:
+		var ext [2]byte
+		if _, err := io.ReadFull(conn, ext[:]); err != nil {
+			return nil, err
+		}
+		length = uint64(binary.BigEndian.Uint16(ext[:]))
+	case 127:
+		var ext [8]byte
+		if _, err := io.ReadFull(conn, ext[:]); err != nil {
+			return nil, err
+		}
+		length = binary.BigEndian.Uint64(ext[:])
+	}
+	var maskKey [4]byte
+	if masked {
+		if _, err := io.ReadFull(conn, maskKey[:]); err != nil {
+			return nil, err
+		}
+	}
+	payload := make([]byte, length)
+	if length > 0 {
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			return nil, err
+		}
+	}
+	if masked {
+		for i := range payload {
+			payload[i] ^= maskKey[i%4]
+		}
+	}
+	return payload, nil
+}
+
+// drainFrames reads and discards client frames until stop channel is closed or error.
+func drainFrames(conn net.Conn, stop <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		if _, err := readMaskedFrame(conn); err != nil {
+			select {
+			case <-stop:
+				return
+			default:
+				continue // timeout, retry
+			}
+		}
+	}
+}
+
+func TestRunSessionProcessesJobResults(t *testing.T) {
+	// Mock external dependencies for fast execution
+	origSnmpDial := snmpDial
+	origMtDial := mikrotikDial
+	origPing := doPing
+	defer func() {
+		snmpDial = origSnmpDial
+		mikrotikDial = origMtDial
+		doPing = origPing
+	}()
+
+	snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		return &mockSnmpQuerier{
+			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+				return &gosnmp.SnmpPacket{}, nil
+			},
+		}, func() {}, nil
+	}
+	mikrotikDial = func(ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
+		return nil, fmt.Errorf("unreachable")
+	}
+	doPing = func(ip string, timeoutMs int) (float64, error) {
+		return 1.5, nil
+	}
+
+	srv := newFakeWSServer(t)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		srv.acceptAndJoin(t)
+
+		// Drain client frames so writes don't block
+		stopDrain := make(chan struct{})
+		go drainFrames(srv.conn, stopDrain)
+
+		time.Sleep(100 * time.Millisecond)
+
+		// SNMP job → snmpResultCh → snmpBatch → flushSnmpBatch → sendBinaryResult
+		srv.sendEvent("jobs", makeJobPayload(&pb.AgentJob{
+			JobId: "s1", JobType: pb.JobType_POLL,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+		}))
+
+		// Mikrotik job → mikrotikResultCh → sendBinaryResult("mikrotik_result")
+		srv.sendEvent("jobs", makeJobPayload(&pb.AgentJob{
+			JobId: "m1", JobType: pb.JobType_MIKROTIK,
+			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
+		}))
+
+		// Ping job → monitoringCheckCh → sendBinaryResult("monitoring_check")
+		srv.sendEvent("jobs", makeJobPayload(&pb.AgentJob{
+			JobId: "p1", JobType: pb.JobType_PING, DeviceId: "dev1",
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+		}))
+
+		// Credential test → credTestResultCh → sendBinaryResult("credential_test_result")
+		srv.sendEvent("jobs", makeJobPayload(&pb.AgentJob{
+			JobId: "ct1", JobType: pb.JobType_TEST_CREDENTIALS,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+		}))
+
+		// Check job → checkResultCh → sendBinaryResult("check_result")
+		checkList := &pb.CheckList{Checks: []*pb.Check{
+			{Id: "c1", CheckType: "tcp", TimeoutMs: 500,
+				Config: &pb.Check_Tcp{Tcp: &pb.TcpCheckConfig{Host: "127.0.0.1", Port: 1}}},
+		}}
+		bin, _ := proto.Marshal(checkList)
+		checkPayload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString(bin)})
+		srv.sendEvent("check_jobs", checkPayload)
+
+		// Wait for results to flow through all channels
+		time.Sleep(2 * time.Second)
+		close(stopDrain)
+		srv.close()
+	}()
+
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	<-serverDone
+	if err == nil {
+		t.Error("expected error after server close")
+	}
+}
+
+func TestRunSessionSnmpBatchThreshold(t *testing.T) {
+	origSnmpDial := snmpDial
+	defer func() { snmpDial = origSnmpDial }()
+
+	snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		return &mockSnmpQuerier{
+			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+				return &gosnmp.SnmpPacket{}, nil
+			},
+		}, func() {}, nil
+	}
+
+	srv := newFakeWSServer(t)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		srv.acceptAndJoin(t)
+
+		stopDrain := make(chan struct{})
+		go drainFrames(srv.conn, stopDrain)
+
+		time.Sleep(100 * time.Millisecond)
+
+		// Send 55 SNMP jobs to trigger batch threshold (>=50)
+		jobs := make([]*pb.AgentJob, 55)
+		for i := range jobs {
+			jobs[i] = &pb.AgentJob{
+				JobId:      fmt.Sprintf("s%d", i),
+				JobType:    pb.JobType_POLL,
+				SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+			}
+		}
+		srv.sendEvent("jobs", makeJobPayload(jobs...))
+
+		time.Sleep(3 * time.Second)
+		close(stopDrain)
+		srv.close()
+	}()
+
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	<-serverDone
+	if err == nil {
+		t.Error("expected error after server close")
+	}
+}
+
+func TestExecuteCheckPoolFull(t *testing.T) {
+	// Use a pool with 1 worker and 1 queue slot, then fill both
+	p := &jobPools{
+		snmp:     newWorkerPool(4),
+		mikrotik: newWorkerPool(4),
+		ping:     newWorkerPool(4),
+		checks:   newWorkerPool(1),
+	}
+	t.Cleanup(func() { p.snmp.stop(); p.mikrotik.stop(); p.ping.stop(); p.checks.stop() })
+
+	done := make(chan struct{})
+	started := make(chan struct{})
+
+	// Block the single worker
+	p.checks.submit(context.Background(), func() {
+		close(started)
+		<-done
+	})
+	<-started
+
+	// Fill the queue slot
+	p.checks.submit(context.Background(), func() { <-done })
+
+	// Pool is now full — submit with cancelled ctx will fail
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	checkCh := make(chan *pb.CheckResult, 1)
+	check := &pb.Check{Id: "c1", CheckType: "tcp", TimeoutMs: 1000}
+	executeCheck(ctx, check, p, checkCh)
+	// Should log "check rejected (pool full)" but not panic
+	close(done)
+}
+
+func TestExecuteCheckCtxDoneInClosure(t *testing.T) {
+	// Tests the ctx.Done path inside executeCheck's closure:
+	// Submit succeeds, check runs, but result channel is blocked so ctx.Done fires.
+	p := testPools(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	checkCh := make(chan *pb.CheckResult) // unbuffered, no reader
+
+	check := &pb.Check{Id: "c1", CheckType: "tcp", TimeoutMs: 100,
+		Config: &pb.Check_Tcp{Tcp: &pb.TcpCheckConfig{Host: "127.0.0.1", Port: 1}}}
+
+	executeCheck(ctx, check, p, checkCh)
+
+	// Wait for the check to complete (TCP to port 1 fails fast)
+	time.Sleep(500 * time.Millisecond)
+	// Cancel ctx so the closure's select picks ctx.Done instead of blocked channel send
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+}
+
+func TestRunSessionRestartInMainLoop(t *testing.T) {
+	srv := newFakeWSServer(t)
+
+	go func() {
+		srv.acceptAndJoin(t)
+		stopDrain := make(chan struct{})
+		go drainFrames(srv.conn, stopDrain)
+
+		time.Sleep(100 * time.Millisecond)
+		// Send restart event — exercised in the main loop select
+		srv.sendEvent("restart", json.RawMessage(`{}`))
+		time.Sleep(time.Second)
+		close(stopDrain)
+		srv.close()
+	}()
+
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	if err != errRestartRequested {
+		t.Errorf("expected errRestartRequested, got: %v", err)
+	}
+}
+
+func TestRunSessionHeartbeats(t *testing.T) {
+	// Use short heartbeat intervals to exercise heartbeat paths
+	origHB := heartbeatInterval
+	origCHB := channelHeartbeatInterval
+	defer func() {
+		heartbeatInterval = origHB
+		channelHeartbeatInterval = origCHB
+	}()
+	heartbeatInterval = 100 * time.Millisecond
+	channelHeartbeatInterval = 100 * time.Millisecond
+
+	srv := newFakeWSServer(t)
+	go func() {
+		srv.acceptAndJoin(t)
+		stopDrain := make(chan struct{})
+		go drainFrames(srv.conn, stopDrain)
+		// Let heartbeats fire a few times
+		time.Sleep(500 * time.Millisecond)
+		close(stopDrain)
+		srv.close()
+	}()
+
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	if err == nil {
+		t.Error("expected error after server close")
+	}
+}
+
+func TestRunAgentCancelDuringRetry(t *testing.T) {
+	// Connects to a port nothing listens on, then cancel during retry delay
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		runAgent(ctx, "ws://127.0.0.1:1", "token")
+		close(done)
+	}()
+
+	// Wait for first connection attempt to fail and retry delay to start
+	time.Sleep(1500 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+		// runAgent returned after cancel during retry
+	case <-time.After(5 * time.Second):
+		t.Error("runAgent did not return after cancel during retry")
+	}
 }
