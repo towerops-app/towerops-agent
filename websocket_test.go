@@ -453,17 +453,19 @@ func TestWSDialHandshakeFailed(t *testing.T) {
 	defer func() { _ = ln.Close() }()
 
 	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				buf := make([]byte, 4096)
+				_, _ = c.Read(buf)
+				resp := "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
+				_, _ = c.Write([]byte(resp))
+			}(conn)
 		}
-		defer func() { _ = conn.Close() }()
-
-		buf := make([]byte, 4096)
-		_, _ = conn.Read(buf)
-
-		resp := "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
-		_, _ = conn.Write([]byte(resp))
 	}()
 
 	addr := ln.Addr().String()
@@ -485,12 +487,16 @@ func TestWSDialReadHandshakeError(t *testing.T) {
 	defer func() { _ = ln.Close() }()
 
 	go func() {
-		conn, _ := ln.Accept()
-		if conn != nil {
-			// Read the request then close immediately
-			buf := make([]byte, 4096)
-			_, _ = conn.Read(buf)
-			_ = conn.Close()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				buf := make([]byte, 4096)
+				_, _ = c.Read(buf)
+				_ = c.Close()
+			}(conn)
 		}
 	}()
 
@@ -597,6 +603,60 @@ func TestWSDialHandshakeTimeout(t *testing.T) {
 	}
 }
 
+func TestWSDialIPv4Fallback(t *testing.T) {
+	// Start a test TCP server on IPv4 that responds with valid WebSocket upgrade
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				buf := make([]byte, 4096)
+				n, _ := c.Read(buf)
+				key := extractHeader(string(buf[:n]), "Sec-WebSocket-Key")
+				accept := computeAcceptKey(key)
+				resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+				_, _ = c.Write([]byte(resp))
+				b := make([]byte, 1)
+				_, _ = c.Read(b)
+			}(conn)
+		}
+	}()
+
+	addr := ln.Addr().String()
+	callCount := 0
+	origDial := netDial
+	defer func() { netDial = origDial }()
+
+	netDial = func(network, a string) (net.Conn, error) {
+		callCount++
+		if network == "tcp" {
+			// Simulate IPv6 failure: TCP connects but server rejects
+			return nil, fmt.Errorf("dial tcp [::1]:%s: connect: connection refused", a)
+		}
+		// tcp4 fallback goes to the real server
+		return net.Dial(network, addr)
+	}
+
+	ws, err := WSDial("ws://" + addr + "/socket")
+	if err != nil {
+		t.Fatalf("expected IPv4 fallback to succeed: %v", err)
+	}
+	_ = ws.Close()
+
+	if callCount < 2 {
+		t.Errorf("expected at least 2 dial attempts (tcp + tcp4), got %d", callCount)
+	}
+}
+
 func TestWSDialDefaultPorts(t *testing.T) {
 	// Test that ws:// defaults to port 80 — will fail to connect but verifies URL parsing
 	_, err := WSDial("ws://127.0.0.1/path")
@@ -659,18 +719,19 @@ func TestWSDialRejectsInvalidAcceptKey(t *testing.T) {
 	defer func() { _ = ln.Close() }()
 
 	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				buf := make([]byte, 4096)
+				_, _ = c.Read(buf)
+				resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: INVALID_KEY\r\n\r\n"
+				_, _ = c.Write([]byte(resp))
+			}(conn)
 		}
-		defer func() { _ = conn.Close() }()
-
-		buf := make([]byte, 4096)
-		_, _ = conn.Read(buf)
-
-		// Send 101 with a wrong accept key
-		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: INVALID_KEY\r\n\r\n"
-		_, _ = conn.Write([]byte(resp))
 	}()
 
 	addr := ln.Addr().String()
