@@ -4,6 +4,9 @@ towerops-agent
 cover.out
 cover.html
 
+# Runtime data
+known_hosts.json
+
 # Database files
 *.db
 *.db-shm
