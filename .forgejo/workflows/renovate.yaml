@@ -1,0 +1,27 @@
+name: Renovate
+
+on:
+  schedule:
+    # Run daily at 6:00 AM UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  renovate:
+    runs-on: ubuntu-latest
+    container:
+      image: renovate/renovate:latest
+    steps:
+      - name: Checkout code
+        uses: https://github.com/actions/checkout@v4
+
+      - name: Run Renovate
+        env:
+          RENOVATE_PLATFORM: forgejo
+          RENOVATE_ENDPOINT: ${{ secrets.FORGEJO_ENDPOINT }}
+          RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
+          RENOVATE_GIT_AUTHOR: Renovate Bot <bot@renovateapp.com>
+          RENOVATE_AUTODISCOVER: false
+          LOG_LEVEL: info
+        run: |
+          renovate graham/towerops-agent
