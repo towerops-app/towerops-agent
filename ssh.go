@@ -65,19 +65,27 @@ func executePingJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.M
 
 	if err != nil {
 		slog.Warn("device down", "device", job.DeviceId, "error", err)
-		resultCh <- &pb.MonitoringCheck{
+		select {
+		case resultCh <- &pb.MonitoringCheck{
 			DeviceId:  job.DeviceId,
 			Status:    "failure",
 			Timestamp: timestamp,
+		}:
+		default:
+			slog.Warn("result channel full", "job_id", job.JobId)
 		}
 		return
 	}
 
 	slog.Debug("device up", "device", job.DeviceId, "response_time_ms", responseTime)
-	resultCh <- &pb.MonitoringCheck{
+	select {
+	case resultCh <- &pb.MonitoringCheck{
 		DeviceId:       job.DeviceId,
 		Status:         "success",
 		ResponseTimeMs: responseTime,
 		Timestamp:      timestamp,
+	}:
+	default:
+		slog.Warn("result channel full", "job_id", job.JobId)
 	}
 }
