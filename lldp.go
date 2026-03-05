@@ -36,7 +36,7 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 	snmpDev := job.SnmpDevice
 	client, err := newSnmpConn(snmpDev)
 	if err != nil {
-		slog.Error("failed to create SNMP client for LLDP", "job_id", jobID, "device_id", deviceID, "error", err)
+		slog.Error("failed to connect SNMP for LLDP", "job_id", jobID, "device_id", deviceID, "error", err)
 		return
 	}
 	defer func() {
@@ -44,11 +44,6 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 			slog.Debug("SNMP close error", "error", err)
 		}
 	}()
-
-	if err := client.Connect(); err != nil {
-		slog.Error("SNMP connect failed for LLDP", "job_id", jobID, "device_id", deviceID, "error", err)
-		return
-	}
 
 	result, err := discoverLldpNeighbors(client, deviceID, jobID)
 	if err != nil {
