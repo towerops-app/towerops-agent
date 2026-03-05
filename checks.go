@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"regexp"
@@ -73,6 +74,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: !config.VerifySsl,
+				MinVersion:         tls.VersionTLS12,
 			},
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -119,10 +121,12 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 
 	// Check content regex if provided
 	if config.Regex != "" {
-		body := make([]byte, 1024*1024) // Read up to 1MB
-		n, _ := resp.Body.Read(body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if err != nil {
+			return 2, fmt.Sprintf("Failed to read body: %v", err), responseTime
+		}
 
-		matched, err := regexp.MatchString(config.Regex, string(body[:n]))
+		matched, err := regexp.MatchString(config.Regex, string(body))
 		if err != nil {
 			return 2, fmt.Sprintf("Invalid regex: %v", err), responseTime
 		}

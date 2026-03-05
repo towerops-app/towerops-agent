@@ -118,23 +118,33 @@ func wsConnect(u *url.URL, host, network string) (*WSConn, error) {
 		return nil, fmt.Errorf("write handshake: %w", err)
 	}
 
-	// Read HTTP response (look for 101 Switching Protocols)
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
+	// Read HTTP response headers using a buffered reader.
+	// A single conn.Read may not capture the full response if it spans
+	// multiple TCP segments, so we read line by line until the blank line.
+	br := bufio.NewReaderSize(conn, 4096)
+	statusLine, err := br.ReadString('\n')
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("read handshake: %w", err)
 	}
-	resp := string(buf[:n])
-	if !strings.Contains(resp, "101") {
+	if !strings.Contains(statusLine, "101") {
 		_ = conn.Close()
-		return nil, fmt.Errorf("handshake failed: %s", strings.SplitN(resp, "\r\n", 2)[0])
+		return nil, fmt.Errorf("handshake failed: %s", strings.TrimSpace(statusLine))
 	}
 
-	// Verify Sec-WebSocket-Accept per RFC 6455
+	// Read remaining headers, verify Sec-WebSocket-Accept per RFC 6455
 	expectedAccept := computeAcceptKey(key)
 	acceptFound := false
-	for _, line := range strings.Split(resp, "\r\n") {
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("read handshake headers: %w", err)
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			break // end of headers
+		}
 		if strings.HasPrefix(strings.ToLower(line), "sec-websocket-accept: ") {
 			actual := strings.TrimSpace(line[len("Sec-WebSocket-Accept: "):])
 			if actual != expectedAccept {
@@ -142,7 +152,6 @@ func wsConnect(u *url.URL, host, network string) (*WSConn, error) {
 				return nil, fmt.Errorf("invalid accept key: got %q, want %q", actual, expectedAccept)
 			}
 			acceptFound = true
-			break
 		}
 	}
 	if !acceptFound {
@@ -153,7 +162,8 @@ func wsConnect(u *url.URL, host, network string) (*WSConn, error) {
 	// Clear handshake deadline — normal operation uses no deadline
 	_ = conn.SetDeadline(time.Time{})
 
-	return &WSConn{conn: conn, reader: bufio.NewReaderSize(conn, 8192)}, nil
+	// Reuse the buffered reader — it may hold leftover data from the handshake
+	return &WSConn{conn: conn, reader: br}, nil
 }
 
 // ReadMessage reads the next text or binary message, handling control frames internally.

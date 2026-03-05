@@ -231,8 +231,11 @@ func parseMgmtAddr(oid string) (key string, ip string) {
 		// Convert 16 octets to IPv6 hex format
 		var ipv6Parts []string
 		for i := 0; i < 16; i += 2 {
-			a, _ := strconv.Atoi(parts[5+i])
-			b, _ := strconv.Atoi(parts[5+i+1])
+			a, errA := strconv.Atoi(parts[5+i])
+			b, errB := strconv.Atoi(parts[5+i+1])
+			if errA != nil || errB != nil {
+				return key, ""
+			}
 			ipv6Parts = append(ipv6Parts, fmt.Sprintf("%x", a*256+b))
 		}
 		ip = strings.Join(ipv6Parts, ":")

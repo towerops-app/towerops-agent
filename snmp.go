@@ -130,11 +130,15 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<
 	timestamp := time.Now().Unix()
 
 	if err != nil {
-		resultCh <- &pb.CredentialTestResult{
+		select {
+		case resultCh <- &pb.CredentialTestResult{
 			TestId:       job.JobId,
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("connection failed: %v", err),
 			Timestamp:    timestamp,
+		}:
+		default:
+			slog.Warn("result channel full", "job_id", job.JobId)
 		}
 		return
 	}
@@ -142,11 +146,15 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<
 
 	result, err := conn.Get([]string{"1.3.6.1.2.1.1.1.0"})
 	if err != nil {
-		resultCh <- &pb.CredentialTestResult{
+		select {
+		case resultCh <- &pb.CredentialTestResult{
 			TestId:       job.JobId,
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("SNMP test failed: %v", err),
 			Timestamp:    timestamp,
+		}:
+		default:
+			slog.Warn("result channel full", "job_id", job.JobId)
 		}
 		return
 	}
@@ -156,11 +164,15 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<
 		sysDescr = snmpValueToString(result.Variables[0])
 	}
 
-	resultCh <- &pb.CredentialTestResult{
+	select {
+	case resultCh <- &pb.CredentialTestResult{
 		TestId:            job.JobId,
 		Success:           true,
 		SystemDescription: sysDescr,
 		Timestamp:         timestamp,
+	}:
+	default:
+		slog.Warn("result channel full", "job_id", job.JobId)
 	}
 }
 
@@ -263,7 +275,10 @@ func snmpValueToString(pdu gosnmp.SnmpPDU) string {
 	case gosnmp.Integer:
 		return strconv.FormatInt(gosnmp.ToBigInt(pdu.Value).Int64(), 10)
 	case gosnmp.OctetString:
-		b := pdu.Value.([]byte)
+		b, ok := pdu.Value.([]byte)
+		if !ok {
+			return fmt.Sprintf("%v", pdu.Value)
+		}
 		if !utf8.Valid(b) {
 			return formatHex(b)
 		}
@@ -274,21 +289,42 @@ func snmpValueToString(pdu gosnmp.SnmpPDU) string {
 		}
 		return string(b)
 	case gosnmp.ObjectIdentifier:
-		return pdu.Value.(string)
+		if s, ok := pdu.Value.(string); ok {
+			return s
+		}
+		return fmt.Sprintf("%v", pdu.Value)
 	case gosnmp.Counter32:
-		return strconv.FormatUint(uint64(pdu.Value.(uint)), 10)
+		if v, ok := pdu.Value.(uint); ok {
+			return strconv.FormatUint(uint64(v), 10)
+		}
+		return fmt.Sprintf("%v", pdu.Value)
 	case gosnmp.Counter64:
-		return strconv.FormatUint(pdu.Value.(uint64), 10)
+		if v, ok := pdu.Value.(uint64); ok {
+			return strconv.FormatUint(v, 10)
+		}
+		return fmt.Sprintf("%v", pdu.Value)
 	case gosnmp.Gauge32:
-		return strconv.FormatUint(uint64(pdu.Value.(uint)), 10)
+		if v, ok := pdu.Value.(uint); ok {
+			return strconv.FormatUint(uint64(v), 10)
+		}
+		return fmt.Sprintf("%v", pdu.Value)
 	case gosnmp.TimeTicks:
-		return strconv.FormatUint(uint64(pdu.Value.(uint32)), 10)
+		if v, ok := pdu.Value.(uint32); ok {
+			return strconv.FormatUint(uint64(v), 10)
+		}
+		return fmt.Sprintf("%v", pdu.Value)
 	case gosnmp.IPAddress:
-		return pdu.Value.(string)
+		if s, ok := pdu.Value.(string); ok {
+			return s
+		}
+		return fmt.Sprintf("%v", pdu.Value)
 	case gosnmp.Null, gosnmp.NoSuchObject, gosnmp.NoSuchInstance, gosnmp.EndOfMibView:
 		return "null"
 	case gosnmp.Opaque:
-		return formatHex(pdu.Value.([]byte))
+		if b, ok := pdu.Value.([]byte); ok {
+			return formatHex(b)
+		}
+		return fmt.Sprintf("%v", pdu.Value)
 	default:
 		return fmt.Sprintf("%v", pdu.Value)
 	}
