@@ -199,6 +199,7 @@ func (ws *WSConn) Close() error {
 }
 
 const wsReadTimeout = 90 * time.Second
+const wsWriteTimeout = 30 * time.Second
 
 func (ws *WSConn) readFrame() (opcode int, payload []byte, err error) {
 	// Set read deadline to detect dead connections (MEDIUM-4)
@@ -260,6 +261,10 @@ func (ws *WSConn) readFrame() (opcode int, payload []byte, err error) {
 func (ws *WSConn) writeFrame(opcode int, payload []byte) error {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
+
+	if nc, ok := ws.conn.(net.Conn); ok {
+		_ = nc.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+	}
 
 	length := len(payload)
 	// Single buffer: max header (2+8+4=14) + payload

@@ -66,6 +66,9 @@ func ExecuteCheck(ctx context.Context, check *pb.Check) *pb.CheckResult {
 
 // executeHTTPCheck performs an HTTP/HTTPS check
 func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs uint32) (uint32, string, float64) {
+	if timeoutMs == 0 {
+		timeoutMs = 10000
+	}
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 
 	// Create HTTP client with timeout and TLS config
@@ -141,6 +144,9 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 
 // executeTCPCheck performs a TCP port connectivity check
 func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs uint32) (uint32, string, float64) {
+	if timeoutMs == 0 {
+		timeoutMs = 10000
+	}
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	address := net.JoinHostPort(config.Host, strconv.Itoa(int(config.Port)))
 
@@ -181,6 +187,9 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 
 // executeDNSCheck performs a DNS resolution check
 func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs uint32) (uint32, string, float64) {
+	if timeoutMs == 0 {
+		timeoutMs = 10000
+	}
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 
 	resolver := &net.Resolver{}

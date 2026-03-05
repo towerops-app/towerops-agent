@@ -281,11 +281,15 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *
 
 	client, err := mikrotikDial(dev.Ip, dev.Port, dev.Username, dev.Password, dev.UseSsl)
 	if err != nil {
-		resultCh <- &pb.MikrotikResult{
+		select {
+		case resultCh <- &pb.MikrotikResult{
 			DeviceId:  job.DeviceId,
 			JobId:     job.JobId,
 			Error:     fmt.Sprintf("connection failed: %v", err),
 			Timestamp: timestamp,
+		}:
+		default:
+			slog.Warn("result channel full", "job_id", job.JobId)
 		}
 		return
 	}
@@ -314,12 +318,16 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *
 		}
 	}
 
-	resultCh <- &pb.MikrotikResult{
+	select {
+	case resultCh <- &pb.MikrotikResult{
 		DeviceId:  job.DeviceId,
 		JobId:     job.JobId,
 		Sentences: allSentences,
 		Error:     errorMessage,
 		Timestamp: timestamp,
+	}:
+	default:
+		slog.Warn("result channel full", "job_id", job.JobId)
 	}
 }
 
@@ -329,21 +337,29 @@ func executeMikrotikBackupViaSSH(job *pb.AgentJob, dev *pb.MikrotikDevice, resul
 
 	config, err := sshBackup(dev.Ip, uint16(dev.SshPort), dev.Username, dev.Password)
 	if err != nil {
-		resultCh <- &pb.MikrotikResult{
+		select {
+		case resultCh <- &pb.MikrotikResult{
 			DeviceId:  job.DeviceId,
 			JobId:     job.JobId,
 			Error:     fmt.Sprintf("SSH backup failed: %v", err),
 			Timestamp: timestamp,
+		}:
+		default:
+			slog.Warn("result channel full", "job_id", job.JobId)
 		}
 		return
 	}
 
-	resultCh <- &pb.MikrotikResult{
+	select {
+	case resultCh <- &pb.MikrotikResult{
 		DeviceId: job.DeviceId,
 		JobId:    job.JobId,
 		Sentences: []*pb.MikrotikSentence{
 			{Attributes: map[string]string{"config": config}},
 		},
 		Timestamp: timestamp,
+	}:
+	default:
+		slog.Warn("result channel full", "job_id", job.JobId)
 	}
 }

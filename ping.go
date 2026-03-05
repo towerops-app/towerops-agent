@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"os"
 	"os/exec"
@@ -72,12 +73,13 @@ func doICMPPing(ip net.IP, network string, isIPv4 bool, timeoutMs int) (float64,
 	}
 
 	id := os.Getpid() & 0xffff
+	seq := int(rand.Uint32() & 0xffff)
 	msg := icmp.Message{
 		Type: msgType,
 		Code: 0,
 		Body: &icmp.Echo{
 			ID:   id,
-			Seq:  1,
+			Seq:  seq,
 			Data: []byte("towerops"),
 		},
 	}
@@ -121,7 +123,7 @@ func doICMPPing(ip net.IP, network string, isIPv4 bool, timeoutMs int) (float64,
 		switch rm.Type {
 		case ipv4.ICMPTypeEchoReply, ipv6.ICMPTypeEchoReply:
 			echo, ok := rm.Body.(*icmp.Echo)
-			if !ok || echo.ID != id {
+			if !ok || echo.ID != id || echo.Seq != seq {
 				continue
 			}
 			return float64(elapsed.Microseconds()) / 1000.0, nil

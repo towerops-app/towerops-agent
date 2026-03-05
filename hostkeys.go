@@ -48,7 +48,11 @@ func (s *hostKeyStore) save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, data, 0600)
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
 }
 
 // verify checks a fingerprint for host. Returns nil on match or first-use, error on mismatch.
