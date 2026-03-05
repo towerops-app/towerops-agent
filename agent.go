@@ -150,6 +150,9 @@ func runSession(ctx context.Context, baseURL, token string) error {
 			return
 		}
 		encoded := base64.StdEncoding.EncodeToString(bin)
+		// Zero the serialized protobuf data (may contain credentials).
+		// MarshalAppend may return a new backing array, so zero both.
+		zeroBytes(bin)
 		full := (*bp)[:cap(*bp)]
 		zeroBytes(full)
 		*bp = full[:0]
@@ -391,6 +394,10 @@ func handleMessage(
 			slog.Error("decode check_jobs payload", "error", err)
 			return false
 		}
+		if len(payload.Binary) > maxJobPayloadBytes {
+			slog.Error("check_jobs payload too large", "size", len(payload.Binary), "max", maxJobPayloadBytes)
+			return false
+		}
 		bin, err := base64.StdEncoding.DecodeString(payload.Binary)
 		if err != nil {
 			slog.Error("decode check_jobs base64", "error", err)
@@ -419,7 +426,7 @@ func handleMessage(
 			slog.Error("invalid update payload")
 			return false
 		}
-		slog.Info("update requested", "url", payload.URL)
+		slog.Info("update requested", "url", sanitizeURL(payload.URL))
 		if err := doSelfUpdate(payload.URL, payload.Checksum); err != nil {
 			slog.Error("self-update failed", "error", err)
 		}

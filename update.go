@@ -34,7 +34,7 @@ func selfUpdate(downloadURL, expectedChecksum string) error {
 		return fmt.Errorf("checksum required for update")
 	}
 
-	slog.Info("downloading update", "url", downloadURL)
+	slog.Info("downloading update", "url", sanitizeURL(downloadURL))
 
 	resp, err := httpGet(downloadURL)
 	if err != nil {
