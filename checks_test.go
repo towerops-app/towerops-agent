@@ -122,7 +122,7 @@ func TestExecuteCheck_TCPRouting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
 
@@ -168,7 +168,7 @@ func TestExecuteCheck_DNSRouting(t *testing.T) {
 func TestHTTPCheck_SuccessfulGET(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		fmt.Fprint(w, "OK")
+		_, _ = fmt.Fprint(w, "OK")
 	}))
 	defer srv.Close()
 
@@ -323,7 +323,7 @@ func TestHTTPCheck_FollowRedirectsTrue(t *testing.T) {
 			return
 		}
 		w.WriteHeader(200)
-		fmt.Fprint(w, "final page")
+		_, _ = fmt.Fprint(w, "final page")
 	}))
 	defer srv.Close()
 
@@ -382,7 +382,7 @@ func TestHTTPCheck_FollowRedirectsFalse_DefaultExpects200(t *testing.T) {
 func TestHTTPCheck_RegexMatchSucceeds(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		fmt.Fprint(w, "Hello World! Version 1.2.3")
+		_, _ = fmt.Fprint(w, "Hello World! Version 1.2.3")
 	}))
 	defer srv.Close()
 
@@ -399,7 +399,7 @@ func TestHTTPCheck_RegexMatchSucceeds(t *testing.T) {
 func TestHTTPCheck_RegexMatchFails(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		fmt.Fprint(w, "Hello World!")
+		_, _ = fmt.Fprint(w, "Hello World!")
 	}))
 	defer srv.Close()
 
@@ -419,7 +419,7 @@ func TestHTTPCheck_RegexMatchFails(t *testing.T) {
 func TestHTTPCheck_InvalidRegex(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		fmt.Fprint(w, "some body")
+		_, _ = fmt.Fprint(w, "some body")
 	}))
 	defer srv.Close()
 
@@ -549,7 +549,7 @@ func TestHTTPCheck_LargeResponseBodyWithRegex(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		fmt.Fprint(w, bigBody)
+		_, _ = fmt.Fprint(w, bigBody)
 	}))
 	defer srv.Close()
 
@@ -603,7 +603,7 @@ func TestTCPCheck_PortOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Accept connections in background so dial doesn't hang
 	go func() {
@@ -612,7 +612,7 @@ func TestTCPCheck_PortOpen(t *testing.T) {
 			if err != nil {
 				return
 			}
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
@@ -641,7 +641,7 @@ func TestTCPCheck_PortClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	port := parsePort(portFromListener(ln))
-	ln.Close() // close immediately so port is refused
+	_ = ln.Close() // close immediately so port is refused
 
 	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host: "127.0.0.1",
@@ -661,7 +661,7 @@ func TestTCPCheck_SendExpectSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Echo server
 	go func() {
@@ -671,11 +671,11 @@ func TestTCPCheck_SendExpectSuccess(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				scanner := bufio.NewScanner(c)
 				if scanner.Scan() {
 					line := scanner.Text()
-					fmt.Fprintf(c, "ECHO:%s\n", line)
+					_, _ = fmt.Fprintf(c, "ECHO:%s\n", line)
 				}
 			}(conn)
 		}
@@ -700,7 +700,7 @@ func TestTCPCheck_SendExpectMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		for {
@@ -709,10 +709,10 @@ func TestTCPCheck_SendExpectMismatch(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				buf := make([]byte, 1024)
-				c.Read(buf)
-				fmt.Fprint(c, "WRONG_RESPONSE")
+				_, _ = c.Read(buf)
+				_, _ = fmt.Fprint(c, "WRONG_RESPONSE")
 			}(conn)
 		}
 	}()
@@ -739,7 +739,7 @@ func TestTCPCheck_SendWithEmptyExpect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		for {
@@ -748,9 +748,9 @@ func TestTCPCheck_SendWithEmptyExpect(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				buf := make([]byte, 1024)
-				c.Read(buf)
+				_, _ = c.Read(buf)
 				// Don't send anything back
 			}(conn)
 		}
@@ -775,7 +775,7 @@ func TestTCPCheck_IPv6Localhost(t *testing.T) {
 	if err != nil {
 		t.Skip("IPv6 not available on this system")
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		for {
@@ -783,7 +783,7 @@ func TestTCPCheck_IPv6Localhost(t *testing.T) {
 			if err != nil {
 				return
 			}
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
@@ -804,7 +804,7 @@ func TestTCPCheck_ReadTimeoutOnExpect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Server that accepts and reads but never writes back
 	go func() {
@@ -814,9 +814,9 @@ func TestTCPCheck_ReadTimeoutOnExpect(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				buf := make([]byte, 1024)
-				c.Read(buf)
+				_, _ = c.Read(buf)
 				// Intentionally never respond - hold connection open
 				time.Sleep(10 * time.Second)
 			}(conn)
@@ -857,7 +857,7 @@ func TestTCPCheck_BinaryDataSendExpect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Server that echoes binary data back
 	go func() {
@@ -867,13 +867,13 @@ func TestTCPCheck_BinaryDataSendExpect(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				buf := make([]byte, 4096)
 				n, err := c.Read(buf)
 				if err != nil {
 					return
 				}
-				c.Write(buf[:n])
+				_, _ = c.Write(buf[:n])
 			}(conn)
 		}
 	}()
@@ -1059,7 +1059,7 @@ func TestDNSCheck_CustomDNSServer(t *testing.T) {
 	if err != nil {
 		t.Skip("Cannot reach 8.8.8.8:53, skipping custom DNS server test")
 	}
-	conn.Close()
+	_ = conn.Close()
 
 	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "example.com",
@@ -1120,7 +1120,7 @@ func TestTCPCheck_SendFailsOnClosedConnection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Server accepts and immediately closes the connection
 	go func() {
@@ -1129,7 +1129,7 @@ func TestTCPCheck_SendFailsOnClosedConnection(t *testing.T) {
 			if err != nil {
 				return
 			}
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
@@ -1201,7 +1201,7 @@ func TestTCPCheck_ResponseTimeReported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		for {
@@ -1209,7 +1209,7 @@ func TestTCPCheck_ResponseTimeReported(t *testing.T) {
 			if err != nil {
 				return
 			}
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
@@ -1241,7 +1241,7 @@ func TestHTTPCheck_TLSServerNoVerify(t *testing.T) {
 	// Create a TLS server with custom cert
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		fmt.Fprint(w, "secure")
+		_, _ = fmt.Fprint(w, "secure")
 	}))
 	srv.TLS = &tls.Config{}
 	srv.StartTLS()
@@ -1323,7 +1323,7 @@ func TestHTTPCheck_MultipleRedirects(t *testing.T) {
 			http.Redirect(w, r, "/c", http.StatusFound)
 		case "/c":
 			w.WriteHeader(200)
-			fmt.Fprint(w, "final")
+			_, _ = fmt.Fprint(w, "final")
 		}
 	}))
 	defer srv.Close()
@@ -1367,6 +1367,6 @@ func portFromListener(ln net.Listener) string {
 // parsePort converts a port string to uint32 for use in proto configs.
 func parsePort(s string) uint32 {
 	var port uint32
-	fmt.Sscanf(s, "%d", &port)
+	_, _ = fmt.Sscanf(s, "%d", &port)
 	return port
 }

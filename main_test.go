@@ -138,7 +138,7 @@ func TestRunMainInvalidFlag(t *testing.T) {
 func TestRunMainTokenFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	tokenPath := filepath.Join(tmpDir, "token")
-	os.WriteFile(tokenPath, []byte("  test-token-123  \n"), 0600)
+	_ = os.WriteFile(tokenPath, []byte("  test-token-123  \n"), 0600)
 
 	t.Setenv("TOWEROPS_API_URL", "")
 	t.Setenv("TOWEROPS_AGENT_TOKEN", "")
