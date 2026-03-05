@@ -106,6 +106,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	credTestResultCh := make(chan *pb.CredentialTestResult, 5000)
 	monitoringCheckCh := make(chan *pb.MonitoringCheck, 10000)
 	checkResultCh := make(chan *pb.CheckResult, 10000)
+	lldpTopologyResultCh := make(chan *pb.LldpTopologyResult, 1000)
 
 	// Ref counter for outbound messages
 	var refCounter atomic.Uint64
@@ -277,7 +278,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 				slog.Warn("invalid message", "error", err)
 				continue
 			}
-			if handleMessage(ctx, msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh) {
+			if handleMessage(ctx, msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh, lldpTopologyResultCh) {
 				flushSnmpBatch()
 				return errRestartRequested
 			}
@@ -303,6 +304,10 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		case result := <-checkResultCh:
 			sendBinaryResult("check_result", result)
 			slog.Info("sent check result", "check", result.CheckId, "status", result.Status)
+
+		case result := <-lldpTopologyResultCh:
+			sendBinaryResult("lldp_topology_result", result)
+			slog.Info("sent LLDP topology result", "device", result.DeviceId, "neighbors", len(result.Neighbors))
 
 		case <-flushTicker.C:
 			flushSnmpBatch()
@@ -345,6 +350,7 @@ func handleMessage(
 	credTestResultCh chan<- *pb.CredentialTestResult,
 	monitoringCheckCh chan<- *pb.MonitoringCheck,
 	checkResultCh chan<- *pb.CheckResult,
+	lldpTopologyResultCh chan<- *pb.LldpTopologyResult,
 ) bool {
 	switch msg.Event {
 	case "phx_reply":
@@ -374,7 +380,7 @@ func handleMessage(
 		}
 		slog.Info("received jobs", "count", len(jobList.Jobs))
 		for _, job := range jobList.Jobs {
-			dispatchJob(ctx, job, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh)
+			dispatchJob(ctx, job, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh, lldpTopologyResultCh)
 		}
 
 	case "check_jobs":
@@ -442,6 +448,7 @@ func dispatchJob(
 	credTestResultCh chan<- *pb.CredentialTestResult,
 	monitoringCheckCh chan<- *pb.MonitoringCheck,
 	checkResultCh chan<- *pb.CheckResult,
+	lldpTopologyResultCh chan<- *pb.LldpTopologyResult,
 ) {
 	slog.Info("starting job", "job_id", job.JobId, "type", job.JobType)
 
@@ -453,6 +460,8 @@ func dispatchJob(
 		ok = pools.snmp.submit(ctx, func() { executeCredentialTest(ctx, job, credTestResultCh) })
 	case pb.JobType_PING:
 		ok = pools.ping.submit(ctx, func() { executePingJob(ctx, job, monitoringCheckCh) })
+	case pb.JobType_LLDP_TOPOLOGY:
+		ok = pools.snmp.submit(ctx, func() { executeLldpTopologyJob(ctx, job, lldpTopologyResultCh) })
 	default:
 		ok = pools.snmp.submit(ctx, func() { executeSnmpJob(ctx, job, snmpResultCh) })
 	}

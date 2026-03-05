@@ -173,6 +173,7 @@ enum JobType {
   MIKROTIK = 2;
   TEST_CREDENTIALS = 3;
   PING = 4;
+  LLDP_TOPOLOGY = 5;  // Discover all LLDP neighbors for topology mapping
 }
 
 enum QueryType {
@@ -272,4 +273,22 @@ message MikrotikResult {
 
 message MikrotikSentence {
   map<string, string> attributes = 1;
+}
+
+// LLDP Topology Discovery Results
+
+message LldpTopologyResult {
+  string device_id = 1;
+  string job_id = 2;
+  string local_system_name = 3;
+  repeated LldpNeighbor neighbors = 4;
+  int64 timestamp = 5;
+}
+
+message LldpNeighbor {
+  string neighbor_name = 1;
+  string local_port = 2;
+  string remote_port = 3;
+  string remote_port_id = 4;
+  repeated string management_addresses = 5;
 }
