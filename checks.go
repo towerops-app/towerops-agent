@@ -189,7 +189,7 @@ func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs u
 			PreferGo: true,
 			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 				d := net.Dialer{Timeout: timeout}
-				return d.DialContext(ctx, "udp", config.Server+":53")
+				return d.DialContext(ctx, "udp", net.JoinHostPort(config.Server, "53"))
 			},
 		}
 	}
