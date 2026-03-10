@@ -42,7 +42,8 @@ type channelMsg struct {
 func runAgent(ctx context.Context, wsURL, token string) {
 	baseURL := strings.TrimRight(wsURL, "/")
 	retryDelay := time.Second
-	maxRetry := 60 * time.Second
+	maxRetry := 10 * time.Second
+	const successfulConnectionThreshold = 30 * time.Second
 
 	for {
 		select {
@@ -51,7 +52,18 @@ func runAgent(ctx context.Context, wsURL, token string) {
 		default:
 		}
 
+		sessionStart := time.Now()
 		err := runSession(ctx, baseURL, token)
+		sessionDuration := time.Since(sessionStart)
+
+		// Reset backoff if session ran successfully for a while (indicates stable connection)
+		if sessionDuration >= successfulConnectionThreshold {
+			slog.Debug("resetting reconnect backoff after successful session",
+				"duration", sessionDuration,
+				"previous_delay", retryDelay)
+			retryDelay = time.Second
+		}
+
 		if ctx.Err() != nil {
 			return
 		}
