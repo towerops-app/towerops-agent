@@ -105,7 +105,7 @@ message MonitoringCheck {
 
 message Check {
   string id = 1;
-  string check_type = 2;  // "http", "tcp", "dns"
+  string check_type = 2;  // "http", "tcp", "dns", "ssl"
   uint32 interval_seconds = 3;
   uint32 timeout_ms = 4;
 
@@ -114,6 +114,7 @@ message Check {
     HttpCheckConfig http = 5;
     TcpCheckConfig tcp = 6;
     DnsCheckConfig dns = 7;
+    SslCheckConfig ssl = 8;
   }
 }
 
@@ -140,6 +141,12 @@ message DnsCheckConfig {
   string server = 2;  // DNS server (optional)
   string record_type = 3;  // A, AAAA, CNAME, MX, TXT
   string expected = 4;  // Expected result (optional)
+}
+
+message SslCheckConfig {
+  string host = 1;
+  uint32 port = 2;          // default 443
+  uint32 warning_days = 3;  // alert if expires within this many days
 }
 
 message CheckResult {
