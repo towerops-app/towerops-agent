@@ -1355,6 +1355,171 @@ func TestHTTPCheck_EmptyHeadersMap(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// SSL check tests
+// ---------------------------------------------------------------------------
+
+func TestExecuteCheck_MissingSSLConfig(t *testing.T) {
+	result := ExecuteCheck(context.Background(), &pb.Check{
+		Id:        "chk-ssl-missing",
+		CheckType: "ssl",
+		TimeoutMs: 5000,
+	})
+	if result.Status != 3 {
+		t.Fatalf("expected status 3, got %d", result.Status)
+	}
+	if !strings.Contains(result.Output, "Missing SSL config") {
+		t.Fatalf("expected missing SSL config message, got %s", result.Output)
+	}
+}
+
+func TestExecuteCheck_SSLRouting(t *testing.T) {
+	// Start a local TLS server with a self-signed cert
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	// Parse the port from the test server URL
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(strings.TrimPrefix(srv.URL, "https://"), "http://"))
+
+	result := ExecuteCheck(context.Background(), &pb.Check{
+		Id:        "chk-route-ssl",
+		CheckType: "ssl",
+		TimeoutMs: 5000,
+		Config: &pb.Check_Ssl{
+			Ssl: &pb.SslCheckConfig{
+				Host:        "127.0.0.1",
+				Port:        parsePort(portStr),
+				WarningDays: 7,
+			},
+		},
+	})
+	// The test server has a valid cert, so should be OK
+	if result.Status == 3 {
+		t.Fatalf("expected routing to SSL handler, got status 3 (UNKNOWN): %s", result.Output)
+	}
+}
+
+func TestSSLCheck_ValidCert(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
+
+	status, output, rt := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host:        "127.0.0.1",
+		Port:        parsePort(portStr),
+		WarningDays: 1,
+	}, 5000)
+
+	// httptest TLS cert is valid, should be OK with warning_days=1
+	if status != 0 {
+		t.Fatalf("expected status 0, got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "OK: Certificate") {
+		t.Fatalf("expected OK message, got %s", output)
+	}
+	if rt < 0 {
+		t.Fatalf("expected non-negative response time, got %f", rt)
+	}
+}
+
+func TestSSLCheck_WarningThreshold(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
+
+	// httptest certs typically expire within a few years.
+	// Set warning_days very high to trigger WARNING.
+	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host:        "127.0.0.1",
+		Port:        parsePort(portStr),
+		WarningDays: 999999,
+	}, 5000)
+
+	if status != 1 {
+		t.Fatalf("expected status 1 (WARNING), got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "WARNING: Certificate") {
+		t.Fatalf("expected WARNING message, got %s", output)
+	}
+}
+
+func TestSSLCheck_ConnectionFailure(t *testing.T) {
+	// Use non-routable address
+	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host: "192.0.2.1",
+		Port: 443,
+	}, 1000)
+
+	if status != 3 {
+		t.Fatalf("expected status 3 (UNKNOWN), got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "Connection failed") {
+		t.Fatalf("expected connection failed message, got %s", output)
+	}
+}
+
+func TestSSLCheck_ClosedPort(t *testing.T) {
+	// Bind and immediately close to get a port that refuses connections
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := parsePort(portFromListener(ln))
+	_ = ln.Close()
+
+	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host: "127.0.0.1",
+		Port: port,
+	}, 2000)
+
+	if status != 3 {
+		t.Fatalf("expected status 3, got %d: %s", status, output)
+	}
+}
+
+func TestSSLCheck_DefaultPort443(t *testing.T) {
+	// When port is 0 (unset), should default to 443.
+	// We just verify it doesn't crash.
+	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host: "192.0.2.1",
+		Port: 0,
+	}, 500)
+
+	// Should fail to connect (non-routable), but shouldn't crash
+	if status != 3 {
+		t.Logf("SSL check with default port returned status %d: %s", status, output)
+	}
+}
+
+func TestSSLCheck_DefaultWarningDays30(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
+
+	// warning_days=0 should default to 30
+	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host:        "127.0.0.1",
+		Port:        parsePort(portStr),
+		WarningDays: 0,
+	}, 5000)
+
+	// httptest certs are valid for ~1 year, with default 30 days warning should be OK
+	if status != 0 {
+		t.Fatalf("expected status 0 with default warning_days, got %d: %s", status, output)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
 
