@@ -1,6 +1,6 @@
 # Towerops Agent
 
-A lightweight Rust-based remote polling agent for Towerops SNMP monitoring.
+A lightweight remote polling agent for Towerops network monitoring.
 
 ## Overview
 
@@ -14,7 +14,7 @@ The Towerops agent enables customers to deploy SNMP polling infrastructure on th
 - **Real-time Updates**: Server pushes configuration changes instantly via persistent WebSocket connection
 - **Automatic Reconnection**: Exponential backoff reconnection on network failures
 - **Automatic Updates**: Checks for new versions hourly and self-updates when available (requires Docker socket access)
-- **Low Resource Usage**: Built in Rust for minimal memory and CPU footprint (< 256 MB RAM typical)
+- **Low Resource Usage**: Minimal memory and CPU footprint (< 256 MB RAM typical)
 - **Docker Ready**: Pre-built Docker images for easy deployment
 
 ## Quick Start
@@ -39,7 +39,6 @@ services:
     image: ghcr.io/towerops-app/towerops-agent:latest
     restart: unless-stopped
     environment:
-      - TOWEROPS_API_URL=https://towerops.net
       - TOWEROPS_AGENT_TOKEN=your-agent-token-here
       - LOG_LEVEL=info
       # Optional: Enable SNMP trap listener
@@ -62,7 +61,6 @@ The agent is configured via environment variables:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `TOWEROPS_API_URL` | Towerops API endpoint | Required |
 | `TOWEROPS_AGENT_TOKEN` | Agent authentication token | Required |
 | `LOG_LEVEL` | Logging level (error, warn, info, debug) | info |
 | `TRAP_ENABLED` | Enable SNMP trap listener | false |
@@ -104,15 +102,13 @@ When enabled (`TRAP_ENABLED=true`), the agent listens for SNMP traps:
 
 ### Prerequisites
 
-- Rust 1.91 or later
+- Go 1.25 or later
 
 ### Build
 
 ```bash
-cargo build --release
+go build -o towerops-agent .
 ```
-
-The binary will be in `target/release/towerops-agent`.
 
 ### Docker Build
 
@@ -124,9 +120,8 @@ docker build -t towerops-agent .
 
 ### Agent Not Connecting
 
-- Verify the API URL is correct (accepts http://, https://, ws://, or wss://)
+- Verify network connectivity to the Towerops API
 - Check that the agent token is valid and hasn't been revoked
-- Ensure network connectivity to the Towerops API
 - Check logs for connection errors: `docker logs towerops-agent`
 
 ### No Metrics Appearing
