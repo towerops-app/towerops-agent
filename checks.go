@@ -46,6 +46,13 @@ func ExecuteCheck(ctx context.Context, check *pb.Check) *pb.CheckResult {
 			status, output = 3, "Missing DNS config"
 		}
 
+	case "ssl":
+		if sslConfig := check.GetSsl(); sslConfig != nil {
+			status, output, responseTimeMs = executeSSLCheck(ctx, sslConfig, check.TimeoutMs)
+		} else {
+			status, output = 3, "Missing SSL config"
+		}
+
 	default:
 		status, output = 3, fmt.Sprintf("Unknown check type: %s", check.CheckType)
 	}
@@ -280,4 +287,58 @@ func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs u
 	}
 
 	return 0, fmt.Sprintf("Resolved to: %s", strings.Join(results, ", ")), responseTime
+}
+
+// executeSSLCheck connects via TLS and checks the certificate expiration date.
+func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs uint32) (uint32, string, float64) {
+	if timeoutMs == 0 {
+		timeoutMs = 10000
+	}
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+
+	host := config.Host
+	port := config.Port
+	if port == 0 {
+		port = 443
+	}
+	warningDays := config.WarningDays
+	if warningDays == 0 {
+		warningDays = 30
+	}
+
+	address := net.JoinHostPort(host, strconv.Itoa(int(port)))
+
+	dialer := &net.Dialer{Timeout: timeout}
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         host,
+	}
+
+	startTime := time.Now()
+	conn, err := tls.DialWithDialer(dialer, "tcp", address, tlsConfig)
+	responseTime := float64(time.Since(startTime).Milliseconds())
+
+	if err != nil {
+		return 3, fmt.Sprintf("Connection failed: %v", err), responseTime
+	}
+	defer func() { _ = conn.Close() }()
+
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return 3, fmt.Sprintf("No certificate presented by %s:%d", host, port), responseTime
+	}
+
+	cert := certs[0]
+	notAfter := cert.NotAfter
+	daysRemaining := int(time.Until(notAfter).Hours() / 24)
+	expiresStr := notAfter.Format("2006-01-02")
+
+	switch {
+	case daysRemaining < 0:
+		return 2, fmt.Sprintf("CRITICAL: Certificate for %s:%d expired %d days ago (%s)", host, port, -daysRemaining, expiresStr), responseTime
+	case daysRemaining <= int(warningDays):
+		return 1, fmt.Sprintf("WARNING: Certificate for %s:%d expires in %d days (%s)", host, port, daysRemaining, expiresStr), responseTime
+	default:
+		return 0, fmt.Sprintf("OK: Certificate for %s:%d valid for %d days (%s)", host, port, daysRemaining, expiresStr), responseTime
+	}
 }
