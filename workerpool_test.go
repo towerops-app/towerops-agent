@@ -57,6 +57,27 @@ func TestWorkerPool(t *testing.T) {
 		pool.stop()
 		pool.stop() // should not panic
 	})
+
+	t.Run("stopWithTimeout returns true when workers finish in time", func(t *testing.T) {
+		pool := newWorkerPool(2)
+		pool.submit(context.Background(), func() {
+			time.Sleep(10 * time.Millisecond)
+		})
+		if !pool.stopWithTimeout(time.Second) {
+			t.Error("expected stopWithTimeout to return true")
+		}
+	})
+
+	t.Run("stopWithTimeout returns false when workers exceed timeout", func(t *testing.T) {
+		pool := newWorkerPool(1)
+		blocker := make(chan struct{})
+		pool.submit(context.Background(), func() { <-blocker })
+
+		if pool.stopWithTimeout(50 * time.Millisecond) {
+			t.Error("expected stopWithTimeout to return false")
+		}
+		close(blocker) // unblock for cleanup
+	})
 }
 
 func TestWorkerPoolRecoversPanic(t *testing.T) {
