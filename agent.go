@@ -251,10 +251,19 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	startTime := time.Now()
 
 	defer func() {
-		pools.snmp.stop()
-		pools.mikrotik.stop()
-		pools.ping.stop()
-		pools.checks.stop()
+		const poolShutdownTimeout = 5 * time.Second
+		if !pools.snmp.stopWithTimeout(poolShutdownTimeout) {
+			slog.Warn("snmp pool shutdown timed out, abandoning in-flight jobs")
+		}
+		if !pools.mikrotik.stopWithTimeout(poolShutdownTimeout) {
+			slog.Warn("mikrotik pool shutdown timed out, abandoning in-flight jobs")
+		}
+		if !pools.ping.stopWithTimeout(poolShutdownTimeout) {
+			slog.Warn("ping pool shutdown timed out, abandoning in-flight jobs")
+		}
+		if !pools.checks.stopWithTimeout(poolShutdownTimeout) {
+			slog.Warn("checks pool shutdown timed out, abandoning in-flight jobs")
+		}
 		close(writeCh)
 		writerWg.Wait()
 	}()
