@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"time"
 )
 
 // workerPool is a fixed-size goroutine pool for executing tasks.
@@ -54,4 +55,21 @@ func (p *workerPool) stop() {
 		close(p.tasks)
 		p.wg.Wait()
 	})
+}
+
+// stopWithTimeout closes the task channel and waits up to timeout for workers
+// to finish. Returns true if all workers completed, false if the timeout was
+// reached and some workers were abandoned.
+func (p *workerPool) stopWithTimeout(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		p.stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
