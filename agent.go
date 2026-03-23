@@ -100,6 +100,11 @@ func runSession(ctx context.Context, baseURL, token string) error {
 
 	slog.Info("connected", "agent_id", agentID)
 
+	// Session-scoped context: cancelled on write/read errors so blocked
+	// pool submits unblock immediately instead of waiting for workers to finish.
+	sessionCtx, sessionCancel := context.WithCancel(ctx)
+	defer sessionCancel()
+
 	// Channel for serializing WebSocket writes
 	writeCh := make(chan []byte, 10000)
 
@@ -180,6 +185,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 			data, _, err := ws.ReadMessage()
 			if err != nil {
 				errCh <- err
+				sessionCancel() // Unblock any stuck pool submits
 				return
 			}
 			msgCh <- data
@@ -236,6 +242,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 				case writeErrCh <- err:
 				default:
 				}
+				sessionCancel() // Unblock any stuck pool submits
 				return
 			}
 		}
@@ -301,7 +308,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 				slog.Warn("invalid message", "error", err)
 				continue
 			}
-			if handleMessage(ctx, msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh, lldpTopologyResultCh) {
+			if handleMessage(sessionCtx, msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh, lldpTopologyResultCh) {
 				flushSnmpBatch()
 				return errRestartRequested
 			}
