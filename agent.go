@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -20,7 +19,6 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var osExit = os.Exit
 var doSelfUpdate = selfUpdate
 
 var errRestartRequested = fmt.Errorf("restart requested")
