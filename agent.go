@@ -68,8 +68,9 @@ func runAgent(ctx context.Context, wsURL, token string) {
 			return
 		}
 		if errors.Is(err, errRestartRequested) {
-			osExit(0)
-			return
+			slog.Info("restart requested, reconnecting immediately")
+			retryDelay = time.Second
+			continue
 		}
 		if err != nil {
 			slog.Error("agent disconnected", "error", err)

@@ -10,6 +10,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1053,35 +1054,36 @@ func TestRunSessionReadErrorDuringJoin(t *testing.T) {
 }
 
 func TestRunAgentReconnectOnError(t *testing.T) {
-	// Server that fails first connection then succeeds, then sends restart
+	// Server that fails first connection then succeeds, then sends restart.
+	// Agent should reconnect (not exit) after both error and restart.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
 
-	connCount := 0
+	var connCount atomic.Int32
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			connCount++
+			count := connCount.Add(1)
 			buf := make([]byte, 4096)
 			n, _ := conn.Read(buf)
 			key := extractWSKey(string(buf[:n]))
 			accept := computeAcceptKey(key)
 
-			if connCount == 1 {
-				// First connection: upgrade then close immediately
+			if count == 1 {
+				// First connection: upgrade then close immediately (triggers error reconnect)
 				resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
 				_, _ = conn.Write([]byte(resp))
 				frameBuf := make([]byte, 4096)
 				_, _ = conn.Read(frameBuf)
 				_ = conn.Close()
-			} else {
-				// Second connection: proper session with restart
+			} else if count == 2 {
+				// Second connection: proper session with restart (triggers restart reconnect)
 				resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
 				_, _ = conn.Write([]byte(resp))
 				frameBuf := make([]byte, 4096)
@@ -1102,14 +1104,12 @@ func TestRunAgentReconnectOnError(t *testing.T) {
 				_, _ = conn.Write(makeTextFrame(restart))
 				time.Sleep(time.Second)
 				_ = conn.Close()
+			} else {
+				// Third connection: agent successfully reconnected after restart
+				_ = conn.Close()
 			}
 		}
 	}()
-
-	origExit := osExit
-	defer func() { osExit = origExit }()
-	exitCalled := make(chan int, 1)
-	osExit = func(code int) { exitCalled <- code }
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1120,14 +1120,22 @@ func TestRunAgentReconnectOnError(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case code := <-exitCalled:
-		if code != 0 {
-			t.Errorf("expected exit code 0, got %d", code)
+	// Wait for 3rd connection attempt (proves agent reconnected after both error and restart)
+	deadline := time.After(10 * time.Second)
+	for {
+		if connCount.Load() >= 3 {
+			cancel()
+			break
 		}
-	case <-time.After(10 * time.Second):
-		t.Error("runAgent did not reconnect and restart")
+		select {
+		case <-deadline:
+			t.Fatalf("expected at least 3 connections, got %d", connCount.Load())
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
+
+	<-done
 }
 
 func TestRunAgentContextCancellation(t *testing.T) {
@@ -1149,80 +1157,80 @@ func TestRunAgentContextCancellation(t *testing.T) {
 }
 
 func TestRunAgentRestart(t *testing.T) {
-	origExit := osExit
-	defer func() { osExit = origExit }()
-
-	exitCalled := make(chan int, 1)
-	osExit = func(code int) {
-		exitCalled <- code
-	}
-
-	// Start a fake WebSocket server that accepts the join and sends restart
+	// After receiving a restart event, the agent should reconnect (not exit).
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
 
+	var connCount atomic.Int32
 	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			count := connCount.Add(1)
+
+			buf := make([]byte, 4096)
+			n, _ := conn.Read(buf)
+			key := extractWSKey(string(buf[:n]))
+			accept := computeAcceptKey(key)
+			resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+			_, _ = conn.Write([]byte(resp))
+
+			frameBuf := make([]byte, 4096)
+			_, _ = conn.Read(frameBuf)
+
+			reply, _ := json.Marshal(channelMsg{
+				Topic:   "agent:agent-0",
+				Event:   "phx_reply",
+				Payload: json.RawMessage(`{"status":"ok"}`),
+				Ref:     strPtr("1"),
+			})
+			_, _ = conn.Write(makeTextFrame(reply))
+
+			if count == 1 {
+				// First connection: send restart event
+				time.Sleep(50 * time.Millisecond)
+				restart, _ := json.Marshal(channelMsg{
+					Topic:   "agent:agent-0",
+					Event:   "restart",
+					Payload: json.RawMessage(`{}`),
+				})
+				_, _ = conn.Write(makeTextFrame(restart))
+				time.Sleep(time.Second)
+			}
+			_ = conn.Close()
 		}
-		defer func() { _ = conn.Close() }()
-
-		buf := make([]byte, 4096)
-		n, _ := conn.Read(buf)
-		reqStr := string(buf[:n])
-		key := extractWSKey(reqStr)
-		accept := computeAcceptKey(key)
-		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
-		_, _ = conn.Write([]byte(resp))
-
-		// Read join frame
-		frameBuf := make([]byte, 4096)
-		_, _ = conn.Read(frameBuf)
-
-		// Send join OK reply
-		reply, _ := json.Marshal(channelMsg{
-			Topic:   "agent:agent-0",
-			Event:   "phx_reply",
-			Payload: json.RawMessage(`{"status":"ok"}`),
-			Ref:     strPtr("1"),
-		})
-		_, _ = conn.Write(makeTextFrame(reply))
-
-		// Small delay then send restart event
-		time.Sleep(50 * time.Millisecond)
-		restart, _ := json.Marshal(channelMsg{
-			Topic:   "agent:agent-0",
-			Event:   "restart",
-			Payload: json.RawMessage(`{}`),
-		})
-		_, _ = conn.Write(makeTextFrame(restart))
-
-		// Keep connection open briefly
-		time.Sleep(2 * time.Second)
 	}()
 
-	addr := ln.Addr().String()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	done := make(chan struct{})
 	go func() {
-		runAgent(ctx, "ws://"+addr, "test-token")
+		runAgent(ctx, "ws://"+ln.Addr().String(), "test-token")
 		close(done)
 	}()
 
-	select {
-	case code := <-exitCalled:
-		if code != 0 {
-			t.Errorf("expected exit code 0, got %d", code)
+	// Wait for 2nd connection (proves agent reconnected after restart instead of exiting)
+	deadline := time.After(5 * time.Second)
+	for {
+		if connCount.Load() >= 2 {
+			cancel()
+			break
 		}
-	case <-time.After(5 * time.Second):
-		t.Error("osExit was not called after restart")
+		select {
+		case <-deadline:
+			t.Fatalf("expected at least 2 connections, got %d", connCount.Load())
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
+
+	<-done
 }
 
 // readMaskedFrame reads a single masked WebSocket frame from the server side.
