@@ -1075,14 +1075,15 @@ func TestRunAgentReconnectOnError(t *testing.T) {
 			key := extractWSKey(string(buf[:n]))
 			accept := computeAcceptKey(key)
 
-			if count == 1 {
+			switch count {
+			case 1:
 				// First connection: upgrade then close immediately (triggers error reconnect)
 				resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
 				_, _ = conn.Write([]byte(resp))
 				frameBuf := make([]byte, 4096)
 				_, _ = conn.Read(frameBuf)
 				_ = conn.Close()
-			} else if count == 2 {
+			case 2:
 				// Second connection: proper session with restart (triggers restart reconnect)
 				resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
 				_, _ = conn.Write([]byte(resp))
@@ -1104,7 +1105,7 @@ func TestRunAgentReconnectOnError(t *testing.T) {
 				_, _ = conn.Write(makeTextFrame(restart))
 				time.Sleep(time.Second)
 				_ = conn.Close()
-			} else {
+			default:
 				// Third connection: agent successfully reconnected after restart
 				_ = conn.Close()
 			}
