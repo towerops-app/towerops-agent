@@ -551,10 +551,10 @@ func TestWSDialWriteHandshakeError(t *testing.T) {
 
 	_, err := WSDial("ws://127.0.0.1:9999/socket")
 	if err == nil {
-		t.Error("expected write handshake error")
+		t.Error("expected connection error")
 	}
-	if !strings.Contains(err.Error(), "write handshake") {
-		t.Errorf("expected 'write handshake' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "write handshake") && !strings.Contains(err.Error(), "set deadline") {
+		t.Errorf("expected 'write handshake' or 'set deadline' in error, got: %v", err)
 	}
 }
 

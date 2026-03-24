@@ -19,8 +19,9 @@ func TestExecutePingJob(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
 		ch := make(chan *pb.MonitoringCheck, 1)
 		executePingJob(context.Background(), &pb.AgentJob{JobId: "p1"}, ch)
-		if len(ch) != 0 {
-			t.Error("expected no result for nil device")
+		result := <-ch
+		if result.Status != "failure" {
+			t.Errorf("expected failure status for nil device, got: %s", result.Status)
 		}
 	})
 
@@ -83,8 +84,12 @@ func TestExecuteMikrotikJob(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
 		ch := make(chan *pb.MikrotikResult, 1)
 		executeMikrotikJob(context.Background(), &pb.AgentJob{JobId: "m1"}, ch)
-		if len(ch) != 0 {
-			t.Error("expected no result for nil device")
+		result := <-ch
+		if result.Error == "" {
+			t.Error("expected error for nil device")
+		}
+		if !strings.Contains(result.Error, "missing device") {
+			t.Errorf("expected 'missing device' in error, got: %s", result.Error)
 		}
 	})
 
@@ -234,6 +239,7 @@ func TestExecuteMikrotikBackupViaSSH(t *testing.T) {
 
 		ch := make(chan *pb.MikrotikResult, 1)
 		executeMikrotikBackupViaSSH(
+			context.Background(),
 			&pb.AgentJob{JobId: "backup:1", DeviceId: "d1"},
 			&pb.MikrotikDevice{Ip: "10.0.0.1", SshPort: 22, Username: "admin", Password: "pass"},
 			ch, 1000,
@@ -258,6 +264,7 @@ func TestExecuteMikrotikBackupViaSSH(t *testing.T) {
 
 		ch := make(chan *pb.MikrotikResult, 1)
 		executeMikrotikBackupViaSSH(
+			context.Background(),
 			&pb.AgentJob{JobId: "backup:2", DeviceId: "d2"},
 			&pb.MikrotikDevice{Ip: "10.0.0.1", SshPort: 22, Username: "admin", Password: "pass"},
 			ch, 1000,
