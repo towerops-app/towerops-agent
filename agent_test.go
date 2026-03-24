@@ -109,7 +109,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		handleMessage(context.Background(), channelMsg{Event: "phx_reply", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "phx_reply", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Just verify it doesn't panic
 	})
 
@@ -137,7 +137,7 @@ func TestHandleMessage(t *testing.T) {
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		})
 
-		handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Wait for goroutine to finish
 		select {
 		case <-snmpCh:
@@ -152,7 +152,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: json.RawMessage(`not json`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: json.RawMessage(`not json`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Should log error but not panic
 	})
 
@@ -163,7 +163,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": "not-base64!!!"})
-		handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 	})
 
 	t.Run("invalid protobuf", func(t *testing.T) {
@@ -173,7 +173,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString([]byte{0xFF, 0xFF, 0xFF})})
-		handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 	})
 
 	t.Run("restart", func(t *testing.T) {
@@ -182,10 +182,44 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		shouldEnd := handleMessage(context.Background(), channelMsg{Event: "restart", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		shouldEnd, reason := handleMessage(context.Background(), channelMsg{Event: "restart", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 
 		if !shouldEnd {
 			t.Error("expected handleMessage to return true for restart")
+		}
+		if reason != errRestartRequested {
+			t.Fatalf("expected restart reason %v, got %v", errRestartRequested, reason)
+		}
+	})
+
+	t.Run("phoenix channel teardown reconnects", func(t *testing.T) {
+		events := []string{"phx_error", "phx_close"}
+
+		for _, event := range events {
+			snmpCh := make(chan *pb.SnmpResult, 1)
+			mtCh := make(chan *pb.MikrotikResult, 1)
+			credCh := make(chan *pb.CredentialTestResult, 1)
+			monCh := make(chan *pb.MonitoringCheck, 1)
+			checkCh := make(chan *pb.CheckResult, 1)
+
+			shouldEnd, reason := handleMessage(
+				context.Background(),
+				channelMsg{Topic: "agent:test", Event: event, Payload: json.RawMessage(`{}`)},
+				testPools(t),
+				snmpCh,
+				mtCh,
+				credCh,
+				monCh,
+				checkCh,
+				make(chan *pb.LldpTopologyResult, 1),
+			)
+
+			if !shouldEnd {
+				t.Fatalf("expected handleMessage to end session for %s", event)
+			}
+			if reason != errChannelReloaded {
+				t.Fatalf("expected reload reason %v for %s, got %v", errChannelReloaded, event, reason)
+			}
 		}
 	})
 
@@ -205,7 +239,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent", "checksum": "abc123"})
-		handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 
 		if calledURL != "https://example.com/agent" {
 			t.Errorf("expected update URL %q, got %q", "https://example.com/agent", calledURL)
@@ -229,7 +263,7 @@ func TestHandleMessage(t *testing.T) {
 		checkCh := make(chan *pb.CheckResult, 1)
 		// Missing URL field
 		payload, _ := json.Marshal(map[string]string{"checksum": "abc123"})
-		handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 
 		if called {
 			t.Error("selfUpdate should not be called with empty URL")
@@ -250,7 +284,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent", "checksum": "abc123"})
-		handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Should log error but not panic
 	})
 
@@ -270,7 +304,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent"})
-		handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 
 		if called {
 			t.Error("selfUpdate should not be called with empty checksum")
@@ -283,7 +317,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		handleMessage(context.Background(), channelMsg{Event: "some_unknown_event", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "some_unknown_event", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Should just log and not panic
 	})
 
@@ -300,7 +334,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		select {
 		case <-checkCh:
 		case <-time.After(5 * time.Second):
@@ -314,7 +348,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: json.RawMessage(`not json`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: json.RawMessage(`not json`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Should log error but not panic
 	})
 
@@ -325,7 +359,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": "not-base64!!!"})
-		handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Should log error but not panic
 	})
 
@@ -336,7 +370,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString([]byte{0xFF, 0xFF, 0xFF})})
-		handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Should log error but not panic
 	})
 
@@ -363,7 +397,7 @@ func TestHandleMessage(t *testing.T) {
 			JobType:    pb.JobType_DISCOVER,
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		})
-		handleMessage(context.Background(), channelMsg{Event: "discovery_job", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "discovery_job", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		select {
 		case <-snmpCh:
 		case <-time.After(2 * time.Second):
@@ -391,7 +425,7 @@ func TestHandleMessage(t *testing.T) {
 			JobType:        pb.JobType_MIKROTIK,
 			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", SshPort: 22, Username: "admin", Password: "pass"},
 		})
-		handleMessage(context.Background(), channelMsg{Event: "backup_job", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "backup_job", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		select {
 		case result := <-mtCh:
 			if result.Error != "" {
@@ -415,7 +449,7 @@ func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
 	encoded := base64.StdEncoding.EncodeToString(oversized)
 	payload, _ := json.Marshal(map[string]string{"binary": encoded})
 
-	handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+	_, _ = handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 
 	// Verify no jobs were dispatched
 	select {

@@ -22,6 +22,7 @@ import (
 var doSelfUpdate = selfUpdate
 
 var errRestartRequested = fmt.Errorf("restart requested")
+var errChannelReloaded = fmt.Errorf("channel reloaded")
 var joinTimeout = 10 * time.Second
 var heartbeatInterval = 60 * time.Second
 var channelHeartbeatInterval = 25 * time.Second
@@ -320,9 +321,10 @@ func runSession(ctx context.Context, baseURL, token string) error {
 				slog.Warn("invalid message", "error", err)
 				continue
 			}
-			if handleMessage(sessionCtx, msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh, lldpTopologyResultCh) {
+			shouldEnd, endErr := handleMessage(sessionCtx, msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh, lldpTopologyResultCh)
+			if shouldEnd {
 				flushSnmpBatch()
-				return errRestartRequested
+				return endErr
 			}
 
 		case result := <-snmpResultCh:
@@ -382,7 +384,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 }
 
 // handleMessage dispatches incoming channel messages.
-// Returns true if the session should end (e.g. restart requested).
+// Returns whether the session should end and the reason for reconnecting.
 func handleMessage(
 	ctx context.Context,
 	msg channelMsg,
@@ -393,10 +395,16 @@ func handleMessage(
 	monitoringCheckCh chan<- *pb.MonitoringCheck,
 	checkResultCh chan<- *pb.CheckResult,
 	lldpTopologyResultCh chan<- *pb.LldpTopologyResult,
-) bool {
+) (bool, error) {
 	switch msg.Event {
 	case "phx_reply":
 		slog.Debug("channel reply", "topic", msg.Topic)
+
+	case "phx_error", "phx_close":
+		slog.Warn("phoenix channel ended, reconnecting",
+			"event", msg.Event,
+			"topic", msg.Topic)
+		return true, errChannelReloaded
 
 	case "jobs", "discovery_job", "backup_job":
 		var payload struct {
@@ -404,21 +412,21 @@ func handleMessage(
 		}
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 			slog.Error("decode job payload", "error", err)
-			return false
+			return false, nil
 		}
 		if len(payload.Binary) > maxJobPayloadBytes {
 			slog.Error("job payload too large", "size", len(payload.Binary), "max", maxJobPayloadBytes)
-			return false
+			return false, nil
 		}
 		bin, err := base64.StdEncoding.DecodeString(payload.Binary)
 		if err != nil {
 			slog.Error("decode base64", "error", err)
-			return false
+			return false, nil
 		}
 		var jobList pb.AgentJobList
 		if err := proto.Unmarshal(bin, &jobList); err != nil {
 			slog.Error("unmarshal job list", "error", err)
-			return false
+			return false, nil
 		}
 		slog.Info("received jobs", "count", len(jobList.Jobs))
 		for _, job := range jobList.Jobs {
@@ -431,21 +439,21 @@ func handleMessage(
 		}
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 			slog.Error("decode check_jobs payload", "error", err)
-			return false
+			return false, nil
 		}
 		if len(payload.Binary) > maxJobPayloadBytes {
 			slog.Error("check_jobs payload too large", "size", len(payload.Binary), "max", maxJobPayloadBytes)
-			return false
+			return false, nil
 		}
 		bin, err := base64.StdEncoding.DecodeString(payload.Binary)
 		if err != nil {
 			slog.Error("decode check_jobs base64", "error", err)
-			return false
+			return false, nil
 		}
 		var checkList pb.CheckList
 		if err := proto.Unmarshal(bin, &checkList); err != nil {
 			slog.Error("unmarshal check list", "error", err)
-			return false
+			return false, nil
 		}
 		slog.Info("received checks", "count", len(checkList.Checks))
 		for _, check := range checkList.Checks {
@@ -454,7 +462,7 @@ func handleMessage(
 
 	case "restart":
 		slog.Info("restart requested by server")
-		return true
+		return true, errRestartRequested
 
 	case "update":
 		var payload struct {
@@ -463,7 +471,7 @@ func handleMessage(
 		}
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil || payload.URL == "" || payload.Checksum == "" {
 			slog.Error("invalid update payload")
-			return false
+			return false, nil
 		}
 		slog.Info("update requested", "url", sanitizeURL(payload.URL))
 		if err := doSelfUpdate(payload.URL, payload.Checksum); err != nil {
@@ -473,7 +481,7 @@ func handleMessage(
 	default:
 		slog.Debug("ignoring event", "event", msg.Event)
 	}
-	return false
+	return false, nil
 }
 
 // jobPools holds the worker pools for each job type.
