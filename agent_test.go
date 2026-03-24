@@ -182,10 +182,44 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		shouldEnd := handleMessage(context.Background(), channelMsg{Event: "restart", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		shouldEnd, reason := handleMessage(context.Background(), channelMsg{Event: "restart", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 
 		if !shouldEnd {
 			t.Error("expected handleMessage to return true for restart")
+		}
+		if reason != errRestartRequested {
+			t.Fatalf("expected restart reason %v, got %v", errRestartRequested, reason)
+		}
+	})
+
+	t.Run("phoenix channel teardown reconnects", func(t *testing.T) {
+		events := []string{"phx_error", "phx_close"}
+
+		for _, event := range events {
+			snmpCh := make(chan *pb.SnmpResult, 1)
+			mtCh := make(chan *pb.MikrotikResult, 1)
+			credCh := make(chan *pb.CredentialTestResult, 1)
+			monCh := make(chan *pb.MonitoringCheck, 1)
+			checkCh := make(chan *pb.CheckResult, 1)
+
+			shouldEnd, reason := handleMessage(
+				context.Background(),
+				channelMsg{Topic: "agent:test", Event: event, Payload: json.RawMessage(`{}`)},
+				testPools(t),
+				snmpCh,
+				mtCh,
+				credCh,
+				monCh,
+				checkCh,
+				make(chan *pb.LldpTopologyResult, 1),
+			)
+
+			if !shouldEnd {
+				t.Fatalf("expected handleMessage to end session for %s", event)
+			}
+			if reason != errChannelReloaded {
+				t.Fatalf("expected reload reason %v for %s, got %v", errChannelReloaded, event, reason)
+			}
 		}
 	})
 
