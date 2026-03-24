@@ -180,16 +180,27 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	// Reader goroutine — must start before join so we can receive the reply
 	msgCh := make(chan []byte, 100)
 	errCh := make(chan error, 1)
+	var readerWg sync.WaitGroup
+	readerWg.Add(1)
 	go func() {
+		defer readerWg.Done()
 		for {
 			data, _, err := ws.ReadMessage()
 			if err != nil {
-				errCh <- err
-				sessionCancel() // Unblock any stuck pool submits
+				select {
+				case errCh <- err:
+				default:
+				}
+				sessionCancel()
 				return
 			}
 			msgCh <- data
 		}
+	}()
+
+	go func() {
+		<-sessionCtx.Done()
+		_ = ws.Close()
 	}()
 
 	// Join channel
@@ -272,9 +283,10 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		}
 		close(writeCh)
 		writerWg.Wait()
+		readerWg.Wait() // Wait for reader goroutine to exit
 	}()
 
-	var snmpBatch []*pb.SnmpResult
+	snmpBatch := make([]*pb.SnmpResult, 0, 50) // Pre-allocate capacity for performance
 
 	flushSnmpBatch := func() {
 		if len(snmpBatch) == 0 {

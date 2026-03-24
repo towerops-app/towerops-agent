@@ -106,33 +106,43 @@ func discoverLldpNeighbors(client *gosnmp.GoSNMP, deviceID, jobID string) (*pb.L
 
 	// Walk remote port descriptions
 	remotePorts := make(map[string]string)
-	_ = client.Walk(oidRemPortDesc, func(pdu gosnmp.SnmpPDU) error {
+	var walkErrors []string
+	if err := client.Walk(oidRemPortDesc, func(pdu gosnmp.SnmpPDU) error {
 		key := parseRemoteKey(pdu.Name, oidRemPortDesc)
 		if key != "" {
 			remotePorts[key] = snmpValueToString(pdu)
 		}
 		return nil
-	})
+	}); err != nil {
+		walkErrors = append(walkErrors, fmt.Sprintf("walk remote port descriptions: %v", err))
+		slog.Warn("failed to walk remote port descriptions", "error", err)
+	}
 
 	// Walk remote port IDs (fallback when description is empty)
 	remotePortIds := make(map[string]string)
-	_ = client.Walk(oidRemPortId, func(pdu gosnmp.SnmpPDU) error {
+	if err := client.Walk(oidRemPortId, func(pdu gosnmp.SnmpPDU) error {
 		key := parseRemoteKey(pdu.Name, oidRemPortId)
 		if key != "" {
 			remotePortIds[key] = snmpValueToString(pdu)
 		}
 		return nil
-	})
+	}); err != nil {
+		walkErrors = append(walkErrors, fmt.Sprintf("walk remote port IDs: %v", err))
+		slog.Warn("failed to walk remote port IDs", "error", err)
+	}
 
 	// Walk management addresses (indexed by timeMark.portNum.remIndex.addrSubtype.addrLen.addr[bytes])
 	mgmtAddrs := make(map[string][]string)
-	_ = client.Walk(oidRemManAddr, func(pdu gosnmp.SnmpPDU) error {
+	if err := client.Walk(oidRemManAddr, func(pdu gosnmp.SnmpPDU) error {
 		key, ip := parseMgmtAddr(pdu.Name)
 		if key != "" && ip != "" {
 			mgmtAddrs[key] = append(mgmtAddrs[key], ip)
 		}
 		return nil
-	})
+	}); err != nil {
+		walkErrors = append(walkErrors, fmt.Sprintf("walk management addresses: %v", err))
+		slog.Warn("failed to walk management addresses", "error", err)
+	}
 
 	// Assemble neighbor list
 	for key, neighborName := range sysNames {
@@ -161,6 +171,9 @@ func discoverLldpNeighbors(client *gosnmp.GoSNMP, deviceID, jobID string) (*pb.L
 
 		result.Neighbors = append(result.Neighbors, neighbor)
 	}
+
+	// Walk errors are already logged; return result with whatever data was collected
+	_ = walkErrors
 
 	return result, nil
 }
