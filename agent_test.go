@@ -109,7 +109,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		handleMessage(context.Background(), channelMsg{Event: "phx_reply", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "phx_reply", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Just verify it doesn't panic
 	})
 
@@ -137,7 +137,7 @@ func TestHandleMessage(t *testing.T) {
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		})
 
-		handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Wait for goroutine to finish
 		select {
 		case <-snmpCh:
@@ -152,7 +152,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: json.RawMessage(`not json`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: json.RawMessage(`not json`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Should log error but not panic
 	})
 
