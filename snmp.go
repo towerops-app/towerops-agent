@@ -37,12 +37,26 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.S
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing snmp device", "job_id", job.JobId)
+		sendSnmpResultWithTimeout(ctx, resultCh, &pb.SnmpResult{
+			DeviceId:  job.DeviceId,
+			JobType:   job.JobType,
+			JobId:     job.JobId,
+			OidValues: make(map[string]string),
+			Timestamp: time.Now().Unix(),
+		}, job.JobId)
 		return
 	}
 
 	conn, closeFn, err := snmpDial(dev)
 	if err != nil {
 		slog.Error("snmp connect", "job_id", job.JobId, "device", dev.Ip, "error", err)
+		sendSnmpResultWithTimeout(ctx, resultCh, &pb.SnmpResult{
+			DeviceId:  job.DeviceId,
+			JobType:   job.JobType,
+			JobId:     job.JobId,
+			OidValues: make(map[string]string),
+			Timestamp: time.Now().Unix(),
+		}, job.JobId)
 		return
 	}
 	defer closeFn()
@@ -110,12 +124,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.S
 	}
 
 	slog.Info("snmp job complete", "job_id", job.JobId, "oids", len(oidValues))
-
-	select {
-	case resultCh <- result:
-	default:
-		slog.Warn("result channel full", "job_id", job.JobId)
-	}
+	sendSnmpResultWithTimeout(ctx, resultCh, result, job.JobId)
 }
 
 // executeCredentialTest tests SNMP credentials by reading sysDescr.0.
@@ -123,6 +132,12 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing snmp device", "job_id", job.JobId)
+		sendCredTestResultWithTimeout(ctx, resultCh, &pb.CredentialTestResult{
+			TestId:       job.JobId,
+			Success:      false,
+			ErrorMessage: "missing device configuration",
+			Timestamp:    time.Now().Unix(),
+		}, job.JobId)
 		return
 	}
 
@@ -130,32 +145,24 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<
 	timestamp := time.Now().Unix()
 
 	if err != nil {
-		select {
-		case resultCh <- &pb.CredentialTestResult{
+		sendCredTestResultWithTimeout(ctx, resultCh, &pb.CredentialTestResult{
 			TestId:       job.JobId,
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("connection failed: %v", err),
 			Timestamp:    timestamp,
-		}:
-		default:
-			slog.Warn("result channel full", "job_id", job.JobId)
-		}
+		}, job.JobId)
 		return
 	}
 	defer closeFn()
 
 	result, err := conn.Get([]string{"1.3.6.1.2.1.1.1.0"})
 	if err != nil {
-		select {
-		case resultCh <- &pb.CredentialTestResult{
+		sendCredTestResultWithTimeout(ctx, resultCh, &pb.CredentialTestResult{
 			TestId:       job.JobId,
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("SNMP test failed: %v", err),
 			Timestamp:    timestamp,
-		}:
-		default:
-			slog.Warn("result channel full", "job_id", job.JobId)
-		}
+		}, job.JobId)
 		return
 	}
 
@@ -164,16 +171,12 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<
 		sysDescr = snmpValueToString(result.Variables[0])
 	}
 
-	select {
-	case resultCh <- &pb.CredentialTestResult{
+	sendCredTestResultWithTimeout(ctx, resultCh, &pb.CredentialTestResult{
 		TestId:            job.JobId,
 		Success:           true,
 		SystemDescription: sysDescr,
 		Timestamp:         timestamp,
-	}:
-	default:
-		slog.Warn("result channel full", "job_id", job.JobId)
-	}
+	}, job.JobId)
 }
 
 // newSnmpConn creates a gosnmp.GoSNMP connection from protobuf device config.
@@ -345,4 +348,24 @@ func formatHex(b []byte) string {
 		buf.WriteByte(h[i+1])
 	}
 	return buf.String()
+}
+
+func sendSnmpResultWithTimeout(ctx context.Context, resultCh chan<- *pb.SnmpResult, result *pb.SnmpResult, jobID string) {
+	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	select {
+	case resultCh <- result:
+	case <-sendCtx.Done():
+		slog.Error("snmp result send timeout - agent overloaded", "job_id", jobID)
+	}
+}
+
+func sendCredTestResultWithTimeout(ctx context.Context, resultCh chan<- *pb.CredentialTestResult, result *pb.CredentialTestResult, jobID string) {
+	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	select {
+	case resultCh <- result:
+	case <-sendCtx.Done():
+		slog.Error("credential test result send timeout - agent overloaded", "job_id", jobID)
+	}
 }
