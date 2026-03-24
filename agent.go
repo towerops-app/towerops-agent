@@ -185,21 +185,22 @@ func runSession(ctx context.Context, baseURL, token string) error {
 	go func() {
 		defer readerWg.Done()
 		for {
-			// Check context cancellation to enable fast shutdown
-			select {
-			case <-sessionCtx.Done():
-				return
-			default:
-			}
-
 			data, _, err := ws.ReadMessage()
 			if err != nil {
-				errCh <- err
-				sessionCancel() // Unblock any stuck pool submits
+				select {
+				case errCh <- err:
+				default:
+				}
+				sessionCancel()
 				return
 			}
 			msgCh <- data
 		}
+	}()
+
+	go func() {
+		<-sessionCtx.Done()
+		_ = ws.Close()
 	}()
 
 	// Join channel

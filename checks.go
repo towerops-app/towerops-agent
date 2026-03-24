@@ -16,22 +16,16 @@ import (
 )
 
 var (
-	defaultHTTPClient = &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-		},
+	defaultHTTPTransport = &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
 	}
-	insecureHTTPClient = &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-		},
+	insecureHTTPTransport = &http.Transport{
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
 	}
 )
 
@@ -93,10 +87,25 @@ func ExecuteCheck(ctx context.Context, check *pb.Check) *pb.CheckResult {
 
 // executeHTTPCheck performs an HTTP/HTTPS check
 func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs uint32) (uint32, string, float64) {
-	// Use shared HTTP client with connection pooling
-	client := defaultHTTPClient
+	transport := defaultHTTPTransport
 	if !config.VerifySsl {
-		client = insecureHTTPClient
+		transport = insecureHTTPTransport
+	}
+
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if !config.FollowRedirects {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
 	}
 
 	method := strings.ToUpper(config.Method)

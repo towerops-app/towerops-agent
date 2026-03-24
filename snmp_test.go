@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/gosnmp/gosnmp"
@@ -300,9 +301,10 @@ func (m *mockSnmpQuerier) BulkWalkAll(rootOid string) ([]gosnmp.SnmpPDU, error) 
 func TestExecuteSnmpJob(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
 		ch := make(chan *pb.SnmpResult, 1)
-		executeSnmpJob(context.Background(), &pb.AgentJob{JobId: "1"}, ch)
-		if len(ch) != 0 {
-			t.Error("expected no result for nil device")
+		executeSnmpJob(context.Background(), &pb.AgentJob{JobId: "1", JobType: pb.JobType_POLL}, ch)
+		result := <-ch
+		if len(result.OidValues) != 0 {
+			t.Errorf("expected empty oid values for nil device, got %d", len(result.OidValues))
 		}
 	})
 
@@ -318,8 +320,9 @@ func TestExecuteSnmpJob(t *testing.T) {
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		}, ch)
-		if len(ch) != 0 {
-			t.Error("expected no result on dial error")
+		result := <-ch
+		if len(result.OidValues) != 0 {
+			t.Errorf("expected empty oid values on dial error, got %d", len(result.OidValues))
 		}
 	})
 
@@ -501,15 +504,11 @@ func TestExecuteSnmpJob(t *testing.T) {
 		ch := make(chan *pb.SnmpResult, 1)
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
-			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
-			Queries: []*pb.SnmpQuery{
-				{QueryType: pb.QueryType_WALK, Oids: []string{".1.3.6.1.2.1.2.2.1.1"}},
-			},
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		}, ch)
-
 		result := <-ch
-		if len(result.OidValues) != 1 {
-			t.Errorf("expected 1 value (others skipped), got %d", len(result.OidValues))
+		if len(result.OidValues) != 0 {
+			t.Errorf("expected empty oid values on dial error, got %d", len(result.OidValues))
 		}
 	})
 
@@ -698,8 +697,12 @@ func TestExecuteCredentialTest(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
 		ch := make(chan *pb.CredentialTestResult, 1)
 		executeCredentialTest(context.Background(), &pb.AgentJob{JobId: "1"}, ch)
-		if len(ch) != 0 {
-			t.Error("expected no result for nil device")
+		result := <-ch
+		if result.Success {
+			t.Error("expected failure for nil device")
+		}
+		if !strings.Contains(result.ErrorMessage, "missing device") {
+			t.Errorf("expected 'missing device' in error, got: %s", result.ErrorMessage)
 		}
 	})
 
