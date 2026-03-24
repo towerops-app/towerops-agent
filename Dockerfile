@@ -7,7 +7,7 @@ COPY . .
 ARG VERSION=dev
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION}" -o towerops-agent .
+    CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION} -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o towerops-agent .
 
 FROM alpine:3.23
 RUN apk add --no-cache ca-certificates iputils libcap

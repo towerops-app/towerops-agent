@@ -13,6 +13,7 @@ import (
 )
 
 var version = "dev"
+var buildDate = "unknown"
 
 var insecureFlag bool
 
@@ -71,7 +72,7 @@ func runMain(ctx context.Context, args []string) int {
 		return 1
 	}
 
-	slog.Info("towerops agent starting", "version", version)
+	slog.Info("towerops agent starting", "version", version, "built", buildDate)
 
 	// Convert HTTP(S) to WebSocket URL
 	wsURL, err := toWebSocketURL(*apiURL)
