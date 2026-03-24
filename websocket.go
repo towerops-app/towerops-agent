@@ -61,6 +61,11 @@ func WSDial(rawURL string) (*WSConn, error) {
 		return nil, fmt.Errorf("parse url: %w", err)
 	}
 
+	// Warn if plaintext websocket connection
+	if u.Scheme == "ws" {
+		slog.Warn("plaintext websocket connection - credentials sent unencrypted", "url", sanitizeURL(rawURL))
+	}
+
 	host := u.Host
 	if !strings.Contains(host, ":") {
 		if u.Scheme == "wss" {
@@ -99,7 +104,10 @@ func wsConnect(u *url.URL, host, network string) (*WSConn, error) {
 	}
 
 	// Set handshake deadline — prevents a slow/malicious server from blocking indefinitely
-	_ = conn.SetDeadline(time.Now().Add(wsHandshakeTimeout))
+	if err := conn.SetDeadline(time.Now().Add(wsHandshakeTimeout)); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("set deadline: %w", err)
+	}
 
 	// Generate random key for Sec-WebSocket-Key
 	keyBytes := make([]byte, 16)
@@ -160,7 +168,10 @@ func wsConnect(u *url.URL, host, network string) (*WSConn, error) {
 	}
 
 	// Clear handshake deadline — normal operation uses no deadline
-	_ = conn.SetDeadline(time.Time{})
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("clear deadline: %w", err)
+	}
 
 	// Reuse the buffered reader — it may hold leftover data from the handshake
 	return &WSConn{conn: conn, reader: br}, nil
@@ -204,7 +215,9 @@ const wsWriteTimeout = 30 * time.Second
 func (ws *WSConn) readFrame() (opcode int, payload []byte, err error) {
 	// Set read deadline to detect dead connections (MEDIUM-4)
 	if nc, ok := ws.conn.(net.Conn); ok {
-		_ = nc.SetReadDeadline(time.Now().Add(wsReadTimeout))
+		if err := nc.SetReadDeadline(time.Now().Add(wsReadTimeout)); err != nil {
+			return 0, nil, fmt.Errorf("set read deadline: %w", err)
+		}
 	}
 
 	var header [2]byte
@@ -263,7 +276,9 @@ func (ws *WSConn) writeFrame(opcode int, payload []byte) error {
 	defer ws.mu.Unlock()
 
 	if nc, ok := ws.conn.(net.Conn); ok {
-		_ = nc.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		if err := nc.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+			return fmt.Errorf("set write deadline: %w", err)
+		}
 	}
 
 	length := len(payload)
@@ -289,9 +304,11 @@ func (ws *WSConn) writeFrame(opcode int, payload []byte) error {
 	buf = append(buf, maskKey[:]...)
 
 	// Masked payload
+	masked := make([]byte, len(payload))
 	for i, b := range payload {
-		buf = append(buf, b^maskKey[i%4])
+		masked[i] = b ^ maskKey[i%4]
 	}
+	buf = append(buf, masked...)
 
 	_, err := ws.conn.Write(buf)
 	return err

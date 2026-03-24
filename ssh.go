@@ -57,6 +57,11 @@ func executePingJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.M
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing device info for ping", "job_id", job.JobId)
+		sendMonitoringCheckWithTimeout(ctx, resultCh, &pb.MonitoringCheck{
+			DeviceId:  job.DeviceId,
+			Status:    "failure",
+			Timestamp: time.Now().Unix(),
+		}, job.JobId)
 		return
 	}
 
@@ -65,27 +70,29 @@ func executePingJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.M
 
 	if err != nil {
 		slog.Warn("device down", "device", job.DeviceId, "error", err)
-		select {
-		case resultCh <- &pb.MonitoringCheck{
+		sendMonitoringCheckWithTimeout(ctx, resultCh, &pb.MonitoringCheck{
 			DeviceId:  job.DeviceId,
 			Status:    "failure",
 			Timestamp: timestamp,
-		}:
-		default:
-			slog.Warn("result channel full", "job_id", job.JobId)
-		}
+		}, job.JobId)
 		return
 	}
 
 	slog.Debug("device up", "device", job.DeviceId, "response_time_ms", responseTime)
-	select {
-	case resultCh <- &pb.MonitoringCheck{
+	sendMonitoringCheckWithTimeout(ctx, resultCh, &pb.MonitoringCheck{
 		DeviceId:       job.DeviceId,
 		Status:         "success",
 		ResponseTimeMs: responseTime,
 		Timestamp:      timestamp,
-	}:
-	default:
-		slog.Warn("result channel full", "job_id", job.JobId)
+	}, job.JobId)
+}
+
+func sendMonitoringCheckWithTimeout(ctx context.Context, resultCh chan<- *pb.MonitoringCheck, result *pb.MonitoringCheck, jobID string) {
+	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	select {
+	case resultCh <- result:
+	case <-sendCtx.Done():
+		slog.Error("monitoring check result send timeout - agent overloaded", "job_id", jobID)
 	}
 }

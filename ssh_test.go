@@ -234,6 +234,7 @@ func TestExecuteMikrotikBackupViaSSH(t *testing.T) {
 
 		ch := make(chan *pb.MikrotikResult, 1)
 		executeMikrotikBackupViaSSH(
+			context.Background(),
 			&pb.AgentJob{JobId: "backup:1", DeviceId: "d1"},
 			&pb.MikrotikDevice{Ip: "10.0.0.1", SshPort: 22, Username: "admin", Password: "pass"},
 			ch, 1000,
@@ -258,6 +259,7 @@ func TestExecuteMikrotikBackupViaSSH(t *testing.T) {
 
 		ch := make(chan *pb.MikrotikResult, 1)
 		executeMikrotikBackupViaSSH(
+			context.Background(),
 			&pb.AgentJob{JobId: "backup:2", DeviceId: "d2"},
 			&pb.MikrotikDevice{Ip: "10.0.0.1", SshPort: 22, Username: "admin", Password: "pass"},
 			ch, 1000,

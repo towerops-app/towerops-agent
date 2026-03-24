@@ -15,6 +15,26 @@ import (
 	"github.com/towerops-app/towerops-agent/pb"
 )
 
+var (
+	defaultHTTPClient = &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+	insecureHTTPClient = &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+)
+
 // ExecuteCheck runs a service check and returns the result.
 // Agent is stateless - just executes what it's told and reports back.
 func ExecuteCheck(ctx context.Context, check *pb.Check) *pb.CheckResult {
@@ -73,26 +93,10 @@ func ExecuteCheck(ctx context.Context, check *pb.Check) *pb.CheckResult {
 
 // executeHTTPCheck performs an HTTP/HTTPS check
 func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs uint32) (uint32, string, float64) {
-	if timeoutMs == 0 {
-		timeoutMs = 10000
-	}
-	timeout := time.Duration(timeoutMs) * time.Millisecond
-
-	// Create HTTP client with timeout and TLS config
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: !config.VerifySsl,
-				MinVersion:         tls.VersionTLS12,
-			},
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if !config.FollowRedirects {
-				return http.ErrUseLastResponse
-			}
-			return nil
-		},
+	// Use shared HTTP client with connection pooling
+	client := defaultHTTPClient
+	if !config.VerifySsl {
+		client = insecureHTTPClient
 	}
 
 	method := strings.ToUpper(config.Method)
@@ -168,7 +172,10 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 
 	// If send/expect strings provided, test them
 	if config.Send != "" {
-		_ = conn.SetDeadline(time.Now().Add(timeout))
+		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+			_ = conn.Close()
+			return 2, fmt.Sprintf("Set deadline failed: %v", err), responseTime
+		}
 
 		_, err = conn.Write([]byte(config.Send))
 		if err != nil {
