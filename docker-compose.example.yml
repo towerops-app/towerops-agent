@@ -1,6 +1,7 @@
 services:
   towerops-agent:
     image: ghcr.io/towerops-app/towerops-agent:latest
+    pull_policy: always
     container_name: towerops-agent
     restart: unless-stopped
     cap_add:
