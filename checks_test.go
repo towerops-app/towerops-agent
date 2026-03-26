@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -1378,6 +1379,7 @@ func TestExecuteCheck_SSLRouting(t *testing.T) {
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
+	withTestSSLRootCA(t, srv.Certificate())
 
 	// Parse the port from the test server URL
 	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(strings.TrimPrefix(srv.URL, "https://"), "http://"))
@@ -1405,6 +1407,7 @@ func TestSSLCheck_ValidCert(t *testing.T) {
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
+	withTestSSLRootCA(t, srv.Certificate())
 
 	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
 
@@ -1431,6 +1434,7 @@ func TestSSLCheck_WarningThreshold(t *testing.T) {
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
+	withTestSSLRootCA(t, srv.Certificate())
 
 	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
 
@@ -1503,6 +1507,7 @@ func TestSSLCheck_DefaultWarningDays30(t *testing.T) {
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
+	withTestSSLRootCA(t, srv.Certificate())
 
 	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
 
@@ -1516,6 +1521,28 @@ func TestSSLCheck_DefaultWarningDays30(t *testing.T) {
 	// httptest certs are valid for ~1 year, with default 30 days warning should be OK
 	if status != 0 {
 		t.Fatalf("expected status 0 with default warning_days, got %d: %s", status, output)
+	}
+}
+
+func TestSSLCheck_UntrustedCertFails(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
+
+	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host:        "127.0.0.1",
+		Port:        parsePort(portStr),
+		WarningDays: 7,
+	}, 5000)
+
+	if status != 3 {
+		t.Fatalf("expected status 3 for untrusted certificate, got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "Connection failed") {
+		t.Fatalf("expected connection failure output, got %s", output)
 	}
 }
 
@@ -1534,4 +1561,15 @@ func parsePort(s string) uint32 {
 	var port uint32
 	_, _ = fmt.Sscanf(s, "%d", &port)
 	return port
+}
+
+func withTestSSLRootCA(t *testing.T, cert *x509.Certificate) {
+	t.Helper()
+	orig := sslRootCAs
+	sslRootCAs = func() (*x509.CertPool, error) {
+		pool := x509.NewCertPool()
+		pool.AddCert(cert)
+		return pool, nil
+	}
+	t.Cleanup(func() { sslRootCAs = orig })
 }

@@ -65,7 +65,8 @@ func (s *hostKeyStore) verify(host, fingerprint string) error {
 		slog.Warn("TOFU: first connection, trusting host key", "host", host, "fingerprint", fingerprint)
 		s.keys[host] = fingerprint
 		if err := s.save(); err != nil {
-			slog.Error("failed to save host keys", "error", err)
+			delete(s.keys, host)
+			return fmt.Errorf("failed to persist trusted host key for %s: %w", host, err)
 		}
 		return nil
 	}

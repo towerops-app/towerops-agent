@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -27,6 +28,7 @@ var (
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
 	}
+	sslRootCAs = x509.SystemCertPool
 )
 
 // ExecuteCheck runs a service check and returns the result.
@@ -325,9 +327,14 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 	address := net.JoinHostPort(host, strconv.Itoa(int(port)))
 
 	dialer := &net.Dialer{Timeout: timeout}
+	rootCAs, err := sslRootCAs()
+	if err != nil {
+		return 3, fmt.Sprintf("Failed to load system root CAs: %v", err), 0
+	}
 	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         host,
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    rootCAs,
+		ServerName: host,
 	}
 
 	startTime := time.Now()
