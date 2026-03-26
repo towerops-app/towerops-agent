@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/towerops-app/towerops-agent/pb"
@@ -42,9 +43,8 @@ func executeMikrotikBackup(ip string, port uint16, username, password string) (s
 
 	output, err := session.CombinedOutput("/export compact")
 	if err != nil {
-		// MikroTik SSH doesn't use exit codes the same way - check if we got output
-		if len(output) > 0 {
-			return string(output), nil
+		if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
+			return "", fmt.Errorf("ssh command: %w: %s", err, trimmed)
 		}
 		return "", fmt.Errorf("ssh command: %w", err)
 	}

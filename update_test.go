@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSelfUpdateRejectsHTTP(t *testing.T) {
@@ -44,9 +45,9 @@ func TestSelfUpdateChecksumMismatch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	origGet := httpGet
-	defer func() { httpGet = origGet }()
-	httpGet = srv.Client().Get
+	origDo := httpDo
+	defer func() { httpDo = origDo }()
+	httpDo = srv.Client().Do
 
 	err := selfUpdate(rewriteToHTTPS(srv.URL), "0000000000000000000000000000000000000000000000000000000000000000")
 	if err == nil {
@@ -60,9 +61,9 @@ func TestSelfUpdate404(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	origGet := httpGet
-	defer func() { httpGet = origGet }()
-	httpGet = srv.Client().Get
+	origDo := httpDo
+	defer func() { httpDo = origDo }()
+	httpDo = srv.Client().Do
 
 	err := selfUpdate(rewriteToHTTPS(srv.URL)+"/missing", "abc123")
 	if err == nil {
@@ -86,9 +87,9 @@ func TestSelfUpdateReadBodyError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	origGet := httpGet
-	defer func() { httpGet = origGet }()
-	httpGet = srv.Client().Get
+	origDo := httpDo
+	defer func() { httpDo = origDo }()
+	httpDo = srv.Client().Do
 
 	err := selfUpdate(rewriteToHTTPS(srv.URL), "abc123")
 	// This may or may not error depending on io.ReadAll behavior with truncated body
@@ -111,9 +112,9 @@ func TestSelfUpdateOsExecutableError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	origGet := httpGet
-	defer func() { httpGet = origGet }()
-	httpGet = srv.Client().Get
+	origDo := httpDo
+	defer func() { httpDo = origDo }()
+	httpDo = srv.Client().Do
 
 	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
 	if err == nil {
@@ -144,9 +145,9 @@ func TestSelfUpdateCreateTempError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	origGet := httpGet
-	defer func() { httpGet = origGet }()
-	httpGet = srv.Client().Get
+	origDo := httpDo
+	defer func() { httpDo = origDo }()
+	httpDo = srv.Client().Do
 
 	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
 	if err == nil {
@@ -178,9 +179,9 @@ func TestSelfUpdateRenameError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	origGet := httpGet
-	defer func() { httpGet = origGet }()
-	httpGet = srv.Client().Get
+	origDo := httpDo
+	defer func() { httpDo = origDo }()
+	httpDo = srv.Client().Do
 
 	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
 	if err == nil {
@@ -200,9 +201,9 @@ func TestSelfUpdateChecksumMatch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	origGet := httpGet
-	defer func() { httpGet = origGet }()
-	httpGet = srv.Client().Get
+	origDo := httpDo
+	defer func() { httpDo = origDo }()
+	httpDo = srv.Client().Do
 
 	// This will fail at the rename step (writing to os.Executable path),
 	// but the checksum verification should pass
@@ -241,9 +242,9 @@ func TestSelfUpdateFilePermissions(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	origGet := httpGet
-	defer func() { httpGet = origGet }()
-	httpGet = srv.Client().Get
+	origDo := httpDo
+	defer func() { httpDo = origDo }()
+	httpDo = srv.Client().Do
 
 	_ = selfUpdate(rewriteToHTTPS(srv.URL), checksum)
 
@@ -270,9 +271,9 @@ func TestSelfUpdateTooLarge(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	origGet := httpGet
-	defer func() { httpGet = origGet }()
-	httpGet = srv.Client().Get
+	origDo := httpDo
+	defer func() { httpDo = origDo }()
+	httpDo = srv.Client().Do
 
 	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
 	if err == nil {
@@ -341,17 +342,17 @@ func TestSelfUpdateFullHappyPath(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	origGet := httpGet
+	origDo := httpDo
 	origExe := osExecutable
 	origRename := osRename
 	origExec := syscallExec
 	defer func() {
-		httpGet = origGet
+		httpDo = origDo
 		osExecutable = origExe
 		osRename = origRename
 		syscallExec = origExec
 	}()
-	httpGet = srv.Client().Get
+	httpDo = srv.Client().Do
 
 	dir := t.TempDir()
 	exePath := filepath.Join(dir, "test-agent")
@@ -378,15 +379,15 @@ func TestSelfUpdateWriteError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	origGet := httpGet
+	origDo := httpDo
 	origExe := osExecutable
 	origCreate := osCreateTemp
 	defer func() {
-		httpGet = origGet
+		httpDo = origDo
 		osExecutable = origExe
 		osCreateTemp = origCreate
 	}()
-	httpGet = srv.Client().Get
+	httpDo = srv.Client().Do
 
 	dir := t.TempDir()
 	osExecutable = func() (string, error) { return filepath.Join(dir, "agent"), nil }
@@ -405,6 +406,29 @@ func TestSelfUpdateWriteError(t *testing.T) {
 	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
 	if err == nil {
 		t.Error("expected write error")
+	}
+}
+
+func TestSelfUpdateDownloadTimeout(t *testing.T) {
+	origDo := httpDo
+	origTimeout := selfUpdateTimeout
+	defer func() {
+		httpDo = origDo
+		selfUpdateTimeout = origTimeout
+	}()
+
+	httpDo = func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	}
+	selfUpdateTimeout = 10 * time.Millisecond
+
+	err := selfUpdate("https://example.com/agent", strings.Repeat("0", 64))
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("expected context deadline exceeded, got: %v", err)
 	}
 }
 

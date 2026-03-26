@@ -360,7 +360,6 @@ func TestExecuteMikrotikBackupCommandError(t *testing.T) {
 }
 
 func TestExecuteMikrotikBackupWithOutput(t *testing.T) {
-	// MikroTik SSH returns output even with non-zero exit code
 	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
 		_, _ = ch.Write([]byte("# partial config\n"))
 		_ = ch.CloseWrite()
@@ -373,12 +372,12 @@ func TestExecuteMikrotikBackupWithOutput(t *testing.T) {
 	var portNum uint16
 	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
-	config, err := executeMikrotikBackup("127.0.0.1", portNum, "admin", "pass")
-	if err != nil {
-		t.Fatalf("expected success when output present despite exit code, got: %v", err)
+	_, err := executeMikrotikBackup("127.0.0.1", portNum, "admin", "pass")
+	if err == nil {
+		t.Fatal("expected command failure when output is present with non-zero exit status")
 	}
-	if config == "" {
-		t.Error("expected non-empty config")
+	if !strings.Contains(err.Error(), "# partial config") {
+		t.Fatalf("expected output to be included in error, got: %v", err)
 	}
 }
 

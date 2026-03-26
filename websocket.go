@@ -135,7 +135,8 @@ func wsConnect(u *url.URL, host, network string) (*WSConn, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("read handshake: %w", err)
 	}
-	if !strings.Contains(statusLine, "101") {
+	statusParts := strings.SplitN(strings.TrimSpace(statusLine), " ", 3)
+	if len(statusParts) < 2 || statusParts[1] != "101" {
 		_ = conn.Close()
 		return nil, fmt.Errorf("handshake failed: %s", strings.TrimSpace(statusLine))
 	}
@@ -143,6 +144,8 @@ func wsConnect(u *url.URL, host, network string) (*WSConn, error) {
 	// Read remaining headers, verify Sec-WebSocket-Accept per RFC 6455
 	expectedAccept := computeAcceptKey(key)
 	acceptFound := false
+	upgradeFound := false
+	connectionFound := false
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
@@ -160,11 +163,31 @@ func wsConnect(u *url.URL, host, network string) (*WSConn, error) {
 				return nil, fmt.Errorf("invalid accept key: got %q, want %q", actual, expectedAccept)
 			}
 			acceptFound = true
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(line), "upgrade: ") {
+			if strings.EqualFold(strings.TrimSpace(line[len("Upgrade: "):]), "websocket") {
+				upgradeFound = true
+			}
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(line), "connection: ") {
+			if headerHasToken(line[len("Connection: "):], "upgrade") {
+				connectionFound = true
+			}
 		}
 	}
 	if !acceptFound {
 		_ = conn.Close()
 		return nil, fmt.Errorf("missing Sec-WebSocket-Accept header")
+	}
+	if !upgradeFound {
+		_ = conn.Close()
+		return nil, fmt.Errorf("missing or invalid Upgrade header")
+	}
+	if !connectionFound {
+		_ = conn.Close()
+		return nil, fmt.Errorf("missing or invalid Connection header")
 	}
 
 	// Clear handshake deadline — normal operation uses no deadline
@@ -175,6 +198,15 @@ func wsConnect(u *url.URL, host, network string) (*WSConn, error) {
 
 	// Reuse the buffered reader — it may hold leftover data from the handshake
 	return &WSConn{conn: conn, reader: br}, nil
+}
+
+func headerHasToken(value, token string) bool {
+	for _, part := range strings.Split(value, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), token) {
+			return true
+		}
+	}
+	return false
 }
 
 // ReadMessage reads the next text or binary message, handling control frames internally.

@@ -52,9 +52,8 @@ func TestHostKeyStorePersistence(t *testing.T) {
 
 func TestHostKeyStoreMissingFile(t *testing.T) {
 	s := newHostKeyStore("/nonexistent/path/known_hosts.json")
-	// Should work in memory even if file can't be read
-	if err := s.verify("host:22", "fp"); err != nil {
-		t.Fatalf("should work without file: %v", err)
+	if err := s.verify("host:22", "fp"); err == nil {
+		t.Fatal("expected error when trusted key cannot be persisted")
 	}
 }
 
@@ -109,9 +108,11 @@ func TestSSHHostKeyCallback(t *testing.T) {
 func TestHostKeyStoreSaveError(t *testing.T) {
 	// Use a path in a non-existent directory
 	s := newHostKeyStore("/nonexistent/dir/hosts.json")
-	// verify should not error even if save fails (it logs instead)
-	if err := s.verify("host:22", "fp"); err != nil {
-		t.Fatalf("should succeed even if save fails: %v", err)
+	if err := s.verify("host:22", "fp"); err == nil {
+		t.Fatal("expected persistence error")
+	}
+	if _, ok := s.keys["host:22"]; ok {
+		t.Fatal("failed first-use trust should not remain cached in memory")
 	}
 }
 

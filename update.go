@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"fmt"
@@ -12,14 +13,18 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 var osExecutable = os.Executable
 var osCreateTemp = os.CreateTemp
 var osRename = os.Rename
-var httpGet = http.Get
+var httpDo = func(req *http.Request) (*http.Response, error) {
+	return http.DefaultClient.Do(req)
+}
 var syscallExec = syscall.Exec
 var maxUpdateSize int64 = 100 << 20 // 100 MB
+var selfUpdateTimeout = 30 * time.Second
 
 // selfUpdate downloads a new binary, verifies its checksum, replaces the current binary, and re-execs.
 func selfUpdate(downloadURL, expectedChecksum string) error {
@@ -36,7 +41,14 @@ func selfUpdate(downloadURL, expectedChecksum string) error {
 
 	slog.Info("downloading update", "url", sanitizeURL(downloadURL))
 
-	resp, err := httpGet(downloadURL)
+	reqCtx, cancel := context.WithTimeout(context.Background(), selfUpdateTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+
+	resp, err := httpDo(req)
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}

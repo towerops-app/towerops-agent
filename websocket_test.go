@@ -711,6 +711,68 @@ func TestWSDialMissingAcceptHeader(t *testing.T) {
 	}
 }
 
+func TestWSDialMissingUpgradeHeader(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		buf := make([]byte, 4096)
+		n, _ := conn.Read(buf)
+		key := extractHeader(string(buf[:n]), "Sec-WebSocket-Key")
+		accept := computeAcceptKey(key)
+		resp := "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+		_, _ = conn.Write([]byte(resp))
+	}()
+
+	_, err = WSDial("ws://" + ln.Addr().String() + "/socket")
+	if err == nil {
+		t.Fatal("expected missing Upgrade header error")
+	}
+	if !strings.Contains(err.Error(), "missing or invalid Upgrade header") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestWSDialRejectsNon101Status(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		buf := make([]byte, 4096)
+		n, _ := conn.Read(buf)
+		key := extractHeader(string(buf[:n]), "Sec-WebSocket-Key")
+		accept := computeAcceptKey(key)
+		resp := "HTTP/1.1 1010 Not Switching\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+		_, _ = conn.Write([]byte(resp))
+	}()
+
+	_, err = WSDial("ws://" + ln.Addr().String() + "/socket")
+	if err == nil {
+		t.Fatal("expected non-101 status to fail")
+	}
+	if !strings.Contains(err.Error(), "handshake failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestWSDialDefaultPorts(t *testing.T) {
 	// Test that ws:// defaults to port 80 — will fail to connect but verifies URL parsing
 	_, err := WSDial("ws://127.0.0.1/path")
