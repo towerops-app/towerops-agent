@@ -33,8 +33,5 @@ result
 # Local scripts
 monitor-deploy.sh
 
-# Tool versions (asdf, mise)
-.tool-versions
-
 # Claude
 CLAUDE.md
