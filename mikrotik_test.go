@@ -660,22 +660,9 @@ func TestReadWordExceedsMaxSize(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for word exceeding max size")
 	}
-	if !containsStr(err.Error(), "exceeds max") {
+	if !strings.Contains(err.Error(), "exceeds max") {
 		t.Errorf("expected 'exceeds max' in error, got: %v", err)
 	}
-}
-
-func containsStr(s, sub string) bool {
-	return len(s) >= len(sub) && searchStr(s, sub)
-}
-
-func searchStr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
 
 func TestReadSentenceError(t *testing.T) {
