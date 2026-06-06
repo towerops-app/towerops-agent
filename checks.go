@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"codeberg.org/towerops-agent/towerops-agent/pb"
@@ -28,7 +29,18 @@ var (
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
 	}
-	sslRootCAs = x509.SystemCertPool
+	sslRootCAsOnce sync.Once
+	sslRootCAsPool *x509.CertPool
+	sslRootCAsErr  error
+
+	// sslRootCAs returns the system cert pool, cached after first load.
+	// Overridable for tests.
+	sslRootCAs = func() (*x509.CertPool, error) {
+		sslRootCAsOnce.Do(func() {
+			sslRootCAsPool, sslRootCAsErr = x509.SystemCertPool()
+		})
+		return sslRootCAsPool, sslRootCAsErr
+	}
 )
 
 // ExecuteCheck runs a service check and returns the result.
@@ -146,17 +158,16 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 
 	// Check content regex if provided
 	if config.Regex != "" {
+		re, err := regexp.Compile(config.Regex)
+		if err != nil {
+			return 2, fmt.Sprintf("Invalid regex: %v", err), responseTime
+		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		if err != nil {
 			return 2, fmt.Sprintf("Failed to read body: %v", err), responseTime
 		}
 
-		matched, err := regexp.MatchString(config.Regex, string(body))
-		if err != nil {
-			return 2, fmt.Sprintf("Invalid regex: %v", err), responseTime
-		}
-
-		if !matched {
+		if !re.Match(body) {
 			return 2, fmt.Sprintf("Content does not match pattern: %s", config.Regex), responseTime
 		}
 	}

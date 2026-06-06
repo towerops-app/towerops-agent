@@ -7,7 +7,9 @@ import (
 	"crypto/rand"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -382,6 +384,15 @@ func TestExecuteMikrotikBackupWithOutput(t *testing.T) {
 }
 
 func TestExecuteMikrotikBackupSessionError(t *testing.T) {
+	// Reset global host key store to avoid TOFU collisions from other tests
+	origStore := globalHostKeys
+	defer func() {
+		hostKeysOnce = sync.Once{}
+		globalHostKeys = origStore
+	}()
+	hostKeysOnce = sync.Once{}
+	t.Setenv("TOWEROPS_HOST_KEYS_FILE", filepath.Join(t.TempDir(), "hosts.json"))
+
 	// SSH server that accepts connection but rejects all channel requests
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

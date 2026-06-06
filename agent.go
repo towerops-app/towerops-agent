@@ -196,7 +196,11 @@ func runSession(ctx context.Context, baseURL, token string) error {
 				sessionCancel()
 				return
 			}
-			msgCh <- data
+			select {
+			case msgCh <- data:
+			case <-sessionCtx.Done():
+				return
+			}
 		}
 	}()
 
@@ -319,7 +323,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		case data := <-msgCh:
 			var msg channelMsg
 			if err := json.Unmarshal(data, &msg); err != nil {
-				slog.Warn("invalid message", "error", err)
+				slog.Debug("invalid message", "error", err)
 				continue
 			}
 			shouldEnd, endErr := handleMessage(sessionCtx, msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh, lldpTopologyResultCh)
