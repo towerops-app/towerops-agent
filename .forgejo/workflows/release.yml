@@ -23,12 +23,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: https://github.com/docker/setup-buildx-action@v3
 
-      - name: Log in to Codeberg Container Registry
+      - name: Log in to Container Registry
         uses: https://github.com/docker/login-action@v3
         with:
-          registry: codeberg.org
-          username: ${{ secrets.CODEBERG_USER }}
-          password: ${{ secrets.CODEBERG_TOKEN }}
+          registry: ${{ secrets.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
 
       - name: Extract version from tag
         id: version
@@ -43,8 +43,8 @@ jobs:
           build-args: |
             VERSION=${{ steps.version.outputs.tag }}
           tags: |
-            codeberg.org/towerops-agent/towerops-agent:latest
-            codeberg.org/towerops-agent/towerops-agent:${{ steps.version.outputs.tag }}
+            ${{ secrets.REGISTRY_URL }}/towerops-agent:latest
+            ${{ secrets.REGISTRY_URL }}/towerops-agent:${{ steps.version.outputs.tag }}
 
       - name: Run tests
         run: go test -race -v -count=1 -timeout 60s ./...
