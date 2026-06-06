@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/towerops-app/towerops-agent/pb"
+	"codeberg.org/towerops-agent/towerops-agent/pb"
 )
 
 const (

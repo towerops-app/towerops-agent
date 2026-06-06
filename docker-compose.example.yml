@@ -1,6 +1,6 @@
 services:
   towerops-agent:
-    image: ghcr.io/towerops-app/towerops-agent:latest
+    image: codeberg.org/towerops-agent/towerops-agent:latest
     pull_policy: always
     container_name: towerops-agent
     restart: unless-stopped
