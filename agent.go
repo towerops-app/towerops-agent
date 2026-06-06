@@ -26,6 +26,7 @@ var errChannelReloaded = fmt.Errorf("channel reloaded")
 var joinTimeout = 10 * time.Second
 var heartbeatInterval = 60 * time.Second
 var channelHeartbeatInterval = 25 * time.Second
+var initialRetryDelay = time.Second
 
 const maxJobPayloadBytes = 4 << 20 // 4 MB — well above any legitimate job list
 
@@ -40,7 +41,7 @@ type channelMsg struct {
 // runAgent connects to the server and runs the event loop with reconnect.
 func runAgent(ctx context.Context, wsURL, token string) {
 	baseURL := strings.TrimRight(wsURL, "/")
-	retryDelay := time.Second
+	retryDelay := initialRetryDelay
 	maxRetry := 10 * time.Second
 	const successfulConnectionThreshold = 30 * time.Second
 
@@ -60,7 +61,7 @@ func runAgent(ctx context.Context, wsURL, token string) {
 			slog.Debug("resetting reconnect backoff after successful session",
 				"duration", sessionDuration,
 				"previous_delay", retryDelay)
-			retryDelay = time.Second
+			retryDelay = initialRetryDelay
 		}
 
 		if ctx.Err() != nil {
@@ -68,7 +69,7 @@ func runAgent(ctx context.Context, wsURL, token string) {
 		}
 		if errors.Is(err, errRestartRequested) {
 			slog.Info("restart requested, reconnecting immediately")
-			retryDelay = time.Second
+			retryDelay = initialRetryDelay
 			continue
 		}
 		if err != nil {

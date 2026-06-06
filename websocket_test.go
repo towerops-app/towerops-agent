@@ -712,6 +712,10 @@ func TestWSDialMissingAcceptHeader(t *testing.T) {
 }
 
 func TestWSDialMissingUpgradeHeader(t *testing.T) {
+	origTimeout := wsHandshakeTimeout
+	defer func() { wsHandshakeTimeout = origTimeout }()
+	wsHandshakeTimeout = time.Second
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -743,6 +747,10 @@ func TestWSDialMissingUpgradeHeader(t *testing.T) {
 }
 
 func TestWSDialRejectsNon101Status(t *testing.T) {
+	origTimeout := wsHandshakeTimeout
+	defer func() { wsHandshakeTimeout = origTimeout }()
+	wsHandshakeTimeout = time.Second
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -774,16 +782,43 @@ func TestWSDialRejectsNon101Status(t *testing.T) {
 }
 
 func TestWSDialDefaultPorts(t *testing.T) {
-	// Test that ws:// defaults to port 80 — will fail to connect but verifies URL parsing
+	origTimeout := wsHandshakeTimeout
+	origDial := netDial
+	origTLS := tlsDial
+	defer func() {
+		wsHandshakeTimeout = origTimeout
+		netDial = origDial
+		tlsDial = origTLS
+	}()
+	wsHandshakeTimeout = time.Second
+
+	var wsCalls, wssCalls int
+	netDial = func(network, addr string) (net.Conn, error) {
+		wsCalls++
+		if addr == "127.0.0.1:80" {
+			return nil, fmt.Errorf("connection refused (mock)")
+		}
+		return nil, fmt.Errorf("mock dial: %s", addr)
+	}
+	tlsDial = func(network, addr string) (net.Conn, error) {
+		wssCalls++
+		return nil, fmt.Errorf("tls dial refused (mock)")
+	}
+
 	_, err := WSDial("ws://127.0.0.1/path")
 	if err == nil {
 		t.Error("expected connection error (nothing on port 80)")
 	}
+	if wsCalls == 0 {
+		t.Error("expected netDial to be called for ws://")
+	}
 
-	// Test that wss:// defaults to port 443
 	_, err = WSDial("wss://127.0.0.1/path")
 	if err == nil {
 		t.Error("expected connection error (nothing on port 443)")
+	}
+	if wssCalls == 0 {
+		t.Error("expected tlsDial to be called for wss://")
 	}
 }
 

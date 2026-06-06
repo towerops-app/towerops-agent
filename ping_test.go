@@ -14,7 +14,10 @@ func TestPingDeviceLocalhost(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping ping test on windows")
 	}
-	ms, err := pingDevice("127.0.0.1", 5000)
+	if testing.Short() {
+		t.Skip("skipping real ICMP ping in short mode")
+	}
+	ms, err := pingDevice("127.0.0.1", 2000)
 	if err != nil {
 		t.Skipf("ping not available: %v", err)
 	}
@@ -34,7 +37,10 @@ func TestPingDeviceIPv6(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping ping test on windows")
 	}
-	ms, err := pingDevice("::1", 5000)
+	if testing.Short() {
+		t.Skip("skipping real ICMP ping in short mode")
+	}
+	ms, err := pingDevice("::1", 2000)
 	if err != nil {
 		t.Skipf("IPv6 not available: %v", err)
 	}
@@ -44,7 +50,10 @@ func TestPingDeviceIPv6(t *testing.T) {
 }
 
 func TestIcmpPingLocalhost(t *testing.T) {
-	ms, err := icmpPing("127.0.0.1", 5000)
+	if testing.Short() {
+		t.Skip("skipping real ICMP ping in short mode")
+	}
+	ms, err := icmpPing("127.0.0.1", 2000)
 	if err != nil {
 		t.Skipf("ICMP not available: %v", err)
 	}
@@ -54,7 +63,10 @@ func TestIcmpPingLocalhost(t *testing.T) {
 }
 
 func TestIcmpPingIPv6(t *testing.T) {
-	ms, err := icmpPing("::1", 5000)
+	if testing.Short() {
+		t.Skip("skipping real ICMP ping in short mode")
+	}
+	ms, err := icmpPing("::1", 2000)
 	if err != nil {
 		t.Skipf("IPv6 ICMP not available: %v", err)
 	}
@@ -139,7 +151,10 @@ func TestExecPingLocalhost(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows")
 	}
-	ms, err := execPing("127.0.0.1", 5000)
+	if testing.Short() {
+		t.Skip("skipping real exec ping in short mode")
+	}
+	ms, err := execPing("127.0.0.1", 2000)
 	if err != nil {
 		t.Skipf("ping command not available: %v", err)
 	}
@@ -159,7 +174,10 @@ func TestExecPingIPv6Localhost(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows")
 	}
-	ms, err := execPing("::1", 5000)
+	if testing.Short() {
+		t.Skip("skipping real exec ping in short mode")
+	}
+	ms, err := execPing("::1", 2000)
 	if err != nil {
 		t.Skipf("ping6 not available: %v", err)
 	}
@@ -185,6 +203,9 @@ func TestPingDeviceFallbackToExec(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows")
 	}
+	if testing.Short() {
+		t.Skip("skipping real ping in short mode")
+	}
 	// Mock icmpListenPacket to always fail → forces fallback to execPing
 	origListen := icmpListenPacket
 	defer func() { icmpListenPacket = origListen }()
@@ -193,7 +214,7 @@ func TestPingDeviceFallbackToExec(t *testing.T) {
 		return nil, fmt.Errorf("permission denied")
 	}
 
-	ms, err := pingDevice("127.0.0.1", 5000)
+	ms, err := pingDevice("127.0.0.1", 2000)
 	if err != nil {
 		t.Skipf("exec ping fallback not available: %v", err)
 	}
@@ -288,6 +309,9 @@ func TestIcmpPingNonICMPUnavailableError(t *testing.T) {
 }
 
 func TestIcmpPingUDPFallback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping real ICMP in short mode")
+	}
 	// Mock raw ICMP to fail, forcing UDP fallback path in icmpPing
 	origListen := icmpListenPacket
 	defer func() { icmpListenPacket = origListen }()
@@ -303,7 +327,7 @@ func TestIcmpPingUDPFallback(t *testing.T) {
 		return icmp.ListenPacket(network, address)
 	}
 
-	ms, err := icmpPing("127.0.0.1", 5000)
+	ms, err := icmpPing("127.0.0.1", 2000)
 	if err != nil {
 		t.Skipf("UDP ICMP not available: %v", err)
 	}

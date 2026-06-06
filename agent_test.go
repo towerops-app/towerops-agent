@@ -141,7 +141,7 @@ func TestHandleMessage(t *testing.T) {
 		// Wait for goroutine to finish
 		select {
 		case <-snmpCh:
-		case <-time.After(2 * time.Second):
+		case <-time.After(500 * time.Millisecond):
 			t.Error("timed out waiting for snmp result")
 		}
 	})
@@ -337,7 +337,7 @@ func TestHandleMessage(t *testing.T) {
 		_, _ = handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		select {
 		case <-checkCh:
-		case <-time.After(5 * time.Second):
+		case <-time.After(time.Second):
 			t.Error("timed out waiting for check result")
 		}
 	})
@@ -400,7 +400,7 @@ func TestHandleMessage(t *testing.T) {
 		_, _ = handleMessage(context.Background(), channelMsg{Event: "discovery_job", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		select {
 		case <-snmpCh:
-		case <-time.After(2 * time.Second):
+		case <-time.After(500 * time.Millisecond):
 			t.Error("timed out waiting for discovery result")
 		}
 	})
@@ -431,7 +431,7 @@ func TestHandleMessage(t *testing.T) {
 			if result.Error != "" {
 				t.Errorf("unexpected error: %s", result.Error)
 			}
-		case <-time.After(2 * time.Second):
+		case <-time.After(500 * time.Millisecond):
 			t.Error("timed out waiting for backup result")
 		}
 	})
@@ -560,7 +560,7 @@ func TestDispatchJob(t *testing.T) {
 			if result.Error == "" {
 				t.Error("expected error from unreachable device")
 			}
-		case <-time.After(2 * time.Second):
+		case <-time.After(500 * time.Millisecond):
 			t.Error("timed out")
 		}
 	})
@@ -589,7 +589,7 @@ func TestDispatchJob(t *testing.T) {
 			if result.Success {
 				t.Error("expected failure")
 			}
-		case <-time.After(2 * time.Second):
+		case <-time.After(500 * time.Millisecond):
 			t.Error("timed out")
 		}
 	})
@@ -618,7 +618,7 @@ func TestDispatchJob(t *testing.T) {
 			if result.Status != "success" {
 				t.Errorf("expected success, got %q", result.Status)
 			}
-		case <-time.After(2 * time.Second):
+		case <-time.After(500 * time.Millisecond):
 			t.Error("timed out")
 		}
 	})
@@ -648,7 +648,7 @@ func TestDispatchJob(t *testing.T) {
 
 		select {
 		case <-snmpCh:
-		case <-time.After(2 * time.Second):
+		case <-time.After(500 * time.Millisecond):
 			t.Error("timed out")
 		}
 	})
@@ -701,7 +701,7 @@ func TestRunSessionRejectsFailedJoin(t *testing.T) {
 		_, _ = conn.Write(frame)
 
 		// Keep connection open for a bit
-		time.Sleep(time.Second)
+		time.Sleep(200 * time.Millisecond)
 	}()
 
 	addr := ln.Addr().String()
@@ -745,7 +745,7 @@ func TestRunSessionJoinTimeout(t *testing.T) {
 		frameBuf := make([]byte, 4096)
 		_, _ = conn.Read(frameBuf)
 
-		time.Sleep(5 * time.Second)
+		time.Sleep(2 * time.Second)
 	}()
 
 	addr := ln.Addr().String()
@@ -932,8 +932,8 @@ func TestRunSessionCtxCancel(t *testing.T) {
 		if err != nil {
 			t.Errorf("expected nil error on ctx cancel, got: %v", err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Error("runSession did not exit after ctx cancel")
+		case <-time.After(2 * time.Second):
+			t.Error("runSession did not exit after ctx cancel")
 	}
 	srv.close()
 }
@@ -1088,6 +1088,10 @@ func TestRunSessionReadErrorDuringJoin(t *testing.T) {
 }
 
 func TestRunAgentReconnectOnError(t *testing.T) {
+	origRetry := initialRetryDelay
+	defer func() { initialRetryDelay = origRetry }()
+	initialRetryDelay = 50 * time.Millisecond
+
 	// Server that fails first connection then succeeds, then sends restart.
 	// Agent should reconnect (not exit) after both error and restart.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1130,14 +1134,14 @@ func TestRunAgentReconnectOnError(t *testing.T) {
 					Ref:     strPtr("1"),
 				})
 				_, _ = conn.Write(makeTextFrame(reply))
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(20 * time.Millisecond)
 				restart, _ := json.Marshal(channelMsg{
 					Topic:   "agent:agent-0",
 					Event:   "restart",
 					Payload: json.RawMessage(`{}`),
 				})
 				_, _ = conn.Write(makeTextFrame(restart))
-				time.Sleep(time.Second)
+				time.Sleep(50 * time.Millisecond)
 				_ = conn.Close()
 			default:
 				// Third connection: agent successfully reconnected after restart
@@ -1146,7 +1150,7 @@ func TestRunAgentReconnectOnError(t *testing.T) {
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	done := make(chan struct{})
@@ -1156,7 +1160,7 @@ func TestRunAgentReconnectOnError(t *testing.T) {
 	}()
 
 	// Wait for 3rd connection attempt (proves agent reconnected after both error and restart)
-	deadline := time.After(10 * time.Second)
+	deadline := time.After(5 * time.Second)
 	for {
 		if connCount.Load() >= 3 {
 			cancel()
@@ -1166,7 +1170,7 @@ func TestRunAgentReconnectOnError(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("expected at least 3 connections, got %d", connCount.Load())
 		default:
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 
@@ -1192,6 +1196,10 @@ func TestRunAgentContextCancellation(t *testing.T) {
 }
 
 func TestRunAgentRestart(t *testing.T) {
+	origRetry := initialRetryDelay
+	defer func() { initialRetryDelay = origRetry }()
+	initialRetryDelay = 50 * time.Millisecond
+
 	// After receiving a restart event, the agent should reconnect (not exit).
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1228,20 +1236,20 @@ func TestRunAgentRestart(t *testing.T) {
 
 			if count == 1 {
 				// First connection: send restart event
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(20 * time.Millisecond)
 				restart, _ := json.Marshal(channelMsg{
 					Topic:   "agent:agent-0",
 					Event:   "restart",
 					Payload: json.RawMessage(`{}`),
 				})
 				_, _ = conn.Write(makeTextFrame(restart))
-				time.Sleep(time.Second)
+				time.Sleep(200 * time.Millisecond)
 			}
 			_ = conn.Close()
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	done := make(chan struct{})
@@ -1261,7 +1269,7 @@ func TestRunAgentRestart(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("expected at least 2 connections, got %d", connCount.Load())
 		default:
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 
@@ -1401,7 +1409,7 @@ func TestRunSessionProcessesJobResults(t *testing.T) {
 		srv.sendEvent("check_jobs", checkPayload)
 
 		// Wait for results to flow through all channels
-		time.Sleep(2 * time.Second)
+		time.Sleep(500 * time.Millisecond)
 		close(stopDrain)
 		srv.close()
 	}()
@@ -1447,7 +1455,7 @@ func TestRunSessionSnmpBatchThreshold(t *testing.T) {
 		}
 		srv.sendEvent("jobs", makeJobPayload(jobs...))
 
-		time.Sleep(3 * time.Second)
+		time.Sleep(time.Second)
 		close(stopDrain)
 		srv.close()
 	}()
@@ -1509,10 +1517,10 @@ func TestExecuteCheckCtxDoneInClosure(t *testing.T) {
 	executeCheck(ctx, check, p, checkCh)
 
 	// Wait for the check to complete (TCP to port 1 fails fast)
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 	// Cancel ctx so the closure's select picks ctx.Done instead of blocked channel send
 	cancel()
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 }
 
 func TestRunSessionRestartInMainLoop(t *testing.T) {
@@ -1523,10 +1531,10 @@ func TestRunSessionRestartInMainLoop(t *testing.T) {
 		stopDrain := make(chan struct{})
 		go drainFrames(srv.conn, stopDrain)
 
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 		// Send restart event — exercised in the main loop select
 		srv.sendEvent("restart", json.RawMessage(`{}`))
-		time.Sleep(time.Second)
+		time.Sleep(200 * time.Millisecond)
 		close(stopDrain)
 		srv.close()
 	}()
@@ -1554,7 +1562,7 @@ func TestRunSessionHeartbeats(t *testing.T) {
 		stopDrain := make(chan struct{})
 		go drainFrames(srv.conn, stopDrain)
 		// Let heartbeats fire a few times
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 		close(stopDrain)
 		srv.close()
 	}()
@@ -1566,6 +1574,10 @@ func TestRunSessionHeartbeats(t *testing.T) {
 }
 
 func TestRunAgentCancelDuringRetry(t *testing.T) {
+	origRetry := initialRetryDelay
+	defer func() { initialRetryDelay = origRetry }()
+	initialRetryDelay = 100 * time.Millisecond
+
 	// Connects to a port nothing listens on, then cancel during retry delay
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -1576,13 +1588,13 @@ func TestRunAgentCancelDuringRetry(t *testing.T) {
 	}()
 
 	// Wait for first connection attempt to fail and retry delay to start
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 	cancel()
 
 	select {
 	case <-done:
 		// runAgent returned after cancel during retry
-	case <-time.After(5 * time.Second):
+	case <-time.After(time.Second):
 		t.Error("runAgent did not return after cancel during retry")
 	}
 }
