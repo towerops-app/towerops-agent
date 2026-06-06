@@ -35,7 +35,7 @@ func TestChannelMsgSerialization(t *testing.T) {
 	s := string(data)
 	checks := []string{"agent:123", "phx_join", "token", "test"}
 	for _, c := range checks {
-		if !contains(s, c) {
+		if !strings.Contains(s, c) {
 			t.Errorf("expected %q in JSON output %q", c, s)
 		}
 	}
@@ -67,19 +67,6 @@ func TestChannelMsgNullRef(t *testing.T) {
 	if msg.Ref != nil {
 		t.Errorf("expected nil ref, got %q", *msg.Ref)
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-func searchString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
 
 func testPools(t *testing.T) *jobPools {

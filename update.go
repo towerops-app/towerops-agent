@@ -85,7 +85,7 @@ func selfUpdate(downloadURL, expectedChecksum string) error {
 		return fmt.Errorf("create temp: %w", err)
 	}
 	tempPath := tempFile.Name()
-	defer func() { _ = os.Remove(tempPath) }() // cleanup on any failure
+	defer func() { _ = os.Remove(tempPath) }()
 
 	if _, err := tempFile.Write(body); err != nil {
 		_ = tempFile.Close()
