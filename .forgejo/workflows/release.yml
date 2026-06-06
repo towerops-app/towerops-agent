@@ -30,7 +30,7 @@ jobs:
           username: ${{ secrets.REGISTRY_USER }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
-      - name: Extract version from tag
+      - name: Extract version
         id: version
         run: echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
@@ -43,8 +43,8 @@ jobs:
           build-args: |
             VERSION=${{ steps.version.outputs.tag }}
           tags: |
-            ${{ secrets.REGISTRY_URL }}/towerops-agent:latest
-            ${{ secrets.REGISTRY_URL }}/towerops-agent:${{ steps.version.outputs.tag }}
+            ${{ secrets.REGISTRY_URL }}/${{ github.repository }}:latest
+            ${{ secrets.REGISTRY_URL }}/${{ github.repository }}:${{ steps.version.outputs.tag }}
 
       - name: Run tests
         run: go test -race -v -count=1 -timeout 60s ./...
