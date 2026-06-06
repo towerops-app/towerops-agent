@@ -106,7 +106,6 @@ func discoverLldpNeighbors(client *gosnmp.GoSNMP, deviceID, jobID string) (*pb.L
 
 	// Walk remote port descriptions
 	remotePorts := make(map[string]string)
-	var walkErrors []string
 	if err := client.Walk(oidRemPortDesc, func(pdu gosnmp.SnmpPDU) error {
 		key := parseRemoteKey(pdu.Name, oidRemPortDesc)
 		if key != "" {
@@ -114,7 +113,6 @@ func discoverLldpNeighbors(client *gosnmp.GoSNMP, deviceID, jobID string) (*pb.L
 		}
 		return nil
 	}); err != nil {
-		walkErrors = append(walkErrors, fmt.Sprintf("walk remote port descriptions: %v", err))
 		slog.Warn("failed to walk remote port descriptions", "error", err)
 	}
 
@@ -127,7 +125,6 @@ func discoverLldpNeighbors(client *gosnmp.GoSNMP, deviceID, jobID string) (*pb.L
 		}
 		return nil
 	}); err != nil {
-		walkErrors = append(walkErrors, fmt.Sprintf("walk remote port IDs: %v", err))
 		slog.Warn("failed to walk remote port IDs", "error", err)
 	}
 
@@ -140,7 +137,6 @@ func discoverLldpNeighbors(client *gosnmp.GoSNMP, deviceID, jobID string) (*pb.L
 		}
 		return nil
 	}); err != nil {
-		walkErrors = append(walkErrors, fmt.Sprintf("walk management addresses: %v", err))
 		slog.Warn("failed to walk management addresses", "error", err)
 	}
 
@@ -171,9 +167,6 @@ func discoverLldpNeighbors(client *gosnmp.GoSNMP, deviceID, jobID string) (*pb.L
 
 		result.Neighbors = append(result.Neighbors, neighbor)
 	}
-
-	// Walk errors are already logged; return result with whatever data was collected
-	_ = walkErrors
 
 	return result, nil
 }
