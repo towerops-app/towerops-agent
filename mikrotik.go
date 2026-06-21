@@ -49,7 +49,9 @@ func mikrotikConnect(ip string, port uint32, username, password string, useSSL b
 			NetDialer: &net.Dialer{Timeout: mikrotikConnTimeout},
 			Config:    &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
 		}
-		conn, err = dialer.DialContext(context.Background(), "tcp", addr)
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), mikrotikConnTimeout)
+		defer dialCancel()
+		conn, err = dialer.DialContext(dialCtx, "tcp", addr)
 		if err == nil {
 			// Verify TLS cert fingerprint via TOFU
 			tlsConn, ok := conn.(*tls.Conn)
@@ -160,13 +162,13 @@ func (c *mikrotikClient) readResponse() (*mikrotikResponse, error) {
 }
 
 func (c *mikrotikClient) readSentence() ([]string, error) {
+	if tc, ok := c.conn.(net.Conn); ok {
+		if err := tc.SetReadDeadline(time.Now().Add(mikrotikReadTimeout)); err != nil {
+			return nil, fmt.Errorf("set read deadline: %w", err)
+		}
+	}
 	var words []string
 	for {
-		if tc, ok := c.conn.(net.Conn); ok {
-			if err := tc.SetReadDeadline(time.Now().Add(mikrotikReadTimeout)); err != nil {
-				return nil, fmt.Errorf("set read deadline: %w", err)
-			}
-		}
 		word, err := c.readWord()
 		if err != nil {
 			return nil, err

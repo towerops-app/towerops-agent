@@ -165,6 +165,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		bin, err := proto.MarshalOptions{}.MarshalAppend(buf, msg)
 		if err != nil {
 			slog.Error("marshal protobuf", "error", err)
+			bufPool.Put(bp)
 			return
 		}
 		encoded := base64.StdEncoding.EncodeToString(bin)
@@ -230,14 +231,17 @@ func runSession(ctx context.Context, baseURL, token string) error {
 		if err := json.Unmarshal(data, &reply); err != nil {
 			return fmt.Errorf("join reply unmarshal: %w", err)
 		}
-		if reply.Event == "phx_reply" {
-			var status struct {
-				Status   string `json:"status"`
-				Response any    `json:"response"`
-			}
-			if err := json.Unmarshal(reply.Payload, &status); err == nil && status.Status != "ok" {
-				return fmt.Errorf("join rejected: %s", status.Status)
-			}
+		if reply.Event != "phx_reply" {
+			return fmt.Errorf("expected phx_reply, got %s", reply.Event)
+		}
+		var status struct {
+			Status string `json:"status"`
+		}
+		if err := json.Unmarshal(reply.Payload, &status); err != nil {
+			return fmt.Errorf("join reply payload: %w", err)
+		}
+		if status.Status != "ok" {
+			return fmt.Errorf("join rejected: %s", status.Status)
 		}
 		slog.Info("channel joined")
 	case err := <-errCh:
@@ -311,6 +315,10 @@ func runSession(ctx context.Context, baseURL, token string) error {
 			slog.Info("shutdown signal, closing connection")
 			flushSnmpBatch()
 			return nil
+
+		case <-sessionCtx.Done():
+			flushSnmpBatch()
+			return fmt.Errorf("session cancelled")
 
 		case err := <-errCh:
 			flushSnmpBatch()

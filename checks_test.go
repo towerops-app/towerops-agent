@@ -429,8 +429,8 @@ func TestHTTPCheck_InvalidRegex(t *testing.T) {
 		Regex: `[invalid`,
 	}, 5000)
 
-	if status != 2 {
-		t.Fatalf("expected status 2 for invalid regex, got %d: %s", status, output)
+	if status != 3 {
+		t.Fatalf("expected status 3 for invalid regex, got %d: %s", status, output)
 	}
 	if !strings.Contains(output, "Invalid regex") {
 		t.Fatalf("expected 'Invalid regex' in output, got %s", output)
