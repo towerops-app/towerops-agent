@@ -30,15 +30,23 @@ var (
 		IdleConnTimeout:     90 * time.Second,
 	}
 	sslRootCAsOnce sync.Once
+	sslRootCAsMu   sync.Mutex
 	sslRootCAsPool *x509.CertPool
 	sslRootCAsErr  error
 
-	// sslRootCAs returns the system cert pool, cached after first load.
+	// sslRootCAs returns the system cert pool, cached after first successful load.
+	// Errors are not cached — subsequent calls will retry loading.
 	// Overridable for tests.
 	sslRootCAs = func() (*x509.CertPool, error) {
+		sslRootCAsMu.Lock()
+		defer sslRootCAsMu.Unlock()
 		sslRootCAsOnce.Do(func() {
 			sslRootCAsPool, sslRootCAsErr = x509.SystemCertPool()
 		})
+		if sslRootCAsErr != nil {
+			// Reset the once so next call will retry
+			sslRootCAsOnce = sync.Once{}
+		}
 		return sslRootCAsPool, sslRootCAsErr
 	}
 )
@@ -50,33 +58,32 @@ func ExecuteCheck(ctx context.Context, check *pb.Check) *pb.CheckResult {
 
 	var status uint32
 	var output string
-	var responseTimeMs float64
 
 	switch check.CheckType {
 	case "http":
 		if httpConfig := check.GetHttp(); httpConfig != nil {
-			status, output, responseTimeMs = executeHTTPCheck(ctx, httpConfig, check.TimeoutMs)
+			status, output, _ = executeHTTPCheck(ctx, httpConfig, check.TimeoutMs)
 		} else {
 			status, output = 3, "Missing HTTP config"
 		}
 
 	case "tcp":
 		if tcpConfig := check.GetTcp(); tcpConfig != nil {
-			status, output, responseTimeMs = executeTCPCheck(ctx, tcpConfig, check.TimeoutMs)
+			status, output, _ = executeTCPCheck(ctx, tcpConfig, check.TimeoutMs)
 		} else {
 			status, output = 3, "Missing TCP config"
 		}
 
 	case "dns":
 		if dnsConfig := check.GetDns(); dnsConfig != nil {
-			status, output, responseTimeMs = executeDNSCheck(ctx, dnsConfig, check.TimeoutMs)
+			status, output, _ = executeDNSCheck(ctx, dnsConfig, check.TimeoutMs)
 		} else {
 			status, output = 3, "Missing DNS config"
 		}
 
 	case "ssl":
 		if sslConfig := check.GetSsl(); sslConfig != nil {
-			status, output, responseTimeMs = executeSSLCheck(ctx, sslConfig, check.TimeoutMs)
+			status, output, _ = executeSSLCheck(ctx, sslConfig, check.TimeoutMs)
 		} else {
 			status, output = 3, "Missing SSL config"
 		}
@@ -85,10 +92,8 @@ func ExecuteCheck(ctx context.Context, check *pb.Check) *pb.CheckResult {
 		status, output = 3, fmt.Sprintf("Unknown check type: %s", check.CheckType)
 	}
 
-	// If responseTimeMs wasn't set by executor, calculate from start time
-	if responseTimeMs == 0 {
-		responseTimeMs = float64(time.Since(startTime).Milliseconds())
-	}
+	// Always calculate elapsed from the outer startTime for consistency.
+	responseTimeMs := float64(time.Since(startTime).Milliseconds())
 
 	return &pb.CheckResult{
 		CheckId:        check.Id,
@@ -160,7 +165,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	if config.Regex != "" {
 		re, err := regexp.Compile(config.Regex)
 		if err != nil {
-			return 2, fmt.Sprintf("Invalid regex: %v", err), responseTime
+			return 3, fmt.Sprintf("Invalid regex: %v", err), responseTime
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		if err != nil {
@@ -184,7 +189,10 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 	address := net.JoinHostPort(config.Host, strconv.Itoa(int(config.Port)))
 
 	startTime := time.Now()
-	conn, err := net.DialTimeout("tcp", address, timeout)
+	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
+	defer dialCancel()
+	var d net.Dialer
+	conn, err := d.DialContext(dialCtx, "tcp", address)
 	responseTime := float64(time.Since(startTime).Milliseconds())
 
 	if err != nil {

@@ -38,7 +38,11 @@ func newHostKeyStore(path string) *hostKeyStore {
 	s := &hostKeyStore{path: path, keys: make(map[string]string)}
 	data, err := os.ReadFile(path)
 	if err == nil {
-		_ = json.Unmarshal(data, &s.keys)
+		if err := json.Unmarshal(data, &s.keys); err != nil {
+			slog.Warn("failed to parse known_hosts.json, starting with empty key store",
+				"path", path,
+				"error", err)
+		}
 	}
 	return s
 }

@@ -320,7 +320,22 @@ func TestExecuteMikrotikBackupDialError(t *testing.T) {
 	}
 }
 
+// resetHostKeyStore resets the global host key store for SSH tests
+// to prevent cross-test TOFU contamination from different server keys.
+func resetHostKeyStore(t *testing.T) {
+	t.Helper()
+	origStore := globalHostKeys
+	t.Cleanup(func() {
+		hostKeysOnce = sync.Once{}
+		globalHostKeys = origStore
+	})
+	hostKeysOnce = sync.Once{}
+	t.Setenv("TOWEROPS_HOST_KEYS_FILE", filepath.Join(t.TempDir(), "hosts.json"))
+}
+
 func TestExecuteMikrotikBackupSuccess(t *testing.T) {
+	resetHostKeyStore(t)
+
 	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
 		_, _ = ch.Write([]byte("# RouterOS config\n/ip address\nadd address=10.0.0.1/24\n"))
 		_ = ch.CloseWrite()
@@ -344,6 +359,7 @@ func TestExecuteMikrotikBackupSuccess(t *testing.T) {
 }
 
 func TestExecuteMikrotikBackupCommandError(t *testing.T) {
+	resetHostKeyStore(t)
 	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
 		// Send exit-status 1 with no output (simulates command failure)
 		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{1}))
@@ -362,6 +378,7 @@ func TestExecuteMikrotikBackupCommandError(t *testing.T) {
 }
 
 func TestExecuteMikrotikBackupWithOutput(t *testing.T) {
+	resetHostKeyStore(t)
 	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
 		_, _ = ch.Write([]byte("# partial config\n"))
 		_ = ch.CloseWrite()
@@ -384,14 +401,7 @@ func TestExecuteMikrotikBackupWithOutput(t *testing.T) {
 }
 
 func TestExecuteMikrotikBackupSessionError(t *testing.T) {
-	// Reset global host key store to avoid TOFU collisions from other tests
-	origStore := globalHostKeys
-	defer func() {
-		hostKeysOnce = sync.Once{}
-		globalHostKeys = origStore
-	}()
-	hostKeysOnce = sync.Once{}
-	t.Setenv("TOWEROPS_HOST_KEYS_FILE", filepath.Join(t.TempDir(), "hosts.json"))
+	resetHostKeyStore(t)
 
 	// SSH server that accepts connection but rejects all channel requests
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

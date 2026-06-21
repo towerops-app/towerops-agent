@@ -42,6 +42,7 @@ type WSConn struct {
 	conn   io.ReadWriteCloser
 	reader *bufio.Reader
 	mu     sync.Mutex // serializes writes
+	closed bool       // prevents double-close
 }
 
 var wsHandshakeTimeout = 30 * time.Second
@@ -66,14 +67,16 @@ func WSDial(rawURL string) (*WSConn, error) {
 		slog.Warn("plaintext websocket connection - credentials sent unencrypted", "url", sanitizeURL(rawURL))
 	}
 
-	host := u.Host
-	if !strings.Contains(host, ":") {
+	hostname := u.Hostname()
+	port := u.Port()
+	if port == "" {
 		if u.Scheme == "wss" {
-			host += ":443"
+			port = "443"
 		} else {
-			host += ":80"
+			port = "80"
 		}
 	}
+	host := net.JoinHostPort(hostname, port)
 
 	ws, err := wsConnect(u, host, "tcp")
 	if err != nil {
@@ -156,23 +159,29 @@ func wsConnect(u *url.URL, host, network string) (*WSConn, error) {
 		if line == "" {
 			break // end of headers
 		}
-		if strings.HasPrefix(strings.ToLower(line), "sec-websocket-accept: ") {
-			actual := strings.TrimSpace(line[len("Sec-WebSocket-Accept: "):])
-			if actual != expectedAccept {
+		colon := strings.Index(line, ":")
+		if colon == -1 {
+			continue
+		}
+		name := line[:colon]
+		value := strings.TrimSpace(line[colon+1:])
+
+		if strings.EqualFold(name, "sec-websocket-accept") {
+			if value != expectedAccept {
 				_ = conn.Close()
-				return nil, fmt.Errorf("invalid accept key: got %q, want %q", actual, expectedAccept)
+				return nil, fmt.Errorf("invalid accept key: got %q, want %q", value, expectedAccept)
 			}
 			acceptFound = true
 			continue
 		}
-		if strings.HasPrefix(strings.ToLower(line), "upgrade: ") {
-			if strings.EqualFold(strings.TrimSpace(line[len("Upgrade: "):]), "websocket") {
+		if strings.EqualFold(name, "upgrade") {
+			if strings.EqualFold(value, "websocket") {
 				upgradeFound = true
 			}
 			continue
 		}
-		if strings.HasPrefix(strings.ToLower(line), "connection: ") {
-			if headerHasToken(line[len("Connection: "):], "upgrade") {
+		if strings.EqualFold(name, "connection") {
+			if headerHasToken(line[colon+1:], "upgrade") {
 				connectionFound = true
 			}
 		}
@@ -237,6 +246,14 @@ func (ws *WSConn) WriteText(data []byte) error {
 
 // Close sends a close frame and closes the underlying connection.
 func (ws *WSConn) Close() error {
+	ws.mu.Lock()
+	if ws.closed {
+		ws.mu.Unlock()
+		return nil
+	}
+	ws.closed = true
+	ws.mu.Unlock()
+
 	_ = ws.writeFrame(opClose, nil) // best-effort
 	return ws.conn.Close()
 }
