@@ -26,9 +26,9 @@ jobs:
       - name: Log in to Container Registry
         uses: https://github.com/docker/login-action@v3
         with:
-          registry: ${{ secrets.REGISTRY_URL }}
-          username: ${{ secrets.REGISTRY_USER }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
+          registry: git.mcintire.me
+          username: graham
+          password: ${{ secrets.FORGEJO_TOKEN }}
 
       - name: Extract version
         id: version
@@ -43,8 +43,8 @@ jobs:
           build-args: |
             VERSION=${{ steps.version.outputs.tag }}
           tags: |
-            ${{ secrets.REGISTRY_URL }}/${{ github.repository }}:latest
-            ${{ secrets.REGISTRY_URL }}/${{ github.repository }}:${{ steps.version.outputs.tag }}
+            git.mcintire.me/${{ github.repository }}:latest
+            git.mcintire.me/${{ github.repository }}:${{ steps.version.outputs.tag }}
 
       - name: Run tests
         run: go test -race -v -count=1 -timeout 60s ./...
