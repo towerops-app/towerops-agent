@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"codeberg.org/towerops-agent/towerops-agent/pb"
+	"git.mcintire.me/towerops-agent/towerops-agent/pb"
 )
 
 var (

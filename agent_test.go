@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/gosnmp/gosnmp"
-	"codeberg.org/towerops-agent/towerops-agent/pb"
+	"git.mcintire.me/towerops-agent/towerops-agent/pb"
 	"google.golang.org/protobuf/proto"
 )
 

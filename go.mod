@@ -1,4 +1,4 @@
-module codeberg.org/towerops-agent/towerops-agent
+module git.mcintire.me/towerops-agent/towerops-agent
 
 go 1.25.6
 

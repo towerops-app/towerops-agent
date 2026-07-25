@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/towerops-agent/towerops-agent/pb"
+	"git.mcintire.me/towerops-agent/towerops-agent/pb"
 	"golang.org/x/crypto/ssh"
 )
 
