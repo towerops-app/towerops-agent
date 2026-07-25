@@ -124,7 +124,7 @@ func wsConnect(u *url.URL, host, network string) (*WSConn, error) {
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
 		path, u.Host, key)
 
-	if _, err := conn.Write([]byte(req)); err != nil {
+	if err := writeAll(conn, []byte(req)); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("write handshake: %w", err)
 	}
@@ -349,16 +349,33 @@ func (ws *WSConn) writeFrame(opcode int, payload []byte) error {
 
 	// Mask key
 	var maskKey [4]byte
-	_, _ = rand.Read(maskKey[:])
+	if _, err := randRead(maskKey[:]); err != nil {
+		return fmt.Errorf("generate frame mask: %w", err)
+	}
 	buf = append(buf, maskKey[:]...)
 
-	// Masked payload
-	masked := make([]byte, len(payload))
+	// Append and mask the payload in place to avoid a second payload-sized
+	// allocation for every outbound frame.
+	payloadStart := len(buf)
+	buf = append(buf, payload...)
+	masked := buf[payloadStart:]
 	for i, b := range payload {
 		masked[i] = b ^ maskKey[i%4]
 	}
-	buf = append(buf, masked...)
 
-	_, err := ws.conn.Write(buf)
-	return err
+	return writeAll(ws.conn, buf)
+}
+
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n <= 0 || n > len(data) {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }
