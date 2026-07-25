@@ -21,7 +21,7 @@ The Towerops agent enables customers to deploy SNMP polling infrastructure on th
 
 ### Using Pre-built Image
 
-Pull the latest image from Codeberg's container registry:
+Pull the latest image from the container registry:
 
 ```bash
 docker pull git.mcintire.me/towerops-agent/towerops-agent:latest
