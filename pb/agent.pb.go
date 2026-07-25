@@ -2993,7 +2993,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\rLLDP_TOPOLOGY\x10\x05*\x1e\n" +
 	"\tQueryType\x12\a\n" +
 	"\x03GET\x10\x00\x12\b\n" +
-	"\x04WALK\x10\x01B/Z-codeberg.org/towerops-agent/towerops-agent/pbb\x06proto3"
+	"\x04WALK\x10\x01B2Z0git.mcintire.me/towerops-agent/towerops-agent/pbb\x06proto3"
 
 var (
 	file_proto_agent_proto_rawDescOnce sync.Once
