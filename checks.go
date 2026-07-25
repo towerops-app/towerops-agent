@@ -158,6 +158,9 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	}
 
 	if resp.StatusCode != expectedStatus {
+		// Drain the response before returning so repeated failing checks can
+		// still reuse the shared transport connection.
+		_, _ = io.Copy(io.Discard, resp.Body)
 		return 2, fmt.Sprintf("HTTP %d, expected %d", resp.StatusCode, expectedStatus), responseTime
 	}
 
@@ -174,6 +177,12 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 
 		if !re.Match(body) {
 			return 2, fmt.Sprintf("Content does not match pattern: %s", config.Regex), responseTime
+		}
+	} else {
+		// Consume successful response bodies so the shared transport can reuse
+		// the underlying connection for subsequent checks.
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			return 2, fmt.Sprintf("Failed to read body: %v", err), responseTime
 		}
 	}
 
@@ -357,7 +366,12 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 	}
 
 	startTime := time.Now()
-	conn, err := tls.DialWithDialer(dialer, "tcp", address, tlsConfig)
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := (&tls.Dialer{
+		NetDialer: dialer,
+		Config:    tlsConfig,
+	}).DialContext(dialCtx, "tcp", address)
 	responseTime := float64(time.Since(startTime).Milliseconds())
 
 	if err != nil {
@@ -365,7 +379,11 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 	}
 	defer func() { _ = conn.Close() }()
 
-	certs := conn.ConnectionState().PeerCertificates
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return 3, "Connection did not negotiate TLS", responseTime
+	}
+	certs := tlsConn.ConnectionState().PeerCertificates
 	if len(certs) == 0 {
 		return 3, fmt.Sprintf("No certificate presented by %s:%d", host, port), responseTime
 	}

@@ -1469,6 +1469,42 @@ func TestSSLCheck_ConnectionFailure(t *testing.T) {
 	}
 }
 
+func TestSSLCheck_HonorsCancelledContext(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr == nil {
+			accepted <- conn
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	status, _, _ := executeSSLCheck(ctx, &pb.SslCheckConfig{
+		Host: "127.0.0.1",
+		Port: parsePort(portFromListener(ln)),
+	}, 5000)
+	if status != 3 {
+		t.Fatalf("expected status 3, got %d", status)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("cancelled check took %v", elapsed)
+	}
+
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	default:
+	}
+}
+
 func TestSSLCheck_ClosedPort(t *testing.T) {
 	// Bind and immediately close to get a port that refuses connections
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

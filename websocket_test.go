@@ -43,6 +43,37 @@ func TestWriteFrameMasked(t *testing.T) {
 	}
 }
 
+func TestWriteFrameHandlesShortWrites(t *testing.T) {
+	var dst bytes.Buffer
+	rw := &shortWriteReadWriter{dst: &dst, maxWrite: 3}
+	ws := testWSConn(&nopCloser{readWriter: rw})
+
+	if err := ws.writeFrame(opText, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if dst.Len() != 2+4+len("hello") {
+		t.Fatalf("frame length: got %d, want %d", dst.Len(), 2+4+len("hello"))
+	}
+}
+
+func TestWriteFrameMaskGenerationError(t *testing.T) {
+	origRandRead := randRead
+	defer func() { randRead = origRandRead }()
+	randRead = func([]byte) (int, error) {
+		return 0, fmt.Errorf("entropy exhausted")
+	}
+
+	var buf bytes.Buffer
+	ws := testWSConn(&nopCloser{readWriter: &buf})
+	err := ws.writeFrame(opText, []byte("hello"))
+	if err == nil || !strings.Contains(err.Error(), "generate frame mask") {
+		t.Fatalf("expected frame mask error, got %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("wrote %d bytes despite mask generation failure", buf.Len())
+	}
+}
+
 func TestWriteFrame16BitLength(t *testing.T) {
 	var buf bytes.Buffer
 	ws := testWSConn(&nopCloser{readWriter: &buf})
@@ -905,6 +936,19 @@ type nopCloser struct {
 		Read([]byte) (int, error)
 		Write([]byte) (int, error)
 	}
+}
+
+type shortWriteReadWriter struct {
+	dst      *bytes.Buffer
+	maxWrite int
+}
+
+func (s *shortWriteReadWriter) Read([]byte) (int, error) { return 0, io.EOF }
+func (s *shortWriteReadWriter) Write(p []byte) (int, error) {
+	if len(p) > s.maxWrite {
+		p = p[:s.maxWrite]
+	}
+	return s.dst.Write(p)
 }
 
 func (n *nopCloser) Read(p []byte) (int, error)  { return n.readWriter.Read(p) }
