@@ -96,7 +96,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "phx_reply", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "phx_reply", Payload: json.RawMessage(`{}`)}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Just verify it doesn't panic
 	})
 
@@ -124,7 +124,7 @@ func TestHandleMessage(t *testing.T) {
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		})
 
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Wait for goroutine to finish
 		select {
 		case <-snmpCh:
@@ -139,7 +139,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: json.RawMessage(`not json`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: json.RawMessage(`not json`)}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Should log error but not panic
 	})
 
@@ -150,7 +150,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": "not-base64!!!"})
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 	})
 
 	t.Run("invalid protobuf", func(t *testing.T) {
@@ -160,7 +160,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString([]byte{0xFF, 0xFF, 0xFF})})
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 	})
 
 	t.Run("restart", func(t *testing.T) {
@@ -169,7 +169,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		shouldEnd, reason := handleMessage(context.Background(), channelMsg{Event: "restart", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		shouldEnd, reason := handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "restart", Payload: json.RawMessage(`{}`)}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 
 		if !shouldEnd {
 			t.Error("expected handleMessage to return true for restart")
@@ -192,6 +192,7 @@ func TestHandleMessage(t *testing.T) {
 			shouldEnd, reason := handleMessage(
 				context.Background(),
 				channelMsg{Topic: "agent:test", Event: event, Payload: json.RawMessage(`{}`)},
+				"agent:test",
 				testPools(t),
 				snmpCh,
 				mtCh,
@@ -226,7 +227,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent", "checksum": "abc123"})
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "update", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 
 		if calledURL != "https://example.com/agent" {
 			t.Errorf("expected update URL %q, got %q", "https://example.com/agent", calledURL)
@@ -250,7 +251,7 @@ func TestHandleMessage(t *testing.T) {
 		checkCh := make(chan *pb.CheckResult, 1)
 		// Missing URL field
 		payload, _ := json.Marshal(map[string]string{"checksum": "abc123"})
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "update", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 
 		if called {
 			t.Error("selfUpdate should not be called with empty URL")
@@ -271,7 +272,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent", "checksum": "abc123"})
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "update", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Should log error but not panic
 	})
 
@@ -291,7 +292,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent"})
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "update", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "update", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 
 		if called {
 			t.Error("selfUpdate should not be called with empty checksum")
@@ -304,7 +305,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "some_unknown_event", Payload: json.RawMessage(`{}`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "some_unknown_event", Payload: json.RawMessage(`{}`)}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Should just log and not panic
 	})
 
@@ -321,7 +322,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		select {
 		case <-checkCh:
 		case <-time.After(time.Second):
@@ -335,7 +336,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: json.RawMessage(`not json`)}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: json.RawMessage(`not json`)}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Should log error but not panic
 	})
 
@@ -346,7 +347,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": "not-base64!!!"})
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Should log error but not panic
 	})
 
@@ -357,7 +358,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString([]byte{0xFF, 0xFF, 0xFF})})
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "check_jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		// Should log error but not panic
 	})
 
@@ -384,7 +385,7 @@ func TestHandleMessage(t *testing.T) {
 			JobType:    pb.JobType_DISCOVER,
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		})
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "discovery_job", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "discovery_job", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		select {
 		case <-snmpCh:
 		case <-time.After(500 * time.Millisecond):
@@ -412,7 +413,7 @@ func TestHandleMessage(t *testing.T) {
 			JobType:        pb.JobType_MIKROTIK,
 			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", SshPort: 22, Username: "admin", Password: "pass"},
 		})
-		_, _ = handleMessage(context.Background(), channelMsg{Event: "backup_job", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "backup_job", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 		select {
 		case result := <-mtCh:
 			if result.Error != "" {
@@ -436,7 +437,7 @@ func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
 	encoded := base64.StdEncoding.EncodeToString(oversized)
 	payload, _ := json.Marshal(map[string]string{"binary": encoded})
 
-	_, _ = handleMessage(context.Background(), channelMsg{Event: "jobs", Payload: payload}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+	_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
 
 	// Verify no jobs were dispatched
 	select {
@@ -833,8 +834,9 @@ func TestDispatchJobCancelledContext(t *testing.T) {
 
 // fakeWSServer is a test helper that sets up a WebSocket server for runSession tests.
 type fakeWSServer struct {
-	ln   net.Listener
-	conn net.Conn
+	ln    net.Listener
+	conn  net.Conn
+	topic string
 }
 
 func newFakeWSServer(t *testing.T) *fakeWSServer {
@@ -867,13 +869,21 @@ func (s *fakeWSServer) acceptAndJoin(t *testing.T) {
 	resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
 	_, _ = conn.Write([]byte(resp))
 
-	// Read join frame
-	frameBuf := make([]byte, 4096)
-	_, _ = conn.Read(frameBuf)
+	// Read join frame and extract topic
+	joinPayload, err := readMaskedFrame(conn)
+	if err == nil {
+		var joinMsg channelMsg
+		if err := json.Unmarshal(joinPayload, &joinMsg); err == nil && joinMsg.Topic != "" {
+			s.topic = joinMsg.Topic
+		}
+	}
+	if s.topic == "" {
+		s.topic = "agent:agent-0"
+	}
 
 	// Send join OK
 	reply, _ := json.Marshal(channelMsg{
-		Topic:   "agent:agent-0",
+		Topic:   s.topic,
 		Event:   "phx_reply",
 		Payload: json.RawMessage(`{"status":"ok"}`),
 		Ref:     strPtr("1"),
@@ -884,7 +894,7 @@ func (s *fakeWSServer) acceptAndJoin(t *testing.T) {
 // sendEvent sends a channel message to the connected client.
 func (s *fakeWSServer) sendEvent(event string, payload json.RawMessage) {
 	msg, _ := json.Marshal(channelMsg{
-		Topic:   "agent:agent-0",
+		Topic:   s.topic,
 		Event:   event,
 		Payload: payload,
 	})
