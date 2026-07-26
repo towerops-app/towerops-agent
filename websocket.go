@@ -28,11 +28,12 @@ func computeAcceptKey(key string) string {
 }
 
 const (
-	opText   = 1
-	opBinary = 2
-	opClose  = 8
-	opPing   = 9
-	opPong   = 10
+	opText       = 1
+	opBinary     = 2
+	opClose      = 8
+	opPing       = 9
+	opPong       = 10
+	opContinuation = 0
 
 	maxFrameSize = 16 << 20 // 16 MB
 )
@@ -219,22 +220,52 @@ func headerHasToken(value, token string) bool {
 }
 
 // ReadMessage reads the next text or binary message, handling control frames internally.
+// Fragmented messages (continuation frames per RFC 6455 Section 5.4) are reassembled.
 func (ws *WSConn) ReadMessage() ([]byte, int, error) {
+	var accumulated []byte
+	var msgOpcode int
+
 	for {
-		opcode, payload, err := ws.readFrame()
+		fin, opcode, payload, err := ws.readFrame()
 		if err != nil {
 			return nil, 0, err
 		}
+
 		switch opcode {
-		case opText, opBinary:
-			return payload, opcode, nil
 		case opPing:
 			if err := ws.writeFrame(opPong, payload); err != nil {
 				return nil, 0, fmt.Errorf("pong: %w", err)
 			}
+			continue
 		case opClose:
-			_ = ws.writeFrame(opClose, nil) // best-effort close reply
+			_ = ws.writeFrame(opClose, nil)
 			return nil, opClose, io.EOF
+		case opPong:
+			continue
+		}
+
+		if opcode == opText || opcode == opBinary {
+			// New message — if we already had an incomplete fragmented message, discard it
+			// (protocol violation by the server, but be resilient).
+			if !fin {
+				msgOpcode = opcode
+				accumulated = append(accumulated[:0], payload...)
+				continue
+			}
+			// Single unfragmented message
+			return payload, opcode, nil
+		}
+
+		// Continuation frame (opcode 0)
+		if accumulated == nil {
+			// Unexpected continuation without a start frame — skip
+			continue
+		}
+		accumulated = append(accumulated, payload...)
+		if fin {
+			result := accumulated
+			accumulated = nil
+			return result, msgOpcode, nil
 		}
 	}
 }
@@ -261,19 +292,20 @@ func (ws *WSConn) Close() error {
 const wsReadTimeout = 90 * time.Second
 const wsWriteTimeout = 30 * time.Second
 
-func (ws *WSConn) readFrame() (opcode int, payload []byte, err error) {
+func (ws *WSConn) readFrame() (fin bool, opcode int, payload []byte, err error) {
 	// Set read deadline to detect dead connections (MEDIUM-4)
 	if nc, ok := ws.conn.(net.Conn); ok {
 		if err := nc.SetReadDeadline(time.Now().Add(wsReadTimeout)); err != nil {
-			return 0, nil, fmt.Errorf("set read deadline: %w", err)
+			return false, 0, nil, fmt.Errorf("set read deadline: %w", err)
 		}
 	}
 
 	var header [2]byte
 	if _, err = io.ReadFull(ws.reader, header[:]); err != nil {
-		return 0, nil, err
+		return false, 0, nil, err
 	}
 
+	fin = header[0]&0x80 != 0
 	opcode = int(header[0] & 0x0F)
 	masked := header[1]&0x80 != 0
 	length := uint64(header[1] & 0x7F)
@@ -282,32 +314,32 @@ func (ws *WSConn) readFrame() (opcode int, payload []byte, err error) {
 	case 126:
 		var ext [2]byte
 		if _, err = io.ReadFull(ws.reader, ext[:]); err != nil {
-			return 0, nil, err
+			return false, 0, nil, err
 		}
 		length = uint64(binary.BigEndian.Uint16(ext[:]))
 	case 127:
 		var ext [8]byte
 		if _, err = io.ReadFull(ws.reader, ext[:]); err != nil {
-			return 0, nil, err
+			return false, 0, nil, err
 		}
 		length = binary.BigEndian.Uint64(ext[:])
 	}
 
 	if length > maxFrameSize {
-		return 0, nil, fmt.Errorf("frame size %d exceeds max %d", length, maxFrameSize)
+		return false, 0, nil, fmt.Errorf("frame size %d exceeds max %d", length, maxFrameSize)
 	}
 
 	var maskKey [4]byte
 	if masked {
 		if _, err = io.ReadFull(ws.reader, maskKey[:]); err != nil {
-			return 0, nil, err
+			return false, 0, nil, err
 		}
 	}
 
 	payload = make([]byte, length)
 	if length > 0 {
 		if _, err = io.ReadFull(ws.reader, payload); err != nil {
-			return 0, nil, err
+			return false, 0, nil, err
 		}
 	}
 
@@ -317,7 +349,7 @@ func (ws *WSConn) readFrame() (opcode int, payload []byte, err error) {
 		}
 	}
 
-	return opcode, payload, nil
+	return fin, opcode, payload, nil
 }
 
 func (ws *WSConn) writeFrame(opcode int, payload []byte) error {

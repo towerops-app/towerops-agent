@@ -67,9 +67,11 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.S
 	}
 	oidValues := make(map[string]string, totalOIDs)
 
+	cancelled := false
 	for _, q := range job.Queries {
 		if ctx.Err() != nil {
-			return
+			cancelled = true
+			break
 		}
 		switch q.QueryType {
 		case pb.QueryType_GET:
@@ -113,6 +115,10 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.S
 				}
 			}
 		}
+	}
+
+	if cancelled {
+		slog.Warn("snmp job cancelled, sending partial result", "job_id", job.JobId, "oids", len(oidValues))
 	}
 
 	result := &pb.SnmpResult{

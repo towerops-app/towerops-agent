@@ -334,7 +334,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 				slog.Debug("invalid message", "error", err)
 				continue
 			}
-			shouldEnd, endErr := handleMessage(sessionCtx, msg, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh, lldpTopologyResultCh)
+			shouldEnd, endErr := handleMessage(sessionCtx, msg, topic, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh, lldpTopologyResultCh)
 			if shouldEnd {
 				flushSnmpBatch()
 				return endErr
@@ -401,6 +401,7 @@ func runSession(ctx context.Context, baseURL, token string) error {
 func handleMessage(
 	ctx context.Context,
 	msg channelMsg,
+	topic string,
 	pools *jobPools,
 	snmpResultCh chan<- *pb.SnmpResult,
 	mikrotikResultCh chan<- *pb.MikrotikResult,
@@ -409,6 +410,12 @@ func handleMessage(
 	checkResultCh chan<- *pb.CheckResult,
 	lldpTopologyResultCh chan<- *pb.LldpTopologyResult,
 ) (bool, error) {
+	// Ignore messages not addressed to our topic (except Phoenix control messages)
+	if msg.Topic != topic && msg.Topic != "phoenix" {
+		slog.Debug("ignoring message for different topic", "got", msg.Topic, "want", topic)
+		return false, nil
+	}
+
 	switch msg.Event {
 	case "phx_reply":
 		slog.Debug("channel reply", "topic", msg.Topic)
@@ -539,11 +546,18 @@ func dispatchJob(
 
 // nextBackoff doubles the current delay (capped at max) and adds up to 25% jitter.
 func nextBackoff(current, maxDelay time.Duration) time.Duration {
+	if current <= 0 {
+		current = initialRetryDelay
+	}
 	next := current * 2
 	if next > maxDelay {
 		next = maxDelay
 	}
-	jitter := time.Duration(rand.Int64N(int64(next / 4)))
+	jitterRange := int64(next / 4)
+	if jitterRange <= 0 {
+		return next
+	}
+	jitter := time.Duration(rand.Int64N(jitterRange))
 	return next + jitter
 }
 

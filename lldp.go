@@ -27,9 +27,15 @@ const (
 func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.LldpTopologyResult) {
 	deviceID := job.DeviceId
 	jobID := job.JobId
+	timestamp := time.Now().Unix()
 
 	if job.SnmpDevice == nil {
 		slog.Error("missing SNMP config for LLDP job", "job_id", jobID, "device_id", deviceID)
+		sendLldpResultWithTimeout(ctx, resultCh, &pb.LldpTopologyResult{
+			DeviceId:  deviceID,
+			JobId:     jobID,
+			Timestamp: timestamp,
+		}, jobID)
 		return
 	}
 
@@ -37,6 +43,11 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 	client, err := newSnmpConn(snmpDev)
 	if err != nil {
 		slog.Error("failed to connect SNMP for LLDP", "job_id", jobID, "device_id", deviceID, "error", err)
+		sendLldpResultWithTimeout(ctx, resultCh, &pb.LldpTopologyResult{
+			DeviceId:  deviceID,
+			JobId:     jobID,
+			Timestamp: timestamp,
+		}, jobID)
 		return
 	}
 	defer func() {
@@ -48,14 +59,25 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 	result, err := discoverLldpNeighbors(client, deviceID, jobID)
 	if err != nil {
 		slog.Error("LLDP discovery failed", "job_id", jobID, "device_id", deviceID, "error", err)
+		sendLldpResultWithTimeout(ctx, resultCh, &pb.LldpTopologyResult{
+			DeviceId:  deviceID,
+			JobId:     jobID,
+			Timestamp: timestamp,
+		}, jobID)
 		return
 	}
 
+	sendLldpResultWithTimeout(ctx, resultCh, result, jobID)
+	slog.Info("LLDP topology discovered", "job_id", jobID, "device_id", deviceID, "neighbors", len(result.Neighbors))
+}
+
+func sendLldpResultWithTimeout(ctx context.Context, resultCh chan<- *pb.LldpTopologyResult, result *pb.LldpTopologyResult, jobID string) {
+	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	select {
 	case resultCh <- result:
-		slog.Info("LLDP topology discovered", "job_id", jobID, "device_id", deviceID, "neighbors", len(result.Neighbors))
-	case <-ctx.Done():
-		slog.Warn("LLDP result send cancelled", "job_id", jobID)
+	case <-sendCtx.Done():
+		slog.Error("LLDP result send timeout - agent overloaded", "job_id", jobID)
 	}
 }
 

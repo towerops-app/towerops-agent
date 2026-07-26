@@ -29,10 +29,8 @@ var (
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
 	}
-	sslRootCAsOnce sync.Once
 	sslRootCAsMu   sync.Mutex
 	sslRootCAsPool *x509.CertPool
-	sslRootCAsErr  error
 
 	// sslRootCAs returns the system cert pool, cached after first successful load.
 	// Errors are not cached — subsequent calls will retry loading.
@@ -40,14 +38,15 @@ var (
 	sslRootCAs = func() (*x509.CertPool, error) {
 		sslRootCAsMu.Lock()
 		defer sslRootCAsMu.Unlock()
-		sslRootCAsOnce.Do(func() {
-			sslRootCAsPool, sslRootCAsErr = x509.SystemCertPool()
-		})
-		if sslRootCAsErr != nil {
-			// Reset the once so next call will retry
-			sslRootCAsOnce = sync.Once{}
+		if sslRootCAsPool != nil {
+			return sslRootCAsPool, nil
 		}
-		return sslRootCAsPool, sslRootCAsErr
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, err
+		}
+		sslRootCAsPool = pool
+		return pool, nil
 	}
 )
 
@@ -168,6 +167,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	if config.Regex != "" {
 		re, err := regexp.Compile(config.Regex)
 		if err != nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
 			return 3, fmt.Sprintf("Invalid regex: %v", err), responseTime
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))

@@ -120,7 +120,7 @@ func TestReadFrame(t *testing.T) {
 	buf.Write(payload)
 
 	ws := testWSConn(&nopCloser{readWriter: &buf})
-	opcode, data, err := ws.readFrame()
+	_, opcode, data, err := ws.readFrame()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestReadFrame16BitLength(t *testing.T) {
 	buf.Write(payload)
 
 	ws := testWSConn(&nopCloser{readWriter: &buf})
-	opcode, data, err := ws.readFrame()
+	_, opcode, data, err := ws.readFrame()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestReadFrame64BitLength(t *testing.T) {
 	buf.Write(payload)
 
 	ws := testWSConn(&nopCloser{readWriter: &buf})
-	opcode, data, err := ws.readFrame()
+	_, opcode, data, err := ws.readFrame()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestReadFrameMasked(t *testing.T) {
 	buf.Write(masked)
 
 	ws := testWSConn(&nopCloser{readWriter: &buf})
-	opcode, data, err := ws.readFrame()
+	_, opcode, data, err := ws.readFrame()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +265,7 @@ func TestReadFrame16BitLengthError(t *testing.T) {
 	buf.WriteByte(126)  // 16-bit length indicator, but no length bytes follow
 
 	ws := testWSConn(&nopCloser{readWriter: &buf})
-	_, _, err := ws.readFrame()
+	_, _, _, err := ws.readFrame()
 	if err == nil {
 		t.Error("expected error for truncated 16-bit length")
 	}
@@ -277,7 +277,7 @@ func TestReadFrame64BitLengthError(t *testing.T) {
 	buf.WriteByte(127)  // 64-bit length indicator, but no length bytes follow
 
 	ws := testWSConn(&nopCloser{readWriter: &buf})
-	_, _, err := ws.readFrame()
+	_, _, _, err := ws.readFrame()
 	if err == nil {
 		t.Error("expected error for truncated 64-bit length")
 	}
@@ -289,7 +289,7 @@ func TestReadFrameMaskKeyError(t *testing.T) {
 	buf.WriteByte(0x80 | 0x01) // masked + length 1, but no mask key or payload
 
 	ws := testWSConn(&nopCloser{readWriter: &buf})
-	_, _, err := ws.readFrame()
+	_, _, _, err := ws.readFrame()
 	if err == nil {
 		t.Error("expected error for missing mask key")
 	}
@@ -301,7 +301,7 @@ func TestReadFramePayloadError(t *testing.T) {
 	buf.WriteByte(5)    // length 5, but no payload
 
 	ws := testWSConn(&nopCloser{readWriter: &buf})
-	_, _, err := ws.readFrame()
+	_, _, _, err := ws.readFrame()
 	if err == nil {
 		t.Error("expected error for truncated payload")
 	}
@@ -348,7 +348,7 @@ func TestReadFrameExceedsMaxSize(t *testing.T) {
 	// Don't need to write the payload — should reject before reading it
 
 	ws := testWSConn(&nopCloser{readWriter: &buf})
-	_, _, err := ws.readFrame()
+	_, _, _, err := ws.readFrame()
 	if err == nil {
 		t.Error("expected error for frame exceeding max size")
 	}
@@ -363,7 +363,7 @@ func TestReadFrameEmptyPayload(t *testing.T) {
 	buf.WriteByte(0)    // zero length
 
 	ws := testWSConn(&nopCloser{readWriter: &buf})
-	opcode, data, err := ws.readFrame()
+	_, opcode, data, err := ws.readFrame()
 	if err != nil {
 		t.Fatal(err)
 	}
