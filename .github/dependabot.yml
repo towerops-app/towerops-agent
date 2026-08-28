@@ -1,0 +1,63 @@
+version: 2
+
+# Full version updates, not just security patches. Dependabot's security
+# updates only fire on a published advisory, which meant the golang.org/x/net
+# DNS parsing panic (GO-2026-5942) shipped in a release image before the Grype
+# gate caught it. Routine bumps keep that window short.
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: deps
+    labels:
+      - dependencies
+    groups:
+      # Minor and patch bumps arrive as a single PR: CI builds and scans the
+      # whole set together, and reviewing twelve near-identical PRs a month is
+      # how dependency updates stop getting reviewed at all. Majors are
+      # deliberately excluded so each one lands on its own and gets read.
+      go-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # Tracks both `FROM` lines in the Dockerfile: the golang builder and the
+  # alpine runtime. The builder tag determines which Go toolchain compiles the
+  # binary, so a stale one ships stdlib vulnerabilities that no change to
+  # go.mod can fix.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: docker
+    labels:
+      - dependencies
+      - docker
