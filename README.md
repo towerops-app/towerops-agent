@@ -24,7 +24,7 @@ The Towerops agent enables customers to deploy SNMP polling infrastructure on th
 Pull the latest image from the container registry:
 
 ```bash
-docker pull git.mcintire.me/towerops-agent/towerops-agent:latest
+docker pull ghcr.io/towerops-app/towerops-agent:latest
 ```
 
 ### Using Docker Compose
@@ -36,7 +36,7 @@ version: '3.8'
 
 services:
   towerops-agent:
-    image: git.mcintire.me/towerops-agent/towerops-agent:latest
+    image: ghcr.io/towerops-app/towerops-agent:latest
     restart: unless-stopped
     environment:
       - TOWEROPS_AGENT_TOKEN=your-agent-token-here

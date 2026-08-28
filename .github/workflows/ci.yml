@@ -19,15 +19,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  DOCKERHUB_IMAGE: gmcintire/towerops-agent
 
 jobs:
   test:
     name: Test
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -35,7 +33,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.25"
+          go-version-file: go.mod
 
       - name: Vet
         run: go vet ./...
@@ -46,7 +44,7 @@ jobs:
           version: latest
 
       - name: Test
-        run: go test -v ./...
+        run: go test -race -count=1 ./...
 
       - name: Build
         run: CGO_ENABLED=0 go build -o /dev/null .
@@ -54,7 +52,7 @@ jobs:
   build-branch:
     name: Build (Branch)
     needs: [test]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: read
@@ -63,8 +61,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Setup Blacksmith Builder
-        uses: useblacksmith/setup-docker-builder@v1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -82,13 +80,13 @@ jobs:
           echo "name=$SAFE_BRANCH" >> $GITHUB_OUTPUT
 
       - name: Build and push
-        uses: useblacksmith/build-push-action@v2
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
           provenance: false
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+          cache-from: type=gha,scope=branch
+          cache-to: type=gha,scope=branch,mode=max
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.branch.outputs.name }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
@@ -96,7 +94,7 @@ jobs:
   # Generate version info for release builds
   version:
     name: Version
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -104,11 +102,6 @@ jobs:
       short_sha: ${{ steps.version.outputs.short_sha }}
       is_tag: ${{ steps.version.outputs.is_tag }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
       - name: Generate version info
         id: version
         run: |
@@ -142,16 +135,16 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-latest
           - platform: linux/arm64
             arch: arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Setup Blacksmith Builder
-        uses: useblacksmith/setup-docker-builder@v1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -160,14 +153,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: gmcintire
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Build and push
-        uses: useblacksmith/build-push-action@v2
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -175,11 +162,10 @@ jobs:
           provenance: false
           build-args: |
             VERSION=${{ needs.version.outputs.version }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }},mode=max
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
-            docker.io/${{ env.DOCKERHUB_IMAGE }}:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
 
       - name: Extract standalone binary
         run: |
@@ -201,12 +187,15 @@ jobs:
   manifest:
     name: Create Manifest
     needs: [version, build-release]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
       packages: write
     steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
         with:
@@ -214,20 +203,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: gmcintire
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Create and push manifests
         run: |
           TAG="${{ needs.version.outputs.tag }}"
           SHORT_SHA="${{ needs.version.outputs.short_sha }}"
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          DH_IMAGE="docker.io/${{ env.DOCKERHUB_IMAGE }}"
 
-          # Create GHCR manifests
           docker buildx imagetools create -t ${IMAGE}:${TAG} \
             ${IMAGE}:${TAG}-amd64 \
             ${IMAGE}:${TAG}-arm64
@@ -240,33 +221,20 @@ jobs:
             ${IMAGE}:${TAG}-amd64 \
             ${IMAGE}:${TAG}-arm64
 
-          # Create Docker Hub manifests
-          docker buildx imagetools create -t ${DH_IMAGE}:${TAG} \
-            ${DH_IMAGE}:${TAG}-amd64 \
-            ${DH_IMAGE}:${TAG}-arm64
-
-          docker buildx imagetools create -t ${DH_IMAGE}:latest \
-            ${DH_IMAGE}:${TAG}-amd64 \
-            ${DH_IMAGE}:${TAG}-arm64
-
-          docker buildx imagetools create -t ${DH_IMAGE}:sha-${SHORT_SHA} \
-            ${DH_IMAGE}:${TAG}-amd64 \
-            ${DH_IMAGE}:${TAG}-arm64
-
       - name: Summary
         run: |
           echo "### Released version: ${{ needs.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "Multi-architecture build (amd64, arm64) - built in parallel" >> $GITHUB_STEP_SUMMARY
-          echo "Tags pushed to GHCR and Docker Hub:" >> $GITHUB_STEP_SUMMARY
-          echo "- \`latest\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ needs.version.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`sha-${{ needs.version.outputs.short_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Tags pushed to GHCR:" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ needs.version.outputs.short_sha }}\`" >> $GITHUB_STEP_SUMMARY
 
   # Create GitHub Release with standalone binaries (only on tags)
   release:
     name: GitHub Release
     needs: [version, manifest]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -294,8 +262,16 @@ jobs:
 
       - name: Notify agents of new release
         if: success()
-        run: |
-          curl -sf -X POST \
-            -H "Authorization: Bearer ${{ secrets.AGENT_WEBHOOK_SECRET }}" \
-            https://towerops.net/api/v1/webhooks/agent-release
         continue-on-error: true
+        env:
+          # The `secrets` context is not available in `if:` conditions, so the
+          # "is it configured?" check has to happen inside the script.
+          WEBHOOK_SECRET: ${{ secrets.AGENT_WEBHOOK_SECRET }}
+        run: |
+          if [ -z "$WEBHOOK_SECRET" ]; then
+            echo "AGENT_WEBHOOK_SECRET is not set; skipping release notification."
+            exit 0
+          fi
+          curl -sf -X POST \
+            -H "Authorization: Bearer $WEBHOOK_SECRET" \
+            https://towerops.net/api/v1/webhooks/agent-release

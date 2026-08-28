@@ -1,6 +1,6 @@
 services:
   towerops-agent:
-    image: git.mcintire.me/towerops-agent/towerops-agent:latest
+    image: ghcr.io/towerops-app/towerops-agent:latest
     pull_policy: always
     container_name: towerops-agent
     restart: unless-stopped
