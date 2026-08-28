@@ -5,9 +5,12 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
-      - "**"
+    branches-ignore:
+      # Dependabot pushes its branch and opens a PR, which fired two runs for
+      # every update. The push-triggered one also reached build-branch, where
+      # Dependabot's read-only token cannot write to GHCR. The pull_request
+      # trigger below covers these branches.
+      - "dependabot/**"
     tags:
       - "v*"
   pull_request:
@@ -18,8 +21,23 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Feature branches and pull requests share one global group, so a new push
+  # cancels every one of them still in flight rather than only the runs on its
+  # own branch. Three Dependabot PRs used to leave six runs going at once.
+  #
+  # Anything that publishes gets its own group and is never cancelled by
+  # unrelated work:
+  #
+  #   main  — cancel-in-progress still applies within the group, so a newer
+  #           push to main supersedes an older one. Without that, two rapid
+  #           pushes race to move the :latest tag.
+  #   v*    — never cancelled at all. A release build killed partway can leave
+  #           the per-arch images pushed but the manifest job never run, which
+  #           publishes a broken :latest.
+  group: >-
+    ci-${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+           && github.ref || 'global' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 env:
   REGISTRY: ghcr.io
