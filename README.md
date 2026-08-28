@@ -153,4 +153,23 @@ docker build -t towerops-agent .
 
 ## License
 
-Copyright 2026 Towerops
+Copyright (C) 2026 Graham McIntire
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See [LICENSE](LICENSE).
+
+It is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+**One exception:** `proto/agent.proto` and the Go bindings generated from it
+in `pb/` are licensed **Apache-2.0** ([LICENSE.Apache-2.0](LICENSE.Apache-2.0)).
+That file is the wire contract between the agent and the server rather than
+part of the agent itself, so anyone can implement this protocol — in any
+language, under any license — without taking on copyleft obligations.
+Speaking the protocol is not what makes something a derivative work.
+
+Contributions are accepted under the Developer Certificate of Origin; see
+[CONTRIBUTING.md](CONTRIBUTING.md).

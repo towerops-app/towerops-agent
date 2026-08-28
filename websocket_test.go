@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Graham McIntire
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 package main
 
 import (

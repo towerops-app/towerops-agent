@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Graham McIntire
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// This file, and the Go bindings generated from it in pb/, are licensed
+// under Apache-2.0 rather than the GPL-3.0-or-later that covers the rest of
+// this repository. See LICENSE.Apache-2.0.
+//
+// This schema is the wire contract between the agent and the Towerops
+// server, not part of the agent's implementation. Licensing it permissively
+// means anyone -- including a server that is not itself GPL -- can implement
+// this protocol without taking on copyleft obligations. Speaking the
+// protocol should never be what makes something a derivative work of the
+// agent.
+
 syntax = "proto3";
 
 package towerops.agent;
