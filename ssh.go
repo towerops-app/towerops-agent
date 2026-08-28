@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"git.mcintire.me/towerops-agent/towerops-agent/pb"
+	"github.com/towerops-app/towerops-agent/pb"
 	"golang.org/x/crypto/ssh"
 )
 

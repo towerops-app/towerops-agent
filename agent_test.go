@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/gosnmp/gosnmp"
-	"git.mcintire.me/towerops-agent/towerops-agent/pb"
+	"github.com/towerops-app/towerops-agent/pb"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -929,8 +929,8 @@ func TestRunSessionCtxCancel(t *testing.T) {
 		if err != nil {
 			t.Errorf("expected nil error on ctx cancel, got: %v", err)
 		}
-		case <-time.After(2 * time.Second):
-			t.Error("runSession did not exit after ctx cancel")
+	case <-time.After(2 * time.Second):
+		t.Error("runSession did not exit after ctx cancel")
 	}
 	srv.close()
 }

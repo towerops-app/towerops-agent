@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/gosnmp/gosnmp"
-	"git.mcintire.me/towerops-agent/towerops-agent/pb"
+	"github.com/towerops-app/towerops-agent/pb"
 )
 
 // LLDP-MIB OIDs (IEEE 802.1AB)
