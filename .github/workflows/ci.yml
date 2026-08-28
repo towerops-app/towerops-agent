@@ -40,6 +40,11 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 env:
+  # Runners already default to Node 24, but an action whose action.yml still
+  # declares `using: node20` would otherwise be run on Node 20. This forces
+  # those onto Node 24 too, so a future dependency bump cannot quietly
+  # reintroduce the deprecated runtime.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
@@ -214,7 +219,7 @@ jobs:
         # problem should not be what stops a release.
         if: always() && steps.scan.outputs.sarif != ''
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: ${{ steps.scan.outputs.sarif }}
           category: grype-${{ matrix.arch }}
