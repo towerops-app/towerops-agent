@@ -32,6 +32,14 @@ var heartbeatInterval = 60 * time.Second
 var channelHeartbeatInterval = 25 * time.Second
 var initialRetryDelay = time.Second
 
+// successfulConnectionThreshold is how long a session must last before the
+// reconnect backoff is considered stale and reset to initialRetryDelay.
+var successfulConnectionThreshold = 30 * time.Second
+
+// poolShutdownTimeout bounds how long session teardown waits for worker pools
+// to drain before abandoning their in-flight jobs.
+var poolShutdownTimeout = 5 * time.Second
+
 const maxJobPayloadBytes = 4 << 20 // 4 MB — well above any legitimate job list
 
 // channelMsg is the WebSocket channel message format (JSON wrapper around binary protobuf).
@@ -48,7 +56,6 @@ func runAgent(ctx context.Context, wsURL, token string, traps <-chan *pb.SnmpTra
 	baseURL := strings.TrimRight(wsURL, "/")
 	retryDelay := initialRetryDelay
 	maxRetry := 10 * time.Second
-	const successfulConnectionThreshold = 30 * time.Second
 
 	for {
 		select {
@@ -145,11 +152,9 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 			Event:   event,
 			Payload: payload,
 		}
-		data, err := json.Marshal(msg)
-		if err != nil {
-			slog.Error("marshal message", "error", err)
-			return false
-		}
+		// Infallible: topic and event are strings and payload is always a
+		// valid json.RawMessage produced by sendBinaryResult.
+		data, _ := json.Marshal(msg)
 		select {
 		case writeCh <- data:
 			return true
@@ -289,7 +294,6 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 		sessionCancel()
 		_ = ws.Close()
 
-		const poolShutdownTimeout = 5 * time.Second
 		for _, name := range pools.stop(poolShutdownTimeout) {
 			slog.Warn("worker pool shutdown timed out, abandoning in-flight jobs", "pool", name)
 		}

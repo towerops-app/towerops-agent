@@ -36,6 +36,25 @@ var (
 	sslRootCAsMu   sync.Mutex
 	sslRootCAsPool *x509.CertPool
 
+	// systemCertPool loads the platform root store. Overridable for tests.
+	systemCertPool = x509.SystemCertPool
+
+	// tcpDialContext establishes the plain TCP connection used by TCP checks.
+	// Overridable for tests.
+	tcpDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, address)
+	}
+
+	// dnsLookupTXT resolves TXT records for DNS checks. Overridable for tests.
+	dnsLookupTXT = (*net.Resolver).LookupTXT
+
+	// sslDialTLS establishes the TLS connection used by SSL checks.
+	// Overridable for tests.
+	sslDialTLS = func(ctx context.Context, dialer *net.Dialer, cfg *tls.Config, network, address string) (net.Conn, error) {
+		return (&tls.Dialer{NetDialer: dialer, Config: cfg}).DialContext(ctx, network, address)
+	}
+
 	// sslRootCAs returns the system cert pool, cached after first successful load.
 	// Errors are not cached — subsequent calls will retry loading.
 	// Overridable for tests.
@@ -45,7 +64,7 @@ var (
 		if sslRootCAsPool != nil {
 			return sslRootCAsPool, nil
 		}
-		pool, err := x509.SystemCertPool()
+		pool, err := systemCertPool()
 		if err != nil {
 			return nil, err
 		}
@@ -216,8 +235,7 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 	deadline := startTime.Add(timeout)
 	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
 	defer dialCancel()
-	var d net.Dialer
-	conn, err := d.DialContext(dialCtx, "tcp", address)
+	conn, err := tcpDialContext(dialCtx, "tcp", address)
 	responseTime := float64(time.Since(startTime).Milliseconds())
 
 	if err != nil {
@@ -332,7 +350,7 @@ func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs u
 		}
 
 	case "TXT":
-		txts, lookupErr := resolver.LookupTXT(ctx, config.Hostname)
+		txts, lookupErr := dnsLookupTXT(resolver, ctx, config.Hostname)
 		err = lookupErr
 		results = txts
 
@@ -412,10 +430,7 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 	startTime := time.Now()
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	conn, err := (&tls.Dialer{
-		NetDialer: dialer,
-		Config:    tlsConfig,
-	}).DialContext(dialCtx, "tcp", address)
+	conn, err := sslDialTLS(dialCtx, dialer, tlsConfig, "tcp", address)
 	responseTime := float64(time.Since(startTime).Milliseconds())
 
 	if err != nil {

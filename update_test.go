@@ -4,7 +4,9 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"pgregory.net/rapid"
 )
 
 func TestSelfUpdateRejectsHTTP(t *testing.T) {
@@ -158,7 +162,7 @@ func TestSelfUpdateCreateTempError(t *testing.T) {
 		osCreateTemp = origCreate
 	}()
 	osExecutable = func() (string, error) { return "/tmp/test-agent", nil }
-	osCreateTemp = func(dir, pattern string) (*os.File, error) {
+	osCreateTemp = func(dir, pattern string) (updateTempFile, error) {
 		return nil, fmt.Errorf("disk full")
 	}
 
@@ -227,19 +231,32 @@ func TestSelfUpdateChecksumMatch(t *testing.T) {
 	defer srv.Close()
 
 	origDo := httpDo
-	defer func() { httpDo = origDo }()
+	origExe := osExecutable
+	origRename := osRename
+	defer func() {
+		httpDo = origDo
+		osExecutable = origExe
+		osRename = origRename
+	}()
 	httpDo = srv.Client().Do
 
-	// This will fail at the rename step (writing to os.Executable path),
-	// but the checksum verification should pass
+	// Stage into a temp dir and stop at the rename: letting the real
+	// os.Executable/os.Rename/syscall.Exec run would overwrite and re-exec the
+	// test binary itself.
+	dir := t.TempDir()
+	osExecutable = func() (string, error) { return filepath.Join(dir, "test-agent"), nil }
+	osRename = func(string, string) error { return fmt.Errorf("stop before replacing binary") }
+
 	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
 	if err == nil {
-		t.Error("expected error (can't replace running binary in test)")
+		t.Fatal("expected error (rename is stubbed out)")
 	}
-	// The error should NOT be about checksum
-	if err != nil && err.Error() != "" {
-		// As long as it's not a checksum error, the checksum verification passed
-		t.Logf("got expected post-checksum error: %v", err)
+	// Reaching the rename step proves checksum verification passed.
+	if !strings.Contains(err.Error(), "stop before replacing binary") {
+		t.Errorf("expected the stubbed rename error, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "checksum mismatch") {
+		t.Errorf("checksum verification unexpectedly failed: %v", err)
 	}
 }
 
@@ -418,7 +435,7 @@ func TestSelfUpdateWriteError(t *testing.T) {
 	osExecutable = func() (string, error) { return filepath.Join(dir, "agent"), nil }
 
 	// Create a temp file that will fail on Write by closing it before selfUpdate tries to write
-	osCreateTemp = func(d, pattern string) (*os.File, error) {
+	osCreateTemp = func(d, pattern string) (updateTempFile, error) {
 		f, err := os.CreateTemp(d, pattern)
 		if err != nil {
 			return nil, err
@@ -464,4 +481,240 @@ func rewriteToHTTPS(rawURL string) string {
 		return "https://" + strings.TrimPrefix(rawURL, "http://")
 	}
 	return rawURL
+}
+
+// cliTUpdateServer serves body over TLS, points httpDo at it, and returns the
+// download URL plus the matching sha256 checksum.
+func cliTUpdateServer(t *testing.T, body []byte) (string, string) {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+
+	origDo := httpDo
+	t.Cleanup(func() { httpDo = origDo })
+	httpDo = srv.Client().Do
+
+	return rewriteToHTTPS(srv.URL), fmt.Sprintf("%x", sha256.Sum256(body))
+}
+
+// cliTFakeTempFile wraps a real temp file so an individual chmod/sync/close
+// call can be made to fail.
+type cliTFakeTempFile struct {
+	file     *os.File
+	chmodErr error
+	syncErr  error
+	closeErr error
+	closes   int
+}
+
+func (f *cliTFakeTempFile) Write(p []byte) (int, error) { return f.file.Write(p) }
+func (f *cliTFakeTempFile) Name() string                { return f.file.Name() }
+
+func (f *cliTFakeTempFile) Chmod(mode os.FileMode) error {
+	if f.chmodErr != nil {
+		return f.chmodErr
+	}
+	return f.file.Chmod(mode)
+}
+
+func (f *cliTFakeTempFile) Sync() error {
+	if f.syncErr != nil {
+		return f.syncErr
+	}
+	return f.file.Sync()
+}
+
+func (f *cliTFakeTempFile) Close() error {
+	f.closes++
+	if f.closeErr != nil {
+		return f.closeErr
+	}
+	return f.file.Close()
+}
+
+func TestCliTSelfUpdateBuildRequestError(t *testing.T) {
+	origNewRequest := httpNewRequest
+	origDo := httpDo
+	defer func() {
+		httpNewRequest = origNewRequest
+		httpDo = origDo
+	}()
+
+	httpNewRequest = func(context.Context, string, string, io.Reader) (*http.Request, error) {
+		return nil, errors.New("unsupported protocol scheme")
+	}
+	httpDo = func(*http.Request) (*http.Response, error) {
+		t.Fatal("httpDo must not run when the request cannot be built")
+		return nil, nil
+	}
+
+	err := selfUpdate("https://example.com/agent", strings.Repeat("0", 64))
+	if err == nil || !strings.Contains(err.Error(), "build request: unsupported protocol scheme") {
+		t.Fatalf("selfUpdate error = %v, want build request failure", err)
+	}
+}
+
+func TestCliTSelfUpdateTempFileFailures(t *testing.T) {
+	tests := []struct {
+		name  string
+		want  string
+		apply func(*cliTFakeTempFile)
+	}{
+		{"chmod", "chmod temp: chmod exploded", func(f *cliTFakeTempFile) { f.chmodErr = errors.New("chmod exploded") }},
+		{"sync", "sync temp: sync exploded", func(f *cliTFakeTempFile) { f.syncErr = errors.New("sync exploded") }},
+		{"close", "close temp: close exploded", func(f *cliTFakeTempFile) { f.closeErr = errors.New("close exploded") }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte("staged update payload")
+			downloadURL, checksum := cliTUpdateServer(t, body)
+
+			origExe := osExecutable
+			origCreate := osCreateTemp
+			origRename := osRename
+			defer func() {
+				osExecutable = origExe
+				osCreateTemp = origCreate
+				osRename = origRename
+			}()
+
+			dir := t.TempDir()
+			osExecutable = func() (string, error) { return filepath.Join(dir, "agent"), nil }
+
+			var fake *cliTFakeTempFile
+			osCreateTemp = func(d, pattern string) (updateTempFile, error) {
+				f, err := os.CreateTemp(d, pattern)
+				if err != nil {
+					return nil, err
+				}
+				t.Cleanup(func() { _ = f.Close() })
+				fake = &cliTFakeTempFile{file: f}
+				tt.apply(fake)
+				return fake, nil
+			}
+
+			renamed := false
+			osRename = func(string, string) error {
+				renamed = true
+				return nil
+			}
+
+			err := selfUpdate(downloadURL, checksum)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("selfUpdate error = %v, want %q", err, tt.want)
+			}
+			if renamed {
+				t.Error("binary was replaced despite a temp file failure")
+			}
+			if fake == nil {
+				t.Fatal("temp file was never created")
+			}
+			if fake.closes != 1 {
+				t.Errorf("temp file closes = %d, want 1", fake.closes)
+			}
+			if _, statErr := os.Stat(fake.Name()); !os.IsNotExist(statErr) {
+				t.Errorf("staged temp file %q survived: %v", fake.Name(), statErr)
+			}
+		})
+	}
+}
+
+func TestCliTSelfUpdateSyncDirectoryError(t *testing.T) {
+	body := []byte("payload for directory sync failure")
+	downloadURL, checksum := cliTUpdateServer(t, body)
+
+	origExe := osExecutable
+	origCreate := osCreateTemp
+	origRename := osRename
+	origExec := syscallExec
+	defer func() {
+		osExecutable = origExe
+		osCreateTemp = origCreate
+		osRename = origRename
+		syscallExec = origExec
+	}()
+
+	stage := t.TempDir()
+	missingDir := filepath.Join(t.TempDir(), "removed")
+	osExecutable = func() (string, error) { return filepath.Join(missingDir, "agent"), nil }
+	osCreateTemp = func(_, pattern string) (updateTempFile, error) { return os.CreateTemp(stage, pattern) }
+	osRename = func(string, string) error { return nil }
+
+	execCalled := false
+	syscallExec = func(string, []string, []string) error {
+		execCalled = true
+		return nil
+	}
+
+	err := selfUpdate(downloadURL, checksum)
+	if err == nil || !strings.Contains(err.Error(), "sync executable directory") {
+		t.Fatalf("selfUpdate error = %v, want directory sync failure", err)
+	}
+	if !strings.Contains(err.Error(), "no such file or directory") {
+		t.Errorf("error %v should wrap the os.Open failure", err)
+	}
+	if execCalled {
+		t.Error("re-exec attempted after the directory sync failed")
+	}
+}
+
+func TestPropCliSanitizeArgs(t *testing.T) {
+	// Other arguments are lowercase-only, so the digit-bearing secret can never
+	// appear in them by chance, nor can they look like a token flag.
+	filler := rapid.SliceOfN(rapid.StringMatching(`[a-z]{0,8}`), 0, 6)
+	secretTail := rapid.StringMatching(`[A-Z0-9]{1,10}`)
+
+	rapid.Check(t, func(t *rapid.T) {
+		others := filler.Draw(t, "others")
+		secret := "s3cr3t" + secretTail.Draw(t, "secret")
+		form := rapid.IntRange(0, 3).Draw(t, "form")
+		pos := rapid.IntRange(0, len(others)).Draw(t, "pos")
+
+		var injected []string
+		switch form {
+		case 0:
+			injected = []string{"--token", secret}
+		case 1:
+			injected = []string{"-token", secret}
+		case 2:
+			injected = []string{"--token=" + secret}
+		case 3:
+			injected = []string{"-token=" + secret}
+		}
+
+		args := make([]string, 0, len(others)+len(injected))
+		args = append(args, others[:pos]...)
+		args = append(args, injected...)
+		args = append(args, others[pos:]...)
+		before := append([]string(nil), args...)
+
+		out := sanitizeArgs(args)
+
+		if len(out) != len(args) {
+			t.Fatalf("sanitizeArgs(%q) length = %d, want %d", before, len(out), len(args))
+		}
+		if strings.Contains(strings.Join(out, "\x00"), secret) {
+			t.Fatalf("sanitizeArgs(%q) = %q leaks the secret", before, out)
+		}
+		for i := range args {
+			inInjected := i >= pos && i < pos+len(injected)
+			if !inInjected && out[i] != before[i] {
+				t.Fatalf("sanitizeArgs(%q) changed arg %d: %q -> %q", before, i, before[i], out[i])
+			}
+		}
+		if out[pos] != injected[0] && out[pos] != strings.SplitN(injected[0], "=", 2)[0]+"=***" {
+			t.Fatalf("sanitizeArgs(%q) mangled the token flag: %q", before, out[pos])
+		}
+		if len(injected) == 2 && out[pos+1] != "***" {
+			t.Fatalf("sanitizeArgs(%q) token value = %q, want ***", before, out[pos+1])
+		}
+		for i := range args {
+			if args[i] != before[i] {
+				t.Fatalf("sanitizeArgs mutated the caller's slice at %d: %q -> %q", i, before[i], args[i])
+			}
+		}
+	})
 }

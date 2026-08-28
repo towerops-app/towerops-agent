@@ -5,8 +5,11 @@ package main
 
 import (
 	"crypto/x509"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -154,5 +157,253 @@ func TestTlsCertFingerprint(t *testing.T) {
 	fp2 := tlsCertFingerprint(cert)
 	if fp != fp2 {
 		t.Error("fingerprint not deterministic")
+	}
+}
+
+// hmTFailingTempFile is an injectable hostKeyTempFile whose Write, Sync and
+// Close outcomes are individually controllable.
+type hmTFailingTempFile struct {
+	name      string
+	writeErr  error
+	syncErr   error
+	closeErr  error
+	written   []byte
+	syncCalls int
+	closed    bool
+}
+
+func (f *hmTFailingTempFile) Write(p []byte) (int, error) {
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	f.written = append(f.written, p...)
+	return len(p), nil
+}
+
+func (f *hmTFailingTempFile) Name() string { return f.name }
+
+func (f *hmTFailingTempFile) Sync() error {
+	f.syncCalls++
+	return f.syncErr
+}
+
+func (f *hmTFailingTempFile) Close() error {
+	f.closed = true
+	return f.closeErr
+}
+
+// hmTNewStore returns a store rooted in a fresh temp dir plus its path.
+func hmTNewStore(t *testing.T) (*hostKeyStore, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "known_hosts.json")
+	return newHostKeyStore(path), path
+}
+
+func TestHmGetHostKeyStoreDefaultPath(t *testing.T) {
+	origStore := globalHostKeys
+	defer func() {
+		hostKeysOnce = sync.Once{}
+		globalHostKeys = origStore
+	}()
+	hostKeysOnce = sync.Once{}
+	t.Setenv("TOWEROPS_HOST_KEYS_FILE", "")
+
+	store := getHostKeyStore()
+	if store == nil {
+		t.Fatal("expected non-nil store")
+	}
+	if store.path != "./known_hosts.json" {
+		t.Fatalf("expected default path ./known_hosts.json, got %q", store.path)
+	}
+	if getHostKeyStore() != store {
+		t.Fatal("getHostKeyStore should memoize the store")
+	}
+}
+
+func TestHmNewHostKeyStoreUnreadablePath(t *testing.T) {
+	// A directory makes os.ReadFile fail with EISDIR, which is not IsNotExist.
+	dir := t.TempDir()
+	s := newHostKeyStore(dir)
+	if s.loadErr == nil {
+		t.Fatal("expected loadErr for unreadable store path")
+	}
+	if !strings.Contains(s.loadErr.Error(), "read host key store") {
+		t.Fatalf("unexpected loadErr: %v", s.loadErr)
+	}
+	// verify must fail closed and must not mutate the in-memory map.
+	err := s.verify("host:22", "fp")
+	if err == nil || !strings.Contains(err.Error(), "read host key store") {
+		t.Fatalf("expected verify to surface loadErr, got %v", err)
+	}
+	if len(s.keys) != 0 {
+		t.Fatalf("expected no keys cached, got %v", s.keys)
+	}
+}
+
+func TestHmNewHostKeyStoreCorruptJSONLoadErr(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "known_hosts.json")
+	if err := os.WriteFile(path, []byte("not json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s := newHostKeyStore(path)
+	if s.loadErr == nil {
+		t.Fatal("expected loadErr for corrupt store")
+	}
+	if !strings.Contains(s.loadErr.Error(), "parse host key store") {
+		t.Fatalf("unexpected loadErr: %v", s.loadErr)
+	}
+}
+
+func TestHmVerifyMismatchMentionsMITM(t *testing.T) {
+	s, _ := hmTNewStore(t)
+	if err := s.verify("10.0.0.9:22", "aaaa"); err != nil {
+		t.Fatalf("first use should succeed: %v", err)
+	}
+	err := s.verify("10.0.0.9:22", "bbbb")
+	if err == nil {
+		t.Fatal("expected mismatch error")
+	}
+	for _, want := range []string{"possible MITM", "stored=aaaa", "got=bbbb"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+	if s.keys["10.0.0.9:22"] != "aaaa" {
+		t.Fatalf("mismatch must not overwrite the stored key, got %q", s.keys["10.0.0.9:22"])
+	}
+}
+
+func TestHmSaveMarshalError(t *testing.T) {
+	orig := hostKeyMarshal
+	defer func() { hostKeyMarshal = orig }()
+	hostKeyMarshal = func(any, string, string) ([]byte, error) {
+		return nil, errors.New("marshal boom")
+	}
+
+	s, _ := hmTNewStore(t)
+	err := s.verify("h:22", "fp")
+	if err == nil || !strings.Contains(err.Error(), "marshal boom") {
+		t.Fatalf("expected marshal error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "failed to persist trusted host key") {
+		t.Fatalf("expected wrapped persistence error, got %v", err)
+	}
+	if _, ok := s.keys["h:22"]; ok {
+		t.Fatal("failed save must roll the key back out of memory")
+	}
+}
+
+func TestHmSaveCreateTempError(t *testing.T) {
+	// filepath.Dir of a path in a missing directory makes os.CreateTemp fail.
+	s := newHostKeyStore(filepath.Join(t.TempDir(), "missing", "known_hosts.json"))
+	err := s.save()
+	if err == nil {
+		t.Fatal("expected CreateTemp error")
+	}
+	if !strings.Contains(err.Error(), "no such file or directory") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestHmSaveTempFileFailures(t *testing.T) {
+	tests := []struct {
+		name       string
+		file       *hmTFailingTempFile
+		wantErr    string
+		wantClosed bool
+	}{
+		{
+			name:       "write fails",
+			file:       &hmTFailingTempFile{name: "unused", writeErr: errors.New("write boom")},
+			wantErr:    "write boom",
+			wantClosed: true,
+		},
+		{
+			name:       "sync fails",
+			file:       &hmTFailingTempFile{name: "unused", syncErr: errors.New("sync boom")},
+			wantErr:    "sync boom",
+			wantClosed: true,
+		},
+		{
+			name:       "close fails",
+			file:       &hmTFailingTempFile{name: "unused", closeErr: errors.New("close boom")},
+			wantErr:    "close boom",
+			wantClosed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tt.file.name = filepath.Join(dir, ".known_hosts.json-tmp")
+
+			orig := hostKeyCreateTemp
+			defer func() { hostKeyCreateTemp = orig }()
+			hostKeyCreateTemp = func(string, string) (hostKeyTempFile, error) { return tt.file, nil }
+
+			s := newHostKeyStore(filepath.Join(dir, "known_hosts.json"))
+			s.keys["h:22"] = "fp"
+			err := s.save()
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected %q, got %v", tt.wantErr, err)
+			}
+			if tt.file.closed != tt.wantClosed {
+				t.Fatalf("closed=%v, want %v", tt.file.closed, tt.wantClosed)
+			}
+			if _, statErr := os.Stat(s.path); !os.IsNotExist(statErr) {
+				t.Fatalf("failed save must not create the store file: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestHmSaveRenameError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "known_hosts.json")
+	// A directory at the destination makes os.Rename fail after a clean write.
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &hostKeyStore{path: path, keys: map[string]string{"h:22": "fp"}}
+	err := s.save()
+	if err == nil {
+		t.Fatal("expected rename error")
+	}
+	if !strings.Contains(err.Error(), "rename") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// The temp file must have been cleaned up by the deferred Remove.
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 || entries[0].Name() != "known_hosts.json" {
+		t.Fatalf("temp file leaked: %v", entries)
+	}
+}
+
+func TestHmSaveSuccessWritesAtomically(t *testing.T) {
+	s, path := hmTNewStore(t)
+	if err := s.verify("h:22", "fp"); err != nil {
+		t.Fatalf("first use should persist: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("store is not valid JSON: %v", err)
+	}
+	if got["h:22"] != "fp" {
+		t.Fatalf("expected persisted fingerprint, got %v", got)
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected only the store file, got %v", entries)
 	}
 }

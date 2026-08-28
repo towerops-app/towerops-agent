@@ -4,13 +4,22 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log"
+	"log/slog"
+	"math"
 	"net"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gosnmp/gosnmp"
 	"github.com/towerops-app/towerops-agent/pb"
+	"pgregory.net/rapid"
 )
 
 func TestTrapToProtoV2c(t *testing.T) {
@@ -545,4 +554,428 @@ func TestTrapListenerRejectsWrongCommunityOnTheWire(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		// Expected: the community filter dropped it.
 	}
+}
+
+// --- tpT: listener lifecycle and property coverage -------------------------
+
+// tpTLogWatcher signals a channel once a given number of records whose message
+// contains substr have been emitted. It gives tests a synchronisation point
+// inside code paths that only announce themselves by logging, such as the trap
+// listener's rebind backoff. Records are forwarded to a plain stderr handler
+// rather than to the previous default: slog.SetDefault also points the standard
+// log package at the new default, so chaining onto slog's built-in handler
+// (which writes through that same log package) would recurse forever.
+type tpTLogWatcher struct {
+	next   slog.Handler
+	substr string
+	state  *tpTLogWatcherState
+}
+
+type tpTLogWatcherState struct {
+	mu    sync.Mutex
+	seen  int
+	want  int
+	fired chan struct{}
+}
+
+func (w *tpTLogWatcher) Enabled(_ context.Context, _ slog.Level) bool { return true }
+
+func (w *tpTLogWatcher) Handle(ctx context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, w.substr) {
+		w.state.mu.Lock()
+		w.state.seen++
+		if w.state.seen == w.state.want {
+			close(w.state.fired)
+		}
+		w.state.mu.Unlock()
+	}
+	if w.next.Enabled(ctx, r.Level) {
+		return w.next.Handle(ctx, r)
+	}
+	return nil
+}
+
+func (w *tpTLogWatcher) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &tpTLogWatcher{next: w.next.WithAttrs(attrs), substr: w.substr, state: w.state}
+}
+
+func (w *tpTLogWatcher) WithGroup(name string) slog.Handler {
+	return &tpTLogWatcher{next: w.next.WithGroup(name), substr: w.substr, state: w.state}
+}
+
+// tpTWatchLog installs the watcher as the default logger for the duration of
+// the test and returns the channel closed on the nth matching record.
+func tpTWatchLog(t *testing.T, substr string, n int) <-chan struct{} {
+	t.Helper()
+	prevLogger := slog.Default()
+	prevWriter := log.Writer()
+	prevFlags := log.Flags()
+
+	state := &tpTLogWatcherState{want: n, fired: make(chan struct{})}
+	sink := newColorHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})
+	slog.SetDefault(slog.New(&tpTLogWatcher{next: sink, substr: substr, state: state}))
+
+	t.Cleanup(func() {
+		slog.SetDefault(prevLogger)
+		// slog.SetDefault rewired the log package; put it back by hand because
+		// restoring the previous slog default does not undo that.
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
+	return state.fired
+}
+
+// tpTFreePort returns a UDP port that stays occupied by conn until the test
+// closes it, so a bind attempt on the same port is guaranteed to fail.
+func tpTOccupiedUDPPort(t *testing.T) uint16 {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		t.Skipf("cannot bind a udp port in this environment: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	udpAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("unexpected local address type %T", conn.LocalAddr())
+	}
+	return uint16(udpAddr.Port) //nolint:gosec // kernel-assigned ephemeral port
+}
+
+// tpTV2cTrap builds a minimal v2c trap packet for handle/queue tests.
+func tpTV2cTrap(community string) *gosnmp.SnmpPacket {
+	return &gosnmp.SnmpPacket{
+		Version:   gosnmp.Version2c,
+		PDUType:   gosnmp.SNMPv2Trap,
+		Community: community,
+		Variables: []gosnmp.SnmpPDU{
+			{Name: oidSnmpTrapOID, Type: gosnmp.ObjectIdentifier, Value: ".1.3.6.1.6.3.1.1.5.2"},
+		},
+	}
+}
+
+func TestTpTStartTrapListenerBindFailure(t *testing.T) {
+	port := tpTOccupiedUDPPort(t)
+
+	l, err := startTrapListener(port, "public")
+	if err == nil {
+		l.Close()
+		t.Fatalf("startTrapListener succeeded on occupied port %d", port)
+	}
+	if l != nil {
+		t.Errorf("listener = %v, want nil on bind failure", l)
+	}
+	if !strings.Contains(err.Error(), "bind trap port") {
+		t.Errorf("error = %q, want it to mention %q", err.Error(), "bind trap port")
+	}
+	if !strings.Contains(err.Error(), strconv.Itoa(int(port))) {
+		t.Errorf("error = %q, want it to name port %d", err.Error(), port)
+	}
+}
+
+func TestTpTCloseWithoutReadyListener(t *testing.T) {
+	tl := &trapListener{
+		traps:  make(chan *pb.SnmpTrap, 1),
+		closed: make(chan struct{}),
+		done:   make(chan struct{}),
+		ready:  make(chan struct{}),
+	}
+	// done closed, ready never closed: Close must give up on the listener
+	// instead of blocking on a socket that never came up.
+	close(tl.done)
+
+	tl.Close()
+
+	select {
+	case <-tl.closed:
+	default:
+		t.Fatal("Close did not close the stop channel")
+	}
+
+	// closeOnce makes repeated Close calls harmless.
+	tl.Close()
+}
+
+func TestTpTCloseWarnsAboutDroppedTraps(t *testing.T) {
+	warned := tpTWatchLog(t, "snmp traps dropped", 1)
+
+	tl := &trapListener{
+		traps:  make(chan *pb.SnmpTrap, trapQueueSize),
+		closed: make(chan struct{}),
+		done:   make(chan struct{}),
+		ready:  make(chan struct{}),
+	}
+	close(tl.done)
+
+	addr := &net.UDPAddr{IP: net.ParseIP("192.0.2.77"), Port: 5001}
+	for i := 0; i < trapQueueSize; i++ {
+		tl.handle(tpTV2cTrap("public"), addr)
+	}
+	if got := len(tl.traps); got != trapQueueSize {
+		t.Fatalf("queued %d traps, want %d", got, trapQueueSize)
+	}
+	if got := tl.dropped.Load(); got != 0 {
+		t.Fatalf("dropped = %d before overflow, want 0", got)
+	}
+
+	tl.handle(tpTV2cTrap("public"), addr)
+	if got := tl.dropped.Load(); got != 1 {
+		t.Fatalf("dropped = %d after overflow, want 1", got)
+	}
+
+	tl.Close()
+
+	select {
+	case <-warned:
+	default:
+		t.Fatal("Close did not warn about dropped traps")
+	}
+}
+
+func TestTpTServeStopsDuringRebindBackoff(t *testing.T) {
+	stopped := tpTWatchLog(t, "stopped unexpectedly", 1)
+
+	tl := &trapListener{traps: make(chan *pb.SnmpTrap, 1), closed: make(chan struct{})}
+	listener := tl.newListener()
+	done := make(chan struct{})
+	tl.listener = listener
+	tl.done = done
+	tl.ready = trapReady(listener, done)
+
+	returned := make(chan struct{})
+	// "nope://" is rejected by gosnmp before it touches a socket, so Listen
+	// fails immediately and serve drops straight into its rebind backoff.
+	go func() {
+		tl.serve(listener, done, "nope://127.0.0.1:1", nil)
+		close(returned)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve never reported an unexpected stop")
+	}
+
+	close(tl.closed)
+
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve did not return while waiting out the rebind backoff")
+	}
+}
+
+func TestTpTServeStopsWhileInstallingRebind(t *testing.T) {
+	stopped := tpTWatchLog(t, "stopped unexpectedly", 1)
+
+	tl := &trapListener{traps: make(chan *pb.SnmpTrap, 1), closed: make(chan struct{})}
+	listener := tl.newListener()
+	done := make(chan struct{})
+	tl.listener = listener
+	tl.done = done
+	tl.ready = trapReady(listener, done)
+
+	// Holding the listener mutex parks serve at the point where it swaps in the
+	// replacement listener, which is exactly the window this test targets.
+	tl.mu.Lock()
+
+	returned := make(chan struct{})
+	go func() {
+		tl.serve(listener, done, "nope://127.0.0.1:1", nil)
+		close(returned)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		tl.mu.Unlock()
+		t.Fatal("serve never reported an unexpected stop")
+	}
+
+	// The backoff is one second; after that serve blocks on the mutex we hold.
+	select {
+	case <-returned:
+		tl.mu.Unlock()
+		t.Fatal("serve returned from the backoff instead of reaching the rebind")
+	case <-time.After(1500 * time.Millisecond):
+	}
+
+	close(tl.closed)
+	tl.mu.Unlock()
+
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve did not abandon the rebind after Close")
+	}
+
+	// The replacement listener must not have been published.
+	tl.mu.Lock()
+	current := tl.listener
+	tl.mu.Unlock()
+	if current != listener {
+		t.Error("serve published a replacement listener after being closed")
+	}
+}
+
+func TestTpTServeRebindMonitorStopsOnClose(t *testing.T) {
+	// Two "stopped unexpectedly" records prove serve completed a rebind (and so
+	// spawned the readiness monitor) before failing to bind again.
+	stoppedTwice := tpTWatchLog(t, "stopped unexpectedly", 2)
+
+	tl := &trapListener{traps: make(chan *pb.SnmpTrap, 1), closed: make(chan struct{})}
+	listener := tl.newListener()
+	done := make(chan struct{})
+	tl.listener = listener
+	tl.done = done
+	tl.ready = trapReady(listener, done)
+
+	returned := make(chan struct{})
+	go func() {
+		tl.serve(listener, done, "nope://127.0.0.1:1", nil)
+		close(returned)
+	}()
+
+	select {
+	case <-stoppedTwice:
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve did not attempt a second bind")
+	}
+
+	tl.mu.Lock()
+	rebound := tl.listener
+	tl.mu.Unlock()
+	if rebound == listener {
+		t.Error("serve did not swap in a replacement listener")
+	}
+
+	close(tl.closed)
+
+	select {
+	case <-returned:
+	case <-time.After(3 * time.Second):
+		t.Fatal("serve did not return after Close")
+	}
+}
+
+// tpTIsDottedNumeric reports whether s is a non-empty dotted-decimal OID.
+func tpTIsDottedNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, part := range strings.Split(s, ".") {
+		if part == "" {
+			return false
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func TestPropTpV1TrapOID(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		generic := rapid.IntRange(-5, 12).Draw(t, "generic")
+		specific := rapid.IntRange(0, 1_000_000).Draw(t, "specific")
+		segs := rapid.SliceOfN(rapid.IntRange(0, 99999), 1, 6).Draw(t, "enterpriseSegments")
+
+		enterprise := ""
+		if !rapid.Bool().Draw(t, "emptyEnterprise") {
+			parts := make([]string, len(segs))
+			for i, s := range segs {
+				parts[i] = strconv.Itoa(s)
+			}
+			enterprise = strings.Join(parts, ".")
+		}
+
+		got := v1TrapOID(enterprise, generic, specific)
+		if got != "" && !tpTIsDottedNumeric(got) {
+			t.Fatalf("v1TrapOID(%q, %d, %d) = %q, want empty or a dotted-numeric OID", enterprise, generic, specific, got)
+		}
+
+		var want string
+		switch {
+		case generic == genericEnterpriseSpecific:
+			if enterprise != "" {
+				want = enterprise + ".0." + strconv.Itoa(specific)
+			}
+		case generic >= 0 && generic <= 5:
+			want = oidSnmpTrapsRoot + "." + strconv.Itoa(generic+1)
+		}
+		if got != want {
+			t.Fatalf("v1TrapOID(%q, %d, %d) = %q, want %q", enterprise, generic, specific, got, want)
+		}
+	})
+}
+
+func TestPropTpUptimeTicks(t *testing.T) {
+	kinds := []string{"uint32", "uint", "uint64", "int", "negative-int", "letters", "digit-string"}
+	rapid.Check(t, func(t *rapid.T) {
+		var pdu gosnmp.SnmpPDU
+		var want uint64
+
+		switch rapid.SampledFrom(kinds).Draw(t, "kind") {
+		case "uint32":
+			v := rapid.Uint32().Draw(t, "uint32")
+			pdu = gosnmp.SnmpPDU{Name: oidSysUpTime, Type: gosnmp.TimeTicks, Value: v}
+			want = uint64(v)
+		case "uint":
+			v := rapid.Uint64Range(0, math.MaxUint32).Draw(t, "uint")
+			pdu = gosnmp.SnmpPDU{Name: oidSysUpTime, Type: gosnmp.TimeTicks, Value: uint(v)}
+			want = v
+		case "uint64":
+			v := rapid.Uint64().Draw(t, "uint64")
+			pdu = gosnmp.SnmpPDU{Name: oidSysUpTime, Type: gosnmp.Counter64, Value: v}
+			want = v
+		case "int":
+			v := rapid.IntRange(0, math.MaxInt32).Draw(t, "int")
+			pdu = gosnmp.SnmpPDU{Name: oidSysUpTime, Type: gosnmp.Integer, Value: v}
+			want = uint64(v)
+		case "negative-int":
+			v := rapid.IntRange(math.MinInt32, -1).Draw(t, "negativeInt")
+			pdu = gosnmp.SnmpPDU{Name: oidSysUpTime, Type: gosnmp.Integer, Value: v}
+			want = 0
+		case "letters":
+			// Unsupported dynamic type whose string form is not a number.
+			s := rapid.StringOfN(rapid.RuneFrom([]rune("abcdefXYZ")), 0, 12, -1).Draw(t, "letters")
+			pdu = gosnmp.SnmpPDU{Name: oidSysUpTime, Type: gosnmp.OctetString, Value: []byte(s)}
+			want = 0
+		case "digit-string":
+			v := rapid.Uint64().Draw(t, "digits")
+			pdu = gosnmp.SnmpPDU{Name: oidSysUpTime, Type: gosnmp.OctetString, Value: []byte(strconv.FormatUint(v, 10))}
+			want = v
+		}
+
+		if got := uptimeTicks(pdu); got != want {
+			t.Fatalf("uptimeTicks(%#v) = %d, want %d", pdu.Value, got, want)
+		}
+	})
+}
+
+func TestPropTpTrapVersion(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		v := gosnmp.SnmpVersion(rapid.Byte().Draw(t, "wireVersion"))
+
+		got := trapVersion(v)
+		switch got {
+		case 0, 1, 2, 3:
+		default:
+			t.Fatalf("trapVersion(%#x) = %d, want one of 0,1,2,3", uint8(v), got)
+		}
+
+		var want uint32
+		switch v {
+		case gosnmp.Version1:
+			want = 1
+		case gosnmp.Version2c:
+			want = 2
+		case gosnmp.Version3:
+			want = 3
+		}
+		if got != want {
+			t.Fatalf("trapVersion(%#x) = %d, want %d", uint8(v), got, want)
+		}
+	})
 }

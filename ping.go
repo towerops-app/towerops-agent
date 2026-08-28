@@ -19,7 +19,21 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-var icmpListenPacket = icmp.ListenPacket
+// icmpConn is the subset of *icmp.PacketConn that doICMPPing uses. Keeping the
+// listen hook interface-typed lets tests substitute a connection that returns
+// specific read results, which a concrete *icmp.PacketConn cannot.
+type icmpConn interface {
+	WriteTo(b []byte, addr net.Addr) (int, error)
+	ReadFrom(b []byte) (int, net.Addr, error)
+	SetDeadline(t time.Time) error
+	Close() error
+}
+
+var icmpListenPacket = func(network, address string) (icmpConn, error) {
+	return icmp.ListenPacket(network, address)
+}
+
+var icmpMarshal = func(m *icmp.Message) ([]byte, error) { return m.Marshal(nil) }
 
 // icmpPing sends a single ICMP echo request and returns the round-trip time in milliseconds.
 // Tries raw ICMP sockets first (requires CAP_NET_RAW or root), then falls back to
@@ -89,7 +103,7 @@ func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, tim
 		},
 	}
 
-	wb, err := msg.Marshal(nil)
+	wb, err := icmpMarshal(&msg)
 	if err != nil {
 		return 0, fmt.Errorf("icmp marshal: %w", err)
 	}

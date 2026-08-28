@@ -60,6 +60,31 @@ func TestWSDialRejectsNonWebSocketURL(t *testing.T) {
 	}
 }
 
+// TestWSDialClosesResponseBodyOnFailedHandshake drives the branch where
+// websocket.Dial returns a non-nil *http.Response alongside an error, which
+// happens when a real HTTP server answers the upgrade with a non-101 status.
+func TestWSDialClosesResponseBodyOnFailedHandshake(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	ws, err := WSDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"))
+	if err == nil {
+		_ = ws.Close()
+		t.Fatal("WSDial succeeded against a 404 handler")
+	}
+	if ws != nil {
+		t.Errorf("WSDial conn = %v, want nil on handshake failure", ws)
+	}
+	if !strings.Contains(err.Error(), "dial websocket") {
+		t.Errorf("WSDial error = %v, want it wrapped with \"dial websocket\"", err)
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("WSDial error = %v, want the 404 status surfaced", err)
+	}
+}
+
 func TestWSConnReadLimit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)

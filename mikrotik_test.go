@@ -14,13 +14,18 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"maps"
 	"math/big"
 	"net"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/towerops-app/towerops-agent/pb"
+	"pgregory.net/rapid"
 )
 
 type nopCloser struct {
@@ -806,4 +811,320 @@ func TestMikrotikConnectSSLTOFUMismatch(t *testing.T) {
 	if !strings.Contains(err.Error(), "TOFU verification failed") {
 		t.Errorf("expected 'TOFU verification failed' in error, got: %v", err)
 	}
+}
+
+// hmTReadConn adapts any io.Reader into an io.ReadWriteCloser whose writes are
+// discarded, so large synthetic RouterOS streams can be fed lazily.
+type hmTReadConn struct {
+	r io.Reader
+}
+
+func (c *hmTReadConn) Read(p []byte) (int, error)  { return c.r.Read(p) }
+func (c *hmTReadConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *hmTReadConn) Close() error                { return nil }
+
+// hmTZeroReader is an infinite source of NUL bytes.
+type hmTZeroReader struct{}
+
+func (hmTZeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
+}
+
+// hmTFillerWord returns readers producing a length prefix followed by n bytes.
+func hmTFillerWord(n int) []io.Reader {
+	return []io.Reader{
+		bytes.NewReader(encodeLength(n)),
+		io.LimitReader(hmTZeroReader{}, int64(n)),
+	}
+}
+
+func TestHmReadResponseTrapWithoutMessage(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write(encodeSentence([]string{"!trap", "=category=0"}))
+	buf.Write(encodeSentence([]string{"!done"}))
+	c := &mikrotikClient{conn: &nopCloser{readWriter: &buf}}
+
+	resp, err := c.readResponse()
+	if err != nil {
+		t.Fatalf("readResponse: %v", err)
+	}
+	if resp.err != "unknown error" {
+		t.Fatalf("expected fallback trap error, got %q", resp.err)
+	}
+	if len(resp.sentences) != 0 {
+		t.Fatalf("expected no data sentences, got %v", resp.sentences)
+	}
+}
+
+func TestHmReadResponseExceedsMaxBytes(t *testing.T) {
+	// Two sentences that each fit the per-sentence budget but together exceed
+	// the aggregate response budget.
+	const word = 9 << 20
+	var readers []io.Reader
+	for range 2 {
+		readers = append(readers, bytes.NewReader(append(encodeLength(len("!re")), "!re"...)))
+		readers = append(readers, hmTFillerWord(word)...)
+		readers = append(readers, bytes.NewReader([]byte{0}))
+	}
+	c := &mikrotikClient{conn: &hmTReadConn{r: io.MultiReader(readers...)}}
+
+	_, err := c.readResponse()
+	if err == nil {
+		t.Fatal("expected aggregate response size error")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("response exceeds %d bytes", maxMikrotikResponse)) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestHmReadSentenceExceedsMaxBytes(t *testing.T) {
+	// A single sentence whose words sum past the response budget.
+	const word = 9 << 20
+	var readers []io.Reader
+	for range 2 {
+		readers = append(readers, hmTFillerWord(word)...)
+	}
+	readers = append(readers, bytes.NewReader([]byte{0}))
+	c := &mikrotikClient{conn: &hmTReadConn{r: io.MultiReader(readers...)}}
+
+	_, err := c.readSentence()
+	if err == nil {
+		t.Fatal("expected per-sentence size error")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("sentence exceeds %d bytes", maxMikrotikResponse)) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestHmReadResponseExceedsMaxSentences(t *testing.T) {
+	// Empty sentences are skipped, so a stream of terminators exhausts the
+	// sentence budget without ever producing a !done.
+	empties := bytes.Repeat([]byte{0}, maxMikrotikSentences+1)
+	c := &mikrotikClient{conn: &nopCloser{readWriter: bytes.NewBuffer(empties)}}
+
+	_, err := c.readResponse()
+	if err == nil {
+		t.Fatal("expected sentence count error")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("response exceeds %d sentences", maxMikrotikSentences)) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestHmReadSentenceDeadlineError(t *testing.T) {
+	// A closed net.Pipe rejects SetReadDeadline with io.ErrClosedPipe.
+	server, client := net.Pipe()
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &mikrotikClient{conn: client}
+	_, err := c.readSentence()
+	if err == nil {
+		t.Fatal("expected SetReadDeadline error")
+	}
+	if !strings.Contains(err.Error(), "set read deadline") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestHmCheckedMikrotikLength(t *testing.T) {
+	got, err := checkedMikrotikLength(0xFFFFFFFF)
+	if err != nil {
+		t.Fatalf("in-range length rejected: %v", err)
+	}
+	if got != 0xFFFFFFFF {
+		t.Fatalf("got %d, want %d", got, 0xFFFFFFFF)
+	}
+
+	if _, err := checkedMikrotikLength(^uint64(0)); err == nil {
+		t.Fatal("expected overflow error")
+	} else if !strings.Contains(err.Error(), "overflows int") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// hmTBlockingConn blocks reads until Close is called.
+type hmTBlockingConn struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *hmTBlockingConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *hmTBlockingConn) Write(p []byte) (int, error) { return len(p), nil }
+
+func (c *hmTBlockingConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestHmExecuteMikrotikJobClosesConnOnContextCancel(t *testing.T) {
+	conn := &hmTBlockingConn{closed: make(chan struct{})}
+
+	origDial := mikrotikDial
+	defer func() { mikrotikDial = origDial }()
+	mikrotikDial = func(context.Context, string, uint32, string, string, bool) (*mikrotikClient, error) {
+		return &mikrotikClient{conn: conn}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Unbuffered and unread: sendResult drops the result once ctx is done.
+	ch := make(chan *pb.MikrotikResult)
+	// Reads block forever unless context.AfterFunc closes the connection, so
+	// returning at all proves the cancellation hook fired.
+	executeMikrotikJob(ctx, &pb.AgentJob{
+		JobId:            "m-cancel",
+		DeviceId:         "dev-1",
+		MikrotikDevice:   &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
+		MikrotikCommands: []*pb.MikrotikCommand{{Command: "/interface/print"}},
+	}, ch)
+
+	select {
+	case <-conn.closed:
+	default:
+		t.Fatal("connection was not closed on context cancellation")
+	}
+}
+
+func TestHmExecuteMikrotikJobDeliversSentences(t *testing.T) {
+	var stream bytes.Buffer
+	stream.Write(encodeSentence([]string{"!re", "=name=ether1", "=mtu=1500"}))
+	stream.Write(encodeSentence([]string{"!done"}))
+	stream.Write(encodeSentence([]string{"!done"})) // reply to /quit in close()
+
+	origDial := mikrotikDial
+	defer func() { mikrotikDial = origDial }()
+	mikrotikDial = func(context.Context, string, uint32, string, string, bool) (*mikrotikClient, error) {
+		return &mikrotikClient{conn: &nopCloser{readWriter: &stream}}, nil
+	}
+
+	ch := make(chan *pb.MikrotikResult, 1)
+	executeMikrotikJob(context.Background(), &pb.AgentJob{
+		JobId:            "m-ok",
+		DeviceId:         "dev-1",
+		MikrotikDevice:   &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
+		MikrotikCommands: []*pb.MikrotikCommand{{Command: "/interface/print"}},
+	}, ch)
+
+	result := <-ch
+	if result.Error != "" {
+		t.Fatalf("unexpected error: %s", result.Error)
+	}
+	if len(result.Sentences) != 1 {
+		t.Fatalf("expected 1 sentence, got %d", len(result.Sentences))
+	}
+	if got := result.Sentences[0].Attributes["name"]; got != "ether1" {
+		t.Fatalf("expected name=ether1, got %q", got)
+	}
+	if got := result.Sentences[0].Attributes["mtu"]; got != "1500" {
+		t.Fatalf("expected mtu=1500, got %q", got)
+	}
+	if result.JobId != "m-ok" || result.DeviceId != "dev-1" {
+		t.Fatalf("unexpected identity: %+v", result)
+	}
+}
+
+func TestPropHmEncodeLengthRoundtrip(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		n := rapid.IntRange(0, 0x0FFFFFFF).Draw(t, "n")
+		enc := encodeLength(n)
+		c := &mikrotikClient{conn: &nopCloser{readWriter: bytes.NewBuffer(enc)}}
+		got, err := c.readLength()
+		if err != nil {
+			t.Fatalf("readLength(%#v) for n=%d: %v", enc, n, err)
+		}
+		if got != n {
+			t.Fatalf("roundtrip mismatch: encoded %d as %#v, decoded %d", n, enc, got)
+		}
+	})
+}
+
+func TestPropHmEncodeLengthPrefixFree(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		n := rapid.IntRange(0, 0x7FFFFFFF).Draw(t, "n")
+		enc := encodeLength(n)
+
+		var wantLen int
+		var wantMask, wantBits byte
+		switch {
+		case n < 0x80:
+			wantLen, wantMask, wantBits = 1, 0x80, 0x00
+		case n < 0x4000:
+			wantLen, wantMask, wantBits = 2, 0xC0, 0x80
+		case n < 0x200000:
+			wantLen, wantMask, wantBits = 3, 0xE0, 0xC0
+		case n < 0x10000000:
+			wantLen, wantMask, wantBits = 4, 0xF0, 0xE0
+		default:
+			wantLen, wantMask, wantBits = 5, 0xFF, 0xF0
+		}
+
+		if len(enc) != wantLen {
+			t.Fatalf("encodeLength(%d) = %#v, want %d bytes", n, enc, wantLen)
+		}
+		if enc[0]&wantMask != wantBits {
+			t.Fatalf("encodeLength(%d) first byte %#x does not match tier bits %#x/%#x", n, enc[0], wantBits, wantMask)
+		}
+	})
+}
+
+func TestPropHmParseMikrotikAttrs(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		attrs := rapid.MapOf(
+			rapid.StringMatching(`[a-zA-Z0-9._\-]{1,12}`),
+			rapid.StringN(0, 12, 24),
+		).Draw(t, "attrs")
+
+		words := make([]string, 0, len(attrs))
+		for k, v := range attrs {
+			words = append(words, "="+k+"="+v)
+		}
+
+		got := parseMikrotikAttrs(words)
+		if !maps.Equal(got, attrs) {
+			t.Fatalf("parseMikrotikAttrs(%q) = %v, want %v", words, got, attrs)
+		}
+
+		// Words without the leading "=" carry no attribute.
+		bare := make([]string, 0, len(words))
+		for _, w := range words {
+			bare = append(bare, strings.TrimPrefix(w, "="))
+		}
+		if skipped := parseMikrotikAttrs(bare); len(skipped) != 0 {
+			t.Fatalf("expected words without '=' prefix to be skipped, got %v", skipped)
+		}
+	})
+}
+
+func TestPropHmWriteSentenceRoundtrip(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		// An empty word terminates a sentence, so words must be non-empty.
+		words := rapid.SliceOfN(rapid.StringN(1, 24, 48), 0, 16).Draw(t, "words")
+
+		var buf bytes.Buffer
+		c := &mikrotikClient{conn: &nopCloser{readWriter: &buf}}
+		if err := c.writeSentence(words); err != nil {
+			t.Fatalf("writeSentence(%q): %v", words, err)
+		}
+
+		got, err := c.readSentence()
+		if err != nil {
+			t.Fatalf("readSentence after writeSentence(%q): %v", words, err)
+		}
+		if !slices.Equal(got, words) {
+			t.Fatalf("roundtrip mismatch: wrote %q, read %q", words, got)
+		}
+	})
 }

@@ -24,6 +24,7 @@ type snmpQuerier interface {
 	Get(oids []string) (*gosnmp.SnmpPacket, error)
 	WalkAll(rootOid string) ([]gosnmp.SnmpPDU, error)
 	BulkWalkAll(rootOid string) ([]gosnmp.SnmpPDU, error)
+	Walk(rootOid string, walkFn gosnmp.WalkFunc) error
 }
 
 // snmpDial connects to an SNMP device and returns a querier + close function.

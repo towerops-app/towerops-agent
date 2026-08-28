@@ -44,7 +44,7 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 	}
 
 	snmpDev := job.SnmpDevice
-	client, err := newSnmpConn(snmpDev)
+	client, closeConn, err := snmpDial(snmpDev)
 	if err != nil {
 		slog.Error("failed to connect SNMP for LLDP", "job_id", jobID, "device_id", deviceID, "error", err)
 		sendResult(ctx, resultCh, &pb.LldpTopologyResult{
@@ -54,29 +54,17 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 		}, jobID)
 		return
 	}
-	defer func() {
-		if err := client.Conn.Close(); err != nil {
-			slog.Debug("SNMP close error", "error", err)
-		}
-	}()
+	defer closeConn()
 
-	result, err := discoverLldpNeighbors(client, deviceID, jobID)
-	if err != nil {
-		slog.Error("LLDP discovery failed", "job_id", jobID, "device_id", deviceID, "error", err)
-		sendResult(ctx, resultCh, &pb.LldpTopologyResult{
-			DeviceId:  deviceID,
-			JobId:     jobID,
-			Timestamp: timestamp,
-		}, jobID)
-		return
-	}
+	result := discoverLldpNeighbors(client, deviceID, jobID)
 
 	sendResult(ctx, resultCh, result, jobID)
 	slog.Info("LLDP topology discovered", "job_id", jobID, "device_id", deviceID, "neighbors", len(result.Neighbors))
 }
 
 // discoverLldpNeighbors walks LLDP-MIB tables and returns discovered neighbors.
-func discoverLldpNeighbors(client *gosnmp.GoSNMP, deviceID, jobID string) (*pb.LldpTopologyResult, error) {
+// Table walk failures are logged and tolerated, so discovery never fails outright.
+func discoverLldpNeighbors(client snmpQuerier, deviceID, jobID string) *pb.LldpTopologyResult {
 	now := time.Now().Unix()
 	result := &pb.LldpTopologyResult{
 		DeviceId:  deviceID,
@@ -112,12 +100,12 @@ func discoverLldpNeighbors(client *gosnmp.GoSNMP, deviceID, jobID string) (*pb.L
 		return nil
 	}); err != nil {
 		slog.Warn("failed to walk remote sys names", "error", err)
-		return result, nil // Return empty result, not an error
+		return result // Return empty result, not an error
 	}
 
 	// If no neighbors found, return early
 	if len(sysNames) == 0 {
-		return result, nil
+		return result
 	}
 
 	// Walk remote port descriptions
@@ -163,11 +151,9 @@ func discoverLldpNeighbors(client *gosnmp.GoSNMP, deviceID, jobID string) (*pb.L
 			continue
 		}
 
+		// parseRemoteKey guarantees exactly timeMark.portNum.remIndex.
 		parts := strings.Split(key, ".")
-		if len(parts) < 2 {
-			continue
-		}
-		portNum := parts[1] // timeMark.portNum.remIndex -> parts[1] is portNum
+		portNum := parts[1]
 
 		localPort := localPorts[portNum]
 		if localPort == "" {
@@ -185,7 +171,7 @@ func discoverLldpNeighbors(client *gosnmp.GoSNMP, deviceID, jobID string) (*pb.L
 		result.Neighbors = append(result.Neighbors, neighbor)
 	}
 
-	return result, nil
+	return result
 }
 
 func sortedLldpKeys(values map[string]string) []string {
@@ -247,9 +233,6 @@ func parseMgmtAddr(oid string) (key string, ip string) {
 
 	switch addrSubtype {
 	case "1": // IPv4
-		if len(parts) < 9 {
-			return key, ""
-		}
 		ip = strings.Join(parts[5:9], ".")
 	case "2": // IPv6
 		if len(parts) < 21 {

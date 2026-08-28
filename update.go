@@ -21,8 +21,23 @@ import (
 )
 
 var osExecutable = os.Executable
-var osCreateTemp = os.CreateTemp
+
+// updateTempFile is the subset of *os.File used to stage a downloaded update.
+// It is an interface so tests can inject chmod/sync/close failures, which no
+// real file produces deterministically.
+type updateTempFile interface {
+	io.Writer
+	Name() string
+	Chmod(os.FileMode) error
+	Sync() error
+	Close() error
+}
+
+var osCreateTemp = func(dir, pattern string) (updateTempFile, error) {
+	return os.CreateTemp(dir, pattern)
+}
 var osRename = os.Rename
+var httpNewRequest = http.NewRequestWithContext
 var httpDo = func(req *http.Request) (*http.Response, error) {
 	return http.DefaultClient.Do(req)
 }
@@ -50,7 +65,7 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string
 
 	reqCtx, cancel := context.WithTimeout(ctx, selfUpdateTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, downloadURL, nil)
+	req, err := httpNewRequest(reqCtx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}

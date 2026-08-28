@@ -629,3 +629,62 @@ func (m *mockMikrotikConn) Read(p []byte) (int, error) {
 }
 
 func (m *mockMikrotikConn) Close() error { return nil }
+
+// chkTOrigSSHDial captures the production sshDial implementation before any
+// test can replace it.
+var chkTOrigSSHDial = sshDial
+
+func TestChkTSSHDialHandshakeFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	// Accept the TCP connection, then speak something that is not an SSH
+	// banner so ssh.NewClientConn fails after the dial succeeded.
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		_, _ = conn.Write([]byte("chkT not an ssh server\r\n"))
+		_ = conn.Close()
+	}()
+
+	client, err := chkTOrigSSHDial(context.Background(), "tcp", ln.Addr().String(), &ssh.ClientConfig{
+		User:            "admin",
+		Auth:            []ssh.AuthMethod{ssh.Password("secret")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	})
+	if err == nil {
+		_ = client.Close()
+		t.Fatal("expected the SSH handshake to fail against a non-SSH server")
+	}
+	if client != nil {
+		t.Fatalf("expected a nil client on handshake failure, got %v", client)
+	}
+}
+
+func TestChkTSSHDialConnectionRefused(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	client, err := chkTOrigSSHDial(context.Background(), "tcp", addr, &ssh.ClientConfig{
+		User:            "admin",
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	})
+	if err == nil {
+		_ = client.Close()
+		t.Fatal("expected a dial failure against a closed port")
+	}
+	if client != nil {
+		t.Fatalf("expected a nil client on dial failure, got %v", client)
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/gosnmp/gosnmp"
 	"github.com/towerops-app/towerops-agent/pb"
 	"google.golang.org/protobuf/proto"
+	"pgregory.net/rapid"
 )
 
 const testWebSocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -1683,4 +1685,1180 @@ func TestRunSessionWriteError(t *testing.T) {
 		t.Error("expected error from write or read failure")
 	}
 	// Either "read:" or "write:" error is acceptable
+}
+
+// ---------------------------------------------------------------------------
+// log capture harness
+// ---------------------------------------------------------------------------
+
+// agtLogWaiter unblocks once need records containing sub have been logged.
+type agtLogWaiter struct {
+	sub   string
+	need  int
+	seen  int
+	fired bool
+	done  chan struct{}
+}
+
+// agtLogSink is a slog.Handler that records every log line so tests can assert
+// on the branches the agent reports only through logs. It can also gate the
+// goroutine that logs a chosen message, which gives tests a precise point
+// inside runSession to interfere from the outside.
+type agtLogSink struct {
+	mu            sync.Mutex
+	lines         []string
+	waiters       []*agtLogWaiter
+	gateMsg       string
+	gateHit       chan struct{}
+	gateHitClosed bool
+	gateRelease   chan struct{}
+}
+
+// agtCaptureLogs installs a recording slog handler for the duration of the test.
+func agtCaptureLogs(t *testing.T) *agtLogSink {
+	t.Helper()
+	sink := &agtLogSink{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(sink))
+	t.Cleanup(func() {
+		sink.ungate()
+		slog.SetDefault(prev)
+	})
+	return sink
+}
+
+func (s *agtLogSink) Enabled(context.Context, slog.Level) bool { return true }
+
+func (s *agtLogSink) WithAttrs([]slog.Attr) slog.Handler { return s }
+
+func (s *agtLogSink) WithGroup(string) slog.Handler { return s }
+
+func (s *agtLogSink) Handle(_ context.Context, r slog.Record) error {
+	var line strings.Builder
+	line.WriteString(r.Level.String())
+	line.WriteByte(' ')
+	line.WriteString(r.Message)
+	r.Attrs(func(a slog.Attr) bool {
+		line.WriteByte(' ')
+		line.WriteString(a.Key)
+		line.WriteByte('=')
+		line.WriteString(a.Value.String())
+		return true
+	})
+	text := line.String()
+
+	var wait chan struct{}
+	s.mu.Lock()
+	s.lines = append(s.lines, text)
+	for _, w := range s.waiters {
+		if w.fired || !strings.Contains(text, w.sub) {
+			continue
+		}
+		w.seen++
+		if w.seen >= w.need {
+			w.fired = true
+			close(w.done)
+		}
+	}
+	if s.gateRelease != nil && r.Message == s.gateMsg {
+		if !s.gateHitClosed {
+			s.gateHitClosed = true
+			close(s.gateHit)
+		}
+		wait = s.gateRelease
+	}
+	s.mu.Unlock()
+
+	if wait != nil {
+		<-wait
+	}
+	return nil
+}
+
+// gateOn parks whichever goroutine logs msg until release is called. hit is
+// closed once the gate is reached.
+func (s *agtLogSink) gateOn(msg string) (hit <-chan struct{}, release func()) {
+	s.mu.Lock()
+	s.gateMsg = msg
+	s.gateHit = make(chan struct{})
+	s.gateHitClosed = false
+	s.gateRelease = make(chan struct{})
+	h := s.gateHit
+	s.mu.Unlock()
+	return h, s.ungate
+}
+
+func (s *agtLogSink) ungate() {
+	s.mu.Lock()
+	rel := s.gateRelease
+	s.gateRelease = nil
+	s.gateMsg = ""
+	s.mu.Unlock()
+	if rel != nil {
+		close(rel)
+	}
+}
+
+func (s *agtLogSink) expect(sub string, need int) <-chan struct{} {
+	w := &agtLogWaiter{sub: sub, need: need, done: make(chan struct{})}
+	s.mu.Lock()
+	for _, line := range s.lines {
+		if strings.Contains(line, sub) {
+			w.seen++
+		}
+	}
+	if w.seen >= w.need {
+		w.fired = true
+		close(w.done)
+	}
+	s.waiters = append(s.waiters, w)
+	s.mu.Unlock()
+	return w.done
+}
+
+func (s *agtLogSink) waitFor(t *testing.T, sub string) {
+	t.Helper()
+	s.waitForCount(t, sub, 1)
+}
+
+func (s *agtLogSink) waitForCount(t *testing.T, sub string, need int) {
+	t.Helper()
+	select {
+	case <-s.expect(sub, need):
+	case <-time.After(15 * time.Second):
+		t.Fatalf("timed out waiting for %d log record(s) containing %q\nlogged:\n%s", need, sub, s.dump())
+	}
+}
+
+func (s *agtLogSink) has(sub string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, line := range s.lines {
+		if strings.Contains(line, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *agtLogSink) dump() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.Join(s.lines, "\n")
+}
+
+// ---------------------------------------------------------------------------
+// websocket server harness (driven from the test goroutine so assertions and
+// t.Fatalf stay on the right goroutine)
+// ---------------------------------------------------------------------------
+
+func agtListen(t *testing.T) *net.TCPListener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	return ln.(*net.TCPListener)
+}
+
+func agtURL(ln net.Listener) string { return "ws://" + ln.Addr().String() }
+
+// agtUpgrade completes the WebSocket handshake for one accepted connection.
+func agtUpgrade(t *testing.T, conn *net.TCPConn) {
+	t.Helper()
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read upgrade request: %v", err)
+	}
+	accept := computeAcceptKey(extractWSKey(string(buf[:n])))
+	resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+	if _, err := conn.Write([]byte(resp)); err != nil {
+		t.Fatalf("write upgrade response: %v", err)
+	}
+}
+
+// agtAcceptRaw accepts one connection and completes the handshake without
+// reading the channel join frame.
+func agtAcceptRaw(t *testing.T, ln *net.TCPListener) *net.TCPConn {
+	t.Helper()
+	_ = ln.SetDeadline(time.Now().Add(15 * time.Second))
+	c, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	conn := c.(*net.TCPConn)
+	t.Cleanup(func() { _ = conn.Close() })
+	agtUpgrade(t, conn)
+	return conn
+}
+
+// agtReadJoin reads the channel join frame and returns the topic the agent used.
+func agtReadJoin(t *testing.T, conn *net.TCPConn) string {
+	t.Helper()
+	data, err := readMaskedFrame(conn)
+	if err != nil {
+		t.Fatalf("read join frame: %v", err)
+	}
+	var join channelMsg
+	if err := json.Unmarshal(data, &join); err != nil {
+		t.Fatalf("unmarshal join frame: %v", err)
+	}
+	if join.Event != "phx_join" {
+		t.Fatalf("first frame event = %q, want phx_join", join.Event)
+	}
+	return join.Topic
+}
+
+// agtAccept accepts one agent connection, completes the handshake and replies
+// to the channel join with status ok. It returns the connection and topic.
+func agtAccept(t *testing.T, ln *net.TCPListener) (*net.TCPConn, string) {
+	t.Helper()
+	conn := agtAcceptRaw(t, ln)
+	topic := agtReadJoin(t, conn)
+	reply, err := json.Marshal(channelMsg{
+		Topic:   topic,
+		Event:   "phx_reply",
+		Payload: json.RawMessage(`{"status":"ok"}`),
+		Ref:     strPtr("1"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(makeTextFrame(reply)); err != nil {
+		t.Fatalf("write join reply: %v", err)
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return conn, topic
+}
+
+// agtSendEvent pushes a channel event to the connected agent.
+func agtSendEvent(t *testing.T, conn net.Conn, topic, event string, payload json.RawMessage) {
+	t.Helper()
+	msg, err := json.Marshal(channelMsg{Topic: topic, Event: event, Payload: payload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(makeTextFrame(msg)); err != nil {
+		t.Fatalf("send %q: %v", event, err)
+	}
+}
+
+// agtReadFrames decodes the agent's outbound frames in the background until the
+// connection dies.
+func agtReadFrames(conn net.Conn) <-chan channelMsg {
+	out := make(chan channelMsg, 512)
+	go func() {
+		defer close(out)
+		for {
+			data, err := readMaskedFrame(conn)
+			if err != nil {
+				return
+			}
+			var msg channelMsg
+			if err := json.Unmarshal(data, &msg); err != nil {
+				continue
+			}
+			select {
+			case out <- msg:
+			default:
+			}
+		}
+	}()
+	return out
+}
+
+// agtWaitEvent returns the next outbound frame carrying event, skipping others.
+func agtWaitEvent(t *testing.T, msgs <-chan channelMsg, event string) channelMsg {
+	t.Helper()
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case msg, ok := <-msgs:
+			if !ok {
+				t.Fatalf("connection closed before a %q frame arrived", event)
+			}
+			if msg.Event == event {
+				return msg
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for a %q frame", event)
+		}
+	}
+}
+
+// agtDecodeBinary unwraps the {"binary": ...} payload of an outbound frame.
+func agtDecodeBinary(t *testing.T, payload json.RawMessage, msg proto.Message) {
+	t.Helper()
+	var wrapper struct {
+		Binary string `json:"binary"`
+	}
+	if err := json.Unmarshal(payload, &wrapper); err != nil {
+		t.Fatalf("unmarshal payload wrapper: %v", err)
+	}
+	bin, err := base64.StdEncoding.DecodeString(wrapper.Binary)
+	if err != nil {
+		t.Fatalf("decode base64 payload: %v", err)
+	}
+	if err := proto.Unmarshal(bin, msg); err != nil {
+		t.Fatalf("unmarshal protobuf payload: %v", err)
+	}
+}
+
+// agtReset aborts a connection with a TCP RST so the peer's pending writes and
+// reads fail immediately instead of draining a graceful close.
+func agtReset(conn *net.TCPConn) {
+	_ = conn.SetLinger(0)
+	_ = conn.Close()
+}
+
+// agtTrap builds a valid trap, optionally padded so a single trap message is
+// larger than any socket buffer.
+func agtTrap(sourceIP string, pad int) *pb.SnmpTrap {
+	trap := &pb.SnmpTrap{
+		SourceIp:  sourceIP,
+		Version:   2,
+		TrapOid:   "1.3.6.1.6.3.1.1.5.3",
+		Timestamp: 1,
+	}
+	if pad > 0 {
+		trap.Varbinds = map[string]string{"1.3.6.1.2.1.1.1.0": strings.Repeat("x", pad)}
+	}
+	return trap
+}
+
+// agtFillerFrame builds an ignorable inbound frame of roughly size bytes.
+func agtFillerFrame(size int) []byte {
+	msg, _ := json.Marshal(struct {
+		Topic   string          `json:"topic"`
+		Event   string          `json:"event"`
+		Payload json.RawMessage `json:"payload"`
+		Pad     string          `json:"pad"`
+	}{Topic: "phoenix", Event: "phx_reply", Payload: json.RawMessage(`{}`), Pad: strings.Repeat("f", size)})
+	return makeTextFrame(msg)
+}
+
+// agtShortHeartbeats disables both heartbeats so they cannot interfere with
+// tests that count outbound frames or fill the write channel deliberately.
+func agtSilenceHeartbeats(t *testing.T) {
+	t.Helper()
+	origHB, origCHB := heartbeatInterval, channelHeartbeatInterval
+	heartbeatInterval = time.Hour
+	channelHeartbeatInterval = time.Hour
+	t.Cleanup(func() {
+		heartbeatInterval = origHB
+		channelHeartbeatInterval = origCHB
+	})
+}
+
+// ---------------------------------------------------------------------------
+// join handshake failures
+// ---------------------------------------------------------------------------
+
+func TestAgtRunSessionJoinReplyWrongEvent(t *testing.T) {
+	ln := agtListen(t)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		conn := c.(*net.TCPConn)
+		defer func() { _ = conn.Close() }()
+		buf := make([]byte, 4096)
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		accept := computeAcceptKey(extractWSKey(string(buf[:n])))
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"))
+		if _, err := readMaskedFrame(conn); err != nil {
+			return
+		}
+		reply, _ := json.Marshal(channelMsg{
+			Topic:   "agent:whatever",
+			Event:   "phx_error",
+			Payload: json.RawMessage(`{"status":"ok"}`),
+			Ref:     strPtr("1"),
+		})
+		_, _ = conn.Write(makeTextFrame(reply))
+		_, _ = readMaskedFrame(conn) // hold the connection open until the agent leaves
+	}()
+
+	err := runSession(context.Background(), agtURL(ln), "token", nil)
+	if err == nil || !strings.Contains(err.Error(), "expected phx_reply, got phx_error") {
+		t.Fatalf("runSession error = %v, want 'expected phx_reply, got phx_error'", err)
+	}
+}
+
+func TestAgtRunSessionJoinReplyBadStatusPayload(t *testing.T) {
+	ln := agtListen(t)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		conn := c.(*net.TCPConn)
+		defer func() { _ = conn.Close() }()
+		buf := make([]byte, 4096)
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		accept := computeAcceptKey(extractWSKey(string(buf[:n])))
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"))
+		if _, err := readMaskedFrame(conn); err != nil {
+			return
+		}
+		// Payload is a JSON array, so decoding it into the status struct fails.
+		reply, _ := json.Marshal(channelMsg{
+			Topic:   "agent:whatever",
+			Event:   "phx_reply",
+			Payload: json.RawMessage(`[1,2,3]`),
+			Ref:     strPtr("1"),
+		})
+		_, _ = conn.Write(makeTextFrame(reply))
+		_, _ = readMaskedFrame(conn)
+	}()
+
+	err := runSession(context.Background(), agtURL(ln), "token", nil)
+	if err == nil || !strings.Contains(err.Error(), "join reply payload") {
+		t.Fatalf("runSession error = %v, want 'join reply payload'", err)
+	}
+}
+
+func TestAgtRunSessionJoinWriteFails(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	// Park the agent right after the WebSocket handshake, before it writes the
+	// channel join, then kill the connection under it.
+	hit, release := logs.gateOn("connected")
+	defer release()
+
+	ln := agtListen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		conn := c.(*net.TCPConn)
+		buf := make([]byte, 4096)
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		accept := computeAcceptKey(extractWSKey(string(buf[:n])))
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"))
+		<-hit
+		cancel()
+		agtReset(conn)
+		release()
+	}()
+
+	err := runSession(ctx, agtURL(ln), "token", nil)
+	if err == nil || !strings.Contains(err.Error(), "send join") {
+		t.Fatalf("runSession error = %v, want 'send join'", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// trap forwarding
+// ---------------------------------------------------------------------------
+
+func TestAgtRunSessionTrapForwarding(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	agtSilenceHeartbeats(t)
+
+	ln := agtListen(t)
+	traps := make(chan *pb.SnmpTrap, 4)
+	done := make(chan error, 1)
+	go func() { done <- runSession(context.Background(), agtURL(ln), "token", traps) }()
+
+	conn, topic := agtAccept(t, ln)
+	msgs := agtReadFrames(conn)
+
+	traps <- agtTrap("10.9.9.9", 0)
+	frame := agtWaitEvent(t, msgs, "trap")
+	var got pb.SnmpTrap
+	agtDecodeBinary(t, frame.Payload, &got)
+	if got.SourceIp != "10.9.9.9" || got.TrapOid != "1.3.6.1.6.3.1.1.5.3" {
+		t.Fatalf("forwarded trap = %+v, want source 10.9.9.9", &got)
+	}
+	if frame.Topic != topic {
+		t.Errorf("trap frame topic = %q, want %q", frame.Topic, topic)
+	}
+
+	// A nil trap is dropped instead of being forwarded or crashing the session.
+	traps <- nil
+	logs.waitFor(t, "ignoring nil snmp trap")
+
+	// A closed listener channel detaches the trap arm and keeps the session up.
+	close(traps)
+	logs.waitFor(t, "snmp trap listener stopped")
+
+	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
+	if err := <-done; !errors.Is(err, errRestartRequested) {
+		t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
+	}
+	if n := len(msgs); n > 0 {
+		for msg := range msgs {
+			if msg.Event == "trap" {
+				t.Errorf("nil trap was forwarded as %+v", msg)
+			}
+		}
+	}
+}
+
+func TestAgtRunSessionTrapMarshalFailure(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	agtSilenceHeartbeats(t)
+
+	ln := agtListen(t)
+	traps := make(chan *pb.SnmpTrap, 4)
+	done := make(chan error, 1)
+	go func() { done <- runSession(context.Background(), agtURL(ln), "token", traps) }()
+
+	conn, topic := agtAccept(t, ln)
+	msgs := agtReadFrames(conn)
+
+	// Invalid UTF-8 in a proto3 string field makes protobuf marshalling fail.
+	traps <- &pb.SnmpTrap{SourceIp: "\xff\xfe", TrapOid: "1.2.3"}
+	logs.waitFor(t, "marshal protobuf")
+
+	// The session survives and still forwards the next valid trap.
+	traps <- agtTrap("10.0.0.7", 0)
+	frame := agtWaitEvent(t, msgs, "trap")
+	var got pb.SnmpTrap
+	agtDecodeBinary(t, frame.Payload, &got)
+	if got.SourceIp != "10.0.0.7" {
+		t.Fatalf("forwarded trap source = %q, want 10.0.0.7 (the unmarshalable trap must be dropped)", got.SourceIp)
+	}
+
+	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
+	if err := <-done; !errors.Is(err, errRestartRequested) {
+		t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// LLDP topology results
+// ---------------------------------------------------------------------------
+
+func TestAgtRunSessionLldpTopologyResult(t *testing.T) {
+	agtSilenceHeartbeats(t)
+
+	origDial := snmpDial
+	defer func() { snmpDial = origDial }()
+	snmpDial = func(*pb.SnmpDevice) (snmpQuerier, func(), error) {
+		return nil, nil, fmt.Errorf("refused")
+	}
+
+	ln := agtListen(t)
+	done := make(chan error, 1)
+	go func() { done <- runSession(context.Background(), agtURL(ln), "token", nil) }()
+
+	conn, topic := agtAccept(t, ln)
+	msgs := agtReadFrames(conn)
+
+	agtSendEvent(t, conn, topic, "jobs", makeJobPayload(&pb.AgentJob{
+		JobId:      "lldp-1",
+		DeviceId:   "dev-lldp",
+		JobType:    pb.JobType_LLDP_TOPOLOGY,
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+	}))
+
+	frame := agtWaitEvent(t, msgs, "lldp_topology_result")
+	var got pb.LldpTopologyResult
+	agtDecodeBinary(t, frame.Payload, &got)
+	if got.DeviceId != "dev-lldp" || got.JobId != "lldp-1" {
+		t.Fatalf("lldp result = %+v, want device dev-lldp job lldp-1", &got)
+	}
+
+	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
+	if err := <-done; !errors.Is(err, errRestartRequested) {
+		t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
+	}
+}
+
+func TestAgtDispatchJobLldpTopology(t *testing.T) {
+	origDial := snmpDial
+	defer func() { snmpDial = origDial }()
+	snmpDial = func(*pb.SnmpDevice) (snmpQuerier, func(), error) {
+		return nil, nil, fmt.Errorf("refused")
+	}
+
+	lldpCh := make(chan *pb.LldpTopologyResult, 1)
+	dispatchJob(context.Background(), &pb.AgentJob{
+		JobId:      "lldp-2",
+		DeviceId:   "dev-2",
+		JobType:    pb.JobType_LLDP_TOPOLOGY,
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.2"},
+	}, testPools(t),
+		make(chan *pb.SnmpResult, 1), make(chan *pb.MikrotikResult, 1),
+		make(chan *pb.CredentialTestResult, 1), make(chan *pb.MonitoringCheck, 1),
+		make(chan *pb.CheckResult, 1), lldpCh)
+
+	select {
+	case result := <-lldpCh:
+		if result.JobId != "lldp-2" || result.DeviceId != "dev-2" {
+			t.Fatalf("result = %+v, want job lldp-2 device dev-2", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("LLDP job never reached the SNMP pool")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// write channel saturation
+// ---------------------------------------------------------------------------
+
+func TestAgtRunSessionWriteChannelFull(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	agtSilenceHeartbeats(t)
+
+	// Overflowing the write channel cancels the session context, and the reader
+	// wakes on that same cancellation, so the session loop reports either the
+	// cancelled session or the reader's context error. Retry until the session
+	// context is the report that wins.
+	const attempts = 20
+	var lastErr error
+	for attempt := range attempts {
+		ln := agtListen(t)
+		traps := make(chan *pb.SnmpTrap, 512)
+		// One oversized trap parks the writer goroutine mid-write (the server
+		// never reads), then the small traps pile up until writeCh (cap 256)
+		// overflows.
+		traps <- agtTrap("10.0.0.1", 2<<20)
+		for range 300 {
+			traps <- agtTrap("10.0.0.2", 0)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- runSession(ctx, agtURL(ln), "token", traps) }()
+
+		conn, _ := agtAccept(t, ln)
+		_ = conn.SetReadBuffer(4096)
+
+		select {
+		case lastErr = <-done:
+		case <-time.After(30 * time.Second):
+			cancel()
+			t.Fatalf("runSession never gave up on the saturated write channel\nlogged:\n%s", logs.dump())
+		}
+		cancel()
+		_ = ln.Close()
+
+		if lastErr == nil {
+			t.Fatal("runSession returned nil despite the saturated write channel")
+		}
+		if !logs.has("write channel full, reconnecting event=trap") {
+			t.Fatalf("expected a 'write channel full' report for the trap event\nlogged:\n%s", logs.dump())
+		}
+		if strings.Contains(lastErr.Error(), "session cancelled") {
+			t.Logf("session loop reported the cancelled session on attempt %d", attempt+1)
+			return
+		}
+	}
+	t.Fatalf("session loop never reported the cancelled session in %d attempts; last error: %v", attempts, lastErr)
+}
+
+func TestAgtRunSessionChannelHeartbeatWriteChannelFull(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	origHB, origCHB := heartbeatInterval, channelHeartbeatInterval
+	defer func() {
+		heartbeatInterval = origHB
+		channelHeartbeatInterval = origCHB
+	}()
+	heartbeatInterval = time.Hour // keep the protobuf heartbeat out of the way
+	channelHeartbeatInterval = 200 * time.Microsecond
+
+	ln := agtListen(t)
+	traps := make(chan *pb.SnmpTrap, 1)
+	traps <- agtTrap("10.0.0.1", 2<<20) // parks the writer goroutine
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runSession(ctx, agtURL(ln), "token", traps) }()
+
+	conn, _ := agtAccept(t, ln)
+	_ = conn.SetReadBuffer(4096)
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("runSession returned nil despite the saturated write channel")
+		}
+	case <-time.After(30 * time.Second):
+		cancel()
+		t.Fatalf("channel heartbeats never overflowed the write channel\nlogged:\n%s", logs.dump())
+	}
+	if !logs.has("write channel full, reconnecting event=heartbeat") {
+		t.Errorf("expected a 'write channel full' report for the channel heartbeat\nlogged:\n%s", logs.dump())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// teardown with a stuck worker pool
+// ---------------------------------------------------------------------------
+
+func TestAgtRunSessionPoolShutdownTimeout(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	agtSilenceHeartbeats(t)
+
+	origTimeout := poolShutdownTimeout
+	defer func() { poolShutdownTimeout = origTimeout }()
+	poolShutdownTimeout = 20 * time.Millisecond
+
+	blocked := make(chan struct{})
+	defer close(blocked)
+	entered := make(chan struct{}, 1)
+
+	origDial := mikrotikDial
+	defer func() { mikrotikDial = origDial }()
+	mikrotikDial = func(context.Context, string, uint32, string, string, bool) (*mikrotikClient, error) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-blocked
+		return nil, fmt.Errorf("released")
+	}
+
+	ln := agtListen(t)
+	done := make(chan error, 1)
+	go func() { done <- runSession(context.Background(), agtURL(ln), "token", nil) }()
+
+	conn, topic := agtAccept(t, ln)
+	agtSendEvent(t, conn, topic, "jobs", makeJobPayload(&pb.AgentJob{
+		JobId:          "mt-stuck",
+		JobType:        pb.JobType_MIKROTIK,
+		MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
+	}))
+
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("mikrotik job never started")
+	}
+
+	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
+	if err := <-done; !errors.Is(err, errRestartRequested) {
+		t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
+	}
+	if !logs.has("worker pool shutdown timed out, abandoning in-flight jobs pool=mikrotik") {
+		t.Errorf("expected the mikrotik pool to be reported as abandoned\nlogged:\n%s", logs.dump())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// stalled session: reader blocked handing off, writer blocked mid-write
+// ---------------------------------------------------------------------------
+
+// agtStallWriteTimeout is how long a test server write may block before we
+// conclude the agent stopped reading the socket.
+const agtStallWriteTimeout = 250 * time.Millisecond
+
+type agtStalledSession struct {
+	conn      *net.TCPConn
+	topic     string
+	done      <-chan error
+	cancel    context.CancelFunc
+	release   func()
+	updateURL string
+	updateSum string
+}
+
+// agtStallSession drives a live session into a fully stalled state:
+//   - the writer goroutine is blocked mid-write on an oversized trap, because
+//     the test server stops reading after the join,
+//   - the session loop is parked inside a self-update,
+//   - msgCh (cap 100) is full, so the reader goroutine is blocked handing its
+//     next message to the session loop instead of watching the socket.
+//
+// trapSeq is the number of traps the calling test already forwarded, so the
+// wait latches onto this session's trap.
+func agtStallSession(t *testing.T, logs *agtLogSink, trapSeq int) *agtStalledSession {
+	t.Helper()
+
+	s := &agtStalledSession{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	s.release = func() { releaseOnce.Do(func() { close(release) }) }
+
+	origUpdate := doSelfUpdate
+	doSelfUpdate = func(_ context.Context, url, checksum string) error {
+		s.updateURL, s.updateSum = url, checksum
+		close(entered)
+		<-release
+		return nil
+	}
+	t.Cleanup(func() {
+		doSelfUpdate = origUpdate
+		s.release()
+	})
+
+	ln := agtListen(t)
+	traps := make(chan *pb.SnmpTrap, 1)
+	traps <- agtTrap("10.0.0.1", 2<<20)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	done := make(chan error, 1)
+	go func() { done <- runSession(ctx, agtURL(ln), "token", traps) }()
+	s.done = done
+
+	conn, topic := agtAccept(t, ln)
+	s.conn, s.topic = conn, topic
+	_ = conn.SetReadBuffer(4096)
+	logs.waitForCount(t, "sent snmp trap", trapSeq+1)
+
+	agtSendEvent(t, conn, topic, "update", json.RawMessage(`{"url":"https://example.invalid/agent","checksum":"deadbeef"}`))
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		cancel()
+		s.release()
+		t.Fatalf("update was never dispatched\nlogged:\n%s", logs.dump())
+	}
+
+	filler := agtFillerFrame(8 << 10)
+	stalled := false
+	for range 4000 {
+		_ = conn.SetWriteDeadline(time.Now().Add(agtStallWriteTimeout))
+		if _, err := conn.Write(filler); err != nil {
+			stalled = true
+			break
+		}
+	}
+	_ = conn.SetWriteDeadline(time.Time{})
+	if !stalled {
+		cancel()
+		s.release()
+		t.Fatal("agent kept reading the socket; msgCh never filled")
+	}
+	return s
+}
+
+func TestAgtRunSessionReaderStopsWhileHandingOffMessage(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	agtSilenceHeartbeats(t)
+
+	s := agtStallSession(t, logs, 0)
+	s.cancel()  // the reader is blocked on the hand-off: it must exit on cancel
+	s.release() // let the session loop finish the update and return
+
+	err := <-s.done
+	if err != nil && strings.Contains(err.Error(), "read:") {
+		t.Fatalf("runSession error = %v; the blocked reader should exit on session cancel, not report a read error", err)
+	}
+	if s.updateURL != "https://example.invalid/agent" || s.updateSum != "deadbeef" {
+		t.Errorf("self-update args = (%q, %q), want the payload url and checksum", s.updateURL, s.updateSum)
+	}
+}
+
+func TestAgtRunSessionReportsWriteError(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	agtSilenceHeartbeats(t)
+
+	// Resetting the connection fails the blocked writer while the blocked reader
+	// stays off the socket, so the session loop can report the write error. It
+	// still picks at random between that error, the cancelled session context
+	// the writer sets right after, and the queued inbound messages, so retry
+	// until the write error is the one that wins.
+	const attempts = 40
+	var lastErr error
+	for attempt := range attempts {
+		s := agtStallSession(t, logs, attempt)
+		agtReset(s.conn)
+		s.release()
+
+		select {
+		case lastErr = <-s.done:
+		case <-time.After(30 * time.Second):
+			s.cancel()
+			t.Fatal("runSession did not return after the connection was reset")
+		}
+		s.cancel()
+
+		if lastErr == nil {
+			t.Fatal("runSession returned nil after the connection was reset")
+		}
+		if strings.Contains(lastErr.Error(), "write:") {
+			t.Logf("writer error reached the session loop on attempt %d", attempt+1)
+			if !logs.has("websocket write") {
+				t.Errorf("expected a 'websocket write' report\nlogged:\n%s", logs.dump())
+			}
+			return
+		}
+	}
+	t.Fatalf("session loop never reported the writer error in %d attempts; last error: %v", attempts, lastErr)
+}
+
+// ---------------------------------------------------------------------------
+// reconnect loop
+// ---------------------------------------------------------------------------
+
+func TestAgtRunAgentResetsBackoffAfterLongSession(t *testing.T) {
+	logs := agtCaptureLogs(t)
+
+	origThreshold, origRetry := successfulConnectionThreshold, initialRetryDelay
+	defer func() {
+		successfulConnectionThreshold = origThreshold
+		initialRetryDelay = origRetry
+	}()
+	successfulConnectionThreshold = time.Nanosecond // every session counts as stable
+	initialRetryDelay = 20 * time.Millisecond
+
+	ln := agtListen(t)
+	connected := make(chan time.Time, 16)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			select {
+			case connected <- time.Now():
+			default:
+			}
+			agtReset(c.(*net.TCPConn))
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	agentDone := make(chan struct{})
+	go func() {
+		runAgent(ctx, agtURL(ln), "token", nil)
+		close(agentDone)
+	}()
+
+	const want = 6
+	stamps := make([]time.Time, 0, want)
+	for len(stamps) < want {
+		select {
+		case ts := <-connected:
+			stamps = append(stamps, ts)
+		case <-time.After(15 * time.Second):
+			cancel()
+			<-agentDone
+			t.Fatalf("only %d of %d reconnects happened", len(stamps), want)
+		}
+	}
+	cancel()
+	<-agentDone
+
+	// With the backoff reset every gap stays near initialRetryDelay; without it
+	// the gaps would double (20ms, 40ms, 80ms, 160ms, ...).
+	for i := 1; i < len(stamps); i++ {
+		if gap := stamps[i].Sub(stamps[i-1]); gap > 130*time.Millisecond {
+			t.Fatalf("reconnect gap %d = %v, want the backoff to stay reset near %v", i, gap, initialRetryDelay)
+		}
+	}
+	if !logs.has("resetting reconnect backoff after successful session") {
+		t.Errorf("expected the backoff reset to be reported\nlogged:\n%s", logs.dump())
+	}
+}
+
+func TestAgtRunAgentStopsWhenCancelledDuringSession(t *testing.T) {
+	logs := agtCaptureLogs(t)
+
+	origRetry := initialRetryDelay
+	defer func() { initialRetryDelay = origRetry }()
+	initialRetryDelay = time.Hour // any retry sleep would hang the test
+
+	ln := agtListen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		cancel() // cancelled while the session is still connecting
+		agtReset(c.(*net.TCPConn))
+	}()
+
+	agentDone := make(chan struct{})
+	go func() {
+		runAgent(ctx, agtURL(ln), "token", nil)
+		close(agentDone)
+	}()
+
+	select {
+	case <-agentDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("runAgent kept retrying after its context was cancelled")
+	}
+	if logs.has("reconnecting delay=") {
+		t.Errorf("runAgent scheduled a reconnect despite the cancelled context\nlogged:\n%s", logs.dump())
+	}
+}
+
+func TestAgtRunAgentReconnectsImmediatelyAfterRestart(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	agtSilenceHeartbeats(t)
+
+	origThreshold, origRetry := successfulConnectionThreshold, initialRetryDelay
+	defer func() {
+		successfulConnectionThreshold = origThreshold
+		initialRetryDelay = origRetry
+	}()
+	successfulConnectionThreshold = time.Hour // only the restart branch may reset
+	initialRetryDelay = 3 * time.Second       // a backoff sleep would be obvious
+
+	ln := agtListen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	agentDone := make(chan struct{})
+	go func() {
+		runAgent(ctx, agtURL(ln), "token", nil)
+		close(agentDone)
+	}()
+
+	conn, topic := agtAccept(t, ln)
+	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
+	restarted := time.Now()
+
+	conn2, _ := agtAccept(t, ln)
+	elapsed := time.Since(restarted)
+	cancel()
+	<-agentDone
+	_ = conn2.Close()
+
+	if elapsed >= initialRetryDelay {
+		t.Fatalf("reconnect took %v, want an immediate retry well under %v", elapsed, initialRetryDelay)
+	}
+	if !logs.has("restart requested, reconnecting immediately") {
+		t.Errorf("expected the immediate reconnect to be reported\nlogged:\n%s", logs.dump())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// backoff arithmetic
+// ---------------------------------------------------------------------------
+
+func TestAgtNextBackoffEdgeCases(t *testing.T) {
+	origRetry := initialRetryDelay
+	defer func() { initialRetryDelay = origRetry }()
+	initialRetryDelay = time.Second
+
+	for _, current := range []time.Duration{0, -time.Second} {
+		got := nextBackoff(current, time.Minute)
+		if got < 2*time.Second || got >= 2*time.Second+500*time.Millisecond {
+			t.Errorf("nextBackoff(%v, 1m) = %v, want a normalized [2s, 2.5s) delay", current, got)
+		}
+	}
+
+	// A cap below 4ns leaves no room for jitter, so the delay is exact.
+	if got := nextBackoff(time.Nanosecond, 2*time.Nanosecond); got != 2*time.Nanosecond {
+		t.Errorf("nextBackoff(1ns, 2ns) = %v, want exactly 2ns", got)
+	}
+}
+
+func TestPropAgtNextBackoff(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		current := time.Duration(rapid.Int64Range(int64(-time.Second), int64(60*time.Second)).Draw(t, "current"))
+		maxDelay := time.Duration(rapid.Int64Range(int64(time.Millisecond), int64(60*time.Second)).Draw(t, "maxDelay"))
+
+		// nextBackoff normalizes a non-positive delay to initialRetryDelay,
+		// doubles it, caps it and then adds strictly less than 25% jitter.
+		base := current
+		if base <= 0 {
+			base = initialRetryDelay
+		}
+		want := base * 2
+		if want > maxDelay {
+			want = maxDelay
+		}
+
+		got := nextBackoff(current, maxDelay)
+		if got < 0 {
+			t.Fatalf("nextBackoff(%v, %v) = %v, want a non-negative delay", current, maxDelay, got)
+		}
+		jitter := want / 4
+		if jitter <= 0 {
+			if got != want {
+				t.Fatalf("nextBackoff(%v, %v) = %v, want exactly %v (no room for jitter)", current, maxDelay, got, want)
+			}
+			return
+		}
+		if got < want || got >= want+jitter {
+			t.Fatalf("nextBackoff(%v, %v) = %v, want in [%v, %v)", current, maxDelay, got, want, want+jitter)
+		}
+	})
+}
+
+func TestPropAgtZeroBytes(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		b := rapid.SliceOf(rapid.Byte()).Draw(t, "bytes")
+		n := len(b)
+
+		zeroBytes(b)
+		if len(b) != n {
+			t.Fatalf("zeroBytes changed the length: %d, want %d", len(b), n)
+		}
+		for i, v := range b {
+			if v != 0 {
+				t.Fatalf("byte %d = %d after zeroBytes, want 0", i, v)
+			}
+		}
+
+		zeroBytes(b) // idempotent
+		if len(b) != n {
+			t.Fatalf("second zeroBytes changed the length: %d, want %d", len(b), n)
+		}
+		for i, v := range b {
+			if v != 0 {
+				t.Fatalf("byte %d = %d after a second zeroBytes, want 0", i, v)
+			}
+		}
+	})
+}
+
+func TestPropAgtDecodeBinaryPayload(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		count := rapid.IntRange(0, 4).Draw(t, "jobs")
+		id := rapid.StringMatching(`[a-zA-Z0-9_-]{0,16}`)
+		list := &pb.AgentJobList{}
+		for i := range count {
+			list.Jobs = append(list.Jobs, &pb.AgentJob{
+				JobId:    id.Draw(t, fmt.Sprintf("job_id_%d", i)),
+				DeviceId: id.Draw(t, fmt.Sprintf("device_id_%d", i)),
+			})
+		}
+
+		bin, err := proto.Marshal(list)
+		if err != nil {
+			t.Fatalf("marshal job list: %v", err)
+		}
+		payload, err := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString(bin)})
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+
+		var got pb.AgentJobList
+		if !decodeBinaryPayload("jobs", payload, &got) {
+			t.Fatalf("decodeBinaryPayload rejected a well-formed payload for %v", list)
+		}
+		if !proto.Equal(list, &got) {
+			t.Fatalf("decoded %v, want %v", &got, list)
+		}
+
+		// Anything outside the base64 alphabet must be rejected, not panic.
+		junk := rapid.SliceOfN(rapid.SampledFrom([]byte("!@#$%^&*()~ ")), 1, 8).Draw(t, "junk")
+		bad, err := json.Marshal(map[string]string{"binary": string(junk)})
+		if err != nil {
+			t.Fatalf("marshal junk payload: %v", err)
+		}
+		var out pb.AgentJobList
+		if decodeBinaryPayload("jobs", bad, &out) {
+			t.Fatalf("decodeBinaryPayload accepted %q as base64", junk)
+		}
+	})
 }

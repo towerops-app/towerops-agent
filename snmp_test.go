@@ -5,12 +5,17 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/gosnmp/gosnmp"
 	"github.com/towerops-app/towerops-agent/pb"
+	"pgregory.net/rapid"
 )
 
 func TestSnmpValueToString(t *testing.T) {
@@ -257,28 +262,67 @@ func TestNewSnmpConnRejectsPortOverflow(t *testing.T) {
 	}
 }
 
-func TestSnmpDialDefault(t *testing.T) {
-	// Test the default snmpDial function variable (wraps newSnmpConn)
-	origDial := snmpDial
-	defer func() { snmpDial = origDial }()
-
-	// Reset to default behavior
-	snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
-		conn, err := newSnmpConn(dev)
-		if err != nil {
-			return nil, nil, err
-		}
-		return conn, func() { _ = conn.Conn.Close() }, nil
-	}
-
-	q, closeFn, err := snmpDial(&pb.SnmpDevice{Ip: "127.0.0.1", Port: 16100, Version: "2c", Community: "public"})
+// snwTFreeUDPPort binds an ephemeral UDP socket on loopback and keeps it open
+// for the duration of the test, so the returned port is stable and cannot be
+// re-bound by a concurrently running test.
+func snwTFreeUDPPort(t *testing.T) uint32 {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("ListenPacket: %v", err)
 	}
-	defer closeFn()
-	if q == nil {
-		t.Error("expected non-nil querier")
+	t.Cleanup(func() { _ = pc.Close() })
+	addr, ok := pc.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("LocalAddr is %T, want *net.UDPAddr", pc.LocalAddr())
 	}
+	return uint32(addr.Port)
+}
+
+// TestSnmpDialDefault exercises the real snmpDial closure (not a copy of it),
+// covering both the newSnmpConn error path and the success path.
+func TestSnmpDialDefault(t *testing.T) {
+	realDial := snmpDial
+
+	t.Run("newSnmpConn error propagates", func(t *testing.T) {
+		q, closeFn, err := realDial(&pb.SnmpDevice{Ip: "127.0.0.1", Port: 65536})
+		if err == nil || !strings.Contains(err.Error(), "invalid SNMP port") {
+			t.Fatalf("snmpDial error = %v, want invalid SNMP port", err)
+		}
+		if q != nil {
+			t.Errorf("snmpDial querier = %v, want nil on error", q)
+		}
+		if closeFn != nil {
+			t.Error("snmpDial close func non-nil on error")
+		}
+	})
+
+	t.Run("udp success returns querier and closer", func(t *testing.T) {
+		// UDP "connect" only binds a socket, so no SNMP server is required.
+		port := snwTFreeUDPPort(t)
+		q, closeFn, err := realDial(&pb.SnmpDevice{Ip: "127.0.0.1", Port: port, Version: "2c", Community: "public"})
+		if err != nil {
+			t.Fatalf("snmpDial: %v", err)
+		}
+		if q == nil {
+			t.Fatal("snmpDial querier = nil, want non-nil")
+		}
+		if closeFn == nil {
+			t.Fatal("snmpDial close func = nil, want non-nil")
+		}
+		conn, ok := q.(*gosnmp.GoSNMP)
+		if !ok {
+			t.Fatalf("snmpDial querier is %T, want *gosnmp.GoSNMP", q)
+		}
+		if conn.Port != uint16(port) {
+			t.Errorf("conn.Port = %d, want %d", conn.Port, port)
+		}
+		closeFn()
+		// The closer released the socket: a second write must now fail.
+		if _, err := conn.Conn.Write([]byte("x")); err == nil {
+			t.Error("write succeeded after closeFn, want closed-socket error")
+		}
+	})
 }
 
 // mockSnmpQuerier implements snmpQuerier for testing.
@@ -286,9 +330,32 @@ type mockSnmpQuerier struct {
 	getFunc        func(oids []string) (*gosnmp.SnmpPacket, error)
 	walkFunc       func(rootOid string) ([]gosnmp.SnmpPDU, error)
 	bulkWalkFunc   func(rootOid string) ([]gosnmp.SnmpPDU, error)
+	walkStepFunc   func(rootOid string) ([]gosnmp.SnmpPDU, error)
+	walkErrs       map[string]error
 	closeCalled    bool
 	walkAllCalled  bool
 	bulkWalkCalled bool
+}
+
+// Walk feeds PDUs to walkFn one at a time, mirroring gosnmp's streaming Walk.
+// walkErrs[rootOid] short-circuits with an error for that subtree.
+func (m *mockSnmpQuerier) Walk(rootOid string, walkFn gosnmp.WalkFunc) error {
+	if err, ok := m.walkErrs[rootOid]; ok {
+		return err
+	}
+	if m.walkStepFunc == nil {
+		return nil
+	}
+	pdus, err := m.walkStepFunc(rootOid)
+	if err != nil {
+		return err
+	}
+	for _, pdu := range pdus {
+		if err := walkFn(pdu); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *mockSnmpQuerier) Get(oids []string) (*gosnmp.SnmpPacket, error) {
@@ -820,6 +887,238 @@ func TestExecuteCredentialTest(t *testing.T) {
 		}
 		if result.SystemDescription != "" {
 			t.Errorf("expected empty sysDescr, got %q", result.SystemDescription)
+		}
+	})
+}
+
+// TestSnmpValueToStringTypeMismatchFallbacks covers the fmt.Sprintf("%v", ...)
+// arms reached when a device (or a buggy decoder) hands us a Value whose Go
+// type is not the one gosnmp normally supplies for that Asn1BER type.
+func TestSnmpValueToStringTypeMismatchFallbacks(t *testing.T) {
+	tests := []struct {
+		name  string
+		typ   gosnmp.Asn1BER
+		value any
+	}{
+		{name: "octet string not bytes", typ: gosnmp.OctetString, value: 42},
+		{name: "object identifier not string", typ: gosnmp.ObjectIdentifier, value: struct{}{}},
+		{name: "counter32 not uint", typ: gosnmp.Counter32, value: struct{}{}},
+		{name: "counter64 not uint64", typ: gosnmp.Counter64, value: struct{}{}},
+		{name: "gauge32 not uint", typ: gosnmp.Gauge32, value: struct{}{}},
+		{name: "timeticks not uint32", typ: gosnmp.TimeTicks, value: struct{}{}},
+		{name: "ipaddress not string", typ: gosnmp.IPAddress, value: struct{}{}},
+		{name: "opaque not bytes", typ: gosnmp.Opaque, value: struct{}{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := fmt.Sprintf("%v", tt.value)
+			got := snmpValueToString(gosnmp.SnmpPDU{Name: ".1.3.6.1.2.1.1.1.0", Type: tt.typ, Value: tt.value})
+			if got != want {
+				t.Errorf("snmpValueToString = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestExecuteSnmpJobWalkSkipsSentinelPDUs asserts the WALK branch drops
+// NoSuchObject / NoSuchInstance / EndOfMibView PDUs instead of recording them.
+func TestExecuteSnmpJobWalkSkipsSentinelPDUs(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	mock := &mockSnmpQuerier{
+		bulkWalkFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
+			return []gosnmp.SnmpPDU{
+				{Name: ".1.3.6.1.2.1.2.2.1.2.1", Type: gosnmp.OctetString, Value: []byte("eth0")},
+				{Name: ".1.3.6.1.2.1.2.2.1.2.2", Type: gosnmp.NoSuchObject},
+				{Name: ".1.3.6.1.2.1.2.2.1.2.3", Type: gosnmp.NoSuchInstance},
+				{Name: ".1.3.6.1.2.1.2.2.1.2.4", Type: gosnmp.EndOfMibView},
+				{Name: ".1.3.6.1.2.1.2.2.1.2.5", Type: gosnmp.OctetString, Value: []byte("eth1")},
+			}, nil
+		},
+	}
+	snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		return mock, func() { mock.closeCalled = true }, nil
+	}
+
+	ch := make(chan *pb.SnmpResult, 1)
+	executeSnmpJob(context.Background(), &pb.AgentJob{
+		JobId:      "walk-sentinels",
+		JobType:    pb.JobType_POLL,
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: "2c"},
+		Queries: []*pb.SnmpQuery{{
+			QueryType: pb.QueryType_WALK,
+			Oids:      []string{".1.3.6.1.2.1.2.2.1.2"},
+		}},
+	}, ch)
+
+	result := <-ch
+	if !mock.bulkWalkCalled {
+		t.Fatal("BulkWalkAll was not called for a v2c WALK")
+	}
+	want := map[string]string{
+		".1.3.6.1.2.1.2.2.1.2.1": "eth0",
+		".1.3.6.1.2.1.2.2.1.2.5": "eth1",
+	}
+	if len(result.OidValues) != len(want) {
+		t.Fatalf("OidValues = %v, want %v", result.OidValues, want)
+	}
+	for oid, v := range want {
+		if result.OidValues[oid] != v {
+			t.Errorf("OidValues[%s] = %q, want %q", oid, result.OidValues[oid], v)
+		}
+	}
+	for _, skipped := range []string{
+		".1.3.6.1.2.1.2.2.1.2.2",
+		".1.3.6.1.2.1.2.2.1.2.3",
+		".1.3.6.1.2.1.2.2.1.2.4",
+	} {
+		if got, ok := result.OidValues[skipped]; ok {
+			t.Errorf("sentinel OID %s recorded as %q, want absent", skipped, got)
+		}
+	}
+	if !mock.closeCalled {
+		t.Error("close func was not invoked")
+	}
+}
+
+// snwTValueGen draws the Value shapes a real (or hostile) SNMP decoder can
+// place in an SnmpPDU.
+var snwTValueGen = rapid.OneOf(
+	rapid.Custom(func(t *rapid.T) any { return any(rapid.SliceOf(rapid.Byte()).Draw(t, "bytes")) }),
+	rapid.Custom(func(t *rapid.T) any { return any(rapid.String().Draw(t, "string")) }),
+	rapid.Custom(func(t *rapid.T) any { return any(rapid.Int().Draw(t, "int")) }),
+	rapid.Custom(func(t *rapid.T) any { return any(rapid.Uint().Draw(t, "uint")) }),
+	rapid.Custom(func(t *rapid.T) any { return any(rapid.Int64().Draw(t, "int64")) }),
+	rapid.Custom(func(t *rapid.T) any { return any(rapid.Uint64().Draw(t, "uint64")) }),
+	rapid.Custom(func(t *rapid.T) any { return any(rapid.Uint32().Draw(t, "uint32")) }),
+	rapid.Just(any(nil)),
+	rapid.Just(any(struct{}{})),
+)
+
+// TestPropSnwSnmpValueToStringNeverPanics is a robustness invariant: whatever
+// type byte and Value shape a device produces, conversion must return a
+// deterministic, valid UTF-8 string rather than panicking.
+func TestPropSnwSnmpValueToStringNeverPanics(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		typ := gosnmp.Asn1BER(rapid.Byte().Draw(t, "type"))
+		value := snwTValueGen.Draw(t, "value")
+		pdu := gosnmp.SnmpPDU{Name: ".1.3.6.1.2.1.1.1.0", Type: typ, Value: value}
+
+		got := snmpValueToString(pdu)
+		if !utf8.ValidString(got) {
+			t.Fatalf("snmpValueToString(type=%#x, value=%#v) = %q: not valid UTF-8", byte(typ), value, got)
+		}
+		if again := snmpValueToString(pdu); again != got {
+			t.Fatalf("snmpValueToString not deterministic: %q then %q", got, again)
+		}
+	})
+}
+
+// snwTOctetGen draws byte slices biased towards both the printable path and
+// the hex-escape path of the OctetString arm.
+var snwTOctetGen = rapid.OneOf(
+	rapid.SliceOf(rapid.Byte()),
+	rapid.Custom(func(t *rapid.T) []byte { return []byte(rapid.String().Draw(t, "clean")) }),
+	rapid.Custom(func(t *rapid.T) []byte {
+		s := []byte(rapid.String().Draw(t, "base"))
+		ctl := rapid.SampledFrom([]byte{0x00, 0x01, 0x07, 0x0b, 0x1f}).Draw(t, "ctl")
+		at := rapid.IntRange(0, len(s)).Draw(t, "at")
+		out := make([]byte, 0, len(s)+1)
+		out = append(out, s[:at]...)
+		out = append(out, ctl)
+		return append(out, s[at:]...)
+	}),
+)
+
+// TestPropSnwOctetStringRoundtrip fully characterises the OctetString arm:
+// printable UTF-8 passes through byte-for-byte, everything else is hex escaped.
+func TestPropSnwOctetStringRoundtrip(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		b := snwTOctetGen.Draw(t, "b")
+		got := snmpValueToString(gosnmp.SnmpPDU{Type: gosnmp.OctetString, Value: b})
+
+		printable := utf8.Valid(b)
+		if printable {
+			for _, c := range b {
+				if c < 0x20 && c != '\n' && c != '\r' && c != '\t' {
+					printable = false
+					break
+				}
+			}
+		}
+		if printable {
+			if got != string(b) {
+				t.Fatalf("snmpValueToString(%#v) = %q, want verbatim %q", b, got, string(b))
+			}
+			return
+		}
+		if got != formatHex(b) {
+			t.Fatalf("snmpValueToString(%#v) = %q, want hex %q", b, got, formatHex(b))
+		}
+	})
+}
+
+// TestPropSnwFormatHex pins formatHex's output shape: deterministic, length a
+// pure function of the input length, and losslessly decodable.
+func TestPropSnwFormatHex(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		b := rapid.SliceOf(rapid.Byte()).Draw(t, "b")
+		got := formatHex(b)
+
+		if again := formatHex(b); again != got {
+			t.Fatalf("formatHex not deterministic: %q then %q", got, again)
+		}
+
+		wantLen := 0
+		wantColons := 0
+		if len(b) > 0 {
+			wantLen = 3*len(b) - 1
+			wantColons = len(b) - 1
+		}
+		if len(got) != wantLen {
+			t.Fatalf("len(formatHex(%d bytes)) = %d, want %d", len(b), len(got), wantLen)
+		}
+		if n := strings.Count(got, ":"); n != wantColons {
+			t.Fatalf("formatHex(%#v) has %d colons, want %d", b, n, wantColons)
+		}
+		if lower := strings.ToLower(got); lower != got {
+			t.Fatalf("formatHex(%#v) = %q, want lowercase hex", b, got)
+		}
+
+		decoded, err := hex.DecodeString(strings.ReplaceAll(got, ":", ""))
+		if err != nil {
+			t.Fatalf("hex.DecodeString(%q): %v", got, err)
+		}
+		if string(decoded) != string(b) {
+			t.Fatalf("formatHex round-trip = %#v, want %#v", decoded, b)
+		}
+	})
+}
+
+// TestPropSnwIntegerRoundtrip asserts the Integer arm is a lossless decimal
+// rendering for both Go types gosnmp may carry.
+func TestPropSnwIntegerRoundtrip(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		v := rapid.Int64().Draw(t, "int64")
+		got := snmpValueToString(gosnmp.SnmpPDU{Type: gosnmp.Integer, Value: v})
+		back, err := strconv.ParseInt(got, 10, 64)
+		if err != nil {
+			t.Fatalf("ParseInt(%q): %v", got, err)
+		}
+		if back != v {
+			t.Fatalf("int64 round-trip: got %d, want %d", back, v)
+		}
+
+		// gosnmp decodes Integer PDUs into a plain int.
+		n := rapid.Int().Draw(t, "int")
+		gotN := snmpValueToString(gosnmp.SnmpPDU{Type: gosnmp.Integer, Value: n})
+		backN, err := strconv.ParseInt(gotN, 10, 64)
+		if err != nil {
+			t.Fatalf("ParseInt(%q): %v", gotN, err)
+		}
+		if backN != int64(n) {
+			t.Fatalf("int round-trip: got %d, want %d", backN, n)
 		}
 	})
 }

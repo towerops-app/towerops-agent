@@ -5,11 +5,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +25,7 @@ import (
 	"time"
 
 	"github.com/towerops-app/towerops-agent/pb"
+	"pgregory.net/rapid"
 )
 
 // ---------------------------------------------------------------------------
@@ -1705,4 +1713,485 @@ func withTestSSLRootCA(t *testing.T, cert *x509.Certificate) {
 		return pool, nil
 	}
 	t.Cleanup(func() { sslRootCAs = orig })
+}
+
+// ---------------------------------------------------------------------------
+// chkT: branch coverage for checks.go error paths
+// ---------------------------------------------------------------------------
+
+// chkTOrigSslRootCAs captures the production sslRootCAs implementation before
+// any test can replace it.
+var chkTOrigSslRootCAs = sslRootCAs
+
+// chkTRawHTTPServer serves a hand-written HTTP response and then closes the
+// connection, which lets tests force response-body read failures.
+func chkTRawHTTPServer(t *testing.T, header string, body []byte) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				br := bufio.NewReader(conn)
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if line == "\r\n" || line == "\n" {
+						break
+					}
+				}
+				if _, err := conn.Write([]byte(header)); err != nil {
+					return
+				}
+				_, _ = conn.Write(body)
+			}()
+		}
+	}()
+
+	return "http://" + ln.Addr().String()
+}
+
+func TestChkTHTTPCheckBodyReadErrorWithRegex(t *testing.T) {
+	url := chkTRawHTTPServer(t,
+		"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n",
+		[]byte("truncated"))
+
+	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+		Url:       url,
+		Regex:     "truncated",
+		VerifySsl: true,
+	}, 5000)
+
+	if status != 2 {
+		t.Fatalf("expected status 2 for truncated body, got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "Failed to read body") {
+		t.Fatalf("expected read-body failure, got %s", output)
+	}
+}
+
+func TestChkTHTTPCheckDrainErrorAfterRegexLimit(t *testing.T) {
+	// io.ReadAll fills the regex limit without error, then the drain io.Copy
+	// hits the truncated body.
+	body := bytes.Repeat([]byte("a"), maxHTTPRegexBody+4096)
+	url := chkTRawHTTPServer(t,
+		fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", maxHTTPRegexBody*4),
+		body)
+
+	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+		Url:       url,
+		Regex:     "aaa",
+		VerifySsl: true,
+	}, 10000)
+
+	if status != 2 {
+		t.Fatalf("expected status 2 for drain failure, got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "Failed to read body") {
+		t.Fatalf("expected read-body failure, got %s", output)
+	}
+}
+
+func TestChkTHTTPCheckDrainErrorWithoutRegex(t *testing.T) {
+	url := chkTRawHTTPServer(t,
+		"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n",
+		[]byte("truncated"))
+
+	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+		Url:       url,
+		VerifySsl: true,
+	}, 5000)
+
+	if status != 2 {
+		t.Fatalf("expected status 2 for truncated body, got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "Failed to read body") {
+		t.Fatalf("expected read-body failure, got %s", output)
+	}
+}
+
+// chkTDeadlineErrConn is a net.Conn whose SetDeadline always fails.
+type chkTDeadlineErrConn struct {
+	net.Conn
+}
+
+func (c *chkTDeadlineErrConn) SetDeadline(time.Time) error {
+	return errors.New("chkT deadline unsupported")
+}
+
+func TestChkTTCPCheckSetDeadlineFailure(t *testing.T) {
+	orig := tcpDialContext
+	defer func() { tcpDialContext = orig }()
+
+	tcpDialContext = func(_ context.Context, _, _ string) (net.Conn, error) {
+		client, server := net.Pipe()
+		t.Cleanup(func() { _ = server.Close() })
+		return &chkTDeadlineErrConn{Conn: client}, nil
+	}
+
+	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+		Host: "127.0.0.1",
+		Port: 1234,
+		Send: "PING\r\n",
+	}, 5000)
+
+	if status != 2 {
+		t.Fatalf("expected status 2 when SetDeadline fails, got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "Set deadline failed") {
+		t.Fatalf("expected set-deadline failure, got %s", output)
+	}
+	if !strings.Contains(output, "chkT deadline unsupported") {
+		t.Fatalf("expected wrapped conn error, got %s", output)
+	}
+}
+
+func TestChkTTCPCheckExpectExceedsResponseLimit(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	// 80 KiB of filler pushes the read loop past its 64 KiB budget without
+	// ever containing the expected banner.
+	filler := bytes.Repeat([]byte("x"), 80<<10)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				_, _ = conn.Write(filler)
+			}()
+		}
+	}()
+
+	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+		Host:   "127.0.0.1",
+		Port:   parsePort(portFromListener(ln)),
+		Expect: "chkT-never-sent",
+	}, 10000)
+
+	if status != 2 {
+		t.Fatalf("expected status 2 when expect never matches, got %d", status)
+	}
+	if !strings.HasPrefix(output, "Unexpected response: ") {
+		t.Fatalf("expected unexpected-response output, got %.60s", output)
+	}
+	if len(output) < 64<<10 {
+		t.Fatalf("expected the full received buffer in output, got %d bytes", len(output))
+	}
+}
+
+// chkTZeroWriter accepts nothing while reporting success, which is the
+// io.ErrShortWrite condition writeAll guards against.
+type chkTZeroWriter struct {
+	calls int
+}
+
+func (w *chkTZeroWriter) Write(p []byte) (int, error) {
+	w.calls++
+	return 0, nil
+}
+
+func TestChkTWriteAllShortWrite(t *testing.T) {
+	w := &chkTZeroWriter{}
+	err := writeAll(w, []byte("payload"))
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("expected io.ErrShortWrite, got %v", err)
+	}
+	if w.calls != 1 {
+		t.Fatalf("expected writeAll to bail out after one write, got %d", w.calls)
+	}
+}
+
+// Go's stub resolver reports "no such host" for an empty answer section, so a
+// record-less success can only be produced through the lookup seam.
+func TestChkTDNSCheckNoRecordsFound(t *testing.T) {
+	orig := dnsLookupTXT
+	defer func() { dnsLookupTXT = orig }()
+
+	var gotHost string
+	dnsLookupTXT = func(_ *net.Resolver, _ context.Context, host string) ([]string, error) {
+		gotHost = host
+		return nil, nil
+	}
+
+	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+		Hostname:   "chkt-empty.example",
+		RecordType: "txt",
+	}, 5000)
+
+	if status != 2 {
+		t.Fatalf("expected status 2 for an empty record set, got %d: %s", status, output)
+	}
+	if output != "No TXT records found" {
+		t.Fatalf("expected no-records output, got %s", output)
+	}
+	if gotHost != "chkt-empty.example" {
+		t.Fatalf("expected the configured hostname to be looked up, got %q", gotHost)
+	}
+}
+
+func TestChkTSslRootCAsSystemPoolError(t *testing.T) {
+	origPool := sslRootCAsPool
+	origSystem := systemCertPool
+	defer func() {
+		sslRootCAsPool = origPool
+		systemCertPool = origSystem
+	}()
+
+	sslRootCAsPool = nil
+	wantErr := errors.New("chkT no system roots")
+	systemCertPool = func() (*x509.CertPool, error) { return nil, wantErr }
+
+	pool, err := chkTOrigSslRootCAs()
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected the system pool error, got %v", err)
+	}
+	if pool != nil {
+		t.Fatalf("expected a nil pool on failure, got %v", pool)
+	}
+	if sslRootCAsPool != nil {
+		t.Fatal("expected failures not to populate the cache")
+	}
+}
+
+func TestChkTSSLCheckRootCALoadFailure(t *testing.T) {
+	orig := sslRootCAs
+	defer func() { sslRootCAs = orig }()
+	sslRootCAs = func() (*x509.CertPool, error) {
+		return nil, errors.New("chkT root store unavailable")
+	}
+
+	status, output, rt := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host: "127.0.0.1",
+		Port: 443,
+	}, 5000)
+
+	if status != 3 {
+		t.Fatalf("expected status 3 when root CAs fail to load, got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "Failed to load system root CAs") {
+		t.Fatalf("expected root CA failure output, got %s", output)
+	}
+	if rt != 0 {
+		t.Fatalf("expected zero response time before dialing, got %f", rt)
+	}
+}
+
+func TestChkTSSLCheckNonTLSConnection(t *testing.T) {
+	orig := sslDialTLS
+	defer func() { sslDialTLS = orig }()
+	sslDialTLS = func(_ context.Context, _ *net.Dialer, _ *tls.Config, _, _ string) (net.Conn, error) {
+		client, server := net.Pipe()
+		t.Cleanup(func() { _ = server.Close() })
+		return client, nil
+	}
+
+	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host: "127.0.0.1",
+		Port: 8443,
+	}, 5000)
+
+	if status != 3 {
+		t.Fatalf("expected status 3 for a non-TLS conn, got %d: %s", status, output)
+	}
+	if output != "Connection did not negotiate TLS" {
+		t.Fatalf("expected TLS negotiation output, got %s", output)
+	}
+}
+
+func TestChkTSSLCheckNoPeerCertificates(t *testing.T) {
+	orig := sslDialTLS
+	defer func() { sslDialTLS = orig }()
+	sslDialTLS = func(_ context.Context, _ *net.Dialer, _ *tls.Config, _, _ string) (net.Conn, error) {
+		client, server := net.Pipe()
+		t.Cleanup(func() { _ = server.Close() })
+		// Never handshaked, so the connection state carries no peer certs.
+		return tls.Client(client, &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true,
+		}), nil
+	}
+
+	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host: "certless.chkt.test",
+		Port: 9443,
+	}, 5000)
+
+	if status != 3 {
+		t.Fatalf("expected status 3 without peer certs, got %d: %s", status, output)
+	}
+	if output != "No certificate presented by certless.chkt.test:9443" {
+		t.Fatalf("expected no-certificate output, got %s", output)
+	}
+}
+
+// chkTSelfSignedCert builds a self-signed leaf valid over the given window.
+func chkTSelfSignedCert(t *testing.T, notBefore, notAfter time.Time) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(20260828),
+		Subject:               pkix.Name{CommonName: "expired.chkt.test"},
+		DNSNames:              []string{"expired.chkt.test"},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}
+}
+
+func TestChkTSSLCheckExpiredCertificate(t *testing.T) {
+	cert := chkTSelfSignedCert(t, time.Now().Add(-96*time.Hour), time.Now().Add(-48*time.Hour))
+
+	orig := sslDialTLS
+	defer func() { sslDialTLS = orig }()
+	sslDialTLS = func(ctx context.Context, _ *net.Dialer, cfg *tls.Config, _, _ string) (net.Conn, error) {
+		clientRaw, serverRaw := net.Pipe()
+		t.Cleanup(func() { _ = serverRaw.Close() })
+
+		go func() {
+			server := tls.Server(serverRaw, &tls.Config{
+				MinVersion:   tls.VersionTLS12,
+				Certificates: []tls.Certificate{cert},
+			})
+			_ = server.HandshakeContext(ctx)
+		}()
+
+		// Verification is deliberately skipped: the point of the check is what
+		// executeSSLCheck concludes about an expired certificate.
+		client := tls.Client(clientRaw, &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			ServerName:         cfg.ServerName,
+			InsecureSkipVerify: true,
+		})
+		if err := client.HandshakeContext(ctx); err != nil {
+			return nil, err
+		}
+		return client, nil
+	}
+
+	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host:        "expired.chkt.test",
+		Port:        443,
+		WarningDays: 30,
+	}, 5000)
+
+	if status != 2 {
+		t.Fatalf("expected status 2 for an expired certificate, got %d: %s", status, output)
+	}
+	want := fmt.Sprintf("CRITICAL: Certificate for expired.chkt.test:443 expired 2 days ago (%s)",
+		cert.Leaf.NotAfter.Format("2006-01-02"))
+	if output != want {
+		t.Fatalf("expected %q, got %q", want, output)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// chkT: property tests
+// ---------------------------------------------------------------------------
+
+// chkTChunkWriter accepts at most chunk bytes per Write and optionally fails
+// once failAfter bytes have been accepted.
+type chkTChunkWriter struct {
+	buf       bytes.Buffer
+	chunk     int
+	failAfter int // negative disables failures
+	err       error
+}
+
+func (w *chkTChunkWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	if n > w.chunk {
+		n = w.chunk
+	}
+	if w.failAfter >= 0 {
+		remaining := w.failAfter - w.buf.Len()
+		if n >= remaining {
+			w.buf.Write(p[:remaining])
+			return remaining, w.err
+		}
+	}
+	w.buf.Write(p[:n])
+	return n, nil
+}
+
+func TestPropChkWriteAll(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		data := rapid.SliceOf(rapid.Byte()).Draw(t, "data")
+		chunk := rapid.IntRange(1, 64).Draw(t, "chunk")
+
+		w := &chkTChunkWriter{chunk: chunk, failAfter: -1}
+		if err := writeAll(w, data); err != nil {
+			t.Fatalf("writeAll returned %v for %d bytes", err, len(data))
+		}
+		if !bytes.Equal(w.buf.Bytes(), data) {
+			t.Fatalf("writer received %d bytes, want %d identical bytes", w.buf.Len(), len(data))
+		}
+
+		if len(data) == 0 {
+			return
+		}
+
+		prefix := rapid.IntRange(0, len(data)-1).Draw(t, "prefix")
+		wantErr := errors.New("chkT write failure")
+		fw := &chkTChunkWriter{chunk: chunk, failAfter: prefix, err: wantErr}
+		if err := writeAll(fw, data); !errors.Is(err, wantErr) {
+			t.Fatalf("expected the writer error after %d bytes, got %v", prefix, err)
+		}
+		if fw.buf.Len() != prefix {
+			t.Fatalf("writer accepted %d bytes, want %d", fw.buf.Len(), prefix)
+		}
+		if !bytes.Equal(fw.buf.Bytes(), data[:prefix]) {
+			t.Fatal("writer received bytes out of order")
+		}
+	})
+}
+
+func TestPropChkCheckTimeout(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		ms := rapid.IntRange(1, 4_000_000).Draw(t, "timeoutMs")
+
+		got := checkTimeout(uint32(ms))
+		if want := time.Duration(ms) * time.Millisecond; got != want {
+			t.Fatalf("checkTimeout(%d) = %v, want %v", ms, got, want)
+		}
+		if got <= 0 {
+			t.Fatalf("checkTimeout(%d) = %v, want a positive duration", ms, got)
+		}
+	})
+
+	if got := checkTimeout(0); got != 10*time.Second {
+		t.Fatalf("checkTimeout(0) = %v, want 10s", got)
+	}
 }

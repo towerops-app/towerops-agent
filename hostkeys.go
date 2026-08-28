@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -27,6 +28,22 @@ type hostKeyStore struct {
 
 var globalHostKeys *hostKeyStore
 var hostKeysOnce sync.Once
+
+// hostKeyTempFile is the subset of *os.File that save uses. Together with the
+// hostKeyCreateTemp and hostKeyMarshal seams it lets tests exercise the
+// serialization and durable-write failure paths that cannot be provoked
+// through the filesystem.
+type hostKeyTempFile interface {
+	io.Writer
+	Name() string
+	Sync() error
+	Close() error
+}
+
+var hostKeyMarshal = json.MarshalIndent
+var hostKeyCreateTemp = func(dir, pattern string) (hostKeyTempFile, error) {
+	return os.CreateTemp(dir, pattern)
+}
 
 func getHostKeyStore() *hostKeyStore {
 	hostKeysOnce.Do(func() {
@@ -53,12 +70,12 @@ func newHostKeyStore(path string) *hostKeyStore {
 }
 
 func (s *hostKeyStore) save() error {
-	data, err := json.MarshalIndent(s.keys, "", "  ")
+	data, err := hostKeyMarshal(s.keys, "", "  ")
 	if err != nil {
 		return err
 	}
 	dir := filepath.Dir(s.path)
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(s.path)+"-*")
+	tmp, err := hostKeyCreateTemp(dir, "."+filepath.Base(s.path)+"-*")
 	if err != nil {
 		return err
 	}
