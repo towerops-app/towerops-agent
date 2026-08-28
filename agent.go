@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"git.mcintire.me/towerops-agent/towerops-agent/pb"
+	"github.com/towerops-app/towerops-agent/pb"
 	"google.golang.org/protobuf/proto"
 )
 

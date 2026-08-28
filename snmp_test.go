@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/gosnmp/gosnmp"
-	"git.mcintire.me/towerops-agent/towerops-agent/pb"
+	"github.com/towerops-app/towerops-agent/pb"
 )
 
 func TestSnmpValueToString(t *testing.T) {

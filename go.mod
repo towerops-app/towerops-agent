@@ -1,4 +1,4 @@
-module git.mcintire.me/towerops-agent/towerops-agent
+module github.com/towerops-app/towerops-agent
 
 go 1.25.6
 

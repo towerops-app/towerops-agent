@@ -28,11 +28,11 @@ func computeAcceptKey(key string) string {
 }
 
 const (
-	opText       = 1
-	opBinary     = 2
-	opClose      = 8
-	opPing       = 9
-	opPong       = 10
+	opText         = 1
+	opBinary       = 2
+	opClose        = 8
+	opPing         = 9
+	opPong         = 10
 	opContinuation = 0
 
 	maxFrameSize = 16 << 20 // 16 MB

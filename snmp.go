@@ -11,7 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gosnmp/gosnmp"
-	"git.mcintire.me/towerops-agent/towerops-agent/pb"
+	"github.com/towerops-app/towerops-agent/pb"
 )
 
 const snmpMaxOIDsPerGet = 60
