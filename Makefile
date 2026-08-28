@@ -1,4 +1,6 @@
-.PHONY: proto test test-fast test-race build vet lint
+.PHONY: all proto test test-fast test-short build vet lint
+
+all: vet lint test build
 
 proto:
 	protoc --go_out=. --go_opt=paths=source_relative proto/agent.proto
@@ -23,4 +25,3 @@ vet:
 lint:
 	golangci-lint run
 
-all: proto vet test build

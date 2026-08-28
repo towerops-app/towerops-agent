@@ -3,9 +3,7 @@
 .gitignore
 .direnv/
 .envrc
-.cargo/
 .claude/
-.conductor/
 Dockerfile
 .dockerignore
 README.md
@@ -15,10 +13,4 @@ flake.lock
 cover.out
 coverage/
 proto/
-*.db
-*.db-shm
-*.db-wal
 *_test.go
-src/
-native/
-target/

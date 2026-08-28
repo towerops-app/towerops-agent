@@ -11,8 +11,11 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/towerops-app/towerops-agent/pb"
 )
 
 var version = "dev"
@@ -34,6 +37,9 @@ func runMain(ctx context.Context, args []string) int {
 	tokenFile := fs.String("token-file", "", "Path to file containing agent token (preferred over --token)")
 	logLevel := fs.String("log-level", envOrDefault("LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
 	fs.BoolVar(&insecureFlag, "insecure", false, "Allow plaintext ws:// connections (insecure)")
+	trapEnabled := fs.Bool("trap-enabled", envBool("TRAP_ENABLED", false), "Listen for SNMP traps")
+	trapPort := fs.Uint("trap-port", envUint("TRAP_PORT", 162), "UDP port for the SNMP trap listener")
+	trapCommunity := fs.String("trap-community", os.Getenv("TRAP_COMMUNITY"), "Only accept traps carrying this community string (default: any)")
 
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -85,8 +91,25 @@ func runMain(ctx context.Context, args []string) int {
 	}
 	slog.Info("websocket url", "url", sanitizeURL(wsURL))
 
+	// The trap listener outlives individual sessions: devices send traps
+	// whenever they like, including while the agent is reconnecting.
+	var traps <-chan *pb.SnmpTrap
+	if *trapEnabled {
+		if *trapPort == 0 || *trapPort > 65535 {
+			fmt.Fprintf(os.Stderr, "error: --trap-port must be 1-65535, got %d\n", *trapPort)
+			return 1
+		}
+		listener, err := startTrapListener(uint16(*trapPort), *trapCommunity)
+		if err != nil {
+			slog.Error("trap listener", "error", err)
+			return 1
+		}
+		defer listener.Close()
+		traps = listener.Traps()
+	}
+
 	// Run agent with reconnect loop
-	runAgent(ctx, wsURL, *token)
+	runAgent(ctx, wsURL, *token, traps)
 
 	slog.Info("towerops agent stopped")
 	return 0
@@ -144,4 +167,24 @@ func envOrDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envBool reads a boolean environment variable, ignoring unparseable values.
+func envBool(key string, fallback bool) bool {
+	v, err := strconv.ParseBool(envOrDefault(key, strconv.FormatBool(fallback)))
+	if err != nil {
+		slog.Warn("ignoring unparseable environment variable", "key", key)
+		return fallback
+	}
+	return v
+}
+
+// envUint reads an unsigned environment variable, ignoring unparseable values.
+func envUint(key string, fallback uint) uint {
+	v, err := strconv.ParseUint(envOrDefault(key, strconv.FormatUint(uint64(fallback), 10)), 10, 32)
+	if err != nil {
+		slog.Warn("ignoring unparseable environment variable", "key", key)
+		return fallback
+	}
+	return uint(v)
 }

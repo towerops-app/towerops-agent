@@ -7,11 +7,6 @@ cover.html
 # Runtime data
 known_hosts.json
 
-# Database files
-*.db
-*.db-shm
-*.db-wal
-
 # IDE
 .idea/
 .vscode/
@@ -19,19 +14,13 @@ known_hosts.json
 *.swo
 *~
 
-# Docker
-data/
-
-# OS
-.DS_Store
-Thumbs.db
-
 # Nix
 .direnv/
 result
 
-# Local scripts
-monitor-deploy.sh
+# OS
+.DS_Store
+Thumbs.db
 
 # Claude
 CLAUDE.md

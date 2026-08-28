@@ -314,3 +314,21 @@ message LldpNeighbor {
   string remote_port_id = 4;
   repeated string management_addresses = 5;
 }
+
+// SNMP traps received by an agent's trap listener.
+//
+// Traps are unsolicited: they carry no job_id and are not tied to a device the
+// server asked about. The server resolves the device from source_ip.
+message SnmpTrap {
+  string source_ip = 1;
+  uint32 version = 2;  // 1 = SNMPv1, 2 = SNMPv2c
+  // snmpTrapOID.0 for v2c; for v1 the RFC 3584 section 3.1 mapping of
+  // enterprise/generic_trap/specific_trap.
+  string trap_oid = 3;
+  string enterprise = 4;      // SNMPv1 only
+  uint32 generic_trap = 5;    // SNMPv1 only
+  uint32 specific_trap = 6;   // SNMPv1 only
+  uint64 uptime_ticks = 7;    // sysUpTime.0, hundredths of a second
+  map<string, string> varbinds = 8;
+  int64 timestamp = 9;
+}

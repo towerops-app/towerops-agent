@@ -273,7 +273,7 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *
 	dev := job.MikrotikDevice
 	if dev == nil {
 		slog.Error("job missing mikrotik device", "job_id", job.JobId)
-		sendMikrotikResultWithTimeout(ctx, resultCh, &pb.MikrotikResult{
+		sendResult(ctx, resultCh, &pb.MikrotikResult{
 			DeviceId:  job.DeviceId,
 			JobId:     job.JobId,
 			Error:     "missing device configuration",
@@ -294,7 +294,7 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *
 
 	client, err := mikrotikDial(dev.Ip, dev.Port, dev.Username, dev.Password, dev.UseSsl)
 	if err != nil {
-		sendMikrotikResultWithTimeout(ctx, resultCh, &pb.MikrotikResult{
+		sendResult(ctx, resultCh, &pb.MikrotikResult{
 			DeviceId:  job.DeviceId,
 			JobId:     job.JobId,
 			Error:     fmt.Sprintf("connection failed: %v", err),
@@ -327,7 +327,7 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *
 		}
 	}
 
-	sendMikrotikResultWithTimeout(ctx, resultCh, &pb.MikrotikResult{
+	sendResult(ctx, resultCh, &pb.MikrotikResult{
 		DeviceId:  job.DeviceId,
 		JobId:     job.JobId,
 		Sentences: allSentences,
@@ -342,7 +342,7 @@ func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.
 
 	config, err := sshBackup(dev.Ip, uint16(dev.SshPort), dev.Username, dev.Password)
 	if err != nil {
-		sendMikrotikResultWithTimeout(ctx, resultCh, &pb.MikrotikResult{
+		sendResult(ctx, resultCh, &pb.MikrotikResult{
 			DeviceId:  job.DeviceId,
 			JobId:     job.JobId,
 			Error:     fmt.Sprintf("SSH backup failed: %v", err),
@@ -351,7 +351,7 @@ func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.
 		return
 	}
 
-	sendMikrotikResultWithTimeout(ctx, resultCh, &pb.MikrotikResult{
+	sendResult(ctx, resultCh, &pb.MikrotikResult{
 		DeviceId: job.DeviceId,
 		JobId:    job.JobId,
 		Sentences: []*pb.MikrotikSentence{
@@ -359,14 +359,4 @@ func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.
 		},
 		Timestamp: timestamp,
 	}, job.JobId)
-}
-
-func sendMikrotikResultWithTimeout(ctx context.Context, resultCh chan<- *pb.MikrotikResult, result *pb.MikrotikResult, jobID string) {
-	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	select {
-	case resultCh <- result:
-	case <-sendCtx.Done():
-		slog.Error("mikrotik result send timeout - agent overloaded", "job_id", jobID)
-	}
 }

@@ -64,10 +64,12 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Pinned to the version in flake.nix: a golangci-lint built against an
+      # older Go refuses to lint a module targeting a newer one.
       - name: Lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.13.1
 
       - name: Test
         run: go test -race -count=1 ./...
@@ -203,8 +205,8 @@ jobs:
         uses: anchore/scan-action@v7
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
-          # High and above fails the build. Alpine ships a handful of
-          # medium-severity busybox findings with no fix available, and
+          # High and above fails the build. The Wolfi base carries a small
+          # number of medium-severity findings with no fix available, and
           # blocking releases on vulnerabilities we cannot act on would only
           # teach us to ignore the gate.
           severity-cutoff: high

@@ -1,29 +1,37 @@
+# Minimal agent deployment. The Agents page in Towerops generates this file
+# with your API URL and token filled in, plus a Watchtower service that keeps
+# the image up to date.
 services:
   towerops-agent:
     image: ghcr.io/towerops-app/towerops-agent:latest
     pull_policy: always
     container_name: towerops-agent
     restart: unless-stopped
+
+    # Only needed for ICMP monitoring. Without it the agent falls back to
+    # unprivileged UDP ping and then to the system ping binary.
     cap_add:
       - NET_RAW
 
     environment:
-      # Required: Agent authentication token (from Towerops web UI)
+      # Required: Towerops base URL
+      - TOWEROPS_API_URL=https://towerops.net
+
+      # Required: agent authentication token
       # Get this from: Organization > Agents > Create New Agent
       - TOWEROPS_AGENT_TOKEN=your-agent-token-here
 
-      # Optional: Log level (error, warn, info, debug)
-      # Default: info
+      # Optional: error, warn, info, debug (default: info)
       - LOG_LEVEL=info
 
-      # Optional: Enable SNMP trap listener
+      # Optional: receive SNMP traps on UDP 162 and forward them to Towerops
       # Default: false
-      - TRAP_ENABLED=true
+      - TRAP_ENABLED=false
 
-      # Optional: SNMP trap listener port (only used if TRAP_ENABLED=true)
-      # Default: 162
-      - TRAP_PORT=162
+      # Optional: only accept traps carrying this community string
+      # Default: unset, which accepts any community
+      # - TRAP_COMMUNITY=public
 
+    # Only needed when TRAP_ENABLED=true.
     ports:
-      # SNMP trap listener (UDP)
       - "162:162/udp"

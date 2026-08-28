@@ -106,6 +106,15 @@ func ExecuteCheck(ctx context.Context, check *pb.Check) *pb.CheckResult {
 	}
 }
 
+// checkTimeout resolves a server-supplied per-check timeout, falling back to
+// 10s when the server leaves it unset.
+func checkTimeout(timeoutMs uint32) time.Duration {
+	if timeoutMs == 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(timeoutMs) * time.Millisecond
+}
+
 // executeHTTPCheck performs an HTTP/HTTPS check
 func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs uint32) (uint32, string, float64) {
 	transport := defaultHTTPTransport
@@ -113,10 +122,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 		transport = insecureHTTPTransport
 	}
 
-	timeout := time.Duration(timeoutMs) * time.Millisecond
-	if timeout == 0 {
-		timeout = 10 * time.Second
-	}
+	timeout := checkTimeout(timeoutMs)
 
 	client := &http.Client{
 		Transport: transport,
@@ -194,10 +200,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 
 // executeTCPCheck performs a TCP port connectivity check
 func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs uint32) (uint32, string, float64) {
-	if timeoutMs == 0 {
-		timeoutMs = 10000
-	}
-	timeout := time.Duration(timeoutMs) * time.Millisecond
+	timeout := checkTimeout(timeoutMs)
 	address := net.JoinHostPort(config.Host, strconv.Itoa(int(config.Port)))
 
 	startTime := time.Now()
@@ -243,10 +246,7 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 
 // executeDNSCheck performs a DNS resolution check
 func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs uint32) (uint32, string, float64) {
-	if timeoutMs == 0 {
-		timeoutMs = 10000
-	}
-	timeout := time.Duration(timeoutMs) * time.Millisecond
+	timeout := checkTimeout(timeoutMs)
 
 	resolver := &net.Resolver{}
 	if config.Server != "" {
@@ -340,10 +340,7 @@ func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs u
 
 // executeSSLCheck connects via TLS and checks the certificate expiration date.
 func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs uint32) (uint32, string, float64) {
-	if timeoutMs == 0 {
-		timeoutMs = 10000
-	}
-	timeout := time.Duration(timeoutMs) * time.Millisecond
+	timeout := checkTimeout(timeoutMs)
 
 	host := config.Host
 	port := config.Port

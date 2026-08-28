@@ -696,7 +696,7 @@ func TestRunSessionRejectsFailedJoin(t *testing.T) {
 	}()
 
 	addr := ln.Addr().String()
-	err = runSession(context.Background(), "ws://"+addr, "bad-token")
+	err = runSession(context.Background(), "ws://"+addr, "bad-token", nil)
 	if err == nil {
 		t.Fatal("expected error from rejected join")
 	}
@@ -741,7 +741,7 @@ func TestRunSessionJoinTimeout(t *testing.T) {
 
 	addr := ln.Addr().String()
 	start := time.Now()
-	err = runSession(context.Background(), "ws://"+addr, "token")
+	err = runSession(context.Background(), "ws://"+addr, "token", nil)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -920,7 +920,7 @@ func TestRunSessionCtxCancel(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- runSession(ctx, "ws://"+srv.addr(), "token")
+		done <- runSession(ctx, "ws://"+srv.addr(), "token", nil)
 	}()
 
 	// Give the session time to enter the main loop
@@ -948,7 +948,7 @@ func TestRunSessionReadError(t *testing.T) {
 		srv.close()
 	}()
 
-	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token", nil)
 	if err == nil {
 		t.Error("expected read error")
 	}
@@ -970,7 +970,7 @@ func TestRunSessionInvalidMessage(t *testing.T) {
 		srv.close()
 	}()
 
-	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token", nil)
 	// Should end with read error from close, not crash
 	if err == nil {
 		t.Error("expected error")
@@ -978,7 +978,7 @@ func TestRunSessionInvalidMessage(t *testing.T) {
 }
 
 func TestRunSessionConnectError(t *testing.T) {
-	err := runSession(context.Background(), "ws://127.0.0.1:1", "token")
+	err := runSession(context.Background(), "ws://127.0.0.1:1", "token", nil)
 	if err == nil {
 		t.Error("expected connect error")
 	}
@@ -1011,7 +1011,7 @@ func TestRunSessionJoinWriteError(t *testing.T) {
 		_ = conn.Close()
 	}()
 
-	err = runSession(context.Background(), "ws://"+ln.Addr().String(), "token")
+	err = runSession(context.Background(), "ws://"+ln.Addr().String(), "token", nil)
 	if err == nil {
 		t.Error("expected error")
 	}
@@ -1044,7 +1044,7 @@ func TestRunSessionJoinUnmarshalError(t *testing.T) {
 		time.Sleep(time.Second)
 	}()
 
-	err = runSession(context.Background(), "ws://"+ln.Addr().String(), "token")
+	err = runSession(context.Background(), "ws://"+ln.Addr().String(), "token", nil)
 	if err == nil {
 		t.Error("expected unmarshal error")
 	}
@@ -1078,7 +1078,7 @@ func TestRunSessionReadErrorDuringJoin(t *testing.T) {
 		_ = conn.Close()
 	}()
 
-	err = runSession(context.Background(), "ws://"+ln.Addr().String(), "token")
+	err = runSession(context.Background(), "ws://"+ln.Addr().String(), "token", nil)
 	if err == nil {
 		t.Error("expected read during join error")
 	}
@@ -1155,7 +1155,7 @@ func TestRunAgentReconnectOnError(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runAgent(ctx, "ws://"+ln.Addr().String(), "token")
+		runAgent(ctx, "ws://"+ln.Addr().String(), "token", nil)
 		close(done)
 	}()
 
@@ -1183,7 +1183,7 @@ func TestRunAgentContextCancellation(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runAgent(ctx, "ws://127.0.0.1:1", "token")
+		runAgent(ctx, "ws://127.0.0.1:1", "token", nil)
 		close(done)
 	}()
 
@@ -1254,7 +1254,7 @@ func TestRunAgentRestart(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runAgent(ctx, "ws://"+ln.Addr().String(), "test-token")
+		runAgent(ctx, "ws://"+ln.Addr().String(), "test-token", nil)
 		close(done)
 	}()
 
@@ -1414,7 +1414,7 @@ func TestRunSessionProcessesJobResults(t *testing.T) {
 		srv.close()
 	}()
 
-	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token", nil)
 	<-serverDone
 	if err == nil {
 		t.Error("expected error after server close")
@@ -1460,7 +1460,7 @@ func TestRunSessionSnmpBatchThreshold(t *testing.T) {
 		srv.close()
 	}()
 
-	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token", nil)
 	<-serverDone
 	if err == nil {
 		t.Error("expected error after server close")
@@ -1539,7 +1539,7 @@ func TestRunSessionRestartInMainLoop(t *testing.T) {
 		srv.close()
 	}()
 
-	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token", nil)
 	if err != errRestartRequested {
 		t.Errorf("expected errRestartRequested, got: %v", err)
 	}
@@ -1567,7 +1567,7 @@ func TestRunSessionHeartbeats(t *testing.T) {
 		srv.close()
 	}()
 
-	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token", nil)
 	if err == nil {
 		t.Error("expected error after server close")
 	}
@@ -1583,7 +1583,7 @@ func TestRunAgentCancelDuringRetry(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runAgent(ctx, "ws://127.0.0.1:1", "token")
+		runAgent(ctx, "ws://127.0.0.1:1", "token", nil)
 		close(done)
 	}()
 
@@ -1621,7 +1621,7 @@ func TestRunSessionWriteError(t *testing.T) {
 	defer func() { channelHeartbeatInterval = origCHB }()
 	channelHeartbeatInterval = 50 * time.Millisecond
 
-	err := runSession(context.Background(), "ws://"+srv.addr(), "token")
+	err := runSession(context.Background(), "ws://"+srv.addr(), "token", nil)
 	if err == nil {
 		t.Error("expected error from write or read failure")
 	}

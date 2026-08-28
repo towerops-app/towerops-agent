@@ -63,7 +63,7 @@ upgrading to the current version is the supported remediation path.
 | Latest release | Yes |
 | Anything older | No |
 
-Agents self-update by default, and the container image is published as
+The container image is published as
 `ghcr.io/towerops-app/towerops-agent:latest`. Pinning to an exact tag is fine
 and is what we recommend for reproducible deployments — just be aware that a
 pinned deployment does not pick up security fixes on its own.
@@ -83,9 +83,11 @@ rather than vulnerabilities:
 
 - The agent trusts the Towerops server it is configured to talk to. It runs
   the polling jobs that server dispatches, by design.
-- Mounting the Docker socket to enable self-update grants the container
-  control of the Docker daemon. This is documented, opt-in, and inherent to
-  a container updating itself.
+- Self-update replaces the agent binary with one downloaded from a URL the
+  server supplies, after verifying the SHA-256 digest the server supplies
+  alongside it. An operator who does not want that can run the binary from a
+  directory the agent cannot write to, which is how the published image is
+  built.
 - Credentials the operator configures for polling (SNMP communities, SSH
   keys) are readable by the agent process. That is what they are for.
 

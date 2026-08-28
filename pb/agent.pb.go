@@ -2758,6 +2758,120 @@ func (x *LldpNeighbor) GetManagementAddresses() []string {
 	return nil
 }
 
+// SNMP traps received by an agent's trap listener.
+//
+// Traps are unsolicited: they carry no job_id and are not tied to a device the
+// server asked about. The server resolves the device from source_ip.
+type SnmpTrap struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	SourceIp string                 `protobuf:"bytes,1,opt,name=source_ip,json=sourceIp,proto3" json:"source_ip,omitempty"`
+	Version  uint32                 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"` // 1 = SNMPv1, 2 = SNMPv2c
+	// snmpTrapOID.0 for v2c; for v1 the RFC 3584 section 3.1 mapping of
+	// enterprise/generic_trap/specific_trap.
+	TrapOid       string            `protobuf:"bytes,3,opt,name=trap_oid,json=trapOid,proto3" json:"trap_oid,omitempty"`
+	Enterprise    string            `protobuf:"bytes,4,opt,name=enterprise,proto3" json:"enterprise,omitempty"`                          // SNMPv1 only
+	GenericTrap   uint32            `protobuf:"varint,5,opt,name=generic_trap,json=genericTrap,proto3" json:"generic_trap,omitempty"`    // SNMPv1 only
+	SpecificTrap  uint32            `protobuf:"varint,6,opt,name=specific_trap,json=specificTrap,proto3" json:"specific_trap,omitempty"` // SNMPv1 only
+	UptimeTicks   uint64            `protobuf:"varint,7,opt,name=uptime_ticks,json=uptimeTicks,proto3" json:"uptime_ticks,omitempty"`    // sysUpTime.0, hundredths of a second
+	Varbinds      map[string]string `protobuf:"bytes,8,rep,name=varbinds,proto3" json:"varbinds,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Timestamp     int64             `protobuf:"varint,9,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SnmpTrap) Reset() {
+	*x = SnmpTrap{}
+	mi := &file_proto_agent_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnmpTrap) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnmpTrap) ProtoMessage() {}
+
+func (x *SnmpTrap) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnmpTrap.ProtoReflect.Descriptor instead.
+func (*SnmpTrap) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *SnmpTrap) GetSourceIp() string {
+	if x != nil {
+		return x.SourceIp
+	}
+	return ""
+}
+
+func (x *SnmpTrap) GetVersion() uint32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *SnmpTrap) GetTrapOid() string {
+	if x != nil {
+		return x.TrapOid
+	}
+	return ""
+}
+
+func (x *SnmpTrap) GetEnterprise() string {
+	if x != nil {
+		return x.Enterprise
+	}
+	return ""
+}
+
+func (x *SnmpTrap) GetGenericTrap() uint32 {
+	if x != nil {
+		return x.GenericTrap
+	}
+	return 0
+}
+
+func (x *SnmpTrap) GetSpecificTrap() uint32 {
+	if x != nil {
+		return x.SpecificTrap
+	}
+	return 0
+}
+
+func (x *SnmpTrap) GetUptimeTicks() uint64 {
+	if x != nil {
+		return x.UptimeTicks
+	}
+	return 0
+}
+
+func (x *SnmpTrap) GetVarbinds() map[string]string {
+	if x != nil {
+		return x.Varbinds
+	}
+	return nil
+}
+
+func (x *SnmpTrap) GetTimestamp() int64 {
+	if x != nil {
+		return x.Timestamp
+	}
+	return 0
+}
+
 var File_proto_agent_proto protoreflect.FileDescriptor
 
 const file_proto_agent_proto_rawDesc = "" +
@@ -2998,7 +3112,22 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\vremote_port\x18\x03 \x01(\tR\n" +
 	"remotePort\x12$\n" +
 	"\x0eremote_port_id\x18\x04 \x01(\tR\fremotePortId\x121\n" +
-	"\x14management_addresses\x18\x05 \x03(\tR\x13managementAddresses*b\n" +
+	"\x14management_addresses\x18\x05 \x03(\tR\x13managementAddresses\"\x86\x03\n" +
+	"\bSnmpTrap\x12\x1b\n" +
+	"\tsource_ip\x18\x01 \x01(\tR\bsourceIp\x12\x18\n" +
+	"\aversion\x18\x02 \x01(\rR\aversion\x12\x19\n" +
+	"\btrap_oid\x18\x03 \x01(\tR\atrapOid\x12\x1e\n" +
+	"\n" +
+	"enterprise\x18\x04 \x01(\tR\n" +
+	"enterprise\x12!\n" +
+	"\fgeneric_trap\x18\x05 \x01(\rR\vgenericTrap\x12#\n" +
+	"\rspecific_trap\x18\x06 \x01(\rR\fspecificTrap\x12!\n" +
+	"\fuptime_ticks\x18\a \x01(\x04R\vuptimeTicks\x12B\n" +
+	"\bvarbinds\x18\b \x03(\v2&.towerops.agent.SnmpTrap.VarbindsEntryR\bvarbinds\x12\x1c\n" +
+	"\ttimestamp\x18\t \x01(\x03R\ttimestamp\x1a;\n" +
+	"\rVarbindsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01*b\n" +
 	"\aJobType\x12\f\n" +
 	"\bDISCOVER\x10\x00\x12\b\n" +
 	"\x04POLL\x10\x01\x12\f\n" +
@@ -3023,7 +3152,7 @@ func file_proto_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
+var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 41)
 var file_proto_agent_proto_goTypes = []any{
 	(JobType)(0),                 // 0: towerops.agent.JobType
 	(QueryType)(0),               // 1: towerops.agent.QueryType
@@ -3061,11 +3190,13 @@ var file_proto_agent_proto_goTypes = []any{
 	(*MikrotikSentence)(nil),     // 33: towerops.agent.MikrotikSentence
 	(*LldpTopologyResult)(nil),   // 34: towerops.agent.LldpTopologyResult
 	(*LldpNeighbor)(nil),         // 35: towerops.agent.LldpNeighbor
-	nil,                          // 36: towerops.agent.Sensor.MetadataEntry
-	nil,                          // 37: towerops.agent.HttpCheckConfig.HeadersEntry
-	nil,                          // 38: towerops.agent.SnmpResult.OidValuesEntry
-	nil,                          // 39: towerops.agent.MikrotikCommand.ArgsEntry
-	nil,                          // 40: towerops.agent.MikrotikSentence.AttributesEntry
+	(*SnmpTrap)(nil),             // 36: towerops.agent.SnmpTrap
+	nil,                          // 37: towerops.agent.Sensor.MetadataEntry
+	nil,                          // 38: towerops.agent.HttpCheckConfig.HeadersEntry
+	nil,                          // 39: towerops.agent.SnmpResult.OidValuesEntry
+	nil,                          // 40: towerops.agent.MikrotikCommand.ArgsEntry
+	nil,                          // 41: towerops.agent.MikrotikSentence.AttributesEntry
+	nil,                          // 42: towerops.agent.SnmpTrap.VarbindsEntry
 }
 var file_proto_agent_proto_depIdxs = []int32{
 	3,  // 0: towerops.agent.AgentConfig.devices:type_name -> towerops.agent.Device
@@ -3073,7 +3204,7 @@ var file_proto_agent_proto_depIdxs = []int32{
 	4,  // 2: towerops.agent.Device.snmp:type_name -> towerops.agent.SnmpConfig
 	5,  // 3: towerops.agent.Device.sensors:type_name -> towerops.agent.Sensor
 	6,  // 4: towerops.agent.Device.interfaces:type_name -> towerops.agent.Interface
-	36, // 5: towerops.agent.Sensor.metadata:type_name -> towerops.agent.Sensor.MetadataEntry
+	37, // 5: towerops.agent.Sensor.metadata:type_name -> towerops.agent.Sensor.MetadataEntry
 	8,  // 6: towerops.agent.MetricBatch.metrics:type_name -> towerops.agent.Metric
 	9,  // 7: towerops.agent.Metric.sensor_reading:type_name -> towerops.agent.SensorReading
 	10, // 8: towerops.agent.Metric.interface_stat:type_name -> towerops.agent.InterfaceStat
@@ -3084,7 +3215,7 @@ var file_proto_agent_proto_depIdxs = []int32{
 	15, // 13: towerops.agent.Check.tcp:type_name -> towerops.agent.TcpCheckConfig
 	16, // 14: towerops.agent.Check.dns:type_name -> towerops.agent.DnsCheckConfig
 	17, // 15: towerops.agent.Check.ssl:type_name -> towerops.agent.SslCheckConfig
-	37, // 16: towerops.agent.HttpCheckConfig.headers:type_name -> towerops.agent.HttpCheckConfig.HeadersEntry
+	38, // 16: towerops.agent.HttpCheckConfig.headers:type_name -> towerops.agent.HttpCheckConfig.HeadersEntry
 	13, // 17: towerops.agent.CheckList.checks:type_name -> towerops.agent.Check
 	23, // 18: towerops.agent.AgentJobList.jobs:type_name -> towerops.agent.AgentJob
 	0,  // 19: towerops.agent.AgentJob.job_type:type_name -> towerops.agent.JobType
@@ -3094,16 +3225,17 @@ var file_proto_agent_proto_depIdxs = []int32{
 	31, // 23: towerops.agent.AgentJob.mikrotik_commands:type_name -> towerops.agent.MikrotikCommand
 	1,  // 24: towerops.agent.SnmpQuery.query_type:type_name -> towerops.agent.QueryType
 	0,  // 25: towerops.agent.SnmpResult.job_type:type_name -> towerops.agent.JobType
-	38, // 26: towerops.agent.SnmpResult.oid_values:type_name -> towerops.agent.SnmpResult.OidValuesEntry
-	39, // 27: towerops.agent.MikrotikCommand.args:type_name -> towerops.agent.MikrotikCommand.ArgsEntry
+	39, // 26: towerops.agent.SnmpResult.oid_values:type_name -> towerops.agent.SnmpResult.OidValuesEntry
+	40, // 27: towerops.agent.MikrotikCommand.args:type_name -> towerops.agent.MikrotikCommand.ArgsEntry
 	33, // 28: towerops.agent.MikrotikResult.sentences:type_name -> towerops.agent.MikrotikSentence
-	40, // 29: towerops.agent.MikrotikSentence.attributes:type_name -> towerops.agent.MikrotikSentence.AttributesEntry
+	41, // 29: towerops.agent.MikrotikSentence.attributes:type_name -> towerops.agent.MikrotikSentence.AttributesEntry
 	35, // 30: towerops.agent.LldpTopologyResult.neighbors:type_name -> towerops.agent.LldpNeighbor
-	31, // [31:31] is the sub-list for method output_type
-	31, // [31:31] is the sub-list for method input_type
-	31, // [31:31] is the sub-list for extension type_name
-	31, // [31:31] is the sub-list for extension extendee
-	0,  // [0:31] is the sub-list for field type_name
+	42, // 31: towerops.agent.SnmpTrap.varbinds:type_name -> towerops.agent.SnmpTrap.VarbindsEntry
+	32, // [32:32] is the sub-list for method output_type
+	32, // [32:32] is the sub-list for method input_type
+	32, // [32:32] is the sub-list for extension type_name
+	32, // [32:32] is the sub-list for extension extendee
+	0,  // [0:32] is the sub-list for field type_name
 }
 
 func init() { file_proto_agent_proto_init() }
@@ -3130,7 +3262,7 @@ func file_proto_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_agent_proto_rawDesc), len(file_proto_agent_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   39,
+			NumMessages:   41,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

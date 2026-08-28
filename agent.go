@@ -42,7 +42,8 @@ type channelMsg struct {
 }
 
 // runAgent connects to the server and runs the event loop with reconnect.
-func runAgent(ctx context.Context, wsURL, token string) {
+// traps may be nil when the trap listener is disabled.
+func runAgent(ctx context.Context, wsURL, token string, traps <-chan *pb.SnmpTrap) {
 	baseURL := strings.TrimRight(wsURL, "/")
 	retryDelay := initialRetryDelay
 	maxRetry := 10 * time.Second
@@ -56,7 +57,7 @@ func runAgent(ctx context.Context, wsURL, token string) {
 		}
 
 		sessionStart := time.Now()
-		err := runSession(ctx, baseURL, token)
+		err := runSession(ctx, baseURL, token, traps)
 		sessionDuration := time.Since(sessionStart)
 
 		// Reset backoff if session ran successfully for a while (indicates stable connection)
@@ -90,7 +91,7 @@ func runAgent(ctx context.Context, wsURL, token string) {
 }
 
 // runSession runs a single WebSocket session. Returns when disconnected or ctx cancelled.
-func runSession(ctx context.Context, baseURL, token string) error {
+func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.SnmpTrap) error {
 	endpoint := baseURL + "/socket/agent/websocket"
 	slog.Info("connecting", "url", sanitizeURL(endpoint))
 
@@ -369,6 +370,10 @@ func runSession(ctx context.Context, baseURL, token string) error {
 			sendBinaryResult("lldp_topology_result", result)
 			slog.Info("sent LLDP topology result", "device", result.DeviceId, "neighbors", len(result.Neighbors))
 
+		case trap := <-traps:
+			sendBinaryResult("trap", trap)
+			slog.Info("sent snmp trap", "source", trap.SourceIp, "trap_oid", trap.TrapOid)
+
 		case <-flushTicker.C:
 			flushSnmpBatch()
 
@@ -430,25 +435,8 @@ func handleMessage(
 		return true, errChannelReloaded
 
 	case "jobs", "discovery_job", "backup_job":
-		var payload struct {
-			Binary string `json:"binary"`
-		}
-		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-			slog.Error("decode job payload", "error", err)
-			return false, nil
-		}
-		if len(payload.Binary) > maxJobPayloadBytes {
-			slog.Error("job payload too large", "size", len(payload.Binary), "max", maxJobPayloadBytes)
-			return false, nil
-		}
-		bin, err := base64.StdEncoding.DecodeString(payload.Binary)
-		if err != nil {
-			slog.Error("decode base64", "error", err)
-			return false, nil
-		}
 		var jobList pb.AgentJobList
-		if err := proto.Unmarshal(bin, &jobList); err != nil {
-			slog.Error("unmarshal job list", "error", err)
+		if !decodeBinaryPayload(msg.Event, msg.Payload, &jobList) {
 			return false, nil
 		}
 		slog.Info("received jobs", "count", len(jobList.Jobs))
@@ -457,25 +445,8 @@ func handleMessage(
 		}
 
 	case "check_jobs":
-		var payload struct {
-			Binary string `json:"binary"`
-		}
-		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-			slog.Error("decode check_jobs payload", "error", err)
-			return false, nil
-		}
-		if len(payload.Binary) > maxJobPayloadBytes {
-			slog.Error("check_jobs payload too large", "size", len(payload.Binary), "max", maxJobPayloadBytes)
-			return false, nil
-		}
-		bin, err := base64.StdEncoding.DecodeString(payload.Binary)
-		if err != nil {
-			slog.Error("decode check_jobs base64", "error", err)
-			return false, nil
-		}
 		var checkList pb.CheckList
-		if err := proto.Unmarshal(bin, &checkList); err != nil {
-			slog.Error("unmarshal check list", "error", err)
+		if !decodeBinaryPayload(msg.Event, msg.Payload, &checkList) {
 			return false, nil
 		}
 		slog.Info("received checks", "count", len(checkList.Checks))
@@ -505,6 +476,33 @@ func handleMessage(
 		slog.Debug("ignoring event", "event", msg.Event)
 	}
 	return false, nil
+}
+
+// decodeBinaryPayload unwraps the base64 protobuf a server push carries in its
+// {"binary": ...} payload and unmarshals it into msg. Returns false and logs
+// once if the payload is malformed or implausibly large.
+func decodeBinaryPayload(event string, raw json.RawMessage, msg proto.Message) bool {
+	var payload struct {
+		Binary string `json:"binary"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		slog.Error("decode payload", "event", event, "error", err)
+		return false
+	}
+	if len(payload.Binary) > maxJobPayloadBytes {
+		slog.Error("payload too large", "event", event, "size", len(payload.Binary), "max", maxJobPayloadBytes)
+		return false
+	}
+	bin, err := base64.StdEncoding.DecodeString(payload.Binary)
+	if err != nil {
+		slog.Error("decode base64", "event", event, "error", err)
+		return false
+	}
+	if err := proto.Unmarshal(bin, msg); err != nil {
+		slog.Error("unmarshal payload", "event", event, "error", err)
+		return false
+	}
+	return true
 }
 
 // jobPools holds the worker pools for each job type.
@@ -572,6 +570,23 @@ func nextBackoff(current, maxDelay time.Duration) time.Duration {
 func zeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
+	}
+}
+
+// resultSendTimeout bounds how long a worker waits to hand a result to the
+// session loop. Exceeding it means the writer cannot keep up; dropping the
+// result is better than pinning the worker.
+const resultSendTimeout = 5 * time.Second
+
+// sendResult queues a job result for the session's writer, or drops it if the
+// result channel stays full for resultSendTimeout.
+func sendResult[T proto.Message](ctx context.Context, resultCh chan<- T, result T, jobID string) {
+	sendCtx, cancel := context.WithTimeout(ctx, resultSendTimeout)
+	defer cancel()
+	select {
+	case resultCh <- result:
+	case <-sendCtx.Done():
+		slog.Error("result send timeout - agent overloaded", "job_id", jobID)
 	}
 }
 

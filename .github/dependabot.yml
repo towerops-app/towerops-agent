@@ -46,10 +46,10 @@ updates:
           - minor
           - patch
 
-  # Tracks both `FROM` lines in the Dockerfile: the golang builder and the
-  # alpine runtime. The builder tag determines which Go toolchain compiles the
-  # binary, so a stale one ships stdlib vulnerabilities that no change to
-  # go.mod can fix.
+  # Tracks the golang builder tag in the Dockerfile; the Wolfi runtime is
+  # deliberately unpinned at `:latest` and so cannot be bumped here. The
+  # builder tag determines which Go toolchain compiles the binary, so a stale
+  # one ships stdlib vulnerabilities that no change to go.mod can fix.
   - package-ecosystem: docker
     directory: /
     schedule:

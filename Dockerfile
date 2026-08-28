@@ -27,7 +27,7 @@ RUN apk upgrade --no-cache && apk add --no-cache iputils libcap-utils
 COPY --from=builder /app/towerops-agent /usr/local/bin/towerops-agent
 RUN adduser -D -u 1000 towerops && \
     chown towerops /usr/local/bin/towerops-agent && \
-    setcap cap_net_raw+ep /usr/local/bin/towerops-agent && \
+    setcap cap_net_raw,cap_net_bind_service+ep /usr/local/bin/towerops-agent && \
     setcap cap_net_raw+p /usr/local/bin/ping && \
     apk del libcap-utils
 USER towerops

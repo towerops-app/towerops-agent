@@ -108,8 +108,7 @@ make proto    # regenerate pb/ after editing proto/agent.proto
 length-prefixed string, so editing the path by hand leaves a stale length and
 panics at init.
 
-A pre-commit hook runs vet, lint, tests and a build. Do not bypass it with
-`--no-verify`.
+Run `make vet lint test` before pushing; CI runs the same checks and a build.
 
 ## Pull requests
 

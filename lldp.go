@@ -34,7 +34,7 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 
 	if job.SnmpDevice == nil {
 		slog.Error("missing SNMP config for LLDP job", "job_id", jobID, "device_id", deviceID)
-		sendLldpResultWithTimeout(ctx, resultCh, &pb.LldpTopologyResult{
+		sendResult(ctx, resultCh, &pb.LldpTopologyResult{
 			DeviceId:  deviceID,
 			JobId:     jobID,
 			Timestamp: timestamp,
@@ -46,7 +46,7 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 	client, err := newSnmpConn(snmpDev)
 	if err != nil {
 		slog.Error("failed to connect SNMP for LLDP", "job_id", jobID, "device_id", deviceID, "error", err)
-		sendLldpResultWithTimeout(ctx, resultCh, &pb.LldpTopologyResult{
+		sendResult(ctx, resultCh, &pb.LldpTopologyResult{
 			DeviceId:  deviceID,
 			JobId:     jobID,
 			Timestamp: timestamp,
@@ -62,7 +62,7 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 	result, err := discoverLldpNeighbors(client, deviceID, jobID)
 	if err != nil {
 		slog.Error("LLDP discovery failed", "job_id", jobID, "device_id", deviceID, "error", err)
-		sendLldpResultWithTimeout(ctx, resultCh, &pb.LldpTopologyResult{
+		sendResult(ctx, resultCh, &pb.LldpTopologyResult{
 			DeviceId:  deviceID,
 			JobId:     jobID,
 			Timestamp: timestamp,
@@ -70,18 +70,8 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 		return
 	}
 
-	sendLldpResultWithTimeout(ctx, resultCh, result, jobID)
+	sendResult(ctx, resultCh, result, jobID)
 	slog.Info("LLDP topology discovered", "job_id", jobID, "device_id", deviceID, "neighbors", len(result.Neighbors))
-}
-
-func sendLldpResultWithTimeout(ctx context.Context, resultCh chan<- *pb.LldpTopologyResult, result *pb.LldpTopologyResult, jobID string) {
-	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	select {
-	case resultCh <- result:
-	case <-sendCtx.Done():
-		slog.Error("LLDP result send timeout - agent overloaded", "job_id", jobID)
-	}
 }
 
 // discoverLldpNeighbors walks LLDP-MIB tables and returns discovered neighbors.
