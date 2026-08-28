@@ -13,6 +13,9 @@ on:
   pull_request:
     branches:
       - main
+  # Allows re-running a build without pushing a commit, e.g. after changing
+  # repository or org settings that the run's token permissions depend on.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
