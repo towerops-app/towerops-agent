@@ -9,7 +9,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION} -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o towerops-agent .
 
-FROM alpine:3.23
+FROM alpine:3.24
 # `apk upgrade` before installing: the alpine:3.23 tag is rebuilt on its own
 # schedule, so the libcrypto3/libssl3 baked into it lag the 3.23 branch. Left
 # alone the published image shipped seven High CVEs (CVE-2026-18798,
