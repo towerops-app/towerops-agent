@@ -2,13 +2,24 @@
 
 ## Reporting a Vulnerability
 
-Report security issues privately to **graham@towerops.net**. Please do not
-open a public issue, pull request, or discussion for a suspected
+Please do not open a public issue, pull request, or discussion for a suspected
 vulnerability — a public report tells everyone running the agent about the
 problem at the same time it tells us.
 
-If you prefer to work through GitHub, you can also use
-[private vulnerability reporting](https://github.com/towerops-app/towerops-agent/security/advisories/new).
+**Preferred: [open a private security advisory](https://github.com/towerops-app/towerops-agent/security/advisories/new).**
+Private vulnerability reporting is enabled on this repository. The report
+stays private to you and the maintainers, the whole exchange lives on the
+report itself rather than in a mail thread, and it gives us somewhere to
+develop and review the fix privately before publishing. It is also how credit
+and a CVE get attached if the issue warrants one.
+
+**Alternative: email graham@towerops.net.** Use this if you would rather not
+have a GitHub account involved, if the report is awkward to file through the
+form, or if you are unsure whether what you have found is a vulnerability at
+all — a question costs us nothing to answer.
+
+Either route reaches the same person. Pick whichever gets the report to us
+soonest; do not spend time deciding.
 
 ### What to include
 
@@ -26,12 +37,15 @@ The more of this you can provide, the faster a fix lands:
 ### What to expect
 
 - **Acknowledgement within 3 business days.** If you have not heard back by
-  then, assume the mail went astray and send a follow-up.
+  then, chase us — on an advisory, comment on it; over email, assume the
+  message went astray and resend, or file an advisory instead.
 - An assessment of severity and affected versions, and whether we agree it is
   a vulnerability. If we do not, we will explain why rather than going quiet.
 - Progress updates at least every 10 business days while we work on a fix.
-- Credit in the advisory and release notes, unless you would rather not be
-  named.
+- Credit in the published advisory and the release notes, unless you would
+  rather not be named. If you reported by email we will open the advisory on
+  your behalf and add you as a credited reporter, so mailing us does not cost
+  you the attribution.
 
 We ask that you give us 90 days before public disclosure. If a fix is ready
 sooner we will ship it sooner, and if we are still stuck at 90 days we would
@@ -60,8 +74,9 @@ This policy covers the agent in this repository: the Phoenix channel client,
 the SNMP, MikroTik, SSH, LLDP, and ping pollers, the self-update mechanism,
 and the published container image.
 
-Issues in the Towerops web application or API belong to that project, but
-send them to the same address and we will route them.
+Issues in the Towerops web application or API belong to that project, which is
+not hosted here. Report them by either route above anyway and we will pass
+them on — do not go looking for another disclosure channel.
 
 The following are known properties of how the agent is meant to be deployed
 rather than vulnerabilities:
