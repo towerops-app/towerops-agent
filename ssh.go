@@ -16,12 +16,28 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-var sshBackup = executeMikrotikBackup
-var sshDial = ssh.Dial
+var sshBackup = executeMikrotikBackupContext
+var sshDial = func(ctx context.Context, network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	clientConn, channels, requests, err := ssh.NewClientConn(conn, addr, config)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return ssh.NewClient(clientConn, channels, requests), nil
+}
 var doPing = pingDevice
 
 // executeMikrotikBackup connects via SSH and runs /export compact.
 func executeMikrotikBackup(ip string, port uint16, username, password string) (string, error) {
+	return executeMikrotikBackupContext(context.Background(), ip, port, username, password)
+}
+
+func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, username, password string) (string, error) {
 	// SECURITY: TOFU (Trust-On-First-Use) host key verification.
 	// On first connection the key is stored; subsequent connections reject mismatches.
 	config := &ssh.ClientConfig{
@@ -32,7 +48,7 @@ func executeMikrotikBackup(ip string, port uint16, username, password string) (s
 	}
 
 	addr := net.JoinHostPort(ip, strconv.Itoa(int(port)))
-	conn, err := sshDial("tcp", addr, config)
+	conn, err := sshDial(ctx, "tcp", addr, config)
 	if err != nil {
 		return "", fmt.Errorf("ssh dial %s: %w", addr, err)
 	}
@@ -69,7 +85,7 @@ func executePingJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.M
 	}
 
 	timestamp := time.Now().Unix()
-	responseTime, err := doPing(dev.Ip, 5000)
+	responseTime, err := doPing(ctx, dev.Ip, 5000)
 
 	if err != nil {
 		slog.Warn("device down", "device", job.DeviceId, "error", err)

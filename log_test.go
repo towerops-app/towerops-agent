@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"strings"
 	"testing"
@@ -123,6 +124,15 @@ func TestColorHandlerWithGroup(t *testing.T) {
 	output := buf.String()
 	if !strings.Contains(output, "mygroup.key=val") {
 		t.Errorf("expected 'mygroup.key=val' in output, got: %s", output)
+	}
+}
+
+func TestDerivedColorHandlersShareWriteLock(t *testing.T) {
+	h := newColorHandler(io.Discard, nil)
+	withAttrs := h.WithAttrs([]slog.Attr{slog.String("a", "b")}).(*colorHandler)
+	withGroup := h.WithGroup("group").(*colorHandler)
+	if h.mu != withAttrs.mu || h.mu != withGroup.mu {
+		t.Fatal("derived handlers do not share the writer mutex")
 	}
 }
 

@@ -36,6 +36,7 @@ func TestSanitizeURL(t *testing.T) {
 		{"wss://towerops.net/socket", "wss://towerops.net/socket"},
 		{"wss://towerops.net/socket?token=secret", "wss://towerops.net/socket?***"},
 		{"wss://towerops.net/socket?token=secret&key=abc", "wss://towerops.net/socket?***"},
+		{"wss://user:password@towerops.net/socket", "wss://%2A%2A%2A@towerops.net/socket"},
 		{"://invalid url", "[invalid URL]"},
 		{"", ""},
 	}

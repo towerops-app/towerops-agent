@@ -147,7 +147,7 @@ func flagIsSet(fs *flag.FlagSet, name string) bool {
 	return found
 }
 
-// sanitizeURL masks query parameters to prevent credential leakage in logs.
+// sanitizeURL masks query parameters and userinfo to prevent credential leakage in logs.
 func sanitizeURL(rawURL string) string {
 	if rawURL == "" {
 		return ""
@@ -158,6 +158,9 @@ func sanitizeURL(rawURL string) string {
 	}
 	if u.RawQuery != "" {
 		u.RawQuery = "***"
+	}
+	if u.User != nil {
+		u.User = url.User("***")
 	}
 	return u.String()
 }

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +23,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var doSelfUpdate = selfUpdate
+var doSelfUpdate = selfUpdateContext
 
 var errRestartRequested = fmt.Errorf("restart requested")
 var errChannelReloaded = fmt.Errorf("channel reloaded")
@@ -95,7 +96,7 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 	endpoint := baseURL + "/socket/agent/websocket"
 	slog.Info("connecting", "url", sanitizeURL(endpoint))
 
-	ws, err := WSDial(endpoint)
+	ws, err := WSDial(ctx, endpoint)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -112,7 +113,7 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 	defer sessionCancel()
 
 	// Channel for serializing WebSocket writes
-	writeCh := make(chan []byte, 10000)
+	writeCh := make(chan []byte, 256)
 
 	// Worker pools — bounded concurrency for each job type
 	pools := &jobPools{
@@ -123,12 +124,12 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 	}
 
 	// Result channels
-	snmpResultCh := make(chan *pb.SnmpResult, 10000)
-	mikrotikResultCh := make(chan *pb.MikrotikResult, 5000)
-	credTestResultCh := make(chan *pb.CredentialTestResult, 5000)
-	monitoringCheckCh := make(chan *pb.MonitoringCheck, 10000)
-	checkResultCh := make(chan *pb.CheckResult, 10000)
-	lldpTopologyResultCh := make(chan *pb.LldpTopologyResult, 1000)
+	snmpResultCh := make(chan *pb.SnmpResult, 100)
+	mikrotikResultCh := make(chan *pb.MikrotikResult, 20)
+	credTestResultCh := make(chan *pb.CredentialTestResult, 100)
+	monitoringCheckCh := make(chan *pb.MonitoringCheck, 50)
+	checkResultCh := make(chan *pb.CheckResult, 50)
+	lldpTopologyResultCh := make(chan *pb.LldpTopologyResult, 100)
 
 	// Ref counter for outbound messages
 	var refCounter atomic.Uint64
@@ -138,7 +139,7 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 		return strconv.FormatUint(refCounter.Add(1), 10)
 	}
 
-	sendMsg := func(event string, payload json.RawMessage) {
+	sendMsg := func(event string, payload json.RawMessage) bool {
 		msg := channelMsg{
 			Topic:   topic,
 			Event:   event,
@@ -147,12 +148,15 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 		data, err := json.Marshal(msg)
 		if err != nil {
 			slog.Error("marshal message", "error", err)
-			return
+			return false
 		}
 		select {
 		case writeCh <- data:
+			return true
 		default:
-			slog.Warn("write channel full, dropping message", "event", event)
+			slog.Error("write channel full, reconnecting", "event", event)
+			sessionCancel()
+			return false
 		}
 	}
 
@@ -163,14 +167,14 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 		},
 	}
 
-	sendBinaryResult := func(event string, msg proto.Message) {
+	sendBinaryResult := func(event string, msg proto.Message) bool {
 		bp := bufPool.Get().(*[]byte)
 		buf := (*bp)[:0]
 		bin, err := proto.MarshalOptions{}.MarshalAppend(buf, msg)
 		if err != nil {
 			slog.Error("marshal protobuf", "error", err)
 			bufPool.Put(bp)
-			return
+			return false
 		}
 		encoded := base64.StdEncoding.EncodeToString(bin)
 		// Zero the serialized protobuf data (may contain credentials).
@@ -181,7 +185,7 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 		*bp = full[:0]
 		bufPool.Put(bp)
 		payload, _ := json.Marshal(map[string]string{"binary": encoded})
-		sendMsg(event, payload)
+		return sendMsg(event, payload)
 	}
 
 	// Reader goroutine — must start before join so we can receive the reply
@@ -192,7 +196,7 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 	go func() {
 		defer readerWg.Done()
 		for {
-			data, _, err := ws.ReadMessage()
+			data, _, err := ws.ReadMessage(sessionCtx)
 			if err != nil {
 				select {
 				case errCh <- err:
@@ -223,7 +227,7 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 		Ref:     strPtr("1"),
 	}
 	joinData, _ := json.Marshal(joinMsg)
-	if err := ws.WriteText(joinData); err != nil {
+	if err := ws.WriteText(sessionCtx, joinData); err != nil {
 		return fmt.Errorf("send join: %w", err)
 	}
 	slog.Debug("sent channel join request")
@@ -261,7 +265,7 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 	go func() {
 		defer writerWg.Done()
 		for data := range writeCh {
-			if err := ws.WriteText(data); err != nil {
+			if err := ws.WriteText(sessionCtx, data); err != nil {
 				slog.Error("websocket write", "error", err)
 				select {
 				case writeErrCh <- err:
@@ -277,59 +281,36 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 	defer heartbeatTicker.Stop()
 	channelHeartbeatTicker := time.NewTicker(channelHeartbeatInterval)
 	defer channelHeartbeatTicker.Stop()
-	flushTicker := time.NewTicker(100 * time.Millisecond)
-	defer flushTicker.Stop()
 	startTime := time.Now()
 
 	defer func() {
+		// Stop socket I/O before waiting for either goroutine. In particular,
+		// server-requested reconnects return while the reader is still blocked.
+		sessionCancel()
+		_ = ws.Close()
+
 		const poolShutdownTimeout = 5 * time.Second
-		if !pools.snmp.stopWithTimeout(poolShutdownTimeout) {
-			slog.Warn("snmp pool shutdown timed out, abandoning in-flight jobs")
-		}
-		if !pools.mikrotik.stopWithTimeout(poolShutdownTimeout) {
-			slog.Warn("mikrotik pool shutdown timed out, abandoning in-flight jobs")
-		}
-		if !pools.ping.stopWithTimeout(poolShutdownTimeout) {
-			slog.Warn("ping pool shutdown timed out, abandoning in-flight jobs")
-		}
-		if !pools.checks.stopWithTimeout(poolShutdownTimeout) {
-			slog.Warn("checks pool shutdown timed out, abandoning in-flight jobs")
+		for _, name := range pools.stop(poolShutdownTimeout) {
+			slog.Warn("worker pool shutdown timed out, abandoning in-flight jobs", "pool", name)
 		}
 		close(writeCh)
 		writerWg.Wait()
-		readerWg.Wait() // Wait for reader goroutine to exit
+		readerWg.Wait()
 	}()
-
-	snmpBatch := make([]*pb.SnmpResult, 0, 50) // Pre-allocate capacity for performance
-
-	flushSnmpBatch := func() {
-		if len(snmpBatch) == 0 {
-			return
-		}
-		for _, r := range snmpBatch {
-			sendBinaryResult("result", r)
-		}
-		slog.Info("flushed snmp results", "count", len(snmpBatch))
-		snmpBatch = snmpBatch[:0]
-	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("shutdown signal, closing connection")
-			flushSnmpBatch()
 			return nil
 
 		case <-sessionCtx.Done():
-			flushSnmpBatch()
 			return fmt.Errorf("session cancelled")
 
 		case err := <-errCh:
-			flushSnmpBatch()
 			return fmt.Errorf("read: %w", err)
 
 		case err := <-writeErrCh:
-			flushSnmpBatch()
 			return fmt.Errorf("write: %w", err)
 
 		case data := <-msgCh:
@@ -340,15 +321,11 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 			}
 			shouldEnd, endErr := handleMessage(sessionCtx, msg, topic, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh, lldpTopologyResultCh)
 			if shouldEnd {
-				flushSnmpBatch()
 				return endErr
 			}
 
 		case result := <-snmpResultCh:
-			snmpBatch = append(snmpBatch, result)
-			if len(snmpBatch) >= 50 {
-				flushSnmpBatch()
-			}
+			sendBinaryResult("result", result)
 
 		case result := <-mikrotikResultCh:
 			sendBinaryResult("mikrotik_result", result)
@@ -370,12 +347,18 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 			sendBinaryResult("lldp_topology_result", result)
 			slog.Info("sent LLDP topology result", "device", result.DeviceId, "neighbors", len(result.Neighbors))
 
-		case trap := <-traps:
+		case trap, ok := <-traps:
+			if !ok {
+				slog.Warn("snmp trap listener stopped")
+				traps = nil
+				continue
+			}
+			if trap == nil {
+				slog.Warn("ignoring nil snmp trap")
+				continue
+			}
 			sendBinaryResult("trap", trap)
 			slog.Info("sent snmp trap", "source", trap.SourceIp, "trap_oid", trap.TrapOid)
-
-		case <-flushTicker.C:
-			flushSnmpBatch()
 
 		case <-heartbeatTicker.C:
 			hb := &pb.AgentHeartbeat{
@@ -398,6 +381,8 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 			select {
 			case writeCh <- data:
 			default:
+				slog.Error("write channel full, reconnecting", "event", "heartbeat")
+				sessionCancel()
 			}
 			slog.Debug("sent channel heartbeat", "ref", ref)
 		}
@@ -468,7 +453,7 @@ func handleMessage(
 			return false, nil
 		}
 		slog.Info("update requested", "url", sanitizeURL(payload.URL))
-		if err := doSelfUpdate(payload.URL, payload.Checksum); err != nil {
+		if err := doSelfUpdate(ctx, payload.URL, payload.Checksum); err != nil {
 			slog.Error("self-update failed", "error", err)
 		}
 
@@ -511,6 +496,36 @@ type jobPools struct {
 	mikrotik *workerPool
 	ping     *workerPool
 	checks   *workerPool
+}
+
+func (p *jobPools) stop(timeout time.Duration) []string {
+	pools := map[string]*workerPool{
+		"snmp": p.snmp, "mikrotik": p.mikrotik, "ping": p.ping, "checks": p.checks,
+	}
+	done := make(chan string, len(pools))
+	for name, pool := range pools {
+		go func() {
+			pool.stop()
+			done <- name
+		}()
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for len(pools) > 0 {
+		select {
+		case name := <-done:
+			delete(pools, name)
+		case <-timer.C:
+			timedOut := make([]string, 0, len(pools))
+			for name := range pools {
+				timedOut = append(timedOut, name)
+			}
+			slices.Sort(timedOut)
+			return timedOut
+		}
+	}
+	return nil
 }
 
 // dispatchJob routes a job to the appropriate worker pool.

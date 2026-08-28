@@ -8,6 +8,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -33,7 +34,7 @@ func TestExecutePingJob(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		origPing := doPing
 		defer func() { doPing = origPing }()
-		doPing = func(ip string, timeoutMs int) (float64, error) {
+		doPing = func(_ context.Context, ip string, timeoutMs int) (float64, error) {
 			return 3.14, nil
 		}
 
@@ -63,7 +64,7 @@ func TestExecutePingJob(t *testing.T) {
 	t.Run("failure", func(t *testing.T) {
 		origPing := doPing
 		defer func() { doPing = origPing }()
-		doPing = func(ip string, timeoutMs int) (float64, error) {
+		doPing = func(_ context.Context, ip string, timeoutMs int) (float64, error) {
 			return 0, fmt.Errorf("request timeout")
 		}
 
@@ -101,7 +102,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 	t.Run("dial error", func(t *testing.T) {
 		origDial := mikrotikDial
 		defer func() { mikrotikDial = origDial }()
-		mikrotikDial = func(ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
+		mikrotikDial = func(_ context.Context, ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
 			return nil, fmt.Errorf("connection refused")
 		}
 
@@ -122,7 +123,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 		origDial := mikrotikDial
 		defer func() { mikrotikDial = origDial }()
 
-		mikrotikDial = func(ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
+		mikrotikDial = func(_ context.Context, ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
 			return newMockMikrotikClient([]mockMikrotikResponse{
 				{resp: &mikrotikResponse{sentences: []mikrotikSentence{{attributes: map[string]string{"name": "ether1"}}}}},
 				{resp: &mikrotikResponse{}}, // close /quit
@@ -157,7 +158,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 		origDial := mikrotikDial
 		defer func() { mikrotikDial = origDial }()
 
-		mikrotikDial = func(ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
+		mikrotikDial = func(_ context.Context, ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
 			return newMockMikrotikClient([]mockMikrotikResponse{
 				{err: fmt.Errorf("fatal: connection lost")},
 				{resp: &mikrotikResponse{}}, // close
@@ -183,7 +184,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 		origDial := mikrotikDial
 		defer func() { mikrotikDial = origDial }()
 
-		mikrotikDial = func(ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
+		mikrotikDial = func(_ context.Context, ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
 			return newMockMikrotikClient([]mockMikrotikResponse{
 				{resp: &mikrotikResponse{err: "no such command"}},
 				{resp: &mikrotikResponse{}}, // close
@@ -209,7 +210,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 		origSSH := sshBackup
 		defer func() { sshBackup = origSSH }()
 
-		sshBackup = func(ip string, port uint16, username, password string) (string, error) {
+		sshBackup = func(_ context.Context, ip string, port uint16, username, password string) (string, error) {
 			return "/ip address\nadd address=10.0.0.1/24", nil
 		}
 
@@ -238,7 +239,7 @@ func TestExecuteMikrotikBackupViaSSH(t *testing.T) {
 		origSSH := sshBackup
 		defer func() { sshBackup = origSSH }()
 
-		sshBackup = func(ip string, port uint16, username, password string) (string, error) {
+		sshBackup = func(_ context.Context, ip string, port uint16, username, password string) (string, error) {
 			return "# test config", nil
 		}
 
@@ -263,7 +264,7 @@ func TestExecuteMikrotikBackupViaSSH(t *testing.T) {
 		origSSH := sshBackup
 		defer func() { sshBackup = origSSH }()
 
-		sshBackup = func(ip string, port uint16, username, password string) (string, error) {
+		sshBackup = func(_ context.Context, ip string, port uint16, username, password string) (string, error) {
 			return "", fmt.Errorf("ssh connection refused")
 		}
 
@@ -280,6 +281,28 @@ func TestExecuteMikrotikBackupViaSSH(t *testing.T) {
 			t.Error("expected SSH error")
 		}
 	})
+
+	t.Run("port overflow", func(t *testing.T) {
+		origSSH := sshBackup
+		defer func() { sshBackup = origSSH }()
+		called := false
+		sshBackup = func(context.Context, string, uint16, string, string) (string, error) {
+			called = true
+			return "", nil
+		}
+
+		ch := make(chan *pb.MikrotikResult, 1)
+		executeMikrotikBackupViaSSH(
+			context.Background(),
+			&pb.AgentJob{JobId: "backup:3", DeviceId: "d3"},
+			&pb.MikrotikDevice{Ip: "10.0.0.1", SshPort: 65536},
+			ch, 1000,
+		)
+		result := <-ch
+		if called || !strings.Contains(result.Error, "invalid SSH port") {
+			t.Fatalf("called/error = %v/%q, want validation before dialing", called, result.Error)
+		}
+	})
 }
 
 func TestSSHBackupIPv6Address(t *testing.T) {
@@ -287,7 +310,7 @@ func TestSSHBackupIPv6Address(t *testing.T) {
 	defer func() { sshDial = origDial }()
 
 	var capturedAddr string
-	sshDial = func(network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
+	sshDial = func(_ context.Context, network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
 		capturedAddr = addr
 		return nil, fmt.Errorf("mock dial")
 	}
@@ -304,7 +327,7 @@ func TestSSHBackupIPv4Address(t *testing.T) {
 	defer func() { sshDial = origDial }()
 
 	var capturedAddr string
-	sshDial = func(network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
+	sshDial = func(_ context.Context, network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
 		capturedAddr = addr
 		return nil, fmt.Errorf("mock dial")
 	}
@@ -320,6 +343,21 @@ func TestExecuteMikrotikBackupDialError(t *testing.T) {
 	_, err := executeMikrotikBackup("127.0.0.1", 1, "admin", "pass")
 	if err == nil {
 		t.Error("expected SSH dial error")
+	}
+}
+
+func TestSSHBackupHonorsContextCancellation(t *testing.T) {
+	origDial := sshDial
+	defer func() { sshDial = origDial }()
+	sshDial = func(ctx context.Context, _, _ string, _ *ssh.ClientConfig) (*ssh.Client, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := executeMikrotikBackupContext(ctx, "127.0.0.1", 22, "admin", "pass")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("backup error = %v, want context cancellation", err)
 	}
 }
 

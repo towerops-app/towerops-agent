@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -52,6 +53,8 @@ var (
 		return pool, nil
 	}
 )
+
+const maxHTTPRegexBody = 1 << 20
 
 // ExecuteCheck runs a service check and returns the result.
 // Agent is stateless - just executes what it's told and reports back.
@@ -179,9 +182,15 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 			_, _ = io.Copy(io.Discard, resp.Body)
 			return 3, fmt.Sprintf("Invalid regex: %v", err), responseTime
 		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPRegexBody+1))
 		if err != nil {
 			return 2, fmt.Sprintf("Failed to read body: %v", err), responseTime
+		}
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			return 2, fmt.Sprintf("Failed to read body: %v", err), responseTime
+		}
+		if len(body) > maxHTTPRegexBody {
+			return 3, fmt.Sprintf("Response body exceeds regex limit of %d bytes", maxHTTPRegexBody), responseTime
 		}
 
 		if !re.Match(body) {
@@ -204,6 +213,7 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 	address := net.JoinHostPort(config.Host, strconv.Itoa(int(config.Port)))
 
 	startTime := time.Now()
+	deadline := startTime.Add(timeout)
 	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
 	defer dialCancel()
 	var d net.Dialer
@@ -215,27 +225,39 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 	}
 	defer func() { _ = conn.Close() }()
 
-	// If send/expect strings provided, test them
-	if config.Send != "" {
-		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	// If send/expect strings are provided, keep both operations within the
+	// original end-to-end timeout budget.
+	if config.Send != "" || config.Expect != "" {
+		if err := conn.SetDeadline(deadline); err != nil {
 			_ = conn.Close()
 			return 2, fmt.Sprintf("Set deadline failed: %v", err), responseTime
 		}
 
-		_, err = conn.Write([]byte(config.Send))
-		if err != nil {
-			return 2, fmt.Sprintf("Send failed: %v", err), responseTime
+		if config.Send != "" {
+			if err := writeAll(conn, []byte(config.Send)); err != nil {
+				return 2, fmt.Sprintf("Send failed: %v", err), responseTime
+			}
 		}
 
 		if config.Expect != "" {
+			const maxTCPResponse = 64 << 10
+			want := []byte(config.Expect)
+			received := make([]byte, 0, 4096)
 			buffer := make([]byte, 4096)
-			n, err := conn.Read(buffer)
-			if err != nil {
-				return 2, fmt.Sprintf("Receive failed: %v", err), responseTime
+			for len(received) < maxTCPResponse {
+				n, readErr := conn.Read(buffer)
+				received = append(received, buffer[:n]...)
+				if bytes.Contains(received, want) {
+					break
+				}
+				if readErr != nil {
+					if len(received) > 0 {
+						return 2, fmt.Sprintf("Unexpected response: %s", received), responseTime
+					}
+					return 2, fmt.Sprintf("Receive failed: %v", readErr), responseTime
+				}
 			}
-
-			received := string(buffer[:n])
-			if !strings.Contains(received, config.Expect) {
+			if !bytes.Contains(received, want) {
 				return 2, fmt.Sprintf("Unexpected response: %s", received), responseTime
 			}
 		}
@@ -244,19 +266,27 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 	return 0, fmt.Sprintf("TCP port %d open", config.Port), responseTime
 }
 
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
 // executeDNSCheck performs a DNS resolution check
 func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs uint32) (uint32, string, float64) {
 	timeout := checkTimeout(timeoutMs)
 
 	resolver := &net.Resolver{}
 	if config.Server != "" {
-		resolver = &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{Timeout: timeout}
-				return d.DialContext(ctx, "udp", net.JoinHostPort(config.Server, "53"))
-			},
-		}
+		resolver = resolverForServer(config.Server, timeout)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -338,6 +368,20 @@ func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs u
 	return 0, fmt.Sprintf("Resolved to: %s", strings.Join(results, ", ")), responseTime
 }
 
+func resolverForServer(server string, timeout time.Duration) *net.Resolver {
+	address := server
+	if _, _, err := net.SplitHostPort(server); err != nil {
+		address = net.JoinHostPort(server, "53")
+	}
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: timeout}
+			return d.DialContext(ctx, network, address)
+		},
+	}
+}
+
 // executeSSLCheck connects via TLS and checks the certificate expiration date.
 func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs uint32) (uint32, string, float64) {
 	timeout := checkTimeout(timeoutMs)
@@ -390,15 +434,20 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 
 	cert := certs[0]
 	notAfter := cert.NotAfter
-	daysRemaining := int(time.Until(notAfter).Hours() / 24)
+	daysRemaining, expired := certificateDaysRemaining(time.Now(), notAfter)
 	expiresStr := notAfter.Format("2006-01-02")
 
 	switch {
-	case daysRemaining < 0:
+	case expired:
 		return 2, fmt.Sprintf("CRITICAL: Certificate for %s:%d expired %d days ago (%s)", host, port, -daysRemaining, expiresStr), responseTime
 	case daysRemaining <= int(warningDays):
 		return 1, fmt.Sprintf("WARNING: Certificate for %s:%d expires in %d days (%s)", host, port, daysRemaining, expiresStr), responseTime
 	default:
 		return 0, fmt.Sprintf("OK: Certificate for %s:%d valid for %d days (%s)", host, port, daysRemaining, expiresStr), responseTime
 	}
+}
+
+func certificateDaysRemaining(now, notAfter time.Time) (days int, expired bool) {
+	days = int(notAfter.Sub(now).Hours() / 24)
+	return days, !notAfter.After(now)
 }

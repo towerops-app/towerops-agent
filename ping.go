@@ -24,7 +24,7 @@ var icmpListenPacket = icmp.ListenPacket
 // icmpPing sends a single ICMP echo request and returns the round-trip time in milliseconds.
 // Tries raw ICMP sockets first (requires CAP_NET_RAW or root), then falls back to
 // unprivileged UDP-based ICMP (requires ping_group_range sysctl).
-func icmpPing(ip string, timeoutMs int) (float64, error) {
+func icmpPing(ctx context.Context, ip string, timeoutMs int) (float64, error) {
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil {
 		return 0, fmt.Errorf("invalid IP address: %s", ip)
@@ -39,7 +39,7 @@ func icmpPing(ip string, timeoutMs int) (float64, error) {
 	} else {
 		rawNet = "ip6:ipv6-icmp"
 	}
-	ms, err := doICMPPing(parsedIP, rawNet, isIPv4, timeoutMs)
+	ms, err := doICMPPing(ctx, parsedIP, rawNet, isIPv4, timeoutMs)
 	if err == nil {
 		return ms, nil
 	}
@@ -54,16 +54,18 @@ func icmpPing(ip string, timeoutMs int) (float64, error) {
 	} else {
 		udpNet = "udp6"
 	}
-	return doICMPPing(parsedIP, udpNet, isIPv4, timeoutMs)
+	return doICMPPing(ctx, parsedIP, udpNet, isIPv4, timeoutMs)
 }
 
 // doICMPPing performs an ICMP ping over the given network type.
-func doICMPPing(ip net.IP, network string, isIPv4 bool, timeoutMs int) (float64, error) {
+func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, timeoutMs int) (float64, error) {
 	conn, err := icmpListenPacket(network, "")
 	if err != nil {
 		return 0, &errICMPUnavailable{err: fmt.Errorf("icmp listen %s: %w", network, err)}
 	}
 	defer func() { _ = conn.Close() }()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 
 	var msgType icmp.Type
 	var proto int
@@ -143,21 +145,21 @@ func (e *errICMPUnavailable) Error() string { return e.err.Error() }
 // pingDevice pings an IP address and returns the response time in milliseconds.
 // Tries raw ICMP first for efficiency, falls back to exec-based ping only
 // if the system doesn't support unprivileged ICMP.
-func pingDevice(ip string, timeoutMs int) (float64, error) {
-	ms, err := icmpPing(ip, timeoutMs)
+func pingDevice(ctx context.Context, ip string, timeoutMs int) (float64, error) {
+	ms, err := icmpPing(ctx, ip, timeoutMs)
 	if err == nil {
 		return ms, nil
 	}
 
 	// Only fall back to exec if ICMP sockets aren't available
 	if _, ok := err.(*errICMPUnavailable); ok {
-		return execPing(ip, timeoutMs)
+		return execPing(ctx, ip, timeoutMs)
 	}
 	return 0, err
 }
 
 // execPing uses the system ping command as a fallback.
-func execPing(ip string, timeoutMs int) (float64, error) {
+func execPing(parent context.Context, ip string, timeoutMs int) (float64, error) {
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil {
 		return 0, fmt.Errorf("invalid IP address: %s", ip)
@@ -170,7 +172,7 @@ func execPing(ip string, timeoutMs int) (float64, error) {
 
 	timeoutSecs := max(1, timeoutMs/1000)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs+1000)*time.Millisecond)
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutMs+1000)*time.Millisecond)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, pingCmd, "-c", "1", "-W", strconv.Itoa(timeoutSecs), ip)

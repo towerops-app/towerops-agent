@@ -40,26 +40,14 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.S
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing snmp device", "job_id", job.JobId)
-		sendResult(ctx, resultCh, &pb.SnmpResult{
-			DeviceId:  job.DeviceId,
-			JobType:   job.JobType,
-			JobId:     job.JobId,
-			OidValues: make(map[string]string),
-			Timestamp: time.Now().Unix(),
-		}, job.JobId)
+		sendResult(ctx, resultCh, emptySnmpResult(job), job.JobId)
 		return
 	}
 
 	conn, closeFn, err := snmpDial(dev)
 	if err != nil {
 		slog.Error("snmp connect", "job_id", job.JobId, "device", dev.Ip, "error", err)
-		sendResult(ctx, resultCh, &pb.SnmpResult{
-			DeviceId:  job.DeviceId,
-			JobType:   job.JobType,
-			JobId:     job.JobId,
-			OidValues: make(map[string]string),
-			Timestamp: time.Now().Unix(),
-		}, job.JobId)
+		sendResult(ctx, resultCh, emptySnmpResult(job), job.JobId)
 		return
 	}
 	defer closeFn()
@@ -136,6 +124,16 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.S
 	sendResult(ctx, resultCh, result, job.JobId)
 }
 
+func emptySnmpResult(job *pb.AgentJob) *pb.SnmpResult {
+	return &pb.SnmpResult{
+		DeviceId:  job.DeviceId,
+		JobType:   job.JobType,
+		JobId:     job.JobId,
+		OidValues: make(map[string]string),
+		Timestamp: time.Now().Unix(),
+	}
+}
+
 // executeCredentialTest tests SNMP credentials by reading sysDescr.0.
 func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.CredentialTestResult) {
 	dev := job.SnmpDevice
@@ -190,6 +188,9 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<
 
 // newSnmpConn creates a gosnmp.GoSNMP connection from protobuf device config.
 func newSnmpConn(dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error) {
+	if dev.Port > 65535 {
+		return nil, fmt.Errorf("invalid SNMP port %d", dev.Port)
+	}
 	conn := &gosnmp.GoSNMP{
 		Target:         dev.Ip,
 		Port:           uint16(dev.Port),

@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -21,6 +22,27 @@ import (
 	"testing"
 	"time"
 )
+
+type nopCloser struct {
+	readWriter io.ReadWriter
+}
+
+func (n *nopCloser) Read(p []byte) (int, error)  { return n.readWriter.Read(p) }
+func (n *nopCloser) Write(p []byte) (int, error) { return n.readWriter.Write(p) }
+func (n *nopCloser) Close() error                { return nil }
+
+type shortWriter struct {
+	bytes.Buffer
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(p) > 1 {
+		p = p[:1]
+	}
+	return w.Buffer.Write(p)
+}
+
+func (w *shortWriter) Close() error { return nil }
 
 func TestEncodeLength(t *testing.T) {
 	tests := []struct {
@@ -51,6 +73,34 @@ func TestEncodeLength(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+func TestWriteSentenceHandlesShortWrites(t *testing.T) {
+	conn := &shortWriter{}
+	client := &mikrotikClient{conn: conn}
+	if err := client.writeSentence([]string{"/system/resource/print"}); err != nil {
+		t.Fatalf("writeSentence: %v", err)
+	}
+	want := append(encodeLength(len("/system/resource/print")), "/system/resource/print"...)
+	want = append(want, 0)
+	if !bytes.Equal(conn.Bytes(), want) {
+		t.Fatalf("written bytes = %x, want %x", conn.Bytes(), want)
+	}
+}
+
+func TestReadSentenceRejectsTooManyWords(t *testing.T) {
+	var encoded bytes.Buffer
+	for range maxMikrotikWords + 1 {
+		encoded.WriteByte(1)
+		encoded.WriteByte('x')
+	}
+	encoded.WriteByte(0)
+
+	client := &mikrotikClient{conn: &nopCloser{readWriter: &encoded}}
+	_, err := client.readSentence()
+	if err == nil || !strings.Contains(err.Error(), "exceeds 10000 words") {
+		t.Fatalf("readSentence error = %v, want word limit", err)
 	}
 }
 
@@ -399,7 +449,7 @@ func TestMikrotikConnect(t *testing.T) {
 	var portNum uint32
 	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
-	client, err := mikrotikConnect("127.0.0.1", portNum, "admin", "pass", false)
+	client, err := mikrotikConnect(context.Background(), "127.0.0.1", portNum, "admin", "pass", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +480,7 @@ func TestMikrotikConnectAuthError(t *testing.T) {
 	var portNum uint32
 	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
-	_, err = mikrotikConnect("127.0.0.1", portNum, "admin", "wrong", false)
+	_, err = mikrotikConnect(context.Background(), "127.0.0.1", portNum, "admin", "wrong", false)
 	if err == nil {
 		t.Error("expected auth error")
 	}
@@ -459,7 +509,7 @@ func TestMikrotikConnectFatalError(t *testing.T) {
 	var portNum uint32
 	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
-	_, err = mikrotikConnect("127.0.0.1", portNum, "admin", "pass", false)
+	_, err = mikrotikConnect(context.Background(), "127.0.0.1", portNum, "admin", "pass", false)
 	if err == nil {
 		t.Error("expected fatal error")
 	}
@@ -467,7 +517,7 @@ func TestMikrotikConnectFatalError(t *testing.T) {
 
 func TestMikrotikConnectRefused(t *testing.T) {
 	// Connect to a port with nothing listening
-	_, err := mikrotikConnect("127.0.0.1", 1, "admin", "pass", false)
+	_, err := mikrotikConnect(context.Background(), "127.0.0.1", 1, "admin", "pass", false)
 	if err == nil {
 		t.Error("expected connection refused")
 	}
@@ -475,7 +525,7 @@ func TestMikrotikConnectRefused(t *testing.T) {
 
 func TestMikrotikConnectSSL(t *testing.T) {
 	// SSL connect to a port with nothing listening — tests the TLS dialer path
-	_, err := mikrotikConnect("127.0.0.1", 1, "admin", "pass", true)
+	_, err := mikrotikConnect(context.Background(), "127.0.0.1", 1, "admin", "pass", true)
 	if err == nil {
 		t.Error("expected connection error with SSL")
 	}
@@ -517,7 +567,7 @@ func TestMikrotikConnectSSLWithServer(t *testing.T) {
 	var portNum uint32
 	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
-	client, err := mikrotikConnect("127.0.0.1", portNum, "admin", "pass", true)
+	client, err := mikrotikConnect(context.Background(), "127.0.0.1", portNum, "admin", "pass", true)
 	if err != nil {
 		t.Fatalf("expected TLS connection to succeed: %v", err)
 	}
@@ -749,7 +799,7 @@ func TestMikrotikConnectSSLTOFUMismatch(t *testing.T) {
 		time.Sleep(time.Second)
 	}()
 
-	_, err = mikrotikConnect("127.0.0.1", portNum, "admin", "pass", true)
+	_, err = mikrotikConnect(context.Background(), "127.0.0.1", portNum, "admin", "pass", true)
 	if err == nil {
 		t.Error("expected TOFU verification failure")
 	}

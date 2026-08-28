@@ -5,9 +5,11 @@ package main
 
 import (
 	"context"
+	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,6 +23,13 @@ import (
 	"github.com/towerops-app/towerops-agent/pb"
 	"google.golang.org/protobuf/proto"
 )
+
+const testWebSocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+func computeAcceptKey(key string) string {
+	sum := sha1.Sum([]byte(key + testWebSocketGUID))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
 
 func TestChannelMsgSerialization(t *testing.T) {
 	msg := channelMsg{
@@ -219,7 +228,7 @@ func TestHandleMessage(t *testing.T) {
 		defer func() { doSelfUpdate = origUpdate }()
 
 		var calledURL string
-		doSelfUpdate = func(url, checksum string) error {
+		doSelfUpdate = func(_ context.Context, url, checksum string) error {
 			calledURL = url
 			return nil
 		}
@@ -242,7 +251,7 @@ func TestHandleMessage(t *testing.T) {
 		defer func() { doSelfUpdate = origUpdate }()
 
 		called := false
-		doSelfUpdate = func(url, checksum string) error {
+		doSelfUpdate = func(_ context.Context, url, checksum string) error {
 			called = true
 			return nil
 		}
@@ -265,7 +274,7 @@ func TestHandleMessage(t *testing.T) {
 		origUpdate := doSelfUpdate
 		defer func() { doSelfUpdate = origUpdate }()
 
-		doSelfUpdate = func(url, checksum string) error {
+		doSelfUpdate = func(_ context.Context, url, checksum string) error {
 			return fmt.Errorf("download failed")
 		}
 
@@ -284,7 +293,7 @@ func TestHandleMessage(t *testing.T) {
 		defer func() { doSelfUpdate = origUpdate }()
 
 		called := false
-		doSelfUpdate = func(url, checksum string) error {
+		doSelfUpdate = func(_ context.Context, url, checksum string) error {
 			called = true
 			return nil
 		}
@@ -401,7 +410,7 @@ func TestHandleMessage(t *testing.T) {
 		origSSH := sshBackup
 		defer func() { mikrotikDial = origDial; sshBackup = origSSH }()
 
-		sshBackup = func(ip string, port uint16, username, password string) (string, error) {
+		sshBackup = func(_ context.Context, ip string, port uint16, username, password string) (string, error) {
 			return "/ip address\nadd address=10.0.0.1/24", nil
 		}
 
@@ -530,7 +539,7 @@ func TestDispatchJob(t *testing.T) {
 	t.Run("MIKROTIK", func(t *testing.T) {
 		origDial := mikrotikDial
 		defer func() { mikrotikDial = origDial }()
-		mikrotikDial = func(ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
+		mikrotikDial = func(_ context.Context, ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
 			return nil, fmt.Errorf("not reachable")
 		}
 
@@ -588,7 +597,7 @@ func TestDispatchJob(t *testing.T) {
 	t.Run("PING", func(t *testing.T) {
 		origPing := doPing
 		defer func() { doPing = origPing }()
-		doPing = func(ip string, timeoutMs int) (float64, error) {
+		doPing = func(_ context.Context, ip string, timeoutMs int) (float64, error) {
 			return 5.5, nil
 		}
 
@@ -936,6 +945,30 @@ func TestRunSessionCtxCancel(t *testing.T) {
 		t.Error("runSession did not exit after ctx cancel")
 	}
 	srv.close()
+}
+
+func TestRunSessionRestartDoesNotWaitForServerClose(t *testing.T) {
+	srv := newFakeWSServer(t)
+	defer srv.close()
+
+	go func() {
+		srv.acceptAndJoin(t)
+		srv.sendEvent("restart", json.RawMessage(`{}`))
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- runSession(context.Background(), "ws://"+srv.addr(), "token", nil)
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errRestartRequested) {
+			t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runSession waited for the server to close after restart")
+	}
 }
 
 func TestRunSessionReadError(t *testing.T) {
@@ -1356,10 +1389,10 @@ func TestRunSessionProcessesJobResults(t *testing.T) {
 			},
 		}, func() {}, nil
 	}
-	mikrotikDial = func(ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
+	mikrotikDial = func(_ context.Context, ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
 		return nil, fmt.Errorf("unreachable")
 	}
-	doPing = func(ip string, timeoutMs int) (float64, error) {
+	doPing = func(_ context.Context, ip string, timeoutMs int) (float64, error) {
 		return 1.5, nil
 	}
 
@@ -1375,7 +1408,7 @@ func TestRunSessionProcessesJobResults(t *testing.T) {
 
 		time.Sleep(100 * time.Millisecond)
 
-		// SNMP job → snmpResultCh → snmpBatch → flushSnmpBatch → sendBinaryResult
+		// SNMP job → snmpResultCh → sendBinaryResult
 		srv.sendEvent("jobs", makeJobPayload(&pb.AgentJob{
 			JobId: "s1", JobType: pb.JobType_POLL,
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
@@ -1421,7 +1454,7 @@ func TestRunSessionProcessesJobResults(t *testing.T) {
 	}
 }
 
-func TestRunSessionSnmpBatchThreshold(t *testing.T) {
+func TestRunSessionForwardsManySnmpResults(t *testing.T) {
 	origSnmpDial := snmpDial
 	defer func() { snmpDial = origSnmpDial }()
 
@@ -1444,7 +1477,7 @@ func TestRunSessionSnmpBatchThreshold(t *testing.T) {
 
 		time.Sleep(100 * time.Millisecond)
 
-		// Send 55 SNMP jobs to trigger batch threshold (>=50)
+		// Send enough SNMP jobs to exercise sustained result forwarding.
 		jobs := make([]*pb.AgentJob, 55)
 		for i := range jobs {
 			jobs[i] = &pb.AgentJob{
@@ -1469,7 +1502,7 @@ func TestRunSessionSnmpBatchThreshold(t *testing.T) {
 
 func TestExecuteCheckPoolFull(t *testing.T) {
 	// newWorkerPool(1) creates 1 worker goroutine + queue buffer of 1*4=4
-	// We need to block the worker AND fill all 4 queue slots to make submit block.
+	// Block the worker and fill all 4 queue slots so the next submit is rejected.
 	p := &jobPools{
 		snmp:     newWorkerPool(4),
 		mikrotik: newWorkerPool(4),
@@ -1502,6 +1535,30 @@ func TestExecuteCheckPoolFull(t *testing.T) {
 	executeCheck(ctx, check, p, checkCh)
 	// Should log "check rejected (pool full)" but not panic
 	close(done)
+}
+
+func TestJobPoolsStopUsesSingleTimeout(t *testing.T) {
+	blocker := make(chan struct{})
+	pools := &jobPools{
+		snmp: newWorkerPool(1), mikrotik: newWorkerPool(1),
+		ping: newWorkerPool(1), checks: newWorkerPool(1),
+	}
+	for _, pool := range []*workerPool{pools.snmp, pools.mikrotik, pools.ping, pools.checks} {
+		started := make(chan struct{})
+		pool.submit(context.Background(), func() { close(started); <-blocker })
+		<-started
+	}
+
+	start := time.Now()
+	timedOut := pools.stop(50 * time.Millisecond)
+	elapsed := time.Since(start)
+	close(blocker)
+	if len(timedOut) != 4 {
+		t.Fatalf("timed out pools = %v, want all four", timedOut)
+	}
+	if elapsed >= 150*time.Millisecond {
+		t.Fatalf("parallel pool stop took %v, want one timeout window", elapsed)
+	}
 }
 
 func TestExecuteCheckCtxDoneInClosure(t *testing.T) {

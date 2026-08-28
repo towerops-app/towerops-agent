@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"runtime"
@@ -20,7 +21,7 @@ func TestPingDeviceLocalhost(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real ICMP ping in short mode")
 	}
-	ms, err := pingDevice("127.0.0.1", 2000)
+	ms, err := pingDevice(context.Background(), "127.0.0.1", 2000)
 	if err != nil {
 		t.Skipf("ping not available: %v", err)
 	}
@@ -30,7 +31,7 @@ func TestPingDeviceLocalhost(t *testing.T) {
 }
 
 func TestPingDeviceInvalidIP(t *testing.T) {
-	_, err := pingDevice("not-an-ip", 5000)
+	_, err := pingDevice(context.Background(), "not-an-ip", 5000)
 	if err == nil {
 		t.Error("expected error for invalid IP")
 	}
@@ -43,7 +44,7 @@ func TestPingDeviceIPv6(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real ICMP ping in short mode")
 	}
-	ms, err := pingDevice("::1", 2000)
+	ms, err := pingDevice(context.Background(), "::1", 2000)
 	if err != nil {
 		t.Skipf("IPv6 not available: %v", err)
 	}
@@ -56,7 +57,7 @@ func TestIcmpPingLocalhost(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real ICMP ping in short mode")
 	}
-	ms, err := icmpPing("127.0.0.1", 2000)
+	ms, err := icmpPing(context.Background(), "127.0.0.1", 2000)
 	if err != nil {
 		t.Skipf("ICMP not available: %v", err)
 	}
@@ -69,7 +70,7 @@ func TestIcmpPingIPv6(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real ICMP ping in short mode")
 	}
-	ms, err := icmpPing("::1", 2000)
+	ms, err := icmpPing(context.Background(), "::1", 2000)
 	if err != nil {
 		t.Skipf("IPv6 ICMP not available: %v", err)
 	}
@@ -79,7 +80,7 @@ func TestIcmpPingIPv6(t *testing.T) {
 }
 
 func TestIcmpPingInvalidIP(t *testing.T) {
-	_, err := icmpPing("not-an-ip", 5000)
+	_, err := icmpPing(context.Background(), "not-an-ip", 5000)
 	if err == nil {
 		t.Error("expected error for invalid IP")
 	}
@@ -157,7 +158,7 @@ func TestExecPingLocalhost(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real exec ping in short mode")
 	}
-	ms, err := execPing("127.0.0.1", 2000)
+	ms, err := execPing(context.Background(), "127.0.0.1", 2000)
 	if err != nil {
 		t.Skipf("ping command not available: %v", err)
 	}
@@ -167,7 +168,7 @@ func TestExecPingLocalhost(t *testing.T) {
 }
 
 func TestExecPingInvalidIP(t *testing.T) {
-	_, err := execPing("not-an-ip", 5000)
+	_, err := execPing(context.Background(), "not-an-ip", 5000)
 	if err == nil {
 		t.Error("expected error for invalid IP")
 	}
@@ -180,7 +181,7 @@ func TestExecPingIPv6Localhost(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real exec ping in short mode")
 	}
-	ms, err := execPing("::1", 2000)
+	ms, err := execPing(context.Background(), "::1", 2000)
 	if err != nil {
 		t.Skipf("ping6 not available: %v", err)
 	}
@@ -193,7 +194,7 @@ func TestExecPingUnreachable(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows")
 	}
-	_, err := execPing("192.0.2.1", 1000) // TEST-NET-1 — unreachable
+	_, err := execPing(context.Background(), "192.0.2.1", 1000) // TEST-NET-1 — unreachable
 	if err == nil {
 		t.Error("expected error for unreachable host")
 	}
@@ -217,7 +218,7 @@ func TestPingDeviceFallbackToExec(t *testing.T) {
 		return nil, fmt.Errorf("permission denied")
 	}
 
-	ms, err := pingDevice("127.0.0.1", 2000)
+	ms, err := pingDevice(context.Background(), "127.0.0.1", 2000)
 	if err != nil {
 		t.Skipf("exec ping fallback not available: %v", err)
 	}
@@ -245,7 +246,7 @@ func TestPingDeviceNonICMPError(t *testing.T) {
 		return nil, fmt.Errorf("also denied")
 	}
 
-	_, err := pingDevice("127.0.0.1", 1000)
+	_, err := pingDevice(context.Background(), "127.0.0.1", 1000)
 	// Both ICMP attempts fail with errICMPUnavailable, so it falls back to exec
 	// which should succeed for localhost
 	if err != nil {
@@ -256,7 +257,7 @@ func TestPingDeviceNonICMPError(t *testing.T) {
 func TestDoICMPPingIPv6Network(t *testing.T) {
 	// Test with the IPv6 raw network to cover the ipv6-icmp branches
 	ip := net.ParseIP("::1")
-	_, err := doICMPPing(ip, "ip6:ipv6-icmp", false, 1000)
+	_, err := doICMPPing(context.Background(), ip, "ip6:ipv6-icmp", false, 1000)
 	if err != nil {
 		t.Skipf("IPv6 ICMP not available: %v", err)
 	}
@@ -265,7 +266,7 @@ func TestDoICMPPingIPv6Network(t *testing.T) {
 func TestDoICMPPingUDPNetwork(t *testing.T) {
 	// Test with UDP network to cover the udp address branch
 	ip := net.ParseIP("127.0.0.1")
-	_, err := doICMPPing(ip, "udp4", true, 1000)
+	_, err := doICMPPing(context.Background(), ip, "udp4", true, 1000)
 	if err != nil {
 		t.Skipf("UDP ICMP not available: %v", err)
 	}
@@ -274,7 +275,7 @@ func TestDoICMPPingUDPNetwork(t *testing.T) {
 func TestDoICMPPingTimeout(t *testing.T) {
 	// Ping unreachable IP with short timeout → covers icmp read timeout error
 	ip := net.ParseIP("192.0.2.1") // TEST-NET-1 — unreachable
-	_, err := doICMPPing(ip, "udp4", true, 100)
+	_, err := doICMPPing(context.Background(), ip, "udp4", true, 100)
 	if err == nil {
 		t.Error("expected timeout error for unreachable host")
 	}
@@ -286,7 +287,7 @@ func TestDoICMPPingTimeout(t *testing.T) {
 func TestDoICMPPingIPv6Timeout(t *testing.T) {
 	// IPv6 unreachable — covers the ipv6 branch in doICMPPing
 	ip := net.ParseIP("100::1") // Unreachable IPv6
-	_, err := doICMPPing(ip, "udp6", false, 100)
+	_, err := doICMPPing(context.Background(), ip, "udp6", false, 100)
 	if err != nil {
 		// May fail with various errors depending on system IPv6 support
 		t.Logf("IPv6 ICMP error (expected): %v", err)
@@ -305,7 +306,7 @@ func TestIcmpPingNonICMPUnavailableError(t *testing.T) {
 		return icmp.ListenPacket("udp4", address)
 	}
 
-	_, err := icmpPing("192.0.2.1", 100) // TEST-NET-1, 100ms timeout
+	_, err := icmpPing(context.Background(), "192.0.2.1", 100) // TEST-NET-1, 100ms timeout
 	if err == nil {
 		t.Error("expected error for unreachable host")
 	}
@@ -330,7 +331,7 @@ func TestIcmpPingUDPFallback(t *testing.T) {
 		return icmp.ListenPacket(network, address)
 	}
 
-	ms, err := icmpPing("127.0.0.1", 2000)
+	ms, err := icmpPing(context.Background(), "127.0.0.1", 2000)
 	if err != nil {
 		t.Skipf("UDP ICMP not available: %v", err)
 	}

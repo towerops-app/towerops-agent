@@ -250,6 +250,13 @@ func TestNewSnmpConnTCPError(t *testing.T) {
 	}
 }
 
+func TestNewSnmpConnRejectsPortOverflow(t *testing.T) {
+	_, err := newSnmpConn(&pb.SnmpDevice{Ip: "127.0.0.1", Port: 65536})
+	if err == nil || !strings.Contains(err.Error(), "invalid SNMP port") {
+		t.Fatalf("newSnmpConn error = %v, want invalid port", err)
+	}
+}
+
 func TestSnmpDialDefault(t *testing.T) {
 	// Test the default snmpDial function variable (wraps newSnmpConn)
 	origDial := snmpDial

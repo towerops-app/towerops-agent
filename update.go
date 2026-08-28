@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,6 +32,10 @@ var selfUpdateTimeout = 30 * time.Second
 
 // selfUpdate downloads a new binary, verifies its checksum, replaces the current binary, and re-execs.
 func selfUpdate(downloadURL, expectedChecksum string) error {
+	return selfUpdateContext(context.Background(), downloadURL, expectedChecksum)
+}
+
+func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string) error {
 	u, err := url.Parse(downloadURL)
 	if err != nil {
 		return fmt.Errorf("parse url: %w", err)
@@ -41,10 +46,9 @@ func selfUpdate(downloadURL, expectedChecksum string) error {
 	if expectedChecksum == "" {
 		return fmt.Errorf("checksum required for update")
 	}
-
 	slog.Info("downloading update", "url", sanitizeURL(downloadURL))
 
-	reqCtx, cancel := context.WithTimeout(context.Background(), selfUpdateTimeout)
+	reqCtx, cancel := context.WithTimeout(ctx, selfUpdateTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, downloadURL, nil)
 	if err != nil {
@@ -56,26 +60,17 @@ func selfUpdate(downloadURL, expectedChecksum string) error {
 		return fmt.Errorf("download: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.Request == nil || resp.Request.URL == nil || resp.Request.URL.Scheme != "https" {
+		return fmt.Errorf("HTTPS required after redirects")
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download failed: status %d", resp.StatusCode)
 	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUpdateSize+1))
-	if err != nil {
-		return fmt.Errorf("read body: %w", err)
+	expected, err := hex.DecodeString(expectedChecksum)
+	if err != nil || len(expected) != sha256.Size {
+		return fmt.Errorf("checksum must be exactly 64 hexadecimal characters")
 	}
-	if int64(len(body)) > maxUpdateSize {
-		return fmt.Errorf("download size %d exceeds max %d", len(body), maxUpdateSize)
-	}
-	slog.Info("downloaded update", "bytes", len(body))
-
-	// Verify SHA256 checksum (constant-time comparison)
-	actual := fmt.Sprintf("%x", sha256.Sum256(body))
-	if subtle.ConstantTimeCompare([]byte(actual), []byte(expectedChecksum)) != 1 {
-		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actual)
-	}
-	slog.Info("checksum verified")
 
 	// Write to temp file in same directory as binary (ensures same filesystem for atomic rename)
 	currentExe, err := osExecutable()
@@ -90,38 +85,56 @@ func selfUpdate(downloadURL, expectedChecksum string) error {
 	tempPath := tempFile.Name()
 	defer func() { _ = os.Remove(tempPath) }()
 
-	if _, err := tempFile.Write(body); err != nil {
+	hash := sha256.New()
+	written, err := io.Copy(io.MultiWriter(tempFile, hash), io.LimitReader(resp.Body, maxUpdateSize+1))
+	if err != nil {
 		_ = tempFile.Close()
-		return fmt.Errorf("write temp: %w", err)
+		return fmt.Errorf("download update: %w", err)
 	}
+	if written > maxUpdateSize {
+		_ = tempFile.Close()
+		return fmt.Errorf("download size %d exceeds max %d", written, maxUpdateSize)
+	}
+	actual := hash.Sum(nil)
+	if subtle.ConstantTimeCompare(actual, expected) != 1 {
+		_ = tempFile.Close()
+		return fmt.Errorf("checksum mismatch: expected %s, got %x", expectedChecksum, actual)
+	}
+	slog.Info("downloaded and verified update", "bytes", written)
+
 	if err := tempFile.Chmod(0700); err != nil {
 		_ = tempFile.Close()
 		return fmt.Errorf("chmod temp: %w", err)
+	}
+	if err := tempFile.Sync(); err != nil {
+		_ = tempFile.Close()
+		return fmt.Errorf("sync temp: %w", err)
 	}
 	if err := tempFile.Close(); err != nil {
 		return fmt.Errorf("close temp: %w", err)
 	}
 
-	// Re-verify checksum by reading back the written file
-	written, err := os.ReadFile(tempPath)
-	if err != nil {
-		return fmt.Errorf("re-read temp: %w", err)
-	}
-	recheck := fmt.Sprintf("%x", sha256.Sum256(written))
-	if subtle.ConstantTimeCompare([]byte(recheck), []byte(expectedChecksum)) != 1 {
-		return fmt.Errorf("re-verify checksum mismatch: expected %s, got %s", expectedChecksum, recheck)
-	}
-	slog.Info("re-verified checksum after write")
-
 	// Replace current binary (atomic on same filesystem)
 	if err := osRename(tempPath, currentExe); err != nil {
 		return fmt.Errorf("rename: %w", err)
+	}
+	if err := syncDirectory(filepath.Dir(currentExe)); err != nil {
+		return fmt.Errorf("sync executable directory: %w", err)
 	}
 	slog.Info("binary replaced", "path", currentExe)
 
 	// Re-exec with same arguments
 	slog.Info("re-executing", "args", sanitizeArgs(os.Args))
 	return syscallExec(currentExe, os.Args, os.Environ())
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }()
+	return dir.Sync()
 }
 
 // sanitizeArgs returns a copy of args with token values masked.

@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -567,6 +568,21 @@ func TestHTTPCheck_LargeResponseBodyWithRegex(t *testing.T) {
 	}
 }
 
+func TestHTTPCheck_RegexBodyOverLimitIsExplicit(t *testing.T) {
+	bigBody := strings.Repeat("a", maxHTTPRegexBody) + "MARKER_BEYOND_LIMIT"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, bigBody)
+	}))
+	defer srv.Close()
+
+	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+		Url: srv.URL, Regex: `MARKER_BEYOND_LIMIT`,
+	}, 5000)
+	if status != 3 || !strings.Contains(output, "exceeds regex limit") {
+		t.Fatalf("status/output = %d/%q, want explicit size-limit result", status, output)
+	}
+}
+
 func TestHTTPCheck_SlowServerTimeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(500 * time.Millisecond)
@@ -696,6 +712,58 @@ func TestTCPCheck_SendExpectSuccess(t *testing.T) {
 
 	if status != 0 {
 		t.Fatalf("expected status 0, got %d: %s", status, output)
+	}
+}
+
+func TestTCPCheck_ExpectBannerWithoutSend(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = conn.Write([]byte("220 smtp.example ready\r\n"))
+	}()
+
+	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+		Host: "127.0.0.1", Port: parsePort(portFromListener(ln)), Expect: "ready",
+	}, 1000)
+	if status != 0 {
+		t.Fatalf("status = %d, want 0: %s", status, output)
+	}
+}
+
+func TestTCPCheck_ExpectMaySpanReads(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		buffer := make([]byte, 16)
+		_, _ = conn.Read(buffer)
+		_, _ = conn.Write([]byte("EXPEC"))
+		time.Sleep(10 * time.Millisecond)
+		_, _ = conn.Write([]byte("TED"))
+	}()
+
+	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+		Host: "127.0.0.1", Port: parsePort(portFromListener(ln)), Send: "hello", Expect: "EXPECTED",
+	}, 1000)
+	if status != 0 {
+		t.Fatalf("status = %d, want 0: %s", status, output)
 	}
 }
 
@@ -1076,6 +1144,21 @@ func TestDNSCheck_CustomDNSServer(t *testing.T) {
 	}
 }
 
+func TestResolverForServerUsesRequestedNetwork(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	resolver := resolverForServer(ln.Addr().String(), time.Second)
+	conn, err := resolver.Dial(context.Background(), "tcp", "unused")
+	if err != nil {
+		t.Fatalf("dial requested TCP network: %v", err)
+	}
+	_ = conn.Close()
+}
+
 func TestDNSCheck_RecordTypeCaseInsensitive(t *testing.T) {
 	// The code does strings.ToUpper, so lowercase should work
 	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
@@ -1361,6 +1444,17 @@ func TestHTTPCheck_EmptyHeadersMap(t *testing.T) {
 // ---------------------------------------------------------------------------
 // SSL check tests
 // ---------------------------------------------------------------------------
+
+func TestCertificateDaysRemainingRecentlyExpired(t *testing.T) {
+	now := time.Now()
+	days, expired := certificateDaysRemaining(now, now.Add(-time.Hour))
+	if !expired {
+		t.Fatal("certificate expired one hour ago was not classified as expired")
+	}
+	if days != 0 {
+		t.Fatalf("days = %d, want 0 for a certificate expired less than one day", days)
+	}
+}
 
 func TestExecuteCheck_MissingSSLConfig(t *testing.T) {
 	result := ExecuteCheck(context.Background(), &pb.Check{

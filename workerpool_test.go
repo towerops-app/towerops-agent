@@ -16,15 +16,18 @@ func TestWorkerPool(t *testing.T) {
 		defer pool.stop()
 
 		var count atomic.Int32
+		accepted := 0
 		for i := 0; i < 100; i++ {
-			pool.submit(context.Background(), func() {
+			if pool.submit(context.Background(), func() {
 				count.Add(1)
-			})
+			}) {
+				accepted++
+			}
 		}
 
 		pool.stop()
-		if got := count.Load(); got != 100 {
-			t.Errorf("got %d completions, want 100", got)
+		if got := count.Load(); got != int32(accepted) { //nolint:gosec // accepted <= 100
+			t.Errorf("got %d completions, want %d accepted tasks", got, accepted)
 		}
 	})
 
@@ -61,26 +64,6 @@ func TestWorkerPool(t *testing.T) {
 		pool.stop() // should not panic
 	})
 
-	t.Run("stopWithTimeout returns true when workers finish in time", func(t *testing.T) {
-		pool := newWorkerPool(2)
-		pool.submit(context.Background(), func() {
-			time.Sleep(10 * time.Millisecond)
-		})
-		if !pool.stopWithTimeout(time.Second) {
-			t.Error("expected stopWithTimeout to return true")
-		}
-	})
-
-	t.Run("stopWithTimeout returns false when workers exceed timeout", func(t *testing.T) {
-		pool := newWorkerPool(1)
-		blocker := make(chan struct{})
-		pool.submit(context.Background(), func() { <-blocker })
-
-		if pool.stopWithTimeout(50 * time.Millisecond) {
-			t.Error("expected stopWithTimeout to return false")
-		}
-		close(blocker) // unblock for cleanup
-	})
 }
 
 func TestWorkerPoolRecoversPanic(t *testing.T) {
@@ -134,4 +117,26 @@ func TestWorkerPoolSubmitRespectsContext(t *testing.T) {
 
 	// Unblock everything for cleanup
 	close(blocker)
+}
+
+func TestWorkerPoolRejectsImmediatelyWhenFull(t *testing.T) {
+	pool := newWorkerPool(1)
+	blocker := make(chan struct{})
+	started := make(chan struct{})
+	pool.submit(context.Background(), func() { close(started); <-blocker })
+	<-started
+	for range cap(pool.tasks) {
+		if !pool.submit(context.Background(), func() { <-blocker }) {
+			t.Fatal("queue rejected a task before reaching capacity")
+		}
+	}
+	start := time.Now()
+	if pool.submit(context.Background(), func() {}) {
+		t.Fatal("full queue accepted another task")
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("full queue rejection blocked for %v", elapsed)
+	}
+	close(blocker)
+	pool.stop()
 }

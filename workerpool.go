@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
-	"time"
 )
 
 // workerPool is a fixed-size goroutine pool for executing tasks.
@@ -42,12 +41,16 @@ func newWorkerPool(n int) *workerPool {
 	return p
 }
 
-// submit enqueues a task. Returns false if the context is cancelled before the task can be queued.
+// submit enqueues a task without blocking the session event loop. Callers must
+// handle false as overload (or cancellation).
 func (p *workerPool) submit(ctx context.Context, fn func()) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	select {
 	case p.tasks <- fn:
 		return true
-	case <-ctx.Done():
+	default:
 		return false
 	}
 }
@@ -58,23 +61,4 @@ func (p *workerPool) stop() {
 		close(p.tasks)
 		p.wg.Wait()
 	})
-}
-
-// stopWithTimeout closes the task channel and waits up to timeout for workers
-// to finish. Returns true if all workers completed, false if the timeout was
-// reached and some workers were abandoned.
-func (p *workerPool) stopWithTimeout(timeout time.Duration) bool {
-	done := make(chan struct{})
-	go func() {
-		p.stop()
-		close(done)
-	}()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-done:
-		return true
-	case <-timer.C:
-		return false
-	}
 }

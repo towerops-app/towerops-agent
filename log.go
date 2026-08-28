@@ -14,7 +14,7 @@ import (
 type colorHandler struct {
 	w     io.Writer
 	level slog.Level
-	mu    sync.Mutex
+	mu    *sync.Mutex
 	attrs []slog.Attr
 	group string
 }
@@ -32,7 +32,7 @@ func newColorHandler(w io.Writer, opts *slog.HandlerOptions) *colorHandler {
 	if opts != nil {
 		level = opts.Level.Level()
 	}
-	return &colorHandler{w: w, level: level}
+	return &colorHandler{w: w, level: level, mu: &sync.Mutex{}}
 }
 
 func (h *colorHandler) Enabled(_ context.Context, level slog.Level) bool {
@@ -104,6 +104,7 @@ func (h *colorHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 		level: h.level,
 		attrs: newAttrs,
 		group: h.group,
+		mu:    h.mu,
 	}
 }
 
@@ -117,5 +118,6 @@ func (h *colorHandler) WithGroup(name string) slog.Handler {
 		level: h.level,
 		attrs: h.attrs,
 		group: g,
+		mu:    h.mu,
 	}
 }

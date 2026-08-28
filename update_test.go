@@ -6,6 +6,7 @@ package main
 import (
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,6 +23,27 @@ func TestSelfUpdateRejectsHTTP(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "HTTPS required") {
 		t.Errorf("expected 'HTTPS required' in error, got: %v", err)
+	}
+}
+
+func TestSelfUpdateRejectsRedirectToHTTP(t *testing.T) {
+	origDo := httpDo
+	defer func() { httpDo = origDo }()
+	httpDo = func(*http.Request) (*http.Response, error) {
+		request, err := http.NewRequest(http.MethodGet, "http://example.com/agent", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("binary")),
+			Request:    request,
+		}, nil
+	}
+
+	err := selfUpdate("https://example.com/agent", strings.Repeat("0", 64))
+	if err == nil || !strings.Contains(err.Error(), "after redirects") {
+		t.Fatalf("selfUpdate error = %v, want HTTPS redirect rejection", err)
 	}
 }
 

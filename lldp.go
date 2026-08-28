@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -156,7 +157,8 @@ func discoverLldpNeighbors(client *gosnmp.GoSNMP, deviceID, jobID string) (*pb.L
 	}
 
 	// Assemble neighbor list
-	for key, neighborName := range sysNames {
+	for _, key := range sortedLldpKeys(sysNames) {
+		neighborName := sysNames[key]
 		if neighborName == "" {
 			continue
 		}
@@ -184,6 +186,15 @@ func discoverLldpNeighbors(client *gosnmp.GoSNMP, deviceID, jobID string) (*pb.L
 	}
 
 	return result, nil
+}
+
+func sortedLldpKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 // extractSuffix strips the base OID prefix and returns the suffix.

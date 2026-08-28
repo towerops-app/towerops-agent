@@ -5,6 +5,7 @@ package main
 
 import (
 	"crypto/x509"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -57,6 +58,24 @@ func TestHostKeyStoreMissingFile(t *testing.T) {
 	s := newHostKeyStore("/nonexistent/path/known_hosts.json")
 	if err := s.verify("host:22", "fp"); err == nil {
 		t.Fatal("expected error when trusted key cannot be persisted")
+	}
+}
+
+func TestHostKeyStoreCorruptFileFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "known_hosts.json")
+	if err := os.WriteFile(path, []byte("not json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s := newHostKeyStore(path)
+	if err := s.verify("host:22", "new-fingerprint"); err == nil {
+		t.Fatal("corrupt host-key store allowed first-use trust")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "not json" {
+		t.Fatalf("corrupt store was overwritten: %q", data)
 	}
 }
 

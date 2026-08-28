@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
@@ -18,9 +19,10 @@ import (
 
 // hostKeyStore implements trust-on-first-use (TOFU) for SSH host keys and TLS cert fingerprints.
 type hostKeyStore struct {
-	path string
-	mu   sync.Mutex
-	keys map[string]string // "host:port" -> hex fingerprint
+	path    string
+	mu      sync.Mutex
+	keys    map[string]string // "host:port" -> hex fingerprint
+	loadErr error
 }
 
 var globalHostKeys *hostKeyStore
@@ -42,10 +44,10 @@ func newHostKeyStore(path string) *hostKeyStore {
 	data, err := os.ReadFile(path)
 	if err == nil {
 		if err := json.Unmarshal(data, &s.keys); err != nil {
-			slog.Warn("failed to parse known_hosts.json, starting with empty key store",
-				"path", path,
-				"error", err)
+			s.loadErr = fmt.Errorf("parse host key store %s: %w", path, err)
 		}
+	} else if !os.IsNotExist(err) {
+		s.loadErr = fmt.Errorf("read host key store %s: %w", path, err)
 	}
 	return s
 }
@@ -55,17 +57,37 @@ func (s *hostKeyStore) save() error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	dir := filepath.Dir(s.path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(s.path)+"-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := writeAll(tmp, data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		return err
+	}
+	return syncDirectory(dir)
 }
 
 // verify checks a fingerprint for host. Returns nil on match or first-use, error on mismatch.
 func (s *hostKeyStore) verify(host, fingerprint string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.loadErr != nil {
+		return s.loadErr
+	}
 
 	stored, exists := s.keys[host]
 	if !exists {

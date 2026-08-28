@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -45,10 +46,16 @@ const (
 // whenever they like, and dropping them because the agent happens to be
 // reconnecting would lose exactly the events that matter during an outage.
 type trapListener struct {
+	mu        sync.Mutex
+	closeOnce sync.Once
 	listener  *gosnmp.TrapListener
+	ready     <-chan struct{}
+	done      chan struct{}
 	traps     chan *pb.SnmpTrap
 	community string
 	dropped   atomic.Uint64
+	closed    chan struct{}
+	port      uint16
 }
 
 // startTrapListener binds the trap port and serves until Close is called.
@@ -58,48 +65,119 @@ func startTrapListener(port uint16, community string) (*trapListener, error) {
 	t := &trapListener{
 		traps:     make(chan *pb.SnmpTrap, trapQueueSize),
 		community: community,
+		closed:    make(chan struct{}),
+		port:      port,
 	}
 
-	t.listener = gosnmp.NewTrapListener().WithBufferSize(trapReadBuffer)
-	t.listener.OnNewTrap = t.handle
-	// Community and Version are not enforced by gosnmp on receive; both v1 and
-	// v2c traps arrive on this one socket regardless of what is set here.
-	t.listener.Params = &gosnmp.GoSNMP{
-		Port:      port,
-		Transport: "udp",
-		Version:   gosnmp.Version2c,
-		Timeout:   5 * time.Second,
-		Retries:   1,
-		MaxOids:   gosnmp.MaxOids,
-	}
+	t.listener = t.newListener()
+	t.done = make(chan struct{})
+	t.ready = trapReady(t.listener, t.done)
 
 	// 0.0.0.0 rather than :port — the bare form binds dual-stack, which makes
 	// the bound family depend on the host's IPv6 configuration.
 	addr := net.JoinHostPort("0.0.0.0", strconv.Itoa(int(port)))
 
 	errCh := make(chan error, 1)
-	go func() {
-		// Listen blocks until Close; it returns nil on a clean shutdown and an
-		// error only if the bind fails.
-		if err := t.listener.Listen(addr); err != nil {
-			errCh <- err
-			return
-		}
-		close(t.traps)
-	}()
+	go t.serve(t.listener, t.done, addr, errCh)
 
 	select {
-	case <-t.listener.Listening():
+	case <-t.ready:
 		slog.Info("snmp trap listener started", "port", port, "community_filter", community != "")
 		return t, nil
 	case err := <-errCh:
+		t.Close()
 		return nil, fmt.Errorf("bind trap port %d: %w", port, err)
 	}
 }
 
+func (t *trapListener) newListener() *gosnmp.TrapListener {
+	listener := gosnmp.NewTrapListener().WithBufferSize(trapReadBuffer)
+	listener.OnNewTrap = t.handle
+	listener.Params = &gosnmp.GoSNMP{
+		Port:      t.port,
+		Transport: "udp",
+		Version:   gosnmp.Version2c,
+		Timeout:   5 * time.Second,
+		Retries:   1,
+		MaxOids:   gosnmp.MaxOids,
+	}
+	return listener
+}
+
+func (t *trapListener) serve(listener *gosnmp.TrapListener, done chan struct{}, addr string, startupErr chan<- error) {
+	for {
+		err := listener.Listen(addr)
+		close(done)
+		if startupErr != nil {
+			startupErr <- err
+			startupErr = nil
+		}
+		select {
+		case <-t.closed:
+			return
+		default:
+		}
+		slog.Error("snmp trap listener stopped unexpectedly; rebinding", "error", err, "port", t.port)
+
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-t.closed:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		listener = t.newListener()
+		done = make(chan struct{})
+		ready := trapReady(listener, done)
+		t.mu.Lock()
+		select {
+		case <-t.closed:
+			t.mu.Unlock()
+			return
+		default:
+			t.listener = listener
+			t.ready = ready
+			t.done = done
+			t.mu.Unlock()
+		}
+		go func(currentReady <-chan struct{}) {
+			select {
+			case <-currentReady:
+				slog.Info("snmp trap listener rebound", "port", t.port)
+			case <-t.closed:
+			}
+		}(ready)
+	}
+}
+
+func trapReady(listener *gosnmp.TrapListener, done <-chan struct{}) <-chan struct{} {
+	ready := make(chan struct{})
+	go func() {
+		select {
+		case <-listener.Listening():
+			close(ready)
+		case <-done:
+		}
+	}()
+	return ready
+}
+
 // Close stops the listener. Safe to call from any goroutine.
 func (t *trapListener) Close() {
-	t.listener.Close()
+	t.closeOnce.Do(func() {
+		close(t.closed)
+		t.mu.Lock()
+		listener := t.listener
+		ready := t.ready
+		done := t.done
+		t.mu.Unlock()
+		select {
+		case <-ready:
+			listener.Close()
+		case <-done:
+		}
+	})
 	if dropped := t.dropped.Load(); dropped > 0 {
 		slog.Warn("snmp traps dropped while queue was full", "count", dropped)
 	}

@@ -17,9 +17,12 @@ import (
 )
 
 const (
-	mikrotikConnTimeout = 30 * time.Second
-	mikrotikReadTimeout = 30 * time.Second
-	maxMikrotikWordSize = 10 << 20 // 10 MB
+	mikrotikConnTimeout  = 30 * time.Second
+	mikrotikReadTimeout  = 30 * time.Second
+	maxMikrotikWordSize  = 10 << 20 // 10 MB
+	maxMikrotikResponse  = 16 << 20 // 16 MB aggregate decoded response
+	maxMikrotikWords     = 10000
+	maxMikrotikSentences = 10000
 )
 
 var mikrotikDial = mikrotikConnect
@@ -39,7 +42,7 @@ type mikrotikResponse struct {
 }
 
 // mikrotikConnect connects and authenticates to a MikroTik device.
-func mikrotikConnect(ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
+func mikrotikConnect(ctx context.Context, ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
 	var conn net.Conn
 	var err error
@@ -52,7 +55,7 @@ func mikrotikConnect(ip string, port uint32, username, password string, useSSL b
 			NetDialer: &net.Dialer{Timeout: mikrotikConnTimeout},
 			Config:    &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
 		}
-		dialCtx, dialCancel := context.WithTimeout(context.Background(), mikrotikConnTimeout)
+		dialCtx, dialCancel := context.WithTimeout(ctx, mikrotikConnTimeout)
 		defer dialCancel()
 		conn, err = dialer.DialContext(dialCtx, "tcp", addr)
 		if err == nil {
@@ -67,7 +70,8 @@ func mikrotikConnect(ip string, port uint32, username, password string, useSSL b
 			}
 		}
 	} else {
-		conn, err = net.DialTimeout("tcp", addr, mikrotikConnTimeout)
+		dialer := net.Dialer{Timeout: mikrotikConnTimeout}
+		conn, err = dialer.DialContext(ctx, "tcp", addr)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("connect %s: %w", addr, err)
@@ -120,20 +124,26 @@ func (c *mikrotikClient) writeSentence(words []string) error {
 	}
 	buf = append(buf, 0) // empty word terminates sentence
 
-	_, err := c.conn.Write(buf)
-	return err
+	return writeAll(c.conn, buf)
 }
 
 func (c *mikrotikClient) readResponse() (*mikrotikResponse, error) {
 	resp := &mikrotikResponse{}
+	totalBytes := 0
 
-	for {
+	for sentenceCount := 0; sentenceCount < maxMikrotikSentences; sentenceCount++ {
 		words, err := c.readSentence()
 		if err != nil {
 			return nil, err
 		}
 		if len(words) == 0 {
 			continue
+		}
+		for _, word := range words {
+			totalBytes += len(word)
+			if totalBytes > maxMikrotikResponse {
+				return nil, fmt.Errorf("response exceeds %d bytes", maxMikrotikResponse)
+			}
 		}
 
 		switch words[0] {
@@ -162,6 +172,7 @@ func (c *mikrotikClient) readResponse() (*mikrotikResponse, error) {
 			return nil, fmt.Errorf("fatal: %s", msg)
 		}
 	}
+	return nil, fmt.Errorf("response exceeds %d sentences", maxMikrotikSentences)
 }
 
 func (c *mikrotikClient) readSentence() ([]string, error) {
@@ -170,18 +181,23 @@ func (c *mikrotikClient) readSentence() ([]string, error) {
 			return nil, fmt.Errorf("set read deadline: %w", err)
 		}
 	}
-	var words []string
-	for {
+	words := make([]string, 0, 16)
+	totalBytes := 0
+	for len(words) < maxMikrotikWords {
 		word, err := c.readWord()
 		if err != nil {
 			return nil, err
 		}
 		if word == "" {
-			break
+			return words, nil
+		}
+		totalBytes += len(word)
+		if totalBytes > maxMikrotikResponse {
+			return nil, fmt.Errorf("sentence exceeds %d bytes", maxMikrotikResponse)
 		}
 		words = append(words, word)
 	}
-	return words, nil
+	return nil, fmt.Errorf("sentence exceeds %d words", maxMikrotikWords)
 }
 
 func (c *mikrotikClient) readWord() (string, error) {
@@ -222,20 +238,28 @@ func (c *mikrotikClient) readLength() (int, error) {
 		if _, err := io.ReadFull(c.conn, extra[:]); err != nil {
 			return 0, err
 		}
-		return int(b&0x1F)<<16 | int(extra[0])<<8 | int(extra[1]), nil
+		return checkedMikrotikLength(uint64(b&0x1F)<<16 | uint64(extra[0])<<8 | uint64(extra[1]))
 	} else if b < 0xF0 {
 		var extra [3]byte
 		if _, err := io.ReadFull(c.conn, extra[:]); err != nil {
 			return 0, err
 		}
-		return int(b&0x0F)<<24 | int(extra[0])<<16 | int(extra[1])<<8 | int(extra[2]), nil
+		return checkedMikrotikLength(uint64(b&0x0F)<<24 | uint64(extra[0])<<16 | uint64(extra[1])<<8 | uint64(extra[2]))
 	} else {
 		var extra [4]byte
 		if _, err := io.ReadFull(c.conn, extra[:]); err != nil {
 			return 0, err
 		}
-		return int(extra[0])<<24 | int(extra[1])<<16 | int(extra[2])<<8 | int(extra[3]), nil
+		return checkedMikrotikLength(uint64(extra[0])<<24 | uint64(extra[1])<<16 | uint64(extra[2])<<8 | uint64(extra[3]))
 	}
+}
+
+func checkedMikrotikLength(length uint64) (int, error) {
+	maxInt := uint64(^uint(0) >> 1)
+	if length > maxInt {
+		return 0, fmt.Errorf("word length %d overflows int", length)
+	}
+	return int(length), nil
 }
 
 // encodeLength encodes a RouterOS API length prefix.
@@ -292,7 +316,7 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *
 
 	slog.Debug("executing mikrotik job", "job_id", job.JobId, "device", dev.Ip, "port", dev.Port, "ssl", dev.UseSsl)
 
-	client, err := mikrotikDial(dev.Ip, dev.Port, dev.Username, dev.Password, dev.UseSsl)
+	client, err := mikrotikDial(ctx, dev.Ip, dev.Port, dev.Username, dev.Password, dev.UseSsl)
 	if err != nil {
 		sendResult(ctx, resultCh, &pb.MikrotikResult{
 			DeviceId:  job.DeviceId,
@@ -303,6 +327,8 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *
 		return
 	}
 	defer func() { _ = client.close() }()
+	stopCancel := context.AfterFunc(ctx, func() { _ = client.conn.Close() })
+	defer stopCancel()
 
 	var allSentences []*pb.MikrotikSentence
 	var errorMessage string
@@ -339,8 +365,15 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *
 // executeMikrotikBackupViaSSH runs /export compact over SSH.
 func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.MikrotikDevice, resultCh chan<- *pb.MikrotikResult, timestamp int64) {
 	slog.Debug("executing backup via ssh", "device", job.DeviceId, "ip", dev.Ip, "ssh_port", dev.SshPort)
+	if dev.SshPort > 65535 {
+		sendResult(ctx, resultCh, &pb.MikrotikResult{
+			DeviceId: job.DeviceId, JobId: job.JobId,
+			Error: fmt.Sprintf("invalid SSH port %d", dev.SshPort), Timestamp: timestamp,
+		}, job.JobId)
+		return
+	}
 
-	config, err := sshBackup(dev.Ip, uint16(dev.SshPort), dev.Username, dev.Password)
+	config, err := sshBackup(ctx, dev.Ip, uint16(dev.SshPort), dev.Username, dev.Password)
 	if err != nil {
 		sendResult(ctx, resultCh, &pb.MikrotikResult{
 			DeviceId:  job.DeviceId,

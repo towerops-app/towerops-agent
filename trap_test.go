@@ -465,6 +465,43 @@ func TestTrapListenerReceivesRealTrap(t *testing.T) {
 	}
 }
 
+func TestTrapListenerRebindsAfterUnexpectedStop(t *testing.T) {
+	port := freeUDPPort(t)
+	l, err := startTrapListener(port, "public")
+	if err != nil {
+		t.Skipf("cannot bind trap port %d: %v", port, err)
+	}
+	defer l.Close()
+
+	l.mu.Lock()
+	original := l.listener
+	l.mu.Unlock()
+	original.Close()
+
+	deadline := time.After(3 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			l.mu.Lock()
+			current := l.listener
+			ready := l.ready
+			l.mu.Unlock()
+			if current != original {
+				select {
+				case <-ready:
+					return
+				case <-deadline:
+					t.Fatal("replacement trap listener did not start")
+				}
+			}
+		case <-deadline:
+			t.Fatal("trap listener was not replaced")
+		}
+	}
+}
+
 func TestTrapListenerRejectsWrongCommunityOnTheWire(t *testing.T) {
 	port := freeUDPPort(t)
 
