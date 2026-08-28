@@ -1,6 +1,6 @@
 module github.com/towerops-app/towerops-agent
 
-go 1.25.6
+go 1.27.0
 
 require (
 	github.com/gosnmp/gosnmp v1.44.0

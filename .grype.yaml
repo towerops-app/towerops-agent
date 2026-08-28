@@ -1,0 +1,28 @@
+# Grype configuration. Picked up automatically by anchore/scan-action, which
+# only disables auto-detection if its `config` input is set.
+#
+# The CI gate fails the build at high severity or above; see .github/workflows/ci.yml.
+
+ignore:
+  # GO-2026-5932: "golang.org/x/crypto/openpgp is unmaintained, unsafe by
+  # design, and has known security issues."
+  #
+  # This is the one entry here, and it is not a deferral — there is nothing to
+  # upgrade to. The advisory has an `introduced: 0` range and no `fixed` event,
+  # so it matches every version of golang.org/x/crypto that has ever been
+  # published. Grype flags it on the module version alone.
+  #
+  # The advisory applies only to code importing golang.org/x/crypto/openpgp.
+  # We do not:
+  #
+  #   $ go list -deps ./... | grep openpgp    # no matches
+  #   $ govulncheck ./...                     # not called
+  #
+  # We depend on x/crypto for SSH and for the chacha20poly1305 and cryptobyte
+  # packages pulled in transitively. If a future change ever does import
+  # openpgp, delete this entry rather than widening it — the package really is
+  # unsafe, and this rule exists because we are not using it.
+  - vulnerability: GO-2026-5932
+    package:
+      name: golang.org/x/crypto
+      type: go-module

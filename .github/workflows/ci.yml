@@ -211,6 +211,10 @@ jobs:
           fail-build: true
           output-format: sarif
           cache-db: true
+          # Named explicitly rather than relying on the action's auto-detection
+          # of .grype.yaml, so a change to that behaviour cannot silently drop
+          # the ignore rule documented in that file.
+          config: .grype.yaml
 
       - name: Upload scan results to code scanning
         # `always()` so findings still reach the Security tab on the run that
