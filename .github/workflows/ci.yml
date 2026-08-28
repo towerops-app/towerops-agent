@@ -132,6 +132,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Grype results are uploaded to the repository's code scanning alerts.
+      security-events: write
     strategy:
       fail-fast: false
       matrix:
@@ -169,6 +171,35 @@ jobs:
           cache-to: type=gha,scope=${{ matrix.arch }},mode=max
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+
+      # Runs before the binary is extracted and before the manifest job, so a
+      # vulnerable build never gets promoted to the :latest tag or attached to
+      # a GitHub Release.
+      - name: Scan image for vulnerabilities
+        id: scan
+        uses: anchore/scan-action@v7
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          # High and above fails the build. Alpine ships a handful of
+          # medium-severity busybox findings with no fix available, and
+          # blocking releases on vulnerabilities we cannot act on would only
+          # teach us to ignore the gate.
+          severity-cutoff: high
+          fail-build: true
+          output-format: sarif
+          cache-db: true
+
+      - name: Upload scan results to code scanning
+        # `always()` so findings still reach the Security tab on the run that
+        # failed the gate, which is exactly when they are worth reading.
+        # Non-blocking: the scan above is the gate, and a code scanning upload
+        # problem should not be what stops a release.
+        if: always() && steps.scan.outputs.sarif != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
+          category: grype-${{ matrix.arch }}
 
       - name: Extract standalone binary
         run: |
