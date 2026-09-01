@@ -18,14 +18,14 @@ const (
 	maxMessageSize     = 16 << 20
 )
 
-// WSConn keeps the small interface used by the agent while delegating the
+// wsConn keeps the small interface used by the agent while delegating the
 // WebSocket protocol to coder/websocket.
-type WSConn struct {
+type wsConn struct {
 	conn *websocket.Conn
 }
 
-// WSDial connects to a WebSocket endpoint and completes its opening handshake.
-func WSDial(ctx context.Context, rawURL string) (*WSConn, error) {
+// wsDial connects to a WebSocket endpoint and completes its opening handshake.
+func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 	ctx, cancel := context.WithTimeout(ctx, wsHandshakeTimeout)
 	defer cancel()
 
@@ -37,23 +37,23 @@ func WSDial(ctx context.Context, rawURL string) (*WSConn, error) {
 		return nil, fmt.Errorf("dial websocket: %w", err)
 	}
 	conn.SetReadLimit(maxMessageSize)
-	return &WSConn{conn: conn}, nil
+	return &wsConn{conn: conn}, nil
 }
 
 // ReadMessage reads one complete text or binary message.
-func (ws *WSConn) ReadMessage(ctx context.Context) ([]byte, int, error) {
+func (ws *wsConn) ReadMessage(ctx context.Context) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, wsReadTimeout)
 	defer cancel()
 
-	messageType, data, err := ws.conn.Read(ctx)
+	_, data, err := ws.conn.Read(ctx)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	return data, int(messageType), nil
+	return data, nil
 }
 
 // WriteText writes one text message.
-func (ws *WSConn) WriteText(ctx context.Context, data []byte) error {
+func (ws *wsConn) WriteText(ctx context.Context, data []byte) error {
 	ctx, cancel := context.WithTimeout(ctx, wsWriteTimeout)
 	defer cancel()
 	return ws.conn.Write(ctx, websocket.MessageText, data)
@@ -61,6 +61,6 @@ func (ws *WSConn) WriteText(ctx context.Context, data []byte) error {
 
 // Close immediately releases the connection and unblocks pending I/O. Session
 // shutdown must not wait for a peer that may already be unreachable.
-func (ws *WSConn) Close() error {
+func (ws *wsConn) Close() error {
 	return ws.conn.CloseNow()
 }

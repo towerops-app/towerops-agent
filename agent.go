@@ -11,11 +11,11 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"os"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,15 +24,19 @@ import (
 )
 
 var doSelfUpdate = selfUpdateContext
+var getHostname = os.Hostname
+var decodeBase64 = base64.StdEncoding.DecodeString
 
-var errRestartRequested = fmt.Errorf("restart requested")
-var errChannelReloaded = fmt.Errorf("channel reloaded")
+var errRestartRequested = errors.New("restart requested")
+var errChannelReloaded = errors.New("channel reloaded")
 var joinTimeout = 10 * time.Second
 var heartbeatInterval = 60 * time.Second
 var channelHeartbeatInterval = 25 * time.Second
 var initialRetryDelay = time.Second
+var writeQueueTimeout = 5 * time.Second
 
 var agentIDCounter atomic.Uint64
+var updateInProgress atomic.Bool
 
 // successfulConnectionThreshold is how long a session must last before the
 // reconnect backoff is considered stale and reset to initialRetryDelay.
@@ -105,7 +109,7 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 	endpoint := baseURL + "/socket/agent/websocket"
 	slog.Info("connecting", "url", sanitizeURL(endpoint))
 
-	ws, err := WSDial(ctx, endpoint)
+	ws, err := wsDial(ctx, endpoint)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -117,6 +121,11 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 	topic := "agent:" + agentID
 
 	slog.Info("connected", "agent_id", agentID)
+
+	hostname, err := getHostname()
+	if err != nil {
+		slog.Error("resolve hostname", "error", err)
+	}
 
 	// Session-scoped context: cancelled on write/read errors so blocked
 	// pool submits unblock immediately instead of waiting for workers to finish.
@@ -134,13 +143,14 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 		checks:   newWorkerPool(50),
 	}
 
-	// Result channels
-	snmpResultCh := make(chan *pb.SnmpResult, 100)
-	mikrotikResultCh := make(chan *pb.MikrotikResult, 20)
-	credTestResultCh := make(chan *pb.CredentialTestResult, 100)
-	monitoringCheckCh := make(chan *pb.MonitoringCheck, 50)
-	checkResultCh := make(chan *pb.CheckResult, 50)
-	lldpTopologyResultCh := make(chan *pb.LldpTopologyResult, 100)
+	results := &resultChannels{
+		snmp:       make(chan *pb.SnmpResult, 100),
+		mikrotik:   make(chan *pb.MikrotikResult, 20),
+		credTest:   make(chan *pb.CredentialTestResult, 100),
+		monitoring: make(chan *pb.MonitoringCheck, 50),
+		check:      make(chan *pb.CheckResult, 50),
+		lldp:       make(chan *pb.LldpTopologyResult, 100),
+	}
 
 	// Ref counter for outbound messages
 	var refCounter atomic.Uint64
@@ -159,40 +169,16 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 		// Infallible: topic and event are strings and payload is always a
 		// valid json.RawMessage produced by sendBinaryResult.
 		data, _ := json.Marshal(msg)
-		select {
-		case writeCh <- data:
-			return true
-		default:
-			slog.Error("write channel full, reconnecting", "event", event)
-			sessionCancel()
-			return false
-		}
-	}
-
-	bufPool := &sync.Pool{
-		New: func() any {
-			b := make([]byte, 0, 4096)
-			return &b
-		},
+		return enqueueWrite(sessionCtx, writeCh, data, event)
 	}
 
 	sendBinaryResult := func(event string, msg proto.Message) bool {
-		bp := bufPool.Get().(*[]byte)
-		buf := (*bp)[:0]
-		bin, err := proto.MarshalOptions{}.MarshalAppend(buf, msg)
+		bin, err := proto.Marshal(msg)
 		if err != nil {
 			slog.Error("marshal protobuf", "error", err)
-			bufPool.Put(bp)
 			return false
 		}
 		encoded := base64.StdEncoding.EncodeToString(bin)
-		// Zero the serialized protobuf data (may contain credentials).
-		// MarshalAppend may return a new backing array, so zero both.
-		zeroBytes(bin)
-		full := (*bp)[:cap(*bp)]
-		zeroBytes(full)
-		*bp = full[:0]
-		bufPool.Put(bp)
 		payload, _ := json.Marshal(map[string]string{"binary": encoded})
 		return sendMsg(event, payload)
 	}
@@ -200,12 +186,11 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 	// Reader goroutine — must start before join so we can receive the reply
 	msgCh := make(chan []byte, 100)
 	errCh := make(chan error, 1)
-	var readerWg sync.WaitGroup
-	readerWg.Add(1)
+	readerDone := make(chan struct{})
 	go func() {
-		defer readerWg.Done()
+		defer close(readerDone)
 		for {
-			data, _, err := ws.ReadMessage(sessionCtx)
+			data, err := ws.ReadMessage(sessionCtx)
 			if err != nil {
 				select {
 				case errCh <- err:
@@ -255,11 +240,10 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 	}
 
 	// Writer goroutine - serializes all writes to the WebSocket
-	var writerWg sync.WaitGroup
+	writerDone := make(chan struct{})
 	writeErrCh := make(chan error, 1)
-	writerWg.Add(1)
 	go func() {
-		defer writerWg.Done()
+		defer close(writerDone)
 		for data := range writeCh {
 			if err := ws.WriteText(sessionCtx, data); err != nil {
 				slog.Error("websocket write", "error", err)
@@ -289,8 +273,8 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 			slog.Warn("worker pool shutdown timed out, abandoning in-flight jobs", "pool", name)
 		}
 		close(writeCh)
-		writerWg.Wait()
-		readerWg.Wait()
+		<-writerDone
+		<-readerDone
 	}()
 
 	for {
@@ -314,33 +298,38 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 				slog.Debug("invalid message", "error", err)
 				continue
 			}
-			shouldEnd, endErr := handleMessage(sessionCtx, msg, topic, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh, lldpTopologyResultCh)
+			shouldEnd, endErr := handleMessage(sessionCtx, msg, topic, pools, results)
 			if shouldEnd {
 				return endErr
 			}
 
-		case result := <-snmpResultCh:
+		case result := <-results.snmp:
 			sendBinaryResult("result", result)
 
-		case result := <-mikrotikResultCh:
-			sendBinaryResult("mikrotik_result", result)
-			slog.Info("sent mikrotik result", "device", result.DeviceId, "job", result.JobId)
+		case result := <-results.mikrotik:
+			if sendBinaryResult("mikrotik_result", result) {
+				slog.Info("sent mikrotik result", "device", result.DeviceId, "job", result.JobId)
+			}
 
-		case result := <-credTestResultCh:
-			sendBinaryResult("credential_test_result", result)
-			slog.Info("sent credential test result", "test_id", result.TestId, "success", result.Success)
+		case result := <-results.credTest:
+			if sendBinaryResult("credential_test_result", result) {
+				slog.Info("sent credential test result", "test_id", result.TestId, "success", result.Success)
+			}
 
-		case result := <-monitoringCheckCh:
-			sendBinaryResult("monitoring_check", result)
-			slog.Info("sent monitoring check", "device", result.DeviceId, "status", result.Status)
+		case result := <-results.monitoring:
+			if sendBinaryResult("monitoring_check", result) {
+				slog.Info("sent monitoring check", "device", result.DeviceId, "status", result.Status)
+			}
 
-		case result := <-checkResultCh:
-			sendBinaryResult("check_result", result)
-			slog.Info("sent check result", "check", result.CheckId, "status", result.Status)
+		case result := <-results.check:
+			if sendBinaryResult("check_result", result) {
+				slog.Info("sent check result", "check", result.CheckId, "status", result.Status)
+			}
 
-		case result := <-lldpTopologyResultCh:
-			sendBinaryResult("lldp_topology_result", result)
-			slog.Info("sent LLDP topology result", "device", result.DeviceId, "neighbors", len(result.Neighbors))
+		case result := <-results.lldp:
+			if sendBinaryResult("lldp_topology_result", result) {
+				slog.Info("sent LLDP topology result", "device", result.DeviceId, "neighbors", len(result.Neighbors))
+			}
 
 		case trap, ok := <-traps:
 			if !ok {
@@ -352,17 +341,20 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 				slog.Warn("ignoring nil snmp trap")
 				continue
 			}
-			sendBinaryResult("trap", trap)
-			slog.Info("sent snmp trap", "source", trap.SourceIp, "trap_oid", trap.TrapOid)
+			if sendBinaryResult("trap", trap) {
+				slog.Info("sent snmp trap", "source", trap.SourceIp, "trap_oid", trap.TrapOid)
+			}
 
 		case <-heartbeatTicker.C:
 			hb := &pb.AgentHeartbeat{
 				Version:       version,
 				UptimeSeconds: uint64(time.Since(startTime).Seconds()),
 				Arch:          runtime.GOARCH,
+				Hostname:      hostname,
 			}
-			sendBinaryResult("heartbeat", hb)
-			slog.Debug("sent heartbeat")
+			if sendBinaryResult("heartbeat", hb) {
+				slog.Debug("sent heartbeat")
+			}
 
 		case <-channelHeartbeatTicker.C:
 			ref := nextRef()
@@ -373,14 +365,36 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 				Ref:     &ref,
 			}
 			data, _ := json.Marshal(msg)
-			select {
-			case writeCh <- data:
-			default:
-				slog.Error("write channel full, reconnecting", "event", "heartbeat")
-				sessionCancel()
+			if enqueueWrite(sessionCtx, writeCh, data, "heartbeat") {
+				slog.Debug("sent channel heartbeat", "ref", ref)
 			}
-			slog.Debug("sent channel heartbeat", "ref", ref)
 		}
+	}
+}
+
+// enqueueWrite gives the session writer a bounded opportunity to accept a
+// message. A full queue drops only that message; the writer's I/O timeout is
+// responsible for detecting a wedged connection.
+func enqueueWrite(ctx context.Context, writeCh chan<- []byte, data []byte, event string) bool {
+	select {
+	case writeCh <- data:
+		return true
+	case <-ctx.Done():
+		return false
+	default:
+	}
+
+	timer := time.NewTimer(writeQueueTimeout)
+	defer timer.Stop()
+
+	select {
+	case writeCh <- data:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		slog.Error("write channel full, dropping message", "event", event)
+		return false
 	}
 }
 
@@ -400,12 +414,18 @@ func validateJoinReply(data []byte) error {
 		return fmt.Errorf("join reply has unexpected ref")
 	}
 	var status struct {
-		Status string `json:"status"`
+		Status   string `json:"status"`
+		Response struct {
+			Reason string `json:"reason"`
+		} `json:"response"`
 	}
 	if err := json.Unmarshal(reply.Payload, &status); err != nil {
 		return fmt.Errorf("join reply payload: %w", err)
 	}
 	if status.Status != "ok" {
+		if status.Response.Reason != "" {
+			return fmt.Errorf("join rejected: %s (%s)", status.Status, status.Response.Reason)
+		}
 		return fmt.Errorf("join rejected: %s", status.Status)
 	}
 	return nil
@@ -418,12 +438,7 @@ func handleMessage(
 	msg channelMsg,
 	topic string,
 	pools *jobPools,
-	snmpResultCh chan<- *pb.SnmpResult,
-	mikrotikResultCh chan<- *pb.MikrotikResult,
-	credTestResultCh chan<- *pb.CredentialTestResult,
-	monitoringCheckCh chan<- *pb.MonitoringCheck,
-	checkResultCh chan<- *pb.CheckResult,
-	lldpTopologyResultCh chan<- *pb.LldpTopologyResult,
+	results *resultChannels,
 ) (bool, error) {
 	// Ignore messages not addressed to our topic (except Phoenix control messages)
 	if msg.Topic != topic && msg.Topic != "phoenix" {
@@ -448,7 +463,7 @@ func handleMessage(
 		}
 		slog.Info("received jobs", "count", len(jobList.Jobs))
 		for _, job := range jobList.Jobs {
-			dispatchJob(ctx, job, pools, snmpResultCh, mikrotikResultCh, credTestResultCh, monitoringCheckCh, checkResultCh, lldpTopologyResultCh)
+			dispatchJob(ctx, job, pools, results)
 		}
 
 	case "check_jobs":
@@ -458,7 +473,7 @@ func handleMessage(
 		}
 		slog.Info("received checks", "count", len(checkList.Checks))
 		for _, check := range checkList.Checks {
-			executeCheck(ctx, check, pools, checkResultCh)
+			executeCheck(ctx, check, pools, results)
 		}
 
 	case "restart":
@@ -474,10 +489,18 @@ func handleMessage(
 			slog.Error("invalid update payload")
 			return false, nil
 		}
-		slog.Info("update requested", "url", sanitizeURL(payload.URL))
-		if err := doSelfUpdate(ctx, payload.URL, payload.Checksum); err != nil {
-			slog.Error("self-update failed", "error", err)
+		if !updateInProgress.CompareAndSwap(false, true) {
+			slog.Warn("self-update already in progress, ignoring duplicate")
+			return false, nil
 		}
+		updateCtx := context.WithoutCancel(ctx)
+		slog.Info("update requested", "url", sanitizeURL(payload.URL))
+		go func() {
+			defer updateInProgress.Store(false)
+			if err := doSelfUpdate(updateCtx, payload.URL, payload.Checksum); err != nil {
+				slog.Error("self-update failed", "error", err)
+			}
+		}()
 
 	default:
 		slog.Debug("ignoring event", "event", msg.Event)
@@ -500,16 +523,27 @@ func decodeBinaryPayload(event string, raw json.RawMessage, msg proto.Message) b
 		slog.Error("payload too large", "event", event, "size", len(payload.Binary), "max", maxJobPayloadBytes)
 		return false
 	}
-	bin, err := base64.StdEncoding.DecodeString(payload.Binary)
+	bin, err := decodeBase64(payload.Binary)
 	if err != nil {
 		slog.Error("decode base64", "event", event, "error", err)
 		return false
 	}
+	defer zeroBytes(bin)
 	if err := proto.Unmarshal(bin, msg); err != nil {
 		slog.Error("unmarshal payload", "event", event, "error", err)
 		return false
 	}
 	return true
+}
+
+// resultChannels groups the session-scoped result queues workers publish to.
+type resultChannels struct {
+	snmp       chan *pb.SnmpResult
+	mikrotik   chan *pb.MikrotikResult
+	credTest   chan *pb.CredentialTestResult
+	monitoring chan *pb.MonitoringCheck
+	check      chan *pb.CheckResult
+	lldp       chan *pb.LldpTopologyResult
 }
 
 // jobPools holds the worker pools for each job type.
@@ -555,27 +589,22 @@ func dispatchJob(
 	ctx context.Context,
 	job *pb.AgentJob,
 	pools *jobPools,
-	snmpResultCh chan<- *pb.SnmpResult,
-	mikrotikResultCh chan<- *pb.MikrotikResult,
-	credTestResultCh chan<- *pb.CredentialTestResult,
-	monitoringCheckCh chan<- *pb.MonitoringCheck,
-	checkResultCh chan<- *pb.CheckResult,
-	lldpTopologyResultCh chan<- *pb.LldpTopologyResult,
+	results *resultChannels,
 ) {
 	slog.Info("starting job", "job_id", job.JobId, "type", job.JobType)
 
 	var ok bool
 	switch job.JobType {
 	case pb.JobType_MIKROTIK:
-		ok = pools.mikrotik.submit(ctx, func() { executeMikrotikJob(ctx, job, mikrotikResultCh) })
+		ok = pools.mikrotik.submit(ctx, func() { executeMikrotikJob(ctx, job, results.mikrotik) })
 	case pb.JobType_TEST_CREDENTIALS:
-		ok = pools.snmp.submit(ctx, func() { executeCredentialTest(ctx, job, credTestResultCh) })
+		ok = pools.snmp.submit(ctx, func() { executeCredentialTest(ctx, job, results.credTest) })
 	case pb.JobType_PING:
-		ok = pools.ping.submit(ctx, func() { executePingJob(ctx, job, monitoringCheckCh) })
+		ok = pools.ping.submit(ctx, func() { executePingJob(ctx, job, results.monitoring) })
 	case pb.JobType_LLDP_TOPOLOGY:
-		ok = pools.snmp.submit(ctx, func() { executeLldpTopologyJob(ctx, job, lldpTopologyResultCh) })
+		ok = pools.snmp.submit(ctx, func() { executeLldpTopologyJob(ctx, job, results.lldp) })
 	default:
-		ok = pools.snmp.submit(ctx, func() { executeSnmpJob(ctx, job, snmpResultCh) })
+		ok = pools.snmp.submit(ctx, func() { executeSnmpJob(ctx, job, results.snmp) })
 	}
 	if !ok {
 		slog.Warn("job dropped, pool full", "job_id", job.JobId)
@@ -599,11 +628,10 @@ func nextBackoff(current, maxDelay time.Duration) time.Duration {
 	return next + jitter
 }
 
-// zeroBytes overwrites a byte slice with zeros.
-// SECURITY: Go strings are immutable and cannot be zeroed in place. This utility
-// is for zeroing byte slices (e.g., password buffers) to limit credential lifetime
-// in memory. Credentials stored as Go strings (ssh.go, snmp.go, mikrotik.go)
-// cannot benefit from this until the protocol layer supports []byte credentials.
+// zeroBytes overwrites a byte slice with zeros. It is used to clear decoded
+// inbound protobuf buffers after unmarshalling job credentials. The protobuf
+// fields themselves are Go strings and remain immutable until the protocol
+// represents credentials as byte slices.
 func zeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
@@ -630,13 +658,10 @@ func sendResult[T proto.Message](ctx context.Context, resultCh chan<- T, result 
 func strPtr(s string) *string { return &s }
 
 // executeCheck dispatches a check to the worker pool.
-func executeCheck(ctx context.Context, check *pb.Check, pools *jobPools, checkResultCh chan<- *pb.CheckResult) {
+func executeCheck(ctx context.Context, check *pb.Check, pools *jobPools, results *resultChannels) {
 	ok := pools.checks.submit(ctx, func() {
 		result := ExecuteCheck(ctx, check)
-		select {
-		case checkResultCh <- result:
-		case <-ctx.Done():
-		}
+		sendResult(ctx, results.check, result, check.Id)
 	})
 	if !ok {
 		slog.Warn("check rejected (pool full)", "check_id", check.Id, "type", check.CheckType)

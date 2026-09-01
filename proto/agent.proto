@@ -137,6 +137,10 @@ message HttpCheckConfig {
   string url = 1;
   string method = 2;  // GET, POST, etc.
   uint32 expected_status = 3;
+  // Verify the server's TLS chain. The server always sets this field
+  // explicitly — true unless the operator opted out — so an agent that
+  // receives it unset (proto3 default false) is talking to a producer that
+  // bypassed that contract, and skips verification.
   bool verify_ssl = 4;
   map<string, string> headers = 5;
   string body = 6;
@@ -241,6 +245,8 @@ message SnmpQuery {
 message SnmpResult {
   string device_id = 1;
   JobType job_type = 2;
+  // OID keys carry no leading dot: "1.3.6.1.2.1.1.1.0". This is the canonical
+  // form for every OID map in this protocol, including SnmpTrap.varbinds.
   map<string, string> oid_values = 3;
   int64 timestamp = 4;
   string job_id = 5;
@@ -329,6 +335,7 @@ message SnmpTrap {
   uint32 generic_trap = 5;    // SNMPv1 only
   uint32 specific_trap = 6;   // SNMPv1 only
   uint64 uptime_ticks = 7;    // sysUpTime.0, hundredths of a second
+  // Keys carry no leading dot, as in SnmpResult.oid_values.
   map<string, string> varbinds = 8;
   int64 timestamp = 9;
 }

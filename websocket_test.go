@@ -32,9 +32,9 @@ func TestWSDialReadWriteAndClose(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ws, err := WSDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"))
+	ws, err := wsDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"))
 	if err != nil {
-		t.Fatalf("WSDial: %v", err)
+		t.Fatalf("wsDial: %v", err)
 	}
 	defer func() { _ = ws.Close() }()
 
@@ -42,12 +42,12 @@ func TestWSDialReadWriteAndClose(t *testing.T) {
 	if err := ws.WriteText(context.Background(), want); err != nil {
 		t.Fatalf("WriteText: %v", err)
 	}
-	got, messageType, err := ws.ReadMessage(context.Background())
+	got, err := ws.ReadMessage(context.Background())
 	if err != nil {
 		t.Fatalf("ReadMessage: %v", err)
 	}
-	if messageType != int(websocket.MessageText) || string(got) != string(want) {
-		t.Fatalf("ReadMessage = (%d, %q), want (%d, %q)", messageType, got, websocket.MessageText, want)
+	if string(got) != string(want) {
+		t.Fatalf("ReadMessage = %q, want %q", got, want)
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("server: %v", err)
@@ -55,8 +55,8 @@ func TestWSDialReadWriteAndClose(t *testing.T) {
 }
 
 func TestWSDialRejectsNonWebSocketURL(t *testing.T) {
-	if _, err := WSDial(context.Background(), "ftp://example.com/socket"); err == nil {
-		t.Fatal("WSDial accepted an ftp URL")
+	if _, err := wsDial(context.Background(), "ftp://example.com/socket"); err == nil {
+		t.Fatal("wsDial accepted an ftp URL")
 	}
 }
 
@@ -69,19 +69,19 @@ func TestWSDialClosesResponseBodyOnFailedHandshake(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ws, err := WSDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"))
+	ws, err := wsDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"))
 	if err == nil {
 		_ = ws.Close()
-		t.Fatal("WSDial succeeded against a 404 handler")
+		t.Fatal("wsDial succeeded against a 404 handler")
 	}
 	if ws != nil {
-		t.Errorf("WSDial conn = %v, want nil on handshake failure", ws)
+		t.Errorf("wsDial conn = %v, want nil on handshake failure", ws)
 	}
 	if !strings.Contains(err.Error(), "dial websocket") {
-		t.Errorf("WSDial error = %v, want it wrapped with \"dial websocket\"", err)
+		t.Errorf("wsDial error = %v, want it wrapped with \"dial websocket\"", err)
 	}
 	if !strings.Contains(err.Error(), "404") {
-		t.Errorf("WSDial error = %v, want the 404 status surfaced", err)
+		t.Errorf("wsDial error = %v, want the 404 status surfaced", err)
 	}
 }
 
@@ -96,13 +96,13 @@ func TestWSConnReadLimit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ws, err := WSDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"))
+	ws, err := wsDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"))
 	if err != nil {
-		t.Fatalf("WSDial: %v", err)
+		t.Fatalf("wsDial: %v", err)
 	}
 	defer func() { _ = ws.Close() }()
 
-	_, _, err = ws.ReadMessage(context.Background())
+	_, err = ws.ReadMessage(context.Background())
 	if !errors.Is(err, websocket.ErrMessageTooBig) {
 		t.Fatalf("ReadMessage error = %v, want ErrMessageTooBig", err)
 	}

@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"strings"
@@ -315,7 +316,7 @@ func TestSSHBackupIPv6Address(t *testing.T) {
 		return nil, fmt.Errorf("mock dial")
 	}
 
-	_, _ = executeMikrotikBackup("::1", 22, "admin", "pass")
+	_, _ = executeMikrotikBackupContext(context.Background(), "::1", 22, "admin", "pass")
 
 	if capturedAddr != "[::1]:22" {
 		t.Errorf("expected [::1]:22, got %q", capturedAddr)
@@ -332,7 +333,7 @@ func TestSSHBackupIPv4Address(t *testing.T) {
 		return nil, fmt.Errorf("mock dial")
 	}
 
-	_, _ = executeMikrotikBackup("10.0.0.1", 22, "admin", "pass")
+	_, _ = executeMikrotikBackupContext(context.Background(), "10.0.0.1", 22, "admin", "pass")
 
 	if capturedAddr != "10.0.0.1:22" {
 		t.Errorf("expected 10.0.0.1:22, got %q", capturedAddr)
@@ -340,7 +341,7 @@ func TestSSHBackupIPv4Address(t *testing.T) {
 }
 
 func TestExecuteMikrotikBackupDialError(t *testing.T) {
-	_, err := executeMikrotikBackup("127.0.0.1", 1, "admin", "pass")
+	_, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", 1, "admin", "pass")
 	if err == nil {
 		t.Error("expected SSH dial error")
 	}
@@ -358,6 +359,87 @@ func TestSSHBackupHonorsContextCancellation(t *testing.T) {
 	_, err := executeMikrotikBackupContext(ctx, "127.0.0.1", 22, "admin", "pass")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("backup error = %v, want context cancellation", err)
+	}
+}
+
+func TestSSHBackupHandshakeTimeout(t *testing.T) {
+	origDial := sshDial
+	origTimeout := sshBackupTimeout
+	defer func() {
+		sshDial = origDial
+		sshBackupTimeout = origTimeout
+	}()
+	sshDial = chkTOrigSSHDial
+	sshBackupTimeout = 100 * time.Millisecond
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	var portNum uint16
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected stalled SSH handshake to time out")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stalled SSH handshake did not return promptly")
+	}
+}
+
+func TestSSHBackupCommandTimeout(t *testing.T) {
+	resetHostKeyStore(t)
+	origTimeout := sshBackupTimeout
+	defer func() { sshBackupTimeout = origTimeout }()
+	sshBackupTimeout = 500 * time.Millisecond
+
+	releaseCommand := make(chan struct{})
+	addr, cleanup := startTestSSHServer(t, func(ssh.Channel) {
+		<-releaseCommand
+	})
+	defer cleanup()
+	defer close(releaseCommand)
+
+	_, port, _ := net.SplitHostPort(addr)
+	var portNum uint16
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected stalled SSH command to time out")
+		}
+		if !strings.Contains(err.Error(), "ssh command") {
+			t.Fatalf("backup error = %v, want SSH command error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stalled SSH command did not return promptly")
 	}
 }
 
@@ -390,7 +472,7 @@ func TestExecuteMikrotikBackupSuccess(t *testing.T) {
 	var portNum uint16
 	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
-	config, err := executeMikrotikBackup("127.0.0.1", portNum, "admin", "pass")
+	config, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +494,7 @@ func TestExecuteMikrotikBackupCommandError(t *testing.T) {
 	var portNum uint16
 	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
-	_, err := executeMikrotikBackup("127.0.0.1", portNum, "admin", "pass")
+	_, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass")
 	if err == nil {
 		t.Error("expected error from failed command")
 	}
@@ -432,7 +514,7 @@ func TestExecuteMikrotikBackupWithOutput(t *testing.T) {
 	var portNum uint16
 	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
-	_, err := executeMikrotikBackup("127.0.0.1", portNum, "admin", "pass")
+	_, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass")
 	if err == nil {
 		t.Fatal("expected command failure when output is present with non-zero exit status")
 	}
@@ -491,7 +573,7 @@ func TestExecuteMikrotikBackupSessionError(t *testing.T) {
 	var portNum uint16
 	_, _ = fmt.Sscanf(port, "%d", &portNum)
 
-	_, err = executeMikrotikBackup("127.0.0.1", portNum, "admin", "pass")
+	_, err = executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass")
 	if err == nil {
 		t.Error("expected session error")
 	}

@@ -21,7 +21,7 @@ import (
 )
 
 func TestSelfUpdateRejectsHTTP(t *testing.T) {
-	err := selfUpdate("http://example.com/agent", "abc123")
+	err := selfUpdateContext(context.Background(), "http://example.com/agent", "abc123")
 	if err == nil {
 		t.Error("expected error for HTTP URL")
 	}
@@ -45,14 +45,14 @@ func TestSelfUpdateRejectsRedirectToHTTP(t *testing.T) {
 		}, nil
 	}
 
-	err := selfUpdate("https://example.com/agent", strings.Repeat("0", 64))
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64))
 	if err == nil || !strings.Contains(err.Error(), "after redirects") {
 		t.Fatalf("selfUpdate error = %v, want HTTPS redirect rejection", err)
 	}
 }
 
 func TestSelfUpdateRequiresChecksum(t *testing.T) {
-	err := selfUpdate("https://example.com/agent", "")
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", "")
 	if err == nil {
 		t.Error("expected error for empty checksum")
 	}
@@ -62,7 +62,7 @@ func TestSelfUpdateRequiresChecksum(t *testing.T) {
 }
 
 func TestSelfUpdateBadURL(t *testing.T) {
-	err := selfUpdate("https://127.0.0.1:1/nonexistent", "abc123")
+	err := selfUpdateContext(context.Background(), "https://127.0.0.1:1/nonexistent", "abc123")
 	if err == nil {
 		t.Error("expected error for unreachable URL")
 	}
@@ -78,7 +78,7 @@ func TestSelfUpdateChecksumMismatch(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdate(rewriteToHTTPS(srv.URL), "0000000000000000000000000000000000000000000000000000000000000000")
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), "0000000000000000000000000000000000000000000000000000000000000000")
 	if err == nil {
 		t.Error("expected checksum mismatch error")
 	}
@@ -94,7 +94,7 @@ func TestSelfUpdate404(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdate(rewriteToHTTPS(srv.URL)+"/missing", "abc123")
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL)+"/missing", "abc123")
 	if err == nil {
 		t.Error("expected error for 404 response")
 	}
@@ -120,7 +120,7 @@ func TestSelfUpdateReadBodyError(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdate(rewriteToHTTPS(srv.URL), "abc123")
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), "abc123")
 	// This may or may not error depending on io.ReadAll behavior with truncated body
 	// but we exercise the code path
 	_ = err
@@ -145,7 +145,7 @@ func TestSelfUpdateOsExecutableError(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
 	if err == nil {
 		t.Error("expected os.Executable error")
 	}
@@ -178,7 +178,7 @@ func TestSelfUpdateCreateTempError(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
 	if err == nil {
 		t.Error("expected create temp error")
 	}
@@ -212,7 +212,7 @@ func TestSelfUpdateRenameError(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
 	if err == nil {
 		t.Error("expected rename error")
 	}
@@ -247,7 +247,7 @@ func TestSelfUpdateChecksumMatch(t *testing.T) {
 	osExecutable = func() (string, error) { return filepath.Join(dir, "test-agent"), nil }
 	osRename = func(string, string) error { return fmt.Errorf("stop before replacing binary") }
 
-	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
 	if err == nil {
 		t.Fatal("expected error (rename is stubbed out)")
 	}
@@ -288,7 +288,7 @@ func TestSelfUpdateFilePermissions(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	_ = selfUpdate(rewriteToHTTPS(srv.URL), checksum)
+	_ = selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
 
 	if capturedPath != "" {
 		info, err := os.Stat(capturedPath)
@@ -317,7 +317,7 @@ func TestSelfUpdateTooLarge(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
 	if err == nil {
 		t.Error("expected error for oversized download")
 	}
@@ -366,7 +366,7 @@ func TestSanitizeArgs(t *testing.T) {
 }
 
 func TestSelfUpdateInvalidURL(t *testing.T) {
-	err := selfUpdate("://\x7f", "abc123")
+	err := selfUpdateContext(context.Background(), "://\x7f", "abc123")
 	if err == nil {
 		t.Error("expected error for invalid URL")
 	}
@@ -406,7 +406,7 @@ func TestSelfUpdateFullHappyPath(t *testing.T) {
 		return nil // success — don't actually re-exec
 	}
 
-	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
 	if err != nil {
 		t.Errorf("expected nil error on full happy path, got: %v", err)
 	}
@@ -445,13 +445,13 @@ func TestSelfUpdateWriteError(t *testing.T) {
 		return f, nil
 	}
 
-	err := selfUpdate(rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
 	if err == nil {
 		t.Error("expected write error")
 	}
 }
 
-func TestSelfUpdateDownloadTimeout(t *testing.T) {
+func TestSelfUpdateResponseHeaderTimeout(t *testing.T) {
 	origDo := httpDo
 	origTimeout := selfUpdateTimeout
 	defer func() {
@@ -465,12 +465,114 @@ func TestSelfUpdateDownloadTimeout(t *testing.T) {
 	}
 	selfUpdateTimeout = 10 * time.Millisecond
 
-	err := selfUpdate("https://example.com/agent", strings.Repeat("0", 64))
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64))
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
 	if !strings.Contains(err.Error(), "context deadline exceeded") {
 		t.Fatalf("expected context deadline exceeded, got: %v", err)
+	}
+}
+
+func TestSelfUpdateSlowProgressingDownloadCompletes(t *testing.T) {
+	body := []byte("slow but steadily progressing update")
+	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
+
+	origDo := httpDo
+	origExe := osExecutable
+	origRename := osRename
+	origExec := syscallExec
+	origTimeout := selfUpdateTimeout
+	origIdleTimeout := selfUpdateIdleTimeout
+	defer func() {
+		httpDo = origDo
+		osExecutable = origExe
+		osRename = origRename
+		syscallExec = origExec
+		selfUpdateTimeout = origTimeout
+		selfUpdateIdleTimeout = origIdleTimeout
+	}()
+
+	httpDo = func(req *http.Request) (*http.Response, error) {
+		reader, writer := io.Pipe()
+		go func() {
+			ticker := time.NewTicker(20 * time.Millisecond)
+			defer ticker.Stop()
+			defer func() { _ = writer.Close() }()
+
+			for offset := 0; offset < len(body); offset += 4 {
+				select {
+				case <-ticker.C:
+					select {
+					case <-req.Context().Done():
+						_ = writer.CloseWithError(req.Context().Err())
+						return
+					default:
+					}
+					end := min(offset+4, len(body))
+					if _, err := writer.Write(body[offset:end]); err != nil {
+						return
+					}
+				case <-req.Context().Done():
+					_ = writer.CloseWithError(req.Context().Err())
+					return
+				}
+			}
+		}()
+
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       reader,
+			Request:    req,
+		}, nil
+	}
+	selfUpdateTimeout = 50 * time.Millisecond
+	selfUpdateIdleTimeout = 500 * time.Millisecond
+
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, "test-agent")
+	osExecutable = func() (string, error) { return exePath, nil }
+	osRename = os.Rename
+	syscallExec = func(string, []string, []string) error { return nil }
+
+	if err := selfUpdateContext(context.Background(), "https://example.com/agent", checksum); err != nil {
+		t.Fatalf("slow progressing update failed: %v", err)
+	}
+}
+
+func TestSelfUpdateStalledBodyTimesOut(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	origDo := httpDo
+	origExe := osExecutable
+	origTimeout := selfUpdateTimeout
+	origIdleTimeout := selfUpdateIdleTimeout
+	defer func() {
+		httpDo = origDo
+		osExecutable = origExe
+		selfUpdateTimeout = origTimeout
+		selfUpdateIdleTimeout = origIdleTimeout
+	}()
+
+	httpDo = srv.Client().Do
+	osExecutable = func() (string, error) { return filepath.Join(t.TempDir(), "test-agent"), nil }
+	selfUpdateTimeout = 500 * time.Millisecond
+	selfUpdateIdleTimeout = 25 * time.Millisecond
+
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), strings.Repeat("0", 64))
+	if err == nil {
+		t.Fatal("expected stalled download body to time out")
+	}
+	if !strings.Contains(err.Error(), "idle timeout") {
+		t.Fatalf("stalled download error = %v, want idle timeout", err)
 	}
 }
 
@@ -550,7 +652,7 @@ func TestCliTSelfUpdateBuildRequestError(t *testing.T) {
 		return nil, nil
 	}
 
-	err := selfUpdate("https://example.com/agent", strings.Repeat("0", 64))
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64))
 	if err == nil || !strings.Contains(err.Error(), "build request: unsupported protocol scheme") {
 		t.Fatalf("selfUpdate error = %v, want build request failure", err)
 	}
@@ -602,7 +704,7 @@ func TestCliTSelfUpdateTempFileFailures(t *testing.T) {
 				return nil
 			}
 
-			err := selfUpdate(downloadURL, checksum)
+			err := selfUpdateContext(context.Background(), downloadURL, checksum)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("selfUpdate error = %v, want %q", err, tt.want)
 			}
@@ -649,7 +751,7 @@ func TestCliTSelfUpdateSyncDirectoryError(t *testing.T) {
 		return nil
 	}
 
-	err := selfUpdate(downloadURL, checksum)
+	err := selfUpdateContext(context.Background(), downloadURL, checksum)
 	if err == nil || !strings.Contains(err.Error(), "sync executable directory") {
 		t.Fatalf("selfUpdate error = %v, want directory sync failure", err)
 	}

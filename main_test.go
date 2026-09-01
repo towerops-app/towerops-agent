@@ -5,8 +5,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
+	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
@@ -76,48 +79,69 @@ func TestFlagIsSet(t *testing.T) {
 	}
 }
 
-func TestToWebSocketURL(t *testing.T) {
-	origInsecure := insecureFlag
-	defer func() { insecureFlag = origInsecure }()
-	insecureFlag = true
+func TestStopSignalNotifierAfterShutdownStarts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
 
+	go stopSignalNotifier(ctx, func() {
+		close(stopped)
+	})
+
+	select {
+	case <-stopped:
+		t.Fatal("signal notifier stopped before shutdown started")
+	default:
+	}
+
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("signal notifier was not stopped after shutdown started")
+	}
+}
+
+func TestToWebSocketURL(t *testing.T) {
 	tests := []struct {
 		input, want string
 	}{
 		{"http://localhost:4000", "ws://localhost:4000"},
+		{"HTTP://LocalHost:4000", "ws://LocalHost:4000"},
 		{"https://towerops.net", "wss://towerops.net"},
+		{"HTTPS://TowerOps.NET", "wss://TowerOps.NET"},
+		{"hTtPs://TowerOps.NET/Socket", "wss://TowerOps.NET/Socket"},
 		{"ws://localhost:4000", "ws://localhost:4000"},
+		{"WS://LocalHost:4000", "ws://LocalHost:4000"},
 		{"wss://towerops.net", "wss://towerops.net"},
+		{"WsS://TowerOps.NET", "wss://TowerOps.NET"},
 		{"towerops.net", "wss://towerops.net"},
 		{"localhost:4000", "wss://localhost:4000"},
 	}
 	for _, tt := range tests {
-		got, err := toWebSocketURL(tt.input)
+		got, err := toWebSocketURL(tt.input, true)
 		if err != nil {
-			t.Errorf("toWebSocketURL(%q) unexpected error: %v", tt.input, err)
+			t.Errorf("toWebSocketURL(%q, true) unexpected error: %v", tt.input, err)
 			continue
 		}
 		if got != tt.want {
-			t.Errorf("toWebSocketURL(%q) = %q, want %q", tt.input, got, tt.want)
+			t.Errorf("toWebSocketURL(%q, true) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
 }
 
 func TestToWebSocketURLRejectsPlaintext(t *testing.T) {
-	origInsecure := insecureFlag
-	defer func() { insecureFlag = origInsecure }()
-	insecureFlag = false
-
 	tests := []struct {
 		name  string
 		input string
 	}{
 		{"ws:// scheme", "ws://localhost:4000"},
+		{"uppercase WS:// scheme", "WS://localhost:4000"},
 		{"http:// converts to ws://", "http://localhost:4000"},
+		{"uppercase HTTP:// converts to ws://", "HTTP://localhost:4000"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := toWebSocketURL(tt.input)
+			_, err := toWebSocketURL(tt.input, false)
 			if err == nil {
 				t.Error("expected error for plaintext URL")
 			}
@@ -192,6 +216,23 @@ func TestRunMainPlaintextRejected(t *testing.T) {
 	}
 }
 
+func TestRunMainPlaintextAllowedWithInsecureFlag(t *testing.T) {
+	origInsecure := insecureFlag
+	defer func() { insecureFlag = origInsecure }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	code := runMain(ctx, []string{
+		"--api-url=HTTP://LocalHost:4000",
+		"--token=test-token",
+		"--insecure",
+	})
+	if code != 0 {
+		t.Errorf("expected exit 0 with --insecure, got %d", code)
+	}
+}
+
 func TestRunMainLogLevels(t *testing.T) {
 	for _, level := range []string{"debug", "warn", "warning", "error", "info", "unknown"} {
 		t.Run(level, func(t *testing.T) {
@@ -207,6 +248,57 @@ func TestRunMainLogLevels(t *testing.T) {
 				t.Errorf("log level %q: expected exit 0, got %d", level, code)
 			}
 		})
+	}
+}
+
+func TestRunMainJSONLogFormat(t *testing.T) {
+	t.Setenv("LOG_FORMAT", "json")
+	t.Setenv("TOWEROPS_API_URL", "wss://example.com")
+	t.Setenv("TOWEROPS_AGENT_TOKEN", "test-token")
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	originalStderr := os.Stderr
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		os.Stderr = originalStderr
+		slog.SetDefault(originalLogger)
+		_ = writer.Close()
+		_ = reader.Close()
+	})
+	os.Stderr = writer
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	code := runMain(ctx, nil)
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	os.Stderr = originalStderr
+	slog.SetDefault(originalLogger)
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr:\n%s", code, output)
+	}
+
+	var foundStart bool
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("log line is not JSON: %q: %v", line, err)
+		}
+		if record["msg"] == "towerops agent starting" {
+			foundStart = true
+		}
+	}
+	if !foundStart {
+		t.Fatalf("JSON logs missing startup record:\n%s", output)
 	}
 }
 
@@ -471,52 +563,54 @@ func TestPropCliSanitizeURL(t *testing.T) {
 }
 
 func TestPropCliToWebSocketURL(t *testing.T) {
-	origInsecure := insecureFlag
-	defer func() { insecureFlag = origInsecure }()
-
 	// The suffix alphabet excludes '/', so a masked-out "http://" can never
 	// reappear from the caller-supplied remainder.
 	suffix := rapid.StringMatching(`[a-z0-9.:-]{0,20}`)
-	prefixes := []string{"", "http://", "https://", "ws://", "wss://"}
+	prefixes := []string{
+		"",
+		"http://", "HTTP://", "HtTp://",
+		"https://", "HTTPS://", "HtTpS://",
+		"ws://", "WS://", "Ws://",
+		"wss://", "WSS://", "WsS://",
+	}
 
 	t.Run("insecure", func(t *testing.T) {
-		insecureFlag = true
 		rapid.Check(t, func(t *rapid.T) {
 			raw := rapid.SampledFrom(prefixes).Draw(t, "prefix") + suffix.Draw(t, "suffix")
-			got, err := toWebSocketURL(raw)
+			got, err := toWebSocketURL(raw, true)
 			if err != nil {
-				t.Fatalf("toWebSocketURL(%q) unexpected error: %v", raw, err)
+				t.Fatalf("toWebSocketURL(%q, true) unexpected error: %v", raw, err)
 			}
 			if !strings.HasPrefix(got, "ws://") && !strings.HasPrefix(got, "wss://") {
-				t.Fatalf("toWebSocketURL(%q) = %q, want ws:// or wss:// prefix", raw, got)
+				t.Fatalf("toWebSocketURL(%q, true) = %q, want ws:// or wss:// prefix", raw, got)
 			}
 			if strings.Contains(got, "http://") || strings.Contains(got, "https://") {
-				t.Fatalf("toWebSocketURL(%q) = %q still carries an http scheme", raw, got)
+				t.Fatalf("toWebSocketURL(%q, true) = %q still carries an http scheme", raw, got)
 			}
 		})
 	})
 
 	t.Run("secure", func(t *testing.T) {
-		insecureFlag = false
 		rapid.Check(t, func(t *rapid.T) {
 			prefix := rapid.SampledFrom(prefixes).Draw(t, "prefix")
 			raw := prefix + suffix.Draw(t, "suffix")
-			got, err := toWebSocketURL(raw)
-			plaintext := prefix == "http://" || prefix == "ws://"
+			got, err := toWebSocketURL(raw, false)
+			lowerPrefix := strings.ToLower(prefix)
+			plaintext := lowerPrefix == "http://" || lowerPrefix == "ws://"
 			if plaintext {
 				if err == nil {
-					t.Fatalf("toWebSocketURL(%q) = %q, want plaintext rejection", raw, got)
+					t.Fatalf("toWebSocketURL(%q, false) = %q, want plaintext rejection", raw, got)
 				}
 				if got != "" {
-					t.Fatalf("toWebSocketURL(%q) returned %q alongside error", raw, got)
+					t.Fatalf("toWebSocketURL(%q, false) returned %q alongside error", raw, got)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("toWebSocketURL(%q) unexpected error: %v", raw, err)
+				t.Fatalf("toWebSocketURL(%q, false) unexpected error: %v", raw, err)
 			}
 			if !strings.HasPrefix(got, "wss://") {
-				t.Fatalf("toWebSocketURL(%q) = %q, want wss:// prefix", raw, got)
+				t.Fatalf("toWebSocketURL(%q, false) = %q, want wss:// prefix", raw, got)
 			}
 		})
 	})

@@ -95,6 +95,24 @@ func testPools(t *testing.T) *jobPools {
 	return p
 }
 
+func newTestResultChannels(
+	snmp chan *pb.SnmpResult,
+	mikrotik chan *pb.MikrotikResult,
+	credTest chan *pb.CredentialTestResult,
+	monitoring chan *pb.MonitoringCheck,
+	check chan *pb.CheckResult,
+	lldp chan *pb.LldpTopologyResult,
+) *resultChannels {
+	return &resultChannels{
+		snmp:       snmp,
+		mikrotik:   mikrotik,
+		credTest:   credTest,
+		monitoring: monitoring,
+		check:      check,
+		lldp:       lldp,
+	}
+}
+
 // makeJobPayload creates a base64-encoded protobuf job list payload.
 func makeJobPayload(jobs ...*pb.AgentJob) json.RawMessage {
 	list := &pb.AgentJobList{Jobs: jobs}
@@ -110,7 +128,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "phx_reply", Payload: json.RawMessage(`{}`)}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "phx_reply", Payload: json.RawMessage(`{}`)}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 		// Just verify it doesn't panic
 	})
 
@@ -118,7 +136,7 @@ func TestHandleMessage(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
 
-		snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
 			return &mockSnmpQuerier{
 				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 					return &gosnmp.SnmpPacket{}, nil
@@ -138,7 +156,7 @@ func TestHandleMessage(t *testing.T) {
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		})
 
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 		// Wait for goroutine to finish
 		select {
 		case <-snmpCh:
@@ -153,7 +171,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: json.RawMessage(`not json`)}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: json.RawMessage(`not json`)}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 		// Should log error but not panic
 	})
 
@@ -164,7 +182,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": "not-base64!!!"})
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 	})
 
 	t.Run("invalid protobuf", func(t *testing.T) {
@@ -174,7 +192,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString([]byte{0xFF, 0xFF, 0xFF})})
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 	})
 
 	t.Run("restart", func(t *testing.T) {
@@ -183,7 +201,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		shouldEnd, reason := handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "restart", Payload: json.RawMessage(`{}`)}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		shouldEnd, reason := handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "restart", Payload: json.RawMessage(`{}`)}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 
 		if !shouldEnd {
 			t.Error("expected handleMessage to return true for restart")
@@ -203,18 +221,7 @@ func TestHandleMessage(t *testing.T) {
 			monCh := make(chan *pb.MonitoringCheck, 1)
 			checkCh := make(chan *pb.CheckResult, 1)
 
-			shouldEnd, reason := handleMessage(
-				context.Background(),
-				channelMsg{Topic: "agent:test", Event: event, Payload: json.RawMessage(`{}`)},
-				"agent:test",
-				testPools(t),
-				snmpCh,
-				mtCh,
-				credCh,
-				monCh,
-				checkCh,
-				make(chan *pb.LldpTopologyResult, 1),
-			)
+			shouldEnd, reason := handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: event, Payload: json.RawMessage(`{}`)}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 
 			if !shouldEnd {
 				t.Fatalf("expected handleMessage to end session for %s", event)
@@ -225,26 +232,76 @@ func TestHandleMessage(t *testing.T) {
 		}
 	})
 
-	t.Run("update success", func(t *testing.T) {
+	t.Run("update runs asynchronously without session cancellation", func(t *testing.T) {
 		origUpdate := doSelfUpdate
-		defer func() { doSelfUpdate = origUpdate }()
+		defer func() {
+			doSelfUpdate = origUpdate
+			updateInProgress.Store(false)
+		}()
+		updateInProgress.Store(false)
 
+		called := make(chan struct{})
+		release := make(chan struct{})
+		finished := make(chan struct{})
 		var calledURL string
-		doSelfUpdate = func(_ context.Context, url, checksum string) error {
+		var updateCtx context.Context
+		var calls atomic.Int32
+		doSelfUpdate = func(ctx context.Context, url, checksum string) error {
+			defer close(finished)
+			updateCtx = ctx
 			calledURL = url
+			calls.Add(1)
+			close(called)
+			<-release
 			return nil
 		}
 
-		snmpCh := make(chan *pb.SnmpResult, 1)
-		mtCh := make(chan *pb.MikrotikResult, 1)
-		credCh := make(chan *pb.CredentialTestResult, 1)
-		monCh := make(chan *pb.MonitoringCheck, 1)
-		checkCh := make(chan *pb.CheckResult, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		returned := make(chan struct{})
 		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent", "checksum": "abc123"})
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "update", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		pools := testPools(t)
+		results := newTestResultChannels(
+			make(chan *pb.SnmpResult, 1),
+			make(chan *pb.MikrotikResult, 1),
+			make(chan *pb.CredentialTestResult, 1),
+			make(chan *pb.MonitoringCheck, 1),
+			make(chan *pb.CheckResult, 1),
+			make(chan *pb.LldpTopologyResult, 1),
+		)
+		go func() {
+			_, _ = handleMessage(ctx, channelMsg{Topic: "agent:test", Event: "update", Payload: payload}, "agent:test", pools, results)
+			close(returned)
+		}()
 
+		select {
+		case <-called:
+		case <-time.After(time.Second):
+			t.Fatal("self-update was not started")
+		}
+		select {
+		case <-returned:
+		case <-time.After(time.Second):
+			t.Fatal("handleMessage blocked on the self-update")
+		}
+
+		cancel()
+		if updateCtx.Err() != nil {
+			t.Fatalf("update context was cancelled with the session: %v", updateCtx.Err())
+		}
 		if calledURL != "https://example.com/agent" {
 			t.Errorf("expected update URL %q, got %q", "https://example.com/agent", calledURL)
+		}
+
+		_, _ = handleMessage(ctx, channelMsg{Topic: "agent:test", Event: "update", Payload: payload}, "agent:test", pools, results)
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("duplicate update started %d downloads, want 1", got)
+		}
+
+		close(release)
+		select {
+		case <-finished:
+		case <-time.After(time.Second):
+			t.Fatal("self-update did not finish after release")
 		}
 	})
 
@@ -258,14 +315,15 @@ func TestHandleMessage(t *testing.T) {
 			return nil
 		}
 
-		snmpCh := make(chan *pb.SnmpResult, 1)
-		mtCh := make(chan *pb.MikrotikResult, 1)
-		credCh := make(chan *pb.CredentialTestResult, 1)
-		monCh := make(chan *pb.MonitoringCheck, 1)
-		checkCh := make(chan *pb.CheckResult, 1)
-		// Missing URL field
 		payload, _ := json.Marshal(map[string]string{"checksum": "abc123"})
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "update", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "update", Payload: payload}, "agent:test", testPools(t), newTestResultChannels(
+			make(chan *pb.SnmpResult, 1),
+			make(chan *pb.MikrotikResult, 1),
+			make(chan *pb.CredentialTestResult, 1),
+			make(chan *pb.MonitoringCheck, 1),
+			make(chan *pb.CheckResult, 1),
+			make(chan *pb.LldpTopologyResult, 1),
+		))
 
 		if called {
 			t.Error("selfUpdate should not be called with empty URL")
@@ -274,20 +332,32 @@ func TestHandleMessage(t *testing.T) {
 
 	t.Run("update error", func(t *testing.T) {
 		origUpdate := doSelfUpdate
-		defer func() { doSelfUpdate = origUpdate }()
+		defer func() {
+			doSelfUpdate = origUpdate
+			updateInProgress.Store(false)
+		}()
+		updateInProgress.Store(false)
 
+		called := make(chan struct{})
 		doSelfUpdate = func(_ context.Context, url, checksum string) error {
+			close(called)
 			return fmt.Errorf("download failed")
 		}
 
-		snmpCh := make(chan *pb.SnmpResult, 1)
-		mtCh := make(chan *pb.MikrotikResult, 1)
-		credCh := make(chan *pb.CredentialTestResult, 1)
-		monCh := make(chan *pb.MonitoringCheck, 1)
-		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent", "checksum": "abc123"})
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "update", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
-		// Should log error but not panic
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "update", Payload: payload}, "agent:test", testPools(t), newTestResultChannels(
+			make(chan *pb.SnmpResult, 1),
+			make(chan *pb.MikrotikResult, 1),
+			make(chan *pb.CredentialTestResult, 1),
+			make(chan *pb.MonitoringCheck, 1),
+			make(chan *pb.CheckResult, 1),
+			make(chan *pb.LldpTopologyResult, 1),
+		))
+		select {
+		case <-called:
+		case <-time.After(time.Second):
+			t.Fatal("self-update error path was not called")
+		}
 	})
 
 	t.Run("update missing checksum", func(t *testing.T) {
@@ -300,13 +370,15 @@ func TestHandleMessage(t *testing.T) {
 			return nil
 		}
 
-		snmpCh := make(chan *pb.SnmpResult, 1)
-		mtCh := make(chan *pb.MikrotikResult, 1)
-		credCh := make(chan *pb.CredentialTestResult, 1)
-		monCh := make(chan *pb.MonitoringCheck, 1)
-		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"url": "https://example.com/agent"})
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "update", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "update", Payload: payload}, "agent:test", testPools(t), newTestResultChannels(
+			make(chan *pb.SnmpResult, 1),
+			make(chan *pb.MikrotikResult, 1),
+			make(chan *pb.CredentialTestResult, 1),
+			make(chan *pb.MonitoringCheck, 1),
+			make(chan *pb.CheckResult, 1),
+			make(chan *pb.LldpTopologyResult, 1),
+		))
 
 		if called {
 			t.Error("selfUpdate should not be called with empty checksum")
@@ -319,7 +391,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "some_unknown_event", Payload: json.RawMessage(`{}`)}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "some_unknown_event", Payload: json.RawMessage(`{}`)}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 		// Should just log and not panic
 	})
 
@@ -336,7 +408,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: payload}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 		select {
 		case <-checkCh:
 		case <-time.After(time.Second):
@@ -350,7 +422,7 @@ func TestHandleMessage(t *testing.T) {
 		credCh := make(chan *pb.CredentialTestResult, 1)
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: json.RawMessage(`not json`)}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: json.RawMessage(`not json`)}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 		// Should log error but not panic
 	})
 
@@ -361,7 +433,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": "not-base64!!!"})
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: payload}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 		// Should log error but not panic
 	})
 
@@ -372,7 +444,7 @@ func TestHandleMessage(t *testing.T) {
 		monCh := make(chan *pb.MonitoringCheck, 1)
 		checkCh := make(chan *pb.CheckResult, 1)
 		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString([]byte{0xFF, 0xFF, 0xFF})})
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: payload}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 		// Should log error but not panic
 	})
 
@@ -380,7 +452,7 @@ func TestHandleMessage(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
 
-		snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
 			return &mockSnmpQuerier{
 				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 					return &gosnmp.SnmpPacket{}, nil
@@ -399,7 +471,7 @@ func TestHandleMessage(t *testing.T) {
 			JobType:    pb.JobType_DISCOVER,
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		})
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "discovery_job", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "discovery_job", Payload: payload}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 		select {
 		case <-snmpCh:
 		case <-time.After(500 * time.Millisecond):
@@ -427,7 +499,7 @@ func TestHandleMessage(t *testing.T) {
 			JobType:        pb.JobType_MIKROTIK,
 			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", SshPort: 22, Username: "admin", Password: "pass"},
 		})
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "backup_job", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "backup_job", Payload: payload}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 		select {
 		case result := <-mtCh:
 			if result.Error != "" {
@@ -451,7 +523,7 @@ func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
 	encoded := base64.StdEncoding.EncodeToString(oversized)
 	payload, _ := json.Marshal(map[string]string{"binary": encoded})
 
-	_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+	_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 
 	// Verify no jobs were dispatched
 	select {
@@ -462,33 +534,50 @@ func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
 	}
 }
 
-func TestBufferPoolZeroesOnReturn(t *testing.T) {
-	pool := &sync.Pool{
-		New: func() any {
-			b := make([]byte, 0, 64)
-			return &b
-		},
-	}
+func TestDecodeBinaryPayloadZeroesDecodedBuffer(t *testing.T) {
+	origDecode := decodeBase64
+	defer func() { decodeBase64 = origDecode }()
 
-	// Get a buffer, write some data, return it
-	bp := pool.Get().(*[]byte)
-	*bp = append((*bp)[:0], []byte("sensitive credentials data here")...)
-	full := (*bp)[:cap(*bp)]
-
-	// Simulate the zeroing that sendBinaryResult should do
-	zeroBytes(full)
-	*bp = full[:0]
-	pool.Put(bp)
-
-	// Get the buffer back and verify it's zeroed
-	bp2 := pool.Get().(*[]byte)
-	full2 := (*bp2)[:cap(*bp2)]
-	for i, b := range full2 {
-		if b != 0 {
-			t.Errorf("byte[%d] = %d, expected 0 — pool buffer not zeroed", i, b)
-			break
+	t.Run("successful protobuf", func(t *testing.T) {
+		bin, err := proto.Marshal(&pb.AgentJobList{Jobs: []*pb.AgentJob{{
+			JobId: "job-1",
+			MikrotikDevice: &pb.MikrotikDevice{
+				Password: "sensitive-password",
+			},
+		}}})
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
+		decodeBase64 = func(string) ([]byte, error) { return bin, nil }
+
+		var got pb.AgentJobList
+		if !decodeBinaryPayload("jobs", json.RawMessage(`{"binary":"ignored"}`), &got) {
+			t.Fatal("decodeBinaryPayload rejected a valid protobuf")
+		}
+		if got.Jobs[0].MikrotikDevice.Password != "sensitive-password" {
+			t.Fatal("decoded credentials were corrupted while zeroing the source buffer")
+		}
+		for i, b := range bin {
+			if b != 0 {
+				t.Fatalf("decoded byte %d = %d, want zero", i, b)
+			}
+		}
+	})
+
+	t.Run("invalid protobuf", func(t *testing.T) {
+		bin := []byte{0xff, 0xff, 0xff}
+		decodeBase64 = func(string) ([]byte, error) { return bin, nil }
+
+		var got pb.AgentJobList
+		if decodeBinaryPayload("jobs", json.RawMessage(`{"binary":"ignored"}`), &got) {
+			t.Fatal("decodeBinaryPayload accepted an invalid protobuf")
+		}
+		for i, b := range bin {
+			if b != 0 {
+				t.Fatalf("decoded byte %d = %d after unmarshal failure, want zero", i, b)
+			}
+		}
+	})
 }
 
 func TestZeroBytes(t *testing.T) {
@@ -555,7 +644,7 @@ func TestDispatchJob(t *testing.T) {
 			JobId:          "mt1",
 			JobType:        pb.JobType_MIKROTIK,
 			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
-		}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		}, testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 
 		select {
 		case result := <-mtCh:
@@ -570,7 +659,7 @@ func TestDispatchJob(t *testing.T) {
 	t.Run("TEST_CREDENTIALS", func(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
-		snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
 			return nil, nil, fmt.Errorf("refused")
 		}
 
@@ -584,7 +673,7 @@ func TestDispatchJob(t *testing.T) {
 			JobId:      "tc1",
 			JobType:    pb.JobType_TEST_CREDENTIALS,
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
-		}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		}, testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 
 		select {
 		case result := <-credCh:
@@ -613,7 +702,7 @@ func TestDispatchJob(t *testing.T) {
 			JobId:      "p1",
 			JobType:    pb.JobType_PING,
 			SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1"},
-		}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		}, testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 
 		select {
 		case result := <-monCh:
@@ -628,7 +717,7 @@ func TestDispatchJob(t *testing.T) {
 	t.Run("default SNMP", func(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
-		snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
 			return &mockSnmpQuerier{
 				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 					return &gosnmp.SnmpPacket{}, nil
@@ -646,7 +735,7 @@ func TestDispatchJob(t *testing.T) {
 			JobId:      "s1",
 			JobType:    pb.JobType_POLL,
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
-		}, testPools(t), snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+		}, testPools(t), newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 
 		select {
 		case <-snmpCh:
@@ -711,8 +800,8 @@ func TestRunSessionRejectsFailedJoin(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from rejected join")
 	}
-	if !strings.Contains(err.Error(), "join rejected") {
-		t.Errorf("expected 'join rejected' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "join rejected: error (invalid token)") {
+		t.Errorf("expected rejection reason in error, got: %v", err)
 	}
 }
 
@@ -740,6 +829,42 @@ func TestValidateJoinReplyRejectsWrongRef(t *testing.T) {
 		if err := validateJoinReply(data); err == nil || !strings.Contains(err.Error(), "unexpected ref") {
 			t.Fatalf("validateJoinReply() error = %v, want unexpected ref", err)
 		}
+	}
+}
+
+func TestValidateJoinReplyRejectionReason(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload json.RawMessage
+		want    string
+	}{
+		{
+			name:    "reason present",
+			payload: json.RawMessage(`{"status":"error","response":{"reason":"invalid token"}}`),
+			want:    "join rejected: error (invalid token)",
+		},
+		{
+			name:    "reason absent",
+			payload: json.RawMessage(`{"status":"error"}`),
+			want:    "join rejected: error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := json.Marshal(channelMsg{
+				Event:   "phx_reply",
+				Payload: tt.payload,
+				Ref:     strPtr("1"),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = validateJoinReply(data)
+			if err == nil || err.Error() != tt.want {
+				t.Fatalf("validateJoinReply() error = %v, want %q", err, tt.want)
+			}
+		})
 	}
 }
 
@@ -856,19 +981,19 @@ func TestDispatchJobCancelledContext(t *testing.T) {
 	// All dispatch types should hit the "pool full" warning
 	dispatchJob(ctx, &pb.AgentJob{
 		JobId: "s1", JobType: pb.JobType_POLL, SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
-	}, p, snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+	}, p, newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 
 	dispatchJob(ctx, &pb.AgentJob{
 		JobId: "m1", JobType: pb.JobType_MIKROTIK, MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1"},
-	}, p, snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+	}, p, newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 
 	dispatchJob(ctx, &pb.AgentJob{
 		JobId: "tc1", JobType: pb.JobType_TEST_CREDENTIALS, SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
-	}, p, snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+	}, p, newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 
 	dispatchJob(ctx, &pb.AgentJob{
 		JobId: "p1", JobType: pb.JobType_PING, SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
-	}, p, snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1))
+	}, p, newTestResultChannels(snmpCh, mtCh, credCh, monCh, checkCh, make(chan *pb.LldpTopologyResult, 1)))
 
 	close(done)
 }
@@ -1411,7 +1536,7 @@ func TestRunSessionProcessesJobResults(t *testing.T) {
 		doPing = origPing
 	}()
 
-	snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+	snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
 		return &mockSnmpQuerier{
 			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 				return &gosnmp.SnmpPacket{}, nil
@@ -1483,11 +1608,42 @@ func TestRunSessionProcessesJobResults(t *testing.T) {
 	}
 }
 
+func TestRunSessionDoesNotLogFailedResultAsSent(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	agtSilenceHeartbeats(t)
+
+	origDial := mikrotikDial
+	defer func() { mikrotikDial = origDial }()
+	mikrotikDial = func(context.Context, string, uint32, string, string, bool) (*mikrotikClient, error) {
+		return nil, errors.New("\xff")
+	}
+
+	ln := agtListen(t)
+	done := make(chan error, 1)
+	go func() { done <- runSession(context.Background(), agtURL(ln), "token", nil) }()
+
+	conn, topic := agtAccept(t, ln)
+	agtSendEvent(t, conn, topic, "jobs", makeJobPayload(&pb.AgentJob{
+		JobId:          "m-invalid",
+		JobType:        pb.JobType_MIKROTIK,
+		MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
+	}))
+	logs.waitFor(t, "marshal protobuf")
+	if logs.has("sent mikrotik result") {
+		t.Fatalf("failed result was logged as sent:\n%s", logs.dump())
+	}
+
+	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
+	if err := <-done; !errors.Is(err, errRestartRequested) {
+		t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
+	}
+}
+
 func TestRunSessionForwardsManySnmpResults(t *testing.T) {
 	origSnmpDial := snmpDial
 	defer func() { snmpDial = origSnmpDial }()
 
-	snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+	snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
 		return &mockSnmpQuerier{
 			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 				return &gosnmp.SnmpPacket{}, nil
@@ -1561,7 +1717,7 @@ func TestExecuteCheckPoolFull(t *testing.T) {
 
 	checkCh := make(chan *pb.CheckResult, 1)
 	check := &pb.Check{Id: "c1", CheckType: "tcp", TimeoutMs: 1000}
-	executeCheck(ctx, check, p, checkCh)
+	executeCheck(ctx, check, p, &resultChannels{check: checkCh})
 	// Should log "check rejected (pool full)" but not panic
 	close(done)
 }
@@ -1591,8 +1747,8 @@ func TestJobPoolsStopUsesSingleTimeout(t *testing.T) {
 }
 
 func TestExecuteCheckCtxDoneInClosure(t *testing.T) {
-	// Tests the ctx.Done path inside executeCheck's closure:
-	// Submit succeeds, check runs, but result channel is blocked so ctx.Done fires.
+	// sendResult must stop waiting on a blocked result channel when the check's
+	// context is cancelled.
 	p := testPools(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	checkCh := make(chan *pb.CheckResult) // unbuffered, no reader
@@ -1600,11 +1756,11 @@ func TestExecuteCheckCtxDoneInClosure(t *testing.T) {
 	check := &pb.Check{Id: "c1", CheckType: "tcp", TimeoutMs: 100,
 		Config: &pb.Check_Tcp{Tcp: &pb.TcpCheckConfig{Host: "127.0.0.1", Port: 1}}}
 
-	executeCheck(ctx, check, p, checkCh)
+	executeCheck(ctx, check, p, &resultChannels{check: checkCh})
 
-	// Wait for the check to complete (TCP to port 1 fails fast)
+	// Wait for the check to complete (TCP to port 1 fails fast), then cancel
+	// the send context so the blocked result handoff returns.
 	time.Sleep(20 * time.Millisecond)
-	// Cancel ctx so the closure's select picks ctx.Done instead of blocked channel send
 	cancel()
 	time.Sleep(10 * time.Millisecond)
 }
@@ -1632,30 +1788,82 @@ func TestRunSessionRestartInMainLoop(t *testing.T) {
 }
 
 func TestRunSessionHeartbeats(t *testing.T) {
-	// Use short heartbeat intervals to exercise heartbeat paths
 	origHB := heartbeatInterval
 	origCHB := channelHeartbeatInterval
+	origHostname := getHostname
 	defer func() {
 		heartbeatInterval = origHB
 		channelHeartbeatInterval = origCHB
+		getHostname = origHostname
 	}()
-	heartbeatInterval = 100 * time.Millisecond
-	channelHeartbeatInterval = 100 * time.Millisecond
+	heartbeatInterval = 10 * time.Millisecond
+	channelHeartbeatInterval = time.Hour
 
-	srv := newFakeWSServer(t)
-	go func() {
-		srv.acceptAndJoin(t)
-		stopDrain := make(chan struct{})
-		go drainFrames(srv.conn, stopDrain)
-		// Let heartbeats fire a few times
-		time.Sleep(200 * time.Millisecond)
-		close(stopDrain)
-		srv.close()
+	var hostnameCalls atomic.Int32
+	getHostname = func() (string, error) {
+		hostnameCalls.Add(1)
+		return "tower-agent-01", nil
+	}
+
+	ln := agtListen(t)
+	done := make(chan error, 1)
+	go func() { done <- runSession(context.Background(), agtURL(ln), "token", nil) }()
+
+	conn, topic := agtAccept(t, ln)
+	msgs := agtReadFrames(conn)
+	for range 2 {
+		frame := agtWaitEvent(t, msgs, "heartbeat")
+		var heartbeat pb.AgentHeartbeat
+		agtDecodeBinary(t, frame.Payload, &heartbeat)
+		if heartbeat.Hostname != "tower-agent-01" {
+			t.Fatalf("heartbeat hostname = %q, want %q", heartbeat.Hostname, "tower-agent-01")
+		}
+	}
+	if got := hostnameCalls.Load(); got != 1 {
+		t.Fatalf("hostname resolved %d times, want once per session", got)
+	}
+
+	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
+	if err := <-done; !errors.Is(err, errRestartRequested) {
+		t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
+	}
+}
+
+func TestRunSessionHostnameErrorStillSendsHeartbeat(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	origHB := heartbeatInterval
+	origCHB := channelHeartbeatInterval
+	origHostname := getHostname
+	defer func() {
+		heartbeatInterval = origHB
+		channelHeartbeatInterval = origCHB
+		getHostname = origHostname
 	}()
+	heartbeatInterval = 10 * time.Millisecond
+	channelHeartbeatInterval = time.Hour
+	getHostname = func() (string, error) {
+		return "", errors.New("hostname unavailable")
+	}
 
-	err := runSession(context.Background(), "ws://"+srv.addr(), "token", nil)
-	if err == nil {
-		t.Error("expected error after server close")
+	ln := agtListen(t)
+	done := make(chan error, 1)
+	go func() { done <- runSession(context.Background(), agtURL(ln), "token", nil) }()
+
+	conn, topic := agtAccept(t, ln)
+	msgs := agtReadFrames(conn)
+	frame := agtWaitEvent(t, msgs, "heartbeat")
+	var heartbeat pb.AgentHeartbeat
+	agtDecodeBinary(t, frame.Payload, &heartbeat)
+	if heartbeat.Hostname != "" {
+		t.Fatalf("heartbeat hostname = %q after resolution error, want empty", heartbeat.Hostname)
+	}
+	if !logs.has("resolve hostname error=hostname unavailable") {
+		t.Fatalf("hostname resolution error was not logged:\n%s", logs.dump())
+	}
+
+	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
+	if err := <-done; !errors.Is(err, errRestartRequested) {
+		t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
 	}
 }
 
@@ -2279,7 +2487,7 @@ func TestAgtRunSessionLldpTopologyResult(t *testing.T) {
 
 	origDial := snmpDial
 	defer func() { snmpDial = origDial }()
-	snmpDial = func(*pb.SnmpDevice) (snmpQuerier, func(), error) {
+	snmpDial = func(context.Context, *pb.SnmpDevice) (snmpQuerier, func(), error) {
 		return nil, nil, fmt.Errorf("refused")
 	}
 
@@ -2313,7 +2521,7 @@ func TestAgtRunSessionLldpTopologyResult(t *testing.T) {
 func TestAgtDispatchJobLldpTopology(t *testing.T) {
 	origDial := snmpDial
 	defer func() { snmpDial = origDial }()
-	snmpDial = func(*pb.SnmpDevice) (snmpQuerier, func(), error) {
+	snmpDial = func(context.Context, *pb.SnmpDevice) (snmpQuerier, func(), error) {
 		return nil, nil, fmt.Errorf("refused")
 	}
 
@@ -2323,10 +2531,7 @@ func TestAgtDispatchJobLldpTopology(t *testing.T) {
 		DeviceId:   "dev-2",
 		JobType:    pb.JobType_LLDP_TOPOLOGY,
 		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.2"},
-	}, testPools(t),
-		make(chan *pb.SnmpResult, 1), make(chan *pb.MikrotikResult, 1),
-		make(chan *pb.CredentialTestResult, 1), make(chan *pb.MonitoringCheck, 1),
-		make(chan *pb.CheckResult, 1), lldpCh)
+	}, testPools(t), newTestResultChannels(make(chan *pb.SnmpResult, 1), make(chan *pb.MikrotikResult, 1), make(chan *pb.CredentialTestResult, 1), make(chan *pb.MonitoringCheck, 1), make(chan *pb.CheckResult, 1), lldpCh))
 
 	select {
 	case result := <-lldpCh:
@@ -2342,90 +2547,31 @@ func TestAgtDispatchJobLldpTopology(t *testing.T) {
 // write channel saturation
 // ---------------------------------------------------------------------------
 
-func TestAgtRunSessionWriteChannelFull(t *testing.T) {
+func TestEnqueueWriteFullQueueDoesNotCancelSession(t *testing.T) {
 	logs := agtCaptureLogs(t)
-	agtSilenceHeartbeats(t)
+	origTimeout := writeQueueTimeout
+	defer func() { writeQueueTimeout = origTimeout }()
+	writeQueueTimeout = 5 * time.Millisecond
 
-	// Overflowing the write channel cancels the session context, and the reader
-	// wakes on that same cancellation, so the session loop reports either the
-	// cancelled session or the reader's context error. Retry until the session
-	// context is the report that wins.
-	const attempts = 20
-	var lastErr error
-	for attempt := range attempts {
-		ln := agtListen(t)
-		traps := make(chan *pb.SnmpTrap, 512)
-		// One oversized trap parks the writer goroutine mid-write (the server
-		// never reads), then the small traps pile up until writeCh (cap 256)
-		// overflows.
-		traps <- agtTrap("10.0.0.1", 2<<20)
-		for range 300 {
-			traps <- agtTrap("10.0.0.2", 0)
-		}
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	defer sessionCancel()
+	writeCh := make(chan []byte, 1)
+	queued := []byte("already queued")
+	writeCh <- queued
 
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan error, 1)
-		go func() { done <- runSession(ctx, agtURL(ln), "token", traps) }()
-
-		conn, _ := agtAccept(t, ln)
-		_ = conn.SetReadBuffer(4096)
-
-		select {
-		case lastErr = <-done:
-		case <-time.After(30 * time.Second):
-			cancel()
-			t.Fatalf("runSession never gave up on the saturated write channel\nlogged:\n%s", logs.dump())
-		}
-		cancel()
-		_ = ln.Close()
-
-		if lastErr == nil {
-			t.Fatal("runSession returned nil despite the saturated write channel")
-		}
-		if !logs.has("write channel full, reconnecting event=trap") {
-			t.Fatalf("expected a 'write channel full' report for the trap event\nlogged:\n%s", logs.dump())
-		}
-		if strings.Contains(lastErr.Error(), "session cancelled") {
-			t.Logf("session loop reported the cancelled session on attempt %d", attempt+1)
-			return
-		}
+	if enqueueWrite(sessionCtx, writeCh, []byte("drop me"), "result") {
+		t.Fatal("enqueueWrite accepted a message after the full-queue timeout")
 	}
-	t.Fatalf("session loop never reported the cancelled session in %d attempts; last error: %v", attempts, lastErr)
-}
-
-func TestAgtRunSessionChannelHeartbeatWriteChannelFull(t *testing.T) {
-	logs := agtCaptureLogs(t)
-	origHB, origCHB := heartbeatInterval, channelHeartbeatInterval
-	defer func() {
-		heartbeatInterval = origHB
-		channelHeartbeatInterval = origCHB
-	}()
-	heartbeatInterval = time.Hour // keep the protobuf heartbeat out of the way
-	channelHeartbeatInterval = 200 * time.Microsecond
-
-	ln := agtListen(t)
-	traps := make(chan *pb.SnmpTrap, 1)
-	traps <- agtTrap("10.0.0.1", 2<<20) // parks the writer goroutine
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- runSession(ctx, agtURL(ln), "token", traps) }()
-
-	conn, _ := agtAccept(t, ln)
-	_ = conn.SetReadBuffer(4096)
-
 	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("runSession returned nil despite the saturated write channel")
-		}
-	case <-time.After(30 * time.Second):
-		cancel()
-		t.Fatalf("channel heartbeats never overflowed the write channel\nlogged:\n%s", logs.dump())
+	case <-sessionCtx.Done():
+		t.Fatal("full write queue cancelled the session")
+	default:
 	}
-	if !logs.has("write channel full, reconnecting event=heartbeat") {
-		t.Errorf("expected a 'write channel full' report for the channel heartbeat\nlogged:\n%s", logs.dump())
+	if got := <-writeCh; string(got) != string(queued) {
+		t.Fatalf("queued message = %q, want original %q", got, queued)
+	}
+	if !logs.has("write channel full, dropping message event=result") {
+		t.Fatalf("expected a write queue timeout log, got:\n%s", logs.dump())
 	}
 }
 
@@ -2491,44 +2637,24 @@ func TestAgtRunSessionPoolShutdownTimeout(t *testing.T) {
 const agtStallWriteTimeout = 250 * time.Millisecond
 
 type agtStalledSession struct {
-	conn      *net.TCPConn
-	topic     string
-	done      <-chan error
-	cancel    context.CancelFunc
-	release   func()
-	updateURL string
-	updateSum string
+	conn    *net.TCPConn
+	done    <-chan error
+	cancel  context.CancelFunc
+	release func()
 }
 
 // agtStallSession drives a live session into a fully stalled state:
 //   - the writer goroutine is blocked mid-write on an oversized trap, because
 //     the test server stops reading after the join,
-//   - the session loop is parked inside a self-update,
+//   - the session loop is parked while reporting that forwarded trap,
 //   - msgCh (cap 100) is full, so the reader goroutine is blocked handing its
 //     next message to the session loop instead of watching the socket.
-//
-// trapSeq is the number of traps the calling test already forwarded, so the
-// wait latches onto this session's trap.
-func agtStallSession(t *testing.T, logs *agtLogSink, trapSeq int) *agtStalledSession {
+func agtStallSession(t *testing.T, logs *agtLogSink, _ int) *agtStalledSession {
 	t.Helper()
 
 	s := &agtStalledSession{}
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	s.release = func() { releaseOnce.Do(func() { close(release) }) }
-
-	origUpdate := doSelfUpdate
-	doSelfUpdate = func(_ context.Context, url, checksum string) error {
-		s.updateURL, s.updateSum = url, checksum
-		close(entered)
-		<-release
-		return nil
-	}
-	t.Cleanup(func() {
-		doSelfUpdate = origUpdate
-		s.release()
-	})
+	hit, release := logs.gateOn("sent snmp trap")
+	s.release = release
 
 	ln := agtListen(t)
 	traps := make(chan *pb.SnmpTrap, 1)
@@ -2536,22 +2662,23 @@ func agtStallSession(t *testing.T, logs *agtLogSink, trapSeq int) *agtStalledSes
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
+	t.Cleanup(func() {
+		cancel()
+		release()
+	})
 	done := make(chan error, 1)
 	go func() { done <- runSession(ctx, agtURL(ln), "token", traps) }()
 	s.done = done
 
-	conn, topic := agtAccept(t, ln)
-	s.conn, s.topic = conn, topic
+	conn, _ := agtAccept(t, ln)
+	s.conn = conn
 	_ = conn.SetReadBuffer(4096)
-	logs.waitForCount(t, "sent snmp trap", trapSeq+1)
-
-	agtSendEvent(t, conn, topic, "update", json.RawMessage(`{"url":"https://example.invalid/agent","checksum":"deadbeef"}`))
 	select {
-	case <-entered:
+	case <-hit:
 	case <-time.After(15 * time.Second):
 		cancel()
-		s.release()
-		t.Fatalf("update was never dispatched\nlogged:\n%s", logs.dump())
+		release()
+		t.Fatalf("trap was never forwarded\nlogged:\n%s", logs.dump())
 	}
 
 	filler := agtFillerFrame(8 << 10)
@@ -2566,7 +2693,7 @@ func agtStallSession(t *testing.T, logs *agtLogSink, trapSeq int) *agtStalledSes
 	_ = conn.SetWriteDeadline(time.Time{})
 	if !stalled {
 		cancel()
-		s.release()
+		release()
 		t.Fatal("agent kept reading the socket; msgCh never filled")
 	}
 	return s
@@ -2578,14 +2705,11 @@ func TestAgtRunSessionReaderStopsWhileHandingOffMessage(t *testing.T) {
 
 	s := agtStallSession(t, logs, 0)
 	s.cancel()  // the reader is blocked on the hand-off: it must exit on cancel
-	s.release() // let the session loop finish the update and return
+	s.release() // let the session loop observe cancellation and return
 
 	err := <-s.done
 	if err != nil && strings.Contains(err.Error(), "read:") {
 		t.Fatalf("runSession error = %v; the blocked reader should exit on session cancel, not report a read error", err)
-	}
-	if s.updateURL != "https://example.invalid/agent" || s.updateSum != "deadbeef" {
-		t.Errorf("self-update args = (%q, %q), want the payload url and checksum", s.updateURL, s.updateSum)
 	}
 }
 

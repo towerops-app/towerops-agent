@@ -1221,15 +1221,19 @@ func (*Check_Dns) isCheck_Config() {}
 func (*Check_Ssl) isCheck_Config() {}
 
 type HttpCheckConfig struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	Url             string                 `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
-	Method          string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"` // GET, POST, etc.
-	ExpectedStatus  uint32                 `protobuf:"varint,3,opt,name=expected_status,json=expectedStatus,proto3" json:"expected_status,omitempty"`
-	VerifySsl       bool                   `protobuf:"varint,4,opt,name=verify_ssl,json=verifySsl,proto3" json:"verify_ssl,omitempty"`
-	Headers         map[string]string      `protobuf:"bytes,5,rep,name=headers,proto3" json:"headers,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Body            string                 `protobuf:"bytes,6,opt,name=body,proto3" json:"body,omitempty"`
-	Regex           string                 `protobuf:"bytes,7,opt,name=regex,proto3" json:"regex,omitempty"` // Content match regex
-	FollowRedirects bool                   `protobuf:"varint,8,opt,name=follow_redirects,json=followRedirects,proto3" json:"follow_redirects,omitempty"`
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Url            string                 `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
+	Method         string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"` // GET, POST, etc.
+	ExpectedStatus uint32                 `protobuf:"varint,3,opt,name=expected_status,json=expectedStatus,proto3" json:"expected_status,omitempty"`
+	// Verify the server's TLS chain. The server always sets this field
+	// explicitly — true unless the operator opted out — so an agent that
+	// receives it unset (proto3 default false) is talking to a producer that
+	// bypassed that contract, and skips verification.
+	VerifySsl       bool              `protobuf:"varint,4,opt,name=verify_ssl,json=verifySsl,proto3" json:"verify_ssl,omitempty"`
+	Headers         map[string]string `protobuf:"bytes,5,rep,name=headers,proto3" json:"headers,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Body            string            `protobuf:"bytes,6,opt,name=body,proto3" json:"body,omitempty"`
+	Regex           string            `protobuf:"bytes,7,opt,name=regex,proto3" json:"regex,omitempty"` // Content match regex
+	FollowRedirects bool              `protobuf:"varint,8,opt,name=follow_redirects,json=followRedirects,proto3" json:"follow_redirects,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -2055,12 +2059,14 @@ func (x *SnmpQuery) GetOids() []string {
 }
 
 type SnmpResult struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	DeviceId      string                 `protobuf:"bytes,1,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
-	JobType       JobType                `protobuf:"varint,2,opt,name=job_type,json=jobType,proto3,enum=towerops.agent.JobType" json:"job_type,omitempty"`
-	OidValues     map[string]string      `protobuf:"bytes,3,rep,name=oid_values,json=oidValues,proto3" json:"oid_values,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Timestamp     int64                  `protobuf:"varint,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	JobId         string                 `protobuf:"bytes,5,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	DeviceId string                 `protobuf:"bytes,1,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
+	JobType  JobType                `protobuf:"varint,2,opt,name=job_type,json=jobType,proto3,enum=towerops.agent.JobType" json:"job_type,omitempty"`
+	// OID keys carry no leading dot: "1.3.6.1.2.1.1.1.0". This is the canonical
+	// form for every OID map in this protocol, including SnmpTrap.varbinds.
+	OidValues     map[string]string `protobuf:"bytes,3,rep,name=oid_values,json=oidValues,proto3" json:"oid_values,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Timestamp     int64             `protobuf:"varint,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	JobId         string            `protobuf:"bytes,5,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2768,11 +2774,12 @@ type SnmpTrap struct {
 	Version  uint32                 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"` // 1 = SNMPv1, 2 = SNMPv2c
 	// snmpTrapOID.0 for v2c; for v1 the RFC 3584 section 3.1 mapping of
 	// enterprise/generic_trap/specific_trap.
-	TrapOid       string            `protobuf:"bytes,3,opt,name=trap_oid,json=trapOid,proto3" json:"trap_oid,omitempty"`
-	Enterprise    string            `protobuf:"bytes,4,opt,name=enterprise,proto3" json:"enterprise,omitempty"`                          // SNMPv1 only
-	GenericTrap   uint32            `protobuf:"varint,5,opt,name=generic_trap,json=genericTrap,proto3" json:"generic_trap,omitempty"`    // SNMPv1 only
-	SpecificTrap  uint32            `protobuf:"varint,6,opt,name=specific_trap,json=specificTrap,proto3" json:"specific_trap,omitempty"` // SNMPv1 only
-	UptimeTicks   uint64            `protobuf:"varint,7,opt,name=uptime_ticks,json=uptimeTicks,proto3" json:"uptime_ticks,omitempty"`    // sysUpTime.0, hundredths of a second
+	TrapOid      string `protobuf:"bytes,3,opt,name=trap_oid,json=trapOid,proto3" json:"trap_oid,omitempty"`
+	Enterprise   string `protobuf:"bytes,4,opt,name=enterprise,proto3" json:"enterprise,omitempty"`                          // SNMPv1 only
+	GenericTrap  uint32 `protobuf:"varint,5,opt,name=generic_trap,json=genericTrap,proto3" json:"generic_trap,omitempty"`    // SNMPv1 only
+	SpecificTrap uint32 `protobuf:"varint,6,opt,name=specific_trap,json=specificTrap,proto3" json:"specific_trap,omitempty"` // SNMPv1 only
+	UptimeTicks  uint64 `protobuf:"varint,7,opt,name=uptime_ticks,json=uptimeTicks,proto3" json:"uptime_ticks,omitempty"`    // sysUpTime.0, hundredths of a second
+	// Keys carry no leading dot, as in SnmpResult.oid_values.
 	Varbinds      map[string]string `protobuf:"bytes,8,rep,name=varbinds,proto3" json:"varbinds,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	Timestamp     int64             `protobuf:"varint,9,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 	unknownFields protoimpl.UnknownFields

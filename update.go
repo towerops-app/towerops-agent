@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -43,13 +44,29 @@ var httpDo = func(req *http.Request) (*http.Response, error) {
 }
 var syscallExec = syscall.Exec
 var maxUpdateSize int64 = 100 << 20 // 100 MB
-var selfUpdateTimeout = 30 * time.Second
 
-// selfUpdate downloads a new binary, verifies its checksum, replaces the current binary, and re-execs.
-func selfUpdate(downloadURL, expectedChecksum string) error {
-	return selfUpdateContext(context.Background(), downloadURL, expectedChecksum)
+// The response-header budget is separate from the transfer watchdog so a
+// progressing download is not rejected solely because the link is slow.
+var selfUpdateTimeout = 30 * time.Second
+var selfUpdateIdleTimeout = 30 * time.Second
+var errSelfUpdateIdleTimeout = errors.New("update download idle timeout")
+
+type updateIdleReader struct {
+	reader  io.Reader
+	timer   *time.Timer
+	timeout time.Duration
 }
 
+func (r *updateIdleReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		r.timer.Reset(r.timeout)
+	}
+	return n, err
+}
+
+// selfUpdateContext downloads a new binary, verifies its checksum, replaces
+// the current binary, and re-execs while honoring caller cancellation.
 func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string) error {
 	u, err := url.Parse(downloadURL)
 	if err != nil {
@@ -63,15 +80,28 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string
 	}
 	slog.Info("downloading update", "url", sanitizeURL(downloadURL))
 
-	reqCtx, cancel := context.WithTimeout(ctx, selfUpdateTimeout)
-	defer cancel()
+	reqCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(context.Canceled)
 	req, err := httpNewRequest(reqCtx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
+	headerTimer := time.AfterFunc(selfUpdateTimeout, func() {
+		cancel(context.DeadlineExceeded)
+	})
 
 	resp, err := httpDo(req)
+	headersInTime := headerTimer.Stop()
+	if !headersInTime {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return fmt.Errorf("download: %w", context.DeadlineExceeded)
+	}
 	if err != nil {
+		if cause := context.Cause(reqCtx); cause != nil {
+			return fmt.Errorf("download: %w", cause)
+		}
 		return fmt.Errorf("download: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -101,9 +131,20 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string
 	defer func() { _ = os.Remove(tempPath) }()
 
 	hash := sha256.New()
-	written, err := io.Copy(io.MultiWriter(tempFile, hash), io.LimitReader(resp.Body, maxUpdateSize+1))
+	idleReader := &updateIdleReader{
+		reader:  resp.Body,
+		timeout: selfUpdateIdleTimeout,
+	}
+	idleReader.timer = time.AfterFunc(selfUpdateIdleTimeout, func() {
+		cancel(errSelfUpdateIdleTimeout)
+	})
+	written, err := io.Copy(io.MultiWriter(tempFile, hash), io.LimitReader(idleReader, maxUpdateSize+1))
+	idleReader.timer.Stop()
 	if err != nil {
 		_ = tempFile.Close()
+		if errors.Is(context.Cause(reqCtx), errSelfUpdateIdleTimeout) {
+			return fmt.Errorf("download update: %w", errSelfUpdateIdleTimeout)
+		}
 		return fmt.Errorf("download update: %w", err)
 	}
 	if written > maxUpdateSize {

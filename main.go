@@ -24,9 +24,17 @@ var buildDate = "unknown"
 var insecureFlag bool
 
 func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	// NotifyContext keeps intercepting signals after it cancels the context.
+	// Stop it when shutdown begins so a second signal uses the default handler.
+	go stopSignalNotifier(ctx, stop)
 	os.Exit(runMain(ctx, os.Args[1:]))
+}
+
+func stopSignalNotifier(ctx context.Context, stop context.CancelFunc) {
+	<-ctx.Done()
+	stop()
 }
 
 // runMain is the testable entry point. Returns an exit code.
@@ -36,6 +44,7 @@ func runMain(ctx context.Context, args []string) int {
 	token := fs.String("token", os.Getenv("TOWEROPS_AGENT_TOKEN"), "Agent authentication token")
 	tokenFile := fs.String("token-file", "", "Path to file containing agent token (preferred over --token)")
 	logLevel := fs.String("log-level", envOrDefault("LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
+	logFormat := fs.String("log-format", envOrDefault("LOG_FORMAT", "text"), "Log output format (text, json)")
 	fs.BoolVar(&insecureFlag, "insecure", false, "Allow plaintext ws:// connections (insecure)")
 	trapEnabled := fs.Bool("trap-enabled", envBool("TRAP_ENABLED", false), "Listen for SNMP traps")
 	trapPort := fs.Uint("trap-port", envUint("TRAP_PORT", 162), "UDP port for the SNMP trap listener")
@@ -73,7 +82,7 @@ func runMain(ctx context.Context, args []string) int {
 	default:
 		level = slog.LevelInfo
 	}
-	slog.SetDefault(slog.New(newColorHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	slog.SetDefault(slog.New(newLogHandler(os.Stderr, level, *logFormat)))
 
 	if *apiURL == "" || *token == "" {
 		fmt.Fprintln(os.Stderr, "error: --api-url and --token are required (or set TOWEROPS_API_URL and TOWEROPS_AGENT_TOKEN)")
@@ -84,7 +93,7 @@ func runMain(ctx context.Context, args []string) int {
 	slog.Info("towerops agent starting", "version", version, "built", buildDate)
 
 	// Convert HTTP(S) to WebSocket URL
-	wsURL, err := toWebSocketURL(*apiURL)
+	wsURL, err := toWebSocketURL(*apiURL, insecureFlag)
 	if err != nil {
 		slog.Error(err.Error())
 		return 1
@@ -116,21 +125,25 @@ func runMain(ctx context.Context, args []string) int {
 }
 
 // toWebSocketURL converts an HTTP(S) URL to a WebSocket URL.
-// Returns an error for plaintext ws:// unless insecureFlag is set.
-func toWebSocketURL(rawURL string) (string, error) {
+// Returns an error for plaintext ws:// unless insecure is set.
+func toWebSocketURL(rawURL string, insecure bool) (string, error) {
+	scheme, remainder, found := strings.Cut(rawURL, "://")
+
 	var result string
-	switch {
-	case strings.HasPrefix(rawURL, "http://"):
-		result = "ws://" + strings.TrimPrefix(rawURL, "http://")
-	case strings.HasPrefix(rawURL, "https://"):
-		result = "wss://" + strings.TrimPrefix(rawURL, "https://")
-	case strings.HasPrefix(rawURL, "ws://"), strings.HasPrefix(rawURL, "wss://"):
-		result = rawURL
-	default:
+	if !found {
 		result = "wss://" + rawURL
+	} else {
+		switch strings.ToLower(scheme) {
+		case "http", "ws":
+			result = "ws://" + remainder
+		case "https", "wss":
+			result = "wss://" + remainder
+		default:
+			result = "wss://" + rawURL
+		}
 	}
 
-	if strings.HasPrefix(result, "ws://") && !insecureFlag {
+	if strings.HasPrefix(result, "ws://") && !insecure {
 		return "", fmt.Errorf("plaintext ws:// connection rejected — use wss:// or pass --insecure to allow")
 	}
 	return result, nil

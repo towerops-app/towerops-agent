@@ -64,8 +64,9 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      # Pinned to the version in flake.nix: a golangci-lint built against an
-      # older Go refuses to lint a module targeting a newer one.
+      # CI pins this explicitly. Keep it in sync by hand with flake.nix's
+      # unpinned pkgs.golangci-lint from nixpkgs-unstable (currently v2.13.1);
+      # an older build refuses to lint a module targeting a newer Go.
       - name: Lint
         uses: golangci/golangci-lint-action@v9
         with:

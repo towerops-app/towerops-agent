@@ -40,22 +40,28 @@ const (
 	trapReadBuffer = 65535
 )
 
+// trapDropLogInterval bounds how often a saturated queue warns. handle runs
+// inline in gosnmp's read loop, so warning on every drop during a burst would
+// itself slow the reader down and make the loss worse.
+var trapDropLogInterval = time.Minute
+
 // trapListener receives SNMP traps on a UDP port and converts them to protobuf.
 //
 // The listener outlives any single WebSocket session: devices send traps
 // whenever they like, and dropping them because the agent happens to be
 // reconnecting would lose exactly the events that matter during an outage.
 type trapListener struct {
-	mu        sync.Mutex
-	closeOnce sync.Once
-	listener  *gosnmp.TrapListener
-	ready     <-chan struct{}
-	done      chan struct{}
-	traps     chan *pb.SnmpTrap
-	community string
-	dropped   atomic.Uint64
-	closed    chan struct{}
-	port      uint16
+	mu          sync.Mutex
+	closeOnce   sync.Once
+	listener    *gosnmp.TrapListener
+	ready       <-chan struct{}
+	done        chan struct{}
+	traps       chan *pb.SnmpTrap
+	community   string
+	dropped     atomic.Uint64
+	lastDropLog atomic.Int64
+	closed      chan struct{}
+	port        uint16
 }
 
 // startTrapListener binds the trap port and serves until Close is called.
@@ -204,8 +210,26 @@ func (t *trapListener) handle(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) {
 	case t.traps <- trap:
 		slog.Debug("received snmp trap", "source", trap.SourceIp, "trap_oid", trap.TrapOid, "varbinds", len(trap.Varbinds))
 	default:
-		t.dropped.Add(1)
+		t.reportDrop(t.dropped.Add(1))
 	}
+}
+
+// reportDrop warns about a saturated queue at most once per
+// trapDropLogInterval. A long-running agent whose queue keeps overflowing
+// otherwise gives no signal at all until it exits.
+func (t *trapListener) reportDrop(dropped uint64) {
+	now := time.Now().UnixNano()
+	last := t.lastDropLog.Load()
+	if last != 0 && now-last < int64(trapDropLogInterval) {
+		return
+	}
+	// Losing the race means another drop is warning right now; one line is
+	// the point of the rate limit.
+	if !t.lastDropLog.CompareAndSwap(last, now) {
+		return
+	}
+	slog.Warn("snmp trap queue full, dropping traps",
+		"dropped_total", dropped, "queue_size", trapQueueSize)
 }
 
 // trapToProto converts a received trap packet to its wire representation.
@@ -307,7 +331,7 @@ func uptimeTicks(pdu gosnmp.SnmpPDU) uint64 {
 }
 
 // trimOID strips the leading dot gosnmp puts on decoded OIDs so stored OIDs
-// match the dotted form used everywhere else in the protocol.
+// match the undotted form the protocol uses for every OID map.
 func trimOID(oid string) string {
 	if len(oid) > 0 && oid[0] == '.' {
 		return oid[1:]

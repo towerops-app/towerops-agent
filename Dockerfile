@@ -25,10 +25,20 @@ FROM cgr.dev/chainguard/wolfi-base:latest
 # binary never ships in the released image.
 RUN apk upgrade --no-cache && apk add --no-cache iputils libcap-utils
 COPY --from=builder /app/towerops-agent /usr/local/bin/towerops-agent
+# wolfi's iputils ships no separate ping6 binary, and its `ping` resolves IPv6
+# targets itself — which is what the agent's exec fallback uses when ping6 is
+# absent. /data holds the trust-on-first-use store, so the unprivileged runtime
+# user must own it.
 RUN adduser -D -u 1000 towerops && \
-    chown towerops /usr/local/bin/towerops-agent && \
+    mkdir -p /data && \
+    chown towerops /usr/local/bin/towerops-agent /data && \
     setcap cap_net_raw,cap_net_bind_service+ep /usr/local/bin/towerops-agent && \
     setcap cap_net_raw+p /usr/local/bin/ping && \
     apk del libcap-utils
+ENV TOWEROPS_HOST_KEYS_FILE=/data/known_hosts.json
+# Without a persistent volume, container recreation resets the TOFU store and
+# defeats host-key and TLS-certificate pinning.
+VOLUME /data
+WORKDIR /data
 USER towerops
 CMD ["/usr/local/bin/towerops-agent"]

@@ -7,16 +7,23 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
 	"sync"
 )
 
-// colorHandler is a slog.Handler that colorizes the level label.
+// colorHandler formats slog records and colorizes the level label on terminals.
 type colorHandler struct {
 	w     io.Writer
 	level slog.Level
+	color bool
 	mu    *sync.Mutex
-	attrs []slog.Attr
+	attrs []colorHandlerAttr
 	group string
+}
+
+type colorHandlerAttr struct {
+	group string
+	attr  slog.Attr
 }
 
 const (
@@ -29,10 +36,32 @@ const (
 
 func newColorHandler(w io.Writer, opts *slog.HandlerOptions) *colorHandler {
 	level := slog.LevelInfo
-	if opts != nil {
+	if opts != nil && opts.Level != nil {
 		level = opts.Level.Level()
 	}
-	return &colorHandler{w: w, level: level, mu: &sync.Mutex{}}
+	return &colorHandler{
+		w:     w,
+		level: level,
+		color: writerSupportsColor(w),
+		mu:    &sync.Mutex{},
+	}
+}
+
+func newLogHandler(w io.Writer, level slog.Level, format string) slog.Handler {
+	opts := &slog.HandlerOptions{Level: level}
+	if format == "json" {
+		return slog.NewJSONHandler(w, opts)
+	}
+	return newColorHandler(w, opts)
+}
+
+func writerSupportsColor(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
 func (h *colorHandler) Enabled(_ context.Context, level slog.Level) bool {
@@ -53,24 +82,26 @@ func levelColor(level slog.Level) string {
 }
 
 func (h *colorHandler) Handle(_ context.Context, r slog.Record) error {
-	color := levelColor(r.Level)
 	levelStr := r.Level.String()
-
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	buf := make([]byte, 0, 256)
 	buf = append(buf, r.Time.Format("2006/01/02 15:04:05")...)
 	buf = append(buf, ' ')
-	buf = append(buf, color...)
+	if h.color {
+		buf = append(buf, levelColor(r.Level)...)
+	}
 	buf = append(buf, levelStr...)
-	buf = append(buf, colorReset...)
+	if h.color {
+		buf = append(buf, colorReset...)
+	}
 	buf = append(buf, ' ')
 	buf = append(buf, r.Message...)
 
 	for _, a := range h.attrs {
 		buf = append(buf, ' ')
-		buf = appendAttr(buf, h.group, a)
+		buf = appendAttr(buf, a.group, a.attr)
 	}
 
 	r.Attrs(func(a slog.Attr) bool {
@@ -96,16 +127,14 @@ func appendAttr(buf []byte, group string, a slog.Attr) []byte {
 }
 
 func (h *colorHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	newAttrs := make([]slog.Attr, len(h.attrs)+len(attrs))
+	newAttrs := make([]colorHandlerAttr, len(h.attrs)+len(attrs))
 	copy(newAttrs, h.attrs)
-	copy(newAttrs[len(h.attrs):], attrs)
-	return &colorHandler{
-		w:     h.w,
-		level: h.level,
-		attrs: newAttrs,
-		group: h.group,
-		mu:    h.mu,
+	for i, attr := range attrs {
+		newAttrs[len(h.attrs)+i] = colorHandlerAttr{group: h.group, attr: attr}
 	}
+	derived := *h
+	derived.attrs = newAttrs
+	return &derived
 }
 
 func (h *colorHandler) WithGroup(name string) slog.Handler {
@@ -113,11 +142,7 @@ func (h *colorHandler) WithGroup(name string) slog.Handler {
 	if h.group != "" {
 		g = h.group + "." + name
 	}
-	return &colorHandler{
-		w:     h.w,
-		level: h.level,
-		attrs: h.attrs,
-		group: g,
-		mu:    h.mu,
-	}
+	derived := *h
+	derived.group = g
+	return &derived
 }

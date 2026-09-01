@@ -22,19 +22,14 @@ import (
 )
 
 var (
-	defaultHTTPTransport = &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
-	}
-	insecureHTTPTransport = &http.Transport{
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
-	}
-	sslRootCAsMu   sync.Mutex
-	sslRootCAsPool *x509.CertPool
+	defaultHTTPTransport  = newCheckHTTPTransport(false)
+	insecureHTTPTransport = newCheckHTTPTransport(true)
+	sslRootCAsMu          sync.Mutex
+	sslRootCAsPool        *x509.CertPool
+
+	httpRegexCacheMu    sync.Mutex
+	httpRegexCache      = make(map[string]*regexp.Regexp)
+	httpRegexCacheOrder []string
 
 	// systemCertPool loads the platform root store. Overridable for tests.
 	systemCertPool = x509.SystemCertPool
@@ -73,7 +68,22 @@ var (
 	}
 )
 
-const maxHTTPRegexBody = 1 << 20
+const (
+	maxHTTPRegexBody         = 1 << 20
+	maxHTTPRegexCacheEntries = 64
+	maxTCPOutputBytes        = 256
+)
+
+func newCheckHTTPTransport(insecure bool) *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 10
+	transport.IdleConnTimeout = 90 * time.Second
+	if insecure {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	return transport
+}
 
 // ExecuteCheck runs a service check and returns the result.
 // Agent is stateless - just executes what it's told and reports back.
@@ -139,6 +149,9 @@ func checkTimeout(timeoutMs uint32) time.Duration {
 
 // executeHTTPCheck performs an HTTP/HTTPS check
 func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs uint32) (uint32, string, float64) {
+	// The server always sends verify_ssl explicitly: true unless the operator
+	// opts out. A false zero value only skips verification for callers that
+	// bypass the server's check builder.
 	transport := defaultHTTPTransport
 	if !config.VerifySsl {
 		transport = insecureHTTPTransport
@@ -196,7 +209,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 
 	// Check content regex if provided
 	if config.Regex != "" {
-		re, err := regexp.Compile(config.Regex)
+		re, err := cachedHTTPRegex(config.Regex)
 		if err != nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			return 3, fmt.Sprintf("Invalid regex: %v", err), responseTime
@@ -224,6 +237,32 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	}
 
 	return 0, fmt.Sprintf("HTTP %d OK", resp.StatusCode), responseTime
+}
+
+// cachedHTTPRegex uses a small FIFO cache: regexes are reused across frequent
+// checks while the fixed capacity prevents server-supplied patterns from
+// growing agent memory without bound. Invalid patterns are never cached.
+func cachedHTTPRegex(pattern string) (*regexp.Regexp, error) {
+	httpRegexCacheMu.Lock()
+	defer httpRegexCacheMu.Unlock()
+
+	if re, ok := httpRegexCache[pattern]; ok {
+		return re, nil
+	}
+
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(httpRegexCacheOrder) == maxHTTPRegexCacheEntries {
+		evicted := httpRegexCacheOrder[0]
+		delete(httpRegexCache, evicted)
+		httpRegexCacheOrder = httpRegexCacheOrder[1:]
+	}
+	httpRegexCache[pattern] = re
+	httpRegexCacheOrder = append(httpRegexCacheOrder, pattern)
+	return re, nil
 }
 
 // executeTCPCheck performs a TCP port connectivity check
@@ -270,18 +309,42 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 				}
 				if readErr != nil {
 					if len(received) > 0 {
-						return 2, fmt.Sprintf("Unexpected response: %s", received), responseTime
+						return 2, fmt.Sprintf("Unexpected response: %s", tcpResponseForOutput(received)), responseTime
 					}
 					return 2, fmt.Sprintf("Receive failed: %v", readErr), responseTime
 				}
 			}
 			if !bytes.Contains(received, want) {
-				return 2, fmt.Sprintf("Unexpected response: %s", received), responseTime
+				return 2, fmt.Sprintf("Unexpected response: %s", tcpResponseForOutput(received)), responseTime
 			}
 		}
 	}
 
 	return 0, fmt.Sprintf("TCP port %d open", config.Port), responseTime
+}
+
+func tcpResponseForOutput(response []byte) string {
+	totalBytes := len(response)
+	truncated := totalBytes > maxTCPOutputBytes
+	if truncated {
+		response = response[:maxTCPOutputBytes]
+	}
+
+	var output strings.Builder
+	output.Grow(len(response) + 48)
+	for _, b := range response {
+		if b >= 0x20 && b <= 0x7e {
+			output.WriteByte(b)
+		} else {
+			output.WriteByte('.')
+		}
+	}
+	if truncated {
+		output.WriteString(" [truncated; ")
+		output.WriteString(strconv.Itoa(totalBytes))
+		output.WriteString(" bytes received]")
+	}
+	return output.String()
 }
 
 func writeAll(w io.Writer, data []byte) error {
@@ -400,7 +463,12 @@ func resolverForServer(server string, timeout time.Duration) *net.Resolver {
 	}
 }
 
-// executeSSLCheck connects via TLS and checks the certificate expiration date.
+// executeSSLCheck connects via TLS and applies the certificate status policy.
+// Operational failures before a certificate can be evaluated, including root
+// store, connection, handshake, non-TLS, and no-certificate failures, are
+// UNKNOWN. Expired, not-yet-valid, untrusted, and hostname-mismatched
+// certificates are CRITICAL. A trusted certificate inside warning_days is
+// WARNING; every other trusted certificate is OK.
 func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs uint32) (uint32, string, float64) {
 	timeout := checkTimeout(timeoutMs)
 
@@ -421,10 +489,13 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 	if err != nil {
 		return 3, fmt.Sprintf("Failed to load system root CAs: %v", err), 0
 	}
+	// Standard verification is deferred so invalid certificates remain
+	// available for the status policy below.
 	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		RootCAs:    rootCAs,
-		ServerName: host,
+		MinVersion:         tls.VersionTLS12,
+		RootCAs:            rootCAs,
+		ServerName:         host,
+		InsecureSkipVerify: true,
 	}
 
 	startTime := time.Now()
@@ -447,19 +518,36 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 		return 3, fmt.Sprintf("No certificate presented by %s:%d", host, port), responseTime
 	}
 
+	now := time.Now()
 	cert := certs[0]
 	notAfter := cert.NotAfter
-	daysRemaining, expired := certificateDaysRemaining(time.Now(), notAfter)
+	daysRemaining, expired := certificateDaysRemaining(now, notAfter)
 	expiresStr := notAfter.Format("2006-01-02")
 
-	switch {
-	case expired:
-		return 2, fmt.Sprintf("CRITICAL: Certificate for %s:%d expired %d days ago (%s)", host, port, -daysRemaining, expiresStr), responseTime
-	case daysRemaining <= int(warningDays):
-		return 1, fmt.Sprintf("WARNING: Certificate for %s:%d expires in %d days (%s)", host, port, daysRemaining, expiresStr), responseTime
-	default:
-		return 0, fmt.Sprintf("OK: Certificate for %s:%d valid for %d days (%s)", host, port, daysRemaining, expiresStr), responseTime
+	if now.Before(cert.NotBefore) {
+		return 2, fmt.Sprintf("CRITICAL: Certificate for %s:%d is not valid until %s", host, port, cert.NotBefore.Format("2006-01-02")), responseTime
 	}
+	if expired {
+		return 2, fmt.Sprintf("CRITICAL: Certificate for %s:%d expired %d days ago (%s)", host, port, -daysRemaining, expiresStr), responseTime
+	}
+
+	intermediates := x509.NewCertPool()
+	for _, intermediate := range certs[1:] {
+		intermediates.AddCert(intermediate)
+	}
+	if _, err := cert.Verify(x509.VerifyOptions{
+		Roots:         rootCAs,
+		Intermediates: intermediates,
+		DNSName:       host,
+		CurrentTime:   now,
+	}); err != nil {
+		return 2, fmt.Sprintf("CRITICAL: Certificate for %s:%d is not trusted: %v", host, port, err), responseTime
+	}
+
+	if daysRemaining <= int(warningDays) {
+		return 1, fmt.Sprintf("WARNING: Certificate for %s:%d expires in %d days (%s)", host, port, daysRemaining, expiresStr), responseTime
+	}
+	return 0, fmt.Sprintf("OK: Certificate for %s:%d valid for %d days (%s)", host, port, daysRemaining, expiresStr), responseTime
 }
 
 func certificateDaysRemaining(now, notAfter time.Time) (days int, expired bool) {

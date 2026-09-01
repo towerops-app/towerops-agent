@@ -44,7 +44,7 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 	}
 
 	snmpDev := job.SnmpDevice
-	client, closeConn, err := snmpDial(snmpDev)
+	client, closeConn, err := snmpDial(ctx, snmpDev)
 	if err != nil {
 		slog.Error("failed to connect SNMP for LLDP", "job_id", jobID, "device_id", deviceID, "error", err)
 		sendResult(ctx, resultCh, &pb.LldpTopologyResult{
@@ -56,7 +56,8 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 	}
 	defer closeConn()
 
-	result := discoverLldpNeighbors(client, deviceID, jobID)
+	useBulk := snmpDev.Version != "1" && snmpDev.Version != "v1"
+	result := discoverLldpNeighbors(client, deviceID, jobID, useBulk)
 
 	sendResult(ctx, resultCh, result, jobID)
 	slog.Info("LLDP topology discovered", "job_id", jobID, "device_id", deviceID, "neighbors", len(result.Neighbors))
@@ -64,7 +65,7 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 
 // discoverLldpNeighbors walks LLDP-MIB tables and returns discovered neighbors.
 // Table walk failures are logged and tolerated, so discovery never fails outright.
-func discoverLldpNeighbors(client snmpQuerier, deviceID, jobID string) *pb.LldpTopologyResult {
+func discoverLldpNeighbors(client snmpQuerier, deviceID, jobID string, useBulk bool) *pb.LldpTopologyResult {
 	now := time.Now().Unix()
 	result := &pb.LldpTopologyResult{
 		DeviceId:  deviceID,
@@ -72,15 +73,23 @@ func discoverLldpNeighbors(client snmpQuerier, deviceID, jobID string) *pb.LldpT
 		Timestamp: now,
 	}
 
+	walk := client.Walk
+	if useBulk {
+		walk = client.BulkWalk
+	}
+
 	// Get local system name
 	sysNamePkt, err := client.Get([]string{oidLocSysName})
-	if err == nil && len(sysNamePkt.Variables) > 0 {
+	if err == nil && len(sysNamePkt.Variables) > 0 && snmpValueUsable(sysNamePkt.Variables[0]) {
 		result.LocalSystemName = snmpValueToString(sysNamePkt.Variables[0])
 	}
 
 	// Walk local port descriptions (indexed by port number)
 	localPorts := make(map[string]string)
-	if err := client.Walk(oidLocPortDesc, func(pdu gosnmp.SnmpPDU) error {
+	if err := walk(oidLocPortDesc, func(pdu gosnmp.SnmpPDU) error {
+		if !snmpValueUsable(pdu) {
+			return nil
+		}
 		portNum := extractSuffix(pdu.Name, oidLocPortDesc)
 		if portNum != "" {
 			localPorts[portNum] = snmpValueToString(pdu)
@@ -92,7 +101,10 @@ func discoverLldpNeighbors(client snmpQuerier, deviceID, jobID string) *pb.LldpT
 
 	// Walk remote system names (indexed by timeMark.portNum.remIndex)
 	sysNames := make(map[string]string)
-	if err := client.Walk(oidRemSysName, func(pdu gosnmp.SnmpPDU) error {
+	if err := walk(oidRemSysName, func(pdu gosnmp.SnmpPDU) error {
+		if !snmpValueUsable(pdu) {
+			return nil
+		}
 		key := parseRemoteKey(pdu.Name, oidRemSysName)
 		if key != "" {
 			sysNames[key] = snmpValueToString(pdu)
@@ -110,7 +122,10 @@ func discoverLldpNeighbors(client snmpQuerier, deviceID, jobID string) *pb.LldpT
 
 	// Walk remote port descriptions
 	remotePorts := make(map[string]string)
-	if err := client.Walk(oidRemPortDesc, func(pdu gosnmp.SnmpPDU) error {
+	if err := walk(oidRemPortDesc, func(pdu gosnmp.SnmpPDU) error {
+		if !snmpValueUsable(pdu) {
+			return nil
+		}
 		key := parseRemoteKey(pdu.Name, oidRemPortDesc)
 		if key != "" {
 			remotePorts[key] = snmpValueToString(pdu)
@@ -122,7 +137,10 @@ func discoverLldpNeighbors(client snmpQuerier, deviceID, jobID string) *pb.LldpT
 
 	// Walk remote port IDs (fallback when description is empty)
 	remotePortIds := make(map[string]string)
-	if err := client.Walk(oidRemPortId, func(pdu gosnmp.SnmpPDU) error {
+	if err := walk(oidRemPortId, func(pdu gosnmp.SnmpPDU) error {
+		if !snmpValueUsable(pdu) {
+			return nil
+		}
 		key := parseRemoteKey(pdu.Name, oidRemPortId)
 		if key != "" {
 			remotePortIds[key] = snmpValueToString(pdu)
@@ -134,7 +152,10 @@ func discoverLldpNeighbors(client snmpQuerier, deviceID, jobID string) *pb.LldpT
 
 	// Walk management addresses (indexed by timeMark.portNum.remIndex.addrSubtype.addrLen.addr[bytes])
 	mgmtAddrs := make(map[string][]string)
-	if err := client.Walk(oidRemManAddr, func(pdu gosnmp.SnmpPDU) error {
+	if err := walk(oidRemManAddr, func(pdu gosnmp.SnmpPDU) error {
+		if !snmpValueUsable(pdu) {
+			return nil
+		}
 		key, ip := parseMgmtAddr(pdu.Name)
 		if key != "" && ip != "" {
 			mgmtAddrs[key] = append(mgmtAddrs[key], ip)

@@ -8,8 +8,13 @@ services:
     container_name: towerops-agent
     restart: unless-stopped
 
-    # Only needed for ICMP monitoring. Without it the agent falls back to
-    # unprivileged UDP ping and then to the system ping binary.
+    volumes:
+      # Persists TOWEROPS_HOST_KEYS_FILE (/data/known_hosts.json) across recreates.
+      - towerops-agent-data:/data
+
+    # Docker includes NET_RAW by default and the image binary carries
+    # cap_net_raw+ep. This is only needed under runtimes that drop NET_RAW,
+    # such as Kubernetes restricted PSS or some hardened Docker daemons.
     cap_add:
       - NET_RAW
 
@@ -35,3 +40,6 @@ services:
     # Only needed when TRAP_ENABLED=true.
     ports:
       - "162:162/udp"
+
+volumes:
+  towerops-agent-data:

@@ -193,7 +193,7 @@ func TestLldpTParseMgmtAddrIPv6NonNumeric(t *testing.T) {
 func TestLldpTDiscoverNeighborsLocalSystemName(t *testing.T) {
 	t.Run("get succeeds", func(t *testing.T) {
 		m := &mockSnmpQuerier{getFunc: lldpTSysNameOK("switch-a")}
-		result := discoverLldpNeighbors(m, "dev-1", "job-1")
+		result := discoverLldpNeighbors(m, "dev-1", "job-1", false)
 		if result.LocalSystemName != "switch-a" {
 			t.Fatalf("LocalSystemName = %q, want %q", result.LocalSystemName, "switch-a")
 		}
@@ -209,7 +209,7 @@ func TestLldpTDiscoverNeighborsLocalSystemName(t *testing.T) {
 		m := &mockSnmpQuerier{getFunc: func([]string) (*gosnmp.SnmpPacket, error) {
 			return nil, errors.New("snmp timeout")
 		}}
-		result := discoverLldpNeighbors(m, "dev-2", "job-2")
+		result := discoverLldpNeighbors(m, "dev-2", "job-2", false)
 		if result.LocalSystemName != "" {
 			t.Fatalf("LocalSystemName = %q, want empty", result.LocalSystemName)
 		}
@@ -219,7 +219,21 @@ func TestLldpTDiscoverNeighborsLocalSystemName(t *testing.T) {
 		m := &mockSnmpQuerier{getFunc: func([]string) (*gosnmp.SnmpPacket, error) {
 			return lldpTPacket(), nil
 		}}
-		result := discoverLldpNeighbors(m, "dev-3", "job-3")
+		result := discoverLldpNeighbors(m, "dev-3", "job-3", false)
+		if result.LocalSystemName != "" {
+			t.Fatalf("LocalSystemName = %q, want empty", result.LocalSystemName)
+		}
+	})
+
+	t.Run("sentinel system name stays empty", func(t *testing.T) {
+		m := &mockSnmpQuerier{getFunc: func([]string) (*gosnmp.SnmpPacket, error) {
+			return lldpTPacket(gosnmp.SnmpPDU{
+				Name:  oidLocSysName,
+				Type:  gosnmp.EndOfMibView,
+				Value: nil,
+			}), nil
+		}}
+		result := discoverLldpNeighbors(m, "dev-4", "job-4", false)
 		if result.LocalSystemName != "" {
 			t.Fatalf("LocalSystemName = %q, want empty", result.LocalSystemName)
 		}
@@ -242,7 +256,7 @@ func TestLldpTDiscoverNeighborsWalkErrors(t *testing.T) {
 			walkStepFunc: lldpTWalk(fullTable),
 			walkErrs:     map[string]error{oidLocPortDesc: errors.New("locport boom")},
 		}
-		result := discoverLldpNeighbors(m, "dev", "job")
+		result := discoverLldpNeighbors(m, "dev", "job", false)
 		if len(result.Neighbors) != 1 {
 			t.Fatalf("Neighbors = %d, want 1", len(result.Neighbors))
 		}
@@ -261,7 +275,7 @@ func TestLldpTDiscoverNeighborsWalkErrors(t *testing.T) {
 			walkStepFunc: lldpTWalk(fullTable),
 			walkErrs:     map[string]error{oidRemSysName: errors.New("remsys boom")},
 		}
-		result := discoverLldpNeighbors(m, "dev", "job")
+		result := discoverLldpNeighbors(m, "dev", "job", false)
 		if len(result.Neighbors) != 0 {
 			t.Fatalf("Neighbors = %v, want empty", result.Neighbors)
 		}
@@ -277,7 +291,7 @@ func TestLldpTDiscoverNeighborsWalkErrors(t *testing.T) {
 				oidLocPortDesc: {lldpTPdu("."+oidLocPortDesc+".5", "ether5")},
 			}),
 		}
-		result := discoverLldpNeighbors(m, "dev", "job")
+		result := discoverLldpNeighbors(m, "dev", "job", false)
 		if len(result.Neighbors) != 0 {
 			t.Fatalf("Neighbors = %v, want empty", result.Neighbors)
 		}
@@ -289,7 +303,7 @@ func TestLldpTDiscoverNeighborsWalkErrors(t *testing.T) {
 			walkStepFunc: lldpTWalk(fullTable),
 			walkErrs:     map[string]error{oidRemPortDesc: errors.New("remportdesc boom")},
 		}
-		result := discoverLldpNeighbors(m, "dev", "job")
+		result := discoverLldpNeighbors(m, "dev", "job", false)
 		if len(result.Neighbors) != 1 {
 			t.Fatalf("Neighbors = %d, want 1", len(result.Neighbors))
 		}
@@ -308,7 +322,7 @@ func TestLldpTDiscoverNeighborsWalkErrors(t *testing.T) {
 			walkStepFunc: lldpTWalk(fullTable),
 			walkErrs:     map[string]error{oidRemPortId: errors.New("remportid boom")},
 		}
-		result := discoverLldpNeighbors(m, "dev", "job")
+		result := discoverLldpNeighbors(m, "dev", "job", false)
 		if len(result.Neighbors) != 1 {
 			t.Fatalf("Neighbors = %d, want 1", len(result.Neighbors))
 		}
@@ -326,7 +340,7 @@ func TestLldpTDiscoverNeighborsWalkErrors(t *testing.T) {
 			walkStepFunc: lldpTWalk(fullTable),
 			walkErrs:     map[string]error{oidRemManAddr: errors.New("manaddr boom")},
 		}
-		result := discoverLldpNeighbors(m, "dev", "job")
+		result := discoverLldpNeighbors(m, "dev", "job", false)
 		if len(result.Neighbors) != 1 {
 			t.Fatalf("Neighbors = %d, want 1", len(result.Neighbors))
 		}
@@ -373,7 +387,7 @@ func TestLldpTDiscoverNeighborsAssembly(t *testing.T) {
 		}),
 	}
 
-	result := discoverLldpNeighbors(m, "dev-9", "job-9")
+	result := discoverLldpNeighbors(m, "dev-9", "job-9", false)
 
 	if result.LocalSystemName != "core-sw" {
 		t.Fatalf("LocalSystemName = %q, want core-sw", result.LocalSystemName)
@@ -430,7 +444,7 @@ func TestLldpTDiscoverNeighborsEmptyIndexParts(t *testing.T) {
 			},
 		}),
 	}
-	result := discoverLldpNeighbors(m, "dev", "job")
+	result := discoverLldpNeighbors(m, "dev", "job", false)
 	// "..." -> suffix ".." -> parts ["", "", ""] -> key ".." -> name "weird",
 	// split on "." gives 3 empty parts so portNum is "" -> LocalPort "port-".
 	names := make([]string, 0, len(result.Neighbors))
@@ -462,7 +476,7 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 	t.Run("dial error", func(t *testing.T) {
 		orig := snmpDial
 		defer func() { snmpDial = orig }()
-		snmpDial = func(*pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(context.Context, *pb.SnmpDevice) (snmpQuerier, func(), error) {
 			return nil, nil, errors.New("dial refused")
 		}
 
@@ -497,15 +511,19 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 					lldpTMgmtOid(true, "0.5.1", "1", 4, []int{10, 1, 2, 3}), "")},
 			}),
 		}
+		var gotCtx context.Context
 		var gotDev *pb.SnmpDevice
-		snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(ctx context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			gotCtx = ctx
 			gotDev = dev
 			return m, func() { closed = true }, nil
 		}
 
 		resultCh := make(chan *pb.LldpTopologyResult, 1)
-		dev := &pb.SnmpDevice{Ip: "10.0.0.1"}
-		executeLldpTopologyJob(context.Background(), &pb.AgentJob{
+		dev := &pb.SnmpDevice{Ip: "10.0.0.1", Version: "2c"}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		executeLldpTopologyJob(ctx, &pb.AgentJob{
 			DeviceId:   "dev-3",
 			JobId:      "job-3",
 			SnmpDevice: dev,
@@ -513,6 +531,9 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 
 		if gotDev != dev {
 			t.Fatalf("snmpDial got device %+v, want %+v", gotDev, dev)
+		}
+		if gotCtx != ctx {
+			t.Fatal("snmpDial did not receive the job context")
 		}
 		if !closed {
 			t.Fatal("close function was not called")
@@ -537,6 +558,65 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 			t.Fatalf("ManagementAddresses = %v, want [10.1.2.3]", n.ManagementAddresses)
 		}
 	})
+}
+
+func TestLldpTExecuteLldpTopologyJobWalkStrategy(t *testing.T) {
+	tests := []struct {
+		name     string
+		version  string
+		wantBulk bool
+	}{
+		{name: "v1 uses Walk", version: "v1"},
+		{name: "v2c uses BulkWalk", version: "2c", wantBulk: true},
+	}
+	wantRoots := []string{
+		oidLocPortDesc,
+		oidRemSysName,
+		oidRemPortDesc,
+		oidRemPortId,
+		oidRemManAddr,
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			orig := snmpDial
+			defer func() { snmpDial = orig }()
+
+			m := &mockSnmpQuerier{
+				getFunc: lldpTSysNameOK("core-sw"),
+				walkStepFunc: lldpTWalk(map[string][]gosnmp.SnmpPDU{
+					oidRemSysName: {lldpTPdu("."+oidRemSysName+".0.5.1", "peer-a")},
+				}),
+			}
+			snmpDial = func(context.Context, *pb.SnmpDevice) (snmpQuerier, func(), error) {
+				return m, func() {}, nil
+			}
+
+			resultCh := make(chan *pb.LldpTopologyResult, 1)
+			executeLldpTopologyJob(context.Background(), &pb.AgentJob{
+				DeviceId:   "dev-walk",
+				JobId:      "job-walk",
+				SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: tt.version},
+			}, resultCh)
+			<-resultCh
+
+			if tt.wantBulk {
+				if !slices.Equal(m.bulkWalkRoots, wantRoots) {
+					t.Fatalf("BulkWalk roots = %v, want %v", m.bulkWalkRoots, wantRoots)
+				}
+				if len(m.walkRoots) != 0 {
+					t.Fatalf("Walk roots = %v, want none", m.walkRoots)
+				}
+			} else {
+				if !slices.Equal(m.walkRoots, wantRoots) {
+					t.Fatalf("Walk roots = %v, want %v", m.walkRoots, wantRoots)
+				}
+				if len(m.bulkWalkRoots) != 0 {
+					t.Fatalf("BulkWalk roots = %v, want none", m.bulkWalkRoots)
+				}
+			}
+		})
+	}
 }
 
 // ---- Property tests ----

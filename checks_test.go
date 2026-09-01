@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -329,6 +330,31 @@ func TestHTTPCheck_VerifySslTrueRejectsSelfSigned(t *testing.T) {
 	}
 }
 
+func TestHTTPCheck_TransportsPreserveProxySupport(t *testing.T) {
+	for name, transport := range map[string]*http.Transport{
+		"default":  defaultHTTPTransport,
+		"insecure": insecureHTTPTransport,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if transport.Proxy == nil {
+				t.Fatal("expected proxy lookup inherited from http.DefaultTransport")
+			}
+			if transport.MaxIdleConns != 100 || transport.MaxIdleConnsPerHost != 10 {
+				t.Fatalf("unexpected idle connection limits: %d/%d",
+					transport.MaxIdleConns, transport.MaxIdleConnsPerHost)
+			}
+			if transport.IdleConnTimeout != 90*time.Second {
+				t.Fatalf("unexpected idle connection timeout: %v", transport.IdleConnTimeout)
+			}
+		})
+	}
+
+	if insecureHTTPTransport.TLSClientConfig == nil ||
+		!insecureHTTPTransport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("expected insecure transport to skip TLS verification")
+	}
+}
+
 func TestHTTPCheck_FollowRedirectsTrue(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/redirect" {
@@ -446,6 +472,47 @@ func TestHTTPCheck_InvalidRegex(t *testing.T) {
 	}
 	if !strings.Contains(output, "Invalid regex") {
 		t.Fatalf("expected 'Invalid regex' in output, got %s", output)
+	}
+
+	httpRegexCacheMu.Lock()
+	_, cached := httpRegexCache[`[invalid`]
+	httpRegexCacheMu.Unlock()
+	if cached {
+		t.Fatal("expected invalid regex not to be cached")
+	}
+}
+
+func TestHTTPRegexCache_ReusesCompiledPattern(t *testing.T) {
+	httpRegexCacheMu.Lock()
+	originalCache := httpRegexCache
+	originalOrder := httpRegexCacheOrder
+	httpRegexCache = make(map[string]*regexp.Regexp)
+	httpRegexCacheOrder = nil
+	httpRegexCacheMu.Unlock()
+	t.Cleanup(func() {
+		httpRegexCacheMu.Lock()
+		httpRegexCache = originalCache
+		httpRegexCacheOrder = originalOrder
+		httpRegexCacheMu.Unlock()
+	})
+
+	first, err := cachedHTTPRegex(`Version \d+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := cachedHTTPRegex(`Version \d+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("expected the compiled regex instance to be reused")
+	}
+
+	httpRegexCacheMu.Lock()
+	cacheSize := len(httpRegexCache)
+	httpRegexCacheMu.Unlock()
+	if cacheSize != 1 {
+		t.Fatalf("expected one cached regex, got %d", cacheSize)
 	}
 }
 
@@ -1665,7 +1732,7 @@ func TestSSLCheck_DefaultWarningDays30(t *testing.T) {
 	}
 }
 
-func TestSSLCheck_UntrustedCertFails(t *testing.T) {
+func TestSSLCheck_SelfSignedCertificateIsCritical(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	}))
@@ -1679,11 +1746,12 @@ func TestSSLCheck_UntrustedCertFails(t *testing.T) {
 		WarningDays: 7,
 	}, 5000)
 
-	if status != 3 {
-		t.Fatalf("expected status 3 for untrusted certificate, got %d: %s", status, output)
+	if status != 2 {
+		t.Fatalf("expected status 2 for untrusted certificate, got %d: %s", status, output)
 	}
-	if !strings.Contains(output, "Connection failed") {
-		t.Fatalf("expected connection failure output, got %s", output)
+	if !strings.Contains(output, "CRITICAL: Certificate for") ||
+		!strings.Contains(output, "is not trusted:") {
+		t.Fatalf("expected certificate trust failure output, got %s", output)
 	}
 }
 
@@ -1857,16 +1925,16 @@ func TestChkTTCPCheckSetDeadlineFailure(t *testing.T) {
 	}
 }
 
-func TestChkTTCPCheckExpectExceedsResponseLimit(t *testing.T) {
+func TestTCPCheck_LongBinaryMismatchOutputIsBoundedAndPrintable(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
 
-	// 80 KiB of filler pushes the read loop past its 64 KiB budget without
-	// ever containing the expected banner.
-	filler := bytes.Repeat([]byte("x"), 80<<10)
+	// 80 KiB of binary filler pushes the read loop past its 64 KiB budget
+	// without ever containing the expected banner.
+	filler := bytes.Repeat([]byte{0x00, 0x01, 0x02, 'x', 0xff}, 16<<10)
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -1892,8 +1960,33 @@ func TestChkTTCPCheckExpectExceedsResponseLimit(t *testing.T) {
 	if !strings.HasPrefix(output, "Unexpected response: ") {
 		t.Fatalf("expected unexpected-response output, got %.60s", output)
 	}
-	if len(output) < 64<<10 {
-		t.Fatalf("expected the full received buffer in output, got %d bytes", len(output))
+	if len(output) > len("Unexpected response: ")+maxTCPOutputBytes+64 {
+		t.Fatalf("expected bounded output, got %d bytes", len(output))
+	}
+	if !strings.Contains(output, "bytes received") {
+		t.Fatalf("expected true response size note, got %q", output)
+	}
+	for _, b := range []byte(output) {
+		if b < 0x20 || b > 0x7e {
+			t.Fatalf("expected printable ASCII output, found byte 0x%02x", b)
+		}
+	}
+}
+
+func TestTCPResponseForOutput_TruncatesSanitizesAndReportsByteCount(t *testing.T) {
+	response := bytes.Repeat([]byte{0x00, 'A', 0xff}, maxTCPOutputBytes)
+	output := tcpResponseForOutput(response)
+
+	if len(output) > maxTCPOutputBytes+64 {
+		t.Fatalf("expected bounded output, got %d bytes", len(output))
+	}
+	if !strings.Contains(output, fmt.Sprintf("%d bytes received", len(response))) {
+		t.Fatalf("expected true response size in %q", output)
+	}
+	for _, b := range []byte(output) {
+		if b < 0x20 || b > 0x7e {
+			t.Fatalf("expected printable ASCII output, found byte 0x%02x", b)
+		}
 	}
 }
 
@@ -2053,6 +2146,7 @@ func chkTSelfSignedCert(t *testing.T, notBefore, notAfter time.Time) tls.Certifi
 		SerialNumber:          big.NewInt(20260828),
 		Subject:               pkix.Name{CommonName: "expired.chkt.test"},
 		DNSNames:              []string{"expired.chkt.test"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
@@ -2114,6 +2208,66 @@ func TestChkTSSLCheckExpiredCertificate(t *testing.T) {
 		cert.Leaf.NotAfter.Format("2006-01-02"))
 	if output != want {
 		t.Fatalf("expected %q, got %q", want, output)
+	}
+}
+
+func TestSSLCheck_ExpiredCertificateHandshakeIsCritical(t *testing.T) {
+	cert := chkTSelfSignedCert(t, time.Now().Add(-96*time.Hour), time.Now().Add(-48*time.Hour))
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.TLS = &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+	}
+	srv.StartTLS()
+	defer srv.Close()
+
+	_, portStr, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host:        "127.0.0.1",
+		Port:        parsePort(portStr),
+		WarningDays: 30,
+	}, 5000)
+
+	if status != 2 {
+		t.Fatalf("expected status 2 rather than a handshake failure, got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "expired 2 days ago") {
+		t.Fatalf("expected certificate expiry output, got %s", output)
+	}
+}
+
+func TestSSLCheck_NotYetValidCertificateIsCritical(t *testing.T) {
+	cert := chkTSelfSignedCert(t, time.Now().Add(48*time.Hour), time.Now().Add(96*time.Hour))
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.TLS = &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+	}
+	srv.StartTLS()
+	defer srv.Close()
+
+	_, portStr, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host:        "127.0.0.1",
+		Port:        parsePort(portStr),
+		WarningDays: 30,
+	}, 5000)
+
+	if status != 2 {
+		t.Fatalf("expected status 2 for a not-yet-valid certificate, got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "is not valid until") {
+		t.Fatalf("expected not-yet-valid output, got %s", output)
 	}
 }
 
