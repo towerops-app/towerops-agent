@@ -12,9 +12,11 @@ import (
 
 // workerPool is a fixed-size goroutine pool for executing tasks.
 type workerPool struct {
-	tasks chan func()
-	wg    sync.WaitGroup
-	once  sync.Once
+	tasks  chan func()
+	wg     sync.WaitGroup
+	once   sync.Once
+	mu     sync.RWMutex
+	closed bool
 }
 
 // newWorkerPool creates a pool with n worker goroutines.
@@ -47,6 +49,11 @@ func (p *workerPool) submit(ctx context.Context, fn func()) bool {
 	if ctx.Err() != nil {
 		return false
 	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.closed {
+		return false
+	}
 	select {
 	case p.tasks <- fn:
 		return true
@@ -58,7 +65,10 @@ func (p *workerPool) submit(ctx context.Context, fn func()) bool {
 // stop closes the task channel and waits for all workers to finish.
 func (p *workerPool) stop() {
 	p.once.Do(func() {
+		p.mu.Lock()
+		p.closed = true
 		close(p.tasks)
+		p.mu.Unlock()
 		p.wg.Wait()
 	})
 }

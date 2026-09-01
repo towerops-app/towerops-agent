@@ -32,6 +32,8 @@ var heartbeatInterval = 60 * time.Second
 var channelHeartbeatInterval = 25 * time.Second
 var initialRetryDelay = time.Second
 
+var agentIDCounter atomic.Uint64
+
 // successfulConnectionThreshold is how long a session must last before the
 // reconnect backoff is considered stale and reset to initialRetryDelay.
 var successfulConnectionThreshold = 30 * time.Second
@@ -109,7 +111,9 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 	}
 	defer func() { _ = ws.Close() }()
 
-	agentID := fmt.Sprintf("agent-%d", time.Now().Unix())
+	// Include nanoseconds and a process-local sequence so immediate reconnects
+	// cannot reuse a Phoenix topic, even when the clock has low resolution.
+	agentID := newAgentID()
 	topic := "agent:" + agentID
 
 	slog.Info("connected", "agent_id", agentID)
@@ -240,21 +244,8 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 	// Wait for join reply before entering main loop
 	select {
 	case data := <-msgCh:
-		var reply channelMsg
-		if err := json.Unmarshal(data, &reply); err != nil {
-			return fmt.Errorf("join reply unmarshal: %w", err)
-		}
-		if reply.Event != "phx_reply" {
-			return fmt.Errorf("expected phx_reply, got %s", reply.Event)
-		}
-		var status struct {
-			Status string `json:"status"`
-		}
-		if err := json.Unmarshal(reply.Payload, &status); err != nil {
-			return fmt.Errorf("join reply payload: %w", err)
-		}
-		if status.Status != "ok" {
-			return fmt.Errorf("join rejected: %s", status.Status)
+		if err := validateJoinReply(data); err != nil {
+			return err
 		}
 		slog.Info("channel joined")
 	case err := <-errCh:
@@ -391,6 +382,33 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 			slog.Debug("sent channel heartbeat", "ref", ref)
 		}
 	}
+}
+
+func newAgentID() string {
+	return fmt.Sprintf("agent-%d-%d", time.Now().UnixNano(), agentIDCounter.Add(1))
+}
+
+func validateJoinReply(data []byte) error {
+	var reply channelMsg
+	if err := json.Unmarshal(data, &reply); err != nil {
+		return fmt.Errorf("join reply unmarshal: %w", err)
+	}
+	if reply.Event != "phx_reply" {
+		return fmt.Errorf("expected phx_reply, got %s", reply.Event)
+	}
+	if reply.Ref == nil || *reply.Ref != "1" {
+		return fmt.Errorf("join reply has unexpected ref")
+	}
+	var status struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(reply.Payload, &status); err != nil {
+		return fmt.Errorf("join reply payload: %w", err)
+	}
+	if status.Status != "ok" {
+		return fmt.Errorf("join rejected: %s", status.Status)
+	}
+	return nil
 }
 
 // handleMessage dispatches incoming channel messages.

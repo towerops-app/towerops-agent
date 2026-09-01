@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -64,6 +65,35 @@ func TestWorkerPool(t *testing.T) {
 		pool.stop() // should not panic
 	})
 
+}
+
+func TestWorkerPoolSubmitAfterStop(t *testing.T) {
+	pool := newWorkerPool(1)
+	pool.stop()
+	if pool.submit(context.Background(), func() { t.Error("stopped pool executed task") }) {
+		t.Fatal("stopped pool accepted task")
+	}
+}
+
+func TestWorkerPoolConcurrentSubmitAndStop(t *testing.T) {
+	for range 100 {
+		pool := newWorkerPool(1)
+		var submitters sync.WaitGroup
+		start := make(chan struct{})
+		for range 8 {
+			submitters.Add(1)
+			go func() {
+				defer submitters.Done()
+				<-start
+				for range 100 {
+					pool.submit(context.Background(), func() {})
+				}
+			}()
+		}
+		close(start)
+		pool.stop()
+		submitters.Wait()
+	}
 }
 
 func TestWorkerPoolRecoversPanic(t *testing.T) {

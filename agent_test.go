@@ -716,6 +716,33 @@ func TestRunSessionRejectsFailedJoin(t *testing.T) {
 	}
 }
 
+func TestNewAgentIDIsUnique(t *testing.T) {
+	seen := make(map[string]struct{}, 1000)
+	for range 1000 {
+		id := newAgentID()
+		if _, exists := seen[id]; exists {
+			t.Fatalf("duplicate agent ID %q", id)
+		}
+		seen[id] = struct{}{}
+	}
+}
+
+func TestValidateJoinReplyRejectsWrongRef(t *testing.T) {
+	for _, ref := range []*string{nil, strPtr("2")} {
+		data, err := json.Marshal(channelMsg{
+			Event:   "phx_reply",
+			Payload: json.RawMessage(`{"status":"ok"}`),
+			Ref:     ref,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateJoinReply(data); err == nil || !strings.Contains(err.Error(), "unexpected ref") {
+			t.Fatalf("validateJoinReply() error = %v, want unexpected ref", err)
+		}
+	}
+}
+
 func TestRunSessionJoinTimeout(t *testing.T) {
 	origTimeout := joinTimeout
 	defer func() { joinTimeout = origTimeout }()
