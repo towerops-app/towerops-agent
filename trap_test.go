@@ -731,6 +731,43 @@ func TestTpTCloseWarnsAboutDroppedTraps(t *testing.T) {
 	}
 }
 
+func TestTpTQueueFullWarnsAtMostOncePerInterval(t *testing.T) {
+	warnedTwice := tpTWatchLog(t, "snmp trap queue full", 2)
+	prev := trapDropLogInterval
+	t.Cleanup(func() { trapDropLogInterval = prev })
+	trapDropLogInterval = time.Hour
+
+	tl := &trapListener{
+		traps:  make(chan *pb.SnmpTrap, 1),
+		closed: make(chan struct{}),
+		done:   make(chan struct{}),
+		ready:  make(chan struct{}),
+	}
+	close(tl.done)
+	addr := &net.UDPAddr{IP: net.ParseIP("192.0.2.78"), Port: 5002}
+
+	tl.handle(tpTV2cTrap("public"), addr)
+	tl.handle(tpTV2cTrap("public"), addr)
+	tl.handle(tpTV2cTrap("public"), addr)
+	if got := tl.dropped.Load(); got != 2 {
+		t.Fatalf("dropped = %d, want 2", got)
+	}
+	select {
+	case <-warnedTwice:
+		t.Fatal("queue-full warning repeated within one interval")
+	default:
+	}
+
+	// Once the interval has elapsed the next drop warns again.
+	trapDropLogInterval = 0
+	tl.handle(tpTV2cTrap("public"), addr)
+	select {
+	case <-warnedTwice:
+	default:
+		t.Fatal("no queue-full warning after the interval elapsed")
+	}
+}
+
 func TestTpTServeStopsDuringRebindBackoff(t *testing.T) {
 	stopped := tpTWatchLog(t, "stopped unexpectedly", 1)
 

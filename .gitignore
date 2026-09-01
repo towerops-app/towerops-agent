@@ -3,6 +3,7 @@ towerops-agent
 *.test
 cover.out
 cover.html
+coverage/
 
 # Runtime data
 known_hosts.json
@@ -23,4 +24,6 @@ result
 Thumbs.db
 
 # Claude
+.claude/
+.omo/
 CLAUDE.md

@@ -45,14 +45,23 @@ Agent**, then run:
 
 ```bash
 docker run -d --name towerops-agent --restart unless-stopped \
+  -v towerops-agent-data:/data \
   --cap-add NET_RAW \
   -e TOWEROPS_API_URL=https://towerops.net \
   -e TOWEROPS_AGENT_TOKEN=your-agent-token \
   ghcr.io/towerops-app/towerops-agent:latest
 ```
 
-`--cap-add NET_RAW` is only needed for ICMP monitoring; without it the agent
-falls back to unprivileged UDP ping and then to the system `ping` binary.
+Docker includes `NET_RAW` by default, and the image binary carries
+`cap_net_raw+ep`. The explicit `--cap-add NET_RAW` only matters under runtimes
+that drop it, such as Kubernetes restricted PSS or some hardened Docker
+daemons. Without raw sockets the agent falls back to unprivileged UDP ping and
+then to the system `ping` binary.
+
+The published image stores its trust-on-first-use data at
+`/data/known_hosts.json` and declares `/data` as a volume. Keep `/data` on a
+named volume or bind mount, as in the example, so SSH host keys and MikroTik TLS
+fingerprints remain pinned when the container is recreated.
 
 For Compose, see [docker-compose.example.yml](docker-compose.example.yml).
 The Agents page in Towerops also generates a ready-to-paste Compose file with
@@ -68,7 +77,8 @@ wins.
 | `TOWEROPS_API_URL` | `--api-url` | Towerops base URL, e.g. `https://towerops.net`. `http`/`https` is rewritten to `ws`/`wss`; a bare host is assumed `wss`. | Required |
 | `TOWEROPS_AGENT_TOKEN` | `--token` | Agent authentication token | Required |
 | `LOG_LEVEL` | `--log-level` | `error`, `warn`, `info` or `debug` | `info` |
-| `TOWEROPS_HOST_KEYS_FILE` | — | Path to the trust-on-first-use store for SSH host keys and MikroTik TLS fingerprints. Must be writable, or SSH and TLS connections are refused. | `./known_hosts.json` |
+| `LOG_FORMAT` | `--log-format` | `text` for human-readable lines, coloured only on a terminal, or `json` for structured records | `text` |
+| `TOWEROPS_HOST_KEYS_FILE` | — | Path to the trust-on-first-use store for SSH host keys and MikroTik TLS fingerprints. Must be writable, or SSH and TLS connections are refused. | `./known_hosts.json` for a local binary; `/data/known_hosts.json` in the published image |
 | `TRAP_ENABLED` | `--trap-enabled` | Listen for SNMP traps | `false` |
 | `TRAP_PORT` | `--trap-port` | UDP port for the trap listener | `162` |
 | `TRAP_COMMUNITY` | `--trap-community` | Only accept traps carrying this community string. Unset accepts any community. | unset |
@@ -169,11 +179,14 @@ Towerops, that its SNMP credentials are correct, and that the agent shows as
 connected on the Agents page. Run with `LOG_LEVEL=debug` to see per-job detail.
 
 **SSH or MikroTik TLS connections refused.** The host key or certificate
-changed since it was pinned, or the store is not writable. Check
-`TOWEROPS_HOST_KEYS_FILE`.
+changed since it was pinned, or the store is not writable. In the published
+image, check that `/data` is mounted persistently and that
+`TOWEROPS_HOST_KEYS_FILE` is `/data/known_hosts.json`.
 
-**ICMP checks failing.** Grant `NET_RAW`, or accept the fallbacks. Raw
-sockets, unprivileged UDP ping and `ping(8)` are tried in that order.
+**ICMP checks failing.** Standard Docker already grants `NET_RAW`, and the
+image binary carries `cap_net_raw+ep`. Under a hardened runtime that drops the
+capability, grant `NET_RAW` if its policy permits; otherwise the agent tries
+unprivileged UDP ping and `ping(8)` after raw sockets fail.
 
 **Traps not arriving.** Confirm `TRAP_ENABLED=true` and that UDP 162 is
 published and not blocked. Run with `LOG_LEVEL=debug`: every accepted trap is

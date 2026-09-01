@@ -83,17 +83,20 @@ Do not open a pull request or issue for a vulnerability. See
 
 ## Development
 
-The repository ships a Nix dev shell with the pinned Go toolchain, linter and
-protobuf compiler. With [direnv](https://direnv.net/) the environment loads on
+The repository ships a Nix dev shell with Go 1.27 selected explicitly and the
+linter and protobuf compiler supplied by nixpkgs-unstable. With
+[direnv](https://direnv.net/) the environment loads on
 `cd`; otherwise:
 
 ```bash
 nix develop
 ```
 
-Using the shell matters more than it looks: the Go version, `golangci-lint`
-and `protoc-gen-go` are all pinned there, and a mismatched `golangci-lint`
-will refuse to lint a module targeting a newer Go than it was built with.
+Using the shell matters more than it looks: only the Go version is selected
+explicitly via `pkgs.go_1_27`. `golangci-lint` and `protoc-gen-go` follow the
+flake's unpinned nixpkgs-unstable input, so CI's explicit linter version must be
+kept in sync by hand. A mismatched `golangci-lint` will refuse to lint a module
+targeting a newer Go than it was built with.
 
 ```bash
 make test     # go test -race -count=1 ./...
@@ -103,10 +106,10 @@ make build
 make proto    # regenerate pb/ after editing proto/agent.proto
 ```
 
-`make proto` output is committed. Never hand-edit `pb/agent.pb.go`: the
-`go_package` option is embedded in the serialized descriptor as a
-length-prefixed string, so editing the path by hand leaves a stale length and
-panics at init.
+`make proto` is the only supported protobuf-regeneration invocation, and its
+output is committed. Never hand-edit `pb/agent.pb.go`: the `go_package` option
+is embedded in the serialized descriptor as a length-prefixed string, so
+editing the path by hand leaves a stale length and panics at init.
 
 Run `make vet lint test` before pushing; CI runs the same checks and a build.
 

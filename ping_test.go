@@ -7,6 +7,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
@@ -178,6 +180,47 @@ func TestExecPingInvalidIP(t *testing.T) {
 	_, err := execPing(context.Background(), "not-an-ip", 5000)
 	if err == nil {
 		t.Error("expected error for invalid IP")
+	}
+}
+
+func TestExecPingTimeoutArgument(t *testing.T) {
+	origGOOS := pingGOOS
+	t.Cleanup(func() { pingGOOS = origGOOS })
+
+	tests := []struct {
+		name      string
+		goos      string
+		timeoutMs int
+		want      int
+	}{
+		{name: "darwin uses milliseconds", goos: "darwin", timeoutMs: 5000, want: 5000},
+		{name: "darwin clamps to one millisecond", goos: "darwin", timeoutMs: 0, want: 1},
+		{name: "linux uses seconds", goos: "linux", timeoutMs: 5000, want: 5},
+		{name: "linux clamps to one second", goos: "linux", timeoutMs: 999, want: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pingGOOS = tt.goos
+			if got := pingTimeoutArg(tt.timeoutMs); got != tt.want {
+				t.Errorf("pingTimeoutArg(%d) on %s = %d, want %d", tt.timeoutMs, tt.goos, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIPv6PingCommandFallsBackToPing(t *testing.T) {
+	origLookPath := pingLookPath
+	t.Cleanup(func() { pingLookPath = origLookPath })
+
+	pingLookPath = func(file string) (string, error) { return "/sbin/" + file, nil }
+	if got := ipv6PingCommand(); got != "ping6" {
+		t.Errorf("ipv6PingCommand() = %q, want ping6 when the binary exists", got)
+	}
+
+	pingLookPath = func(string) (string, error) { return "", exec.ErrNotFound }
+	if got := ipv6PingCommand(); got != "ping" {
+		t.Errorf("ipv6PingCommand() = %q, want ping when ping6 is absent", got)
 	}
 }
 
@@ -367,11 +410,16 @@ type tpTFakeICMPConn struct {
 	onRead      func()
 	closes      atomic.Int32
 	closed      chan struct{}
+	localAddr   net.Addr
 	closeOnce   sync.Once
 }
 
 func tpTNewFakeICMPConn(replies ...func(req []byte) []byte) *tpTFakeICMPConn {
 	return &tpTFakeICMPConn{replies: replies, closed: make(chan struct{})}
+}
+
+func (c *tpTFakeICMPConn) LocalAddr() net.Addr {
+	return c.localAddr
 }
 
 func (c *tpTFakeICMPConn) WriteTo(b []byte, _ net.Addr) (int, error) {
@@ -472,9 +520,76 @@ func tpTEchoReplyFor(t *testing.T, isIPv4 bool, idDelta, seqDelta int) func(req 
 	}
 }
 
+func tpTEchoReplyWithIDFor(t *testing.T, isIPv4 bool, id int) func(req []byte) []byte {
+	t.Helper()
+	proto := 1
+	replyType := icmp.Type(ipv4.ICMPTypeEchoReply)
+	if !isIPv4 {
+		proto = 58
+		replyType = ipv6.ICMPTypeEchoReply
+	}
+	return func(req []byte) []byte {
+		parsed, err := icmp.ParseMessage(proto, req)
+		if err != nil {
+			t.Errorf("scripted reply: request did not parse: %v", err)
+			return nil
+		}
+		echo, ok := parsed.Body.(*icmp.Echo)
+		if !ok {
+			t.Errorf("scripted reply: request body was %T, want *icmp.Echo", parsed.Body)
+			return nil
+		}
+		reply := icmp.Message{
+			Type: replyType,
+			Body: &icmp.Echo{ID: id, Seq: echo.Seq, Data: echo.Data},
+		}
+		wb, err := reply.Marshal(nil)
+		if err != nil {
+			t.Errorf("scripted reply: marshal: %v", err)
+			return nil
+		}
+		return wb
+	}
+}
+
 // tpTStaticReply returns a reply function that always yields the same bytes.
 func tpTStaticReply(pkt []byte) func(req []byte) []byte {
 	return func([]byte) []byte { return pkt }
+}
+
+func TestTpTDoICMPPingUDPMatchesSocketPort(t *testing.T) {
+	socketPort := (os.Getpid() & 0xffff) + 1
+	if socketPort > 0xffff {
+		socketPort = 1
+	}
+	conn := tpTNewFakeICMPConn(
+		tpTEchoReplyFor(t, true, 0, 0),
+		tpTEchoReplyWithIDFor(t, true, socketPort),
+	)
+	conn.localAddr = &net.UDPAddr{Port: socketPort}
+	tpTUseFakeICMPConn(t, conn)
+
+	_, err := doICMPPing(context.Background(), net.ParseIP("127.0.0.1"), "udp4", true, 1000)
+	if err != nil {
+		t.Fatalf("doICMPPing: %v", err)
+	}
+	if got := conn.readsConsumed(); got != 2 {
+		t.Errorf("consumed %d replies, want 2 (pid identifier skipped, socket-port identifier matched)", got)
+	}
+}
+
+func TestTpTDoICMPPingUDPMatchesSequenceWhenLocalAddressIsNotUDP(t *testing.T) {
+	conn := tpTNewFakeICMPConn(tpTEchoReplyFor(t, true, 1, 0))
+	conn.localAddr = &net.IPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	tpTUseFakeICMPConn(t, conn)
+
+	_, err := doICMPPing(context.Background(), net.ParseIP("127.0.0.1"), "udp4", true, 1000)
+	if err != nil {
+		t.Fatalf("doICMPPing: %v", err)
+	}
+	if got := conn.readsConsumed(); got != 1 {
+		t.Errorf("consumed %d replies, want 1 (sequence-only fallback)", got)
+	}
 }
 
 func TestTpTDoICMPPingSkipsUnusableReplies(t *testing.T) {

@@ -17,13 +17,16 @@ import (
 )
 
 var sshBackup = executeMikrotikBackupContext
+var sshBackupTimeout = 60 * time.Second
 var sshDial = func(ctx context.Context, network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	clientConn, channels, requests, err := ssh.NewClientConn(conn, addr, config)
+	stopCancel()
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -32,19 +35,18 @@ var sshDial = func(ctx context.Context, network, addr string, config *ssh.Client
 }
 var doPing = pingDevice
 
-// executeMikrotikBackup connects via SSH and runs /export compact.
-func executeMikrotikBackup(ip string, port uint16, username, password string) (string, error) {
-	return executeMikrotikBackupContext(context.Background(), ip, port, username, password)
-}
-
+// executeMikrotikBackupContext connects via SSH and bounds the complete export,
+// including the handshake and command, so a stalled device cannot pin a worker.
 func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, username, password string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, sshBackupTimeout)
+	defer cancel()
+
 	// SECURITY: TOFU (Trust-On-First-Use) host key verification.
 	// On first connection the key is stored; subsequent connections reject mismatches.
 	config := &ssh.ClientConfig{
 		User:            username,
 		Auth:            []ssh.AuthMethod{ssh.Password(password)},
 		HostKeyCallback: sshHostKeyCallback(),
-		Timeout:         30 * time.Second,
 	}
 
 	addr := net.JoinHostPort(ip, strconv.Itoa(int(port)))
@@ -53,6 +55,8 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 		return "", fmt.Errorf("ssh dial %s: %w", addr, err)
 	}
 	defer func() { _ = conn.Close() }()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 
 	session, err := conn.NewSession()
 	if err != nil {

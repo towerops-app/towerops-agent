@@ -25,11 +25,12 @@ type snmpQuerier interface {
 	WalkAll(rootOid string) ([]gosnmp.SnmpPDU, error)
 	BulkWalkAll(rootOid string) ([]gosnmp.SnmpPDU, error)
 	Walk(rootOid string, walkFn gosnmp.WalkFunc) error
+	BulkWalk(rootOid string, walkFn gosnmp.WalkFunc) error
 }
 
 // snmpDial connects to an SNMP device and returns a querier + close function.
-var snmpDial = func(dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
-	conn, err := newSnmpConn(dev)
+var snmpDial = func(ctx context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+	conn, err := newSnmpConn(ctx, dev)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -45,7 +46,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.S
 		return
 	}
 
-	conn, closeFn, err := snmpDial(dev)
+	conn, closeFn, err := snmpDial(ctx, dev)
 	if err != nil {
 		slog.Error("snmp connect", "job_id", job.JobId, "device", dev.Ip, "error", err)
 		sendResult(ctx, resultCh, emptySnmpResult(job), job.JobId)
@@ -79,10 +80,10 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.S
 					continue
 				}
 				for _, v := range result.Variables {
-					if v.Type == gosnmp.NoSuchObject || v.Type == gosnmp.NoSuchInstance || v.Type == gosnmp.EndOfMibView {
+					if !snmpValueUsable(v) {
 						continue
 					}
-					oidValues[v.Name] = snmpValueToString(v)
+					oidValues[canonicalOID(v.Name)] = snmpValueToString(v)
 				}
 			}
 		case pb.QueryType_WALK:
@@ -100,10 +101,10 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.S
 					continue
 				}
 				for _, v := range results {
-					if v.Type == gosnmp.NoSuchObject || v.Type == gosnmp.NoSuchInstance || v.Type == gosnmp.EndOfMibView {
+					if !snmpValueUsable(v) {
 						continue
 					}
-					oidValues[v.Name] = snmpValueToString(v)
+					oidValues[canonicalOID(v.Name)] = snmpValueToString(v)
 				}
 			}
 		}
@@ -135,6 +136,16 @@ func emptySnmpResult(job *pb.AgentJob) *pb.SnmpResult {
 	}
 }
 
+func snmpValueUsable(pdu gosnmp.SnmpPDU) bool {
+	return pdu.Type != gosnmp.NoSuchObject &&
+		pdu.Type != gosnmp.NoSuchInstance &&
+		pdu.Type != gosnmp.EndOfMibView
+}
+
+func canonicalOID(oid string) string {
+	return strings.TrimPrefix(oid, ".")
+}
+
 // executeCredentialTest tests SNMP credentials by reading sysDescr.0.
 func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.CredentialTestResult) {
 	dev := job.SnmpDevice
@@ -149,7 +160,7 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<
 		return
 	}
 
-	conn, closeFn, err := snmpDial(dev)
+	conn, closeFn, err := snmpDial(ctx, dev)
 	timestamp := time.Now().Unix()
 
 	if err != nil {
@@ -175,9 +186,10 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<
 	}
 
 	sysDescr := ""
-	if len(result.Variables) > 0 {
+	if len(result.Variables) > 0 && snmpValueUsable(result.Variables[0]) {
 		sysDescr = snmpValueToString(result.Variables[0])
 	}
+	// A successful GET proves the credentials work even when sysDescr is unavailable.
 
 	sendResult(ctx, resultCh, &pb.CredentialTestResult{
 		TestId:            job.JobId,
@@ -188,16 +200,21 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<
 }
 
 // newSnmpConn creates a gosnmp.GoSNMP connection from protobuf device config.
-func newSnmpConn(dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error) {
+func newSnmpConn(ctx context.Context, dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error) {
 	if dev.Port > 65535 {
 		return nil, fmt.Errorf("invalid SNMP port %d", dev.Port)
 	}
+	port := dev.Port
+	if port == 0 {
+		port = 161
+	}
 	conn := &gosnmp.GoSNMP{
 		Target:         dev.Ip,
-		Port:           uint16(dev.Port),
+		Port:           uint16(port),
 		Timeout:        10 * time.Second,
 		Retries:        2,
 		MaxRepetitions: 10,
+		Context:        ctx,
 	}
 
 	// Transport
@@ -239,7 +256,7 @@ func newSnmpConn(dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error) {
 	}
 
 	if err := conn.Connect(); err != nil {
-		return nil, fmt.Errorf("snmp connect %s:%d: %w", dev.Ip, dev.Port, err)
+		return nil, fmt.Errorf("snmp connect %s:%d: %w", dev.Ip, port, err)
 	}
 
 	return conn, nil

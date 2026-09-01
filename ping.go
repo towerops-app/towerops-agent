@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ import (
 type icmpConn interface {
 	WriteTo(b []byte, addr net.Addr) (int, error)
 	ReadFrom(b []byte) (int, net.Addr, error)
+	LocalAddr() net.Addr
 	SetDeadline(t time.Time) error
 	Close() error
 }
@@ -34,6 +36,13 @@ var icmpListenPacket = func(network, address string) (icmpConn, error) {
 }
 
 var icmpMarshal = func(m *icmp.Message) ([]byte, error) { return m.Marshal(nil) }
+
+// pingGOOS keeps platform-specific ping arguments testable on any host.
+var pingGOOS = runtime.GOOS
+
+// pingLookPath resolves the fallback ping binaries; a seam so the IPv6 command
+// choice is testable on hosts that do or do not ship ping6.
+var pingLookPath = exec.LookPath
 
 // icmpPing sends a single ICMP echo request and returns the round-trip time in milliseconds.
 // Tries raw ICMP sockets first (requires CAP_NET_RAW or root), then falls back to
@@ -93,6 +102,19 @@ func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, tim
 
 	id := os.Getpid() & 0xffff
 	seq := int(rand.Uint32() & 0xffff)
+
+	expectedID := id
+	matchID := true
+	if strings.HasPrefix(network, "udp") {
+		if localAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+			expectedID = localAddr.Port
+		} else {
+			// Unprivileged ICMP sockets have their echo identifier rewritten to
+			// the local UDP port. If a connection wrapper does not expose that
+			// port, the sequence number is the only stable reply correlator.
+			matchID = false
+		}
+	}
 	msg := icmp.Message{
 		Type: msgType,
 		Code: 0,
@@ -142,7 +164,7 @@ func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, tim
 		switch rm.Type {
 		case ipv4.ICMPTypeEchoReply, ipv6.ICMPTypeEchoReply:
 			echo, ok := rm.Body.(*icmp.Echo)
-			if !ok || echo.ID != id || echo.Seq != seq {
+			if !ok || echo.Seq != seq || (matchID && echo.ID != expectedID) {
 				continue
 			}
 			return float64(elapsed.Microseconds()) / 1000.0, nil
@@ -181,21 +203,38 @@ func execPing(parent context.Context, ip string, timeoutMs int) (float64, error)
 
 	pingCmd := "ping"
 	if parsedIP.To4() == nil {
-		pingCmd = "ping6"
+		pingCmd = ipv6PingCommand()
 	}
 
-	timeoutSecs := max(1, timeoutMs/1000)
+	timeoutArg := pingTimeoutArg(timeoutMs)
 
 	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutMs+1000)*time.Millisecond)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, pingCmd, "-c", "1", "-W", strconv.Itoa(timeoutSecs), ip)
+	cmd := exec.CommandContext(ctx, pingCmd, "-c", "1", "-W", strconv.Itoa(timeoutArg), ip)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return 0, fmt.Errorf("ping failed: %s", strings.TrimSpace(string(output)))
 	}
 
 	return parsePingTime(string(output))
+}
+
+// ipv6PingCommand prefers ping6 where it exists (macOS ships it separately)
+// and otherwise uses ping, whose iputils build — the one in the agent image —
+// handles IPv6 addresses itself and is the only capable binary present.
+func ipv6PingCommand() string {
+	if _, err := pingLookPath("ping6"); err == nil {
+		return "ping6"
+	}
+	return "ping"
+}
+
+func pingTimeoutArg(timeoutMs int) int {
+	if pingGOOS == "darwin" {
+		return max(1, timeoutMs)
+	}
+	return max(1, timeoutMs/1000)
 }
 
 // parsePingTime extracts the response time from ping output.
