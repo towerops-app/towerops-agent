@@ -76,15 +76,17 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 }
 
 // executePingJob pings a device and sends a monitoring check result.
-func executePingJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.MonitoringCheck) {
+func executePingJob(ctx context.Context, job *pb.AgentJob, out resultQueue) {
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing device info for ping", "job_id", job.JobId)
-		sendResult(ctx, resultCh, &pb.MonitoringCheck{
+		result := &pb.MonitoringCheck{
 			DeviceId:  job.DeviceId,
 			Status:    "failure",
 			Timestamp: time.Now().Unix(),
-		}, job.JobId)
+		}
+		slog.Info("ping job complete", "device", job.DeviceId, "status", result.Status)
+		sendResult(ctx, out, "monitoring_check", result, job.JobId)
 		return
 	}
 
@@ -93,19 +95,23 @@ func executePingJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.M
 
 	if err != nil {
 		slog.Warn("device down", "device", job.DeviceId, "error", err)
-		sendResult(ctx, resultCh, &pb.MonitoringCheck{
+		result := &pb.MonitoringCheck{
 			DeviceId:  job.DeviceId,
 			Status:    "failure",
 			Timestamp: timestamp,
-		}, job.JobId)
+		}
+		slog.Info("ping job complete", "device", job.DeviceId, "status", result.Status)
+		sendResult(ctx, out, "monitoring_check", result, job.JobId)
 		return
 	}
 
 	slog.Debug("device up", "device", job.DeviceId, "response_time_ms", responseTime)
-	sendResult(ctx, resultCh, &pb.MonitoringCheck{
+	result := &pb.MonitoringCheck{
 		DeviceId:       job.DeviceId,
 		Status:         "success",
 		ResponseTimeMs: responseTime,
 		Timestamp:      timestamp,
-	}, job.JobId)
+	}
+	slog.Info("ping job complete", "device", job.DeviceId, "status", result.Status)
+	sendResult(ctx, out, "monitoring_check", result, job.JobId)
 }

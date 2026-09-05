@@ -13,21 +13,23 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
 )
 
+const defaultHostKeysPath = "./known_hosts.json"
+
 // hostKeyStore implements trust-on-first-use (TOFU) for SSH host keys and TLS cert fingerprints.
 type hostKeyStore struct {
 	path    string
 	mu      sync.Mutex
-	keys    map[string]string // "host:port" -> hex fingerprint
+	keys    map[string]string // namespaced endpoint -> hex fingerprint
 	loadErr error
 }
 
 var globalHostKeys *hostKeyStore
-var hostKeysOnce sync.Once
 
 // hostKeyTempFile is the subset of *os.File that save uses. Together with the
 // hostKeyCreateTemp and hostKeyMarshal seams it lets tests exercise the
@@ -45,14 +47,23 @@ var hostKeyCreateTemp = func(dir, pattern string) (hostKeyTempFile, error) {
 	return os.CreateTemp(dir, pattern)
 }
 
+// initHostKeyStore installs the process-wide TOFU store, failing startup when
+// the path is unreadable or unwritable instead of the first SSH job.
+func initHostKeyStore(path string) error {
+	s := newHostKeyStore(path)
+	if s.loadErr != nil {
+		return s.loadErr
+	}
+	if err := s.save(); err != nil {
+		return fmt.Errorf("host key store %s: %w", path, err)
+	}
+	globalHostKeys = s
+	return nil
+}
+
+// getHostKeyStore returns the store installed by initHostKeyStore, which
+// runMain calls before any job can reach an SSH or TLS endpoint.
 func getHostKeyStore() *hostKeyStore {
-	hostKeysOnce.Do(func() {
-		path := os.Getenv("TOWEROPS_HOST_KEYS_FILE")
-		if path == "" {
-			path = "./known_hosts.json"
-		}
-		globalHostKeys = newHostKeyStore(path)
-	})
 	return globalHostKeys
 }
 
@@ -108,6 +119,11 @@ func (s *hostKeyStore) verify(host, fingerprint string) error {
 
 	stored, exists := s.keys[host]
 	if !exists {
+		if legacyHost, ok := strings.CutPrefix(host, "ssh:"); ok {
+			stored, exists = s.keys[legacyHost]
+		}
+	}
+	if !exists {
 		slog.Warn("TOFU: first connection, trusting host key", "host", host, "fingerprint", fingerprint)
 		s.keys[host] = fingerprint
 		if err := s.save(); err != nil {
@@ -128,7 +144,7 @@ func sshHostKeyCallback() ssh.HostKeyCallback {
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 		fingerprint := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
 		store := getHostKeyStore()
-		return store.verify(remote.String(), fingerprint)
+		return store.verify("ssh:"+remote.String(), fingerprint)
 	}
 }
 

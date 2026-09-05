@@ -4,14 +4,21 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
 )
 
 func TestHostKeyStoreTOFU(t *testing.T) {
@@ -98,35 +105,124 @@ func TestHostKeyStoreConcurrency(t *testing.T) {
 	wg.Wait()
 }
 
-func TestGetHostKeyStoreDefault(t *testing.T) {
-	// Reset the once for testing
-	origStore := globalHostKeys
-	defer func() {
-		hostKeysOnce = sync.Once{}
-		globalHostKeys = origStore
-	}()
-	hostKeysOnce = sync.Once{}
+func TestInitHostKeyStore(t *testing.T) {
+	t.Run("malformed store", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "hosts.json")
+		if err := os.WriteFile(path, []byte("not json"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		original := globalHostKeys
+		sentinel := &hostKeyStore{}
+		globalHostKeys = sentinel
+		t.Cleanup(func() { globalHostKeys = original })
 
-	t.Setenv("TOWEROPS_HOST_KEYS_FILE", filepath.Join(t.TempDir(), "test_hosts.json"))
-	store := getHostKeyStore()
-	if store == nil {
-		t.Fatal("expected non-nil store")
-	}
+		err := initHostKeyStore(path)
+		if err == nil || !strings.Contains(err.Error(), "parse host key store") {
+			t.Fatalf("initHostKeyStore() error = %v, want malformed-store error", err)
+		}
+		if globalHostKeys != sentinel {
+			t.Fatal("failed initialization replaced the installed store")
+		}
+	})
+
+	t.Run("unwritable directory", func(t *testing.T) {
+		originalStore := globalHostKeys
+		sentinel := &hostKeyStore{}
+		globalHostKeys = sentinel
+		t.Cleanup(func() { globalHostKeys = originalStore })
+
+		originalCreateTemp := hostKeyCreateTemp
+		hostKeyCreateTemp = func(string, string) (hostKeyTempFile, error) {
+			return nil, os.ErrPermission
+		}
+		t.Cleanup(func() { hostKeyCreateTemp = originalCreateTemp })
+
+		path := filepath.Join(t.TempDir(), "hosts.json")
+		err := initHostKeyStore(path)
+		if err == nil {
+			t.Fatal("initHostKeyStore() succeeded for an unwritable directory")
+		}
+		if !strings.Contains(err.Error(), "host key store "+path) {
+			t.Fatalf("initHostKeyStore() error = %q, want path context", err)
+		}
+		if !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("initHostKeyStore() error = %v, want permission error", err)
+		}
+		if globalHostKeys != sentinel {
+			t.Fatal("failed initialization replaced the installed store")
+		}
+	})
+
+	t.Run("success", func(t *testing.T) {
+		original := globalHostKeys
+		t.Cleanup(func() { globalHostKeys = original })
+
+		path := filepath.Join(t.TempDir(), "hosts.json")
+		if err := initHostKeyStore(path); err != nil {
+			t.Fatalf("initHostKeyStore() error = %v", err)
+		}
+		store := getHostKeyStore()
+		if store == nil {
+			t.Fatal("getHostKeyStore() returned nil")
+		}
+		if store.path != path {
+			t.Fatalf("installed store path = %q, want %q", store.path, path)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("initialized store was not persisted: %v", err)
+		}
+	})
 }
 
-func TestSSHHostKeyCallback(t *testing.T) {
-	// Reset global state
-	origStore := globalHostKeys
-	defer func() {
-		hostKeysOnce = sync.Once{}
-		globalHostKeys = origStore
-	}()
-	hostKeysOnce = sync.Once{}
-	t.Setenv("TOWEROPS_HOST_KEYS_FILE", filepath.Join(t.TempDir(), "hosts.json"))
+func TestSSHHostKeyCallbackLegacyAndNamespacedKeys(t *testing.T) {
+	original := globalHostKeys
+	t.Cleanup(func() { globalHostKeys = original })
 
-	cb := sshHostKeyCallback()
-	if cb == nil {
-		t.Fatal("expected non-nil callback")
+	trustedKey := hmTSSHPublicKey(t)
+	changedKey := hmTSSHPublicKey(t)
+	legacyAddress := "127.0.0.1:22"
+	path := filepath.Join(t.TempDir(), "hosts.json")
+	legacyKeys := map[string]string{
+		legacyAddress: fmt.Sprintf("%x", sha256.Sum256(trustedKey.Marshal())),
+	}
+	data, err := json.Marshal(legacyKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	globalHostKeys = newHostKeyStore(path)
+
+	callback := sshHostKeyCallback()
+	legacyRemote := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 22}
+	if err := callback("", legacyRemote, trustedKey); err != nil {
+		t.Fatalf("legacy host key was rejected: %v", err)
+	}
+	if err := callback("", legacyRemote, changedKey); err == nil {
+		t.Fatal("changed legacy host key was accepted")
+	} else if !strings.Contains(err.Error(), "TOFU: host key changed for ssh:"+legacyAddress) {
+		t.Fatalf("mismatch error = %q, want namespaced host", err)
+	}
+
+	newAddress := "192.0.2.1:22"
+	newRemote := &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 22}
+	if err := callback("", newRemote, changedKey); err != nil {
+		t.Fatalf("first-use host key was rejected: %v", err)
+	}
+	persistedData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted map[string]string
+	if err := json.Unmarshal(persistedData, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := persisted["ssh:"+newAddress]; !ok {
+		t.Fatalf("first-use key was not stored under %q: %v", "ssh:"+newAddress, persisted)
+	}
+	if _, ok := persisted[newAddress]; ok {
+		t.Fatalf("first-use key was stored under legacy name %q", newAddress)
 	}
 }
 
@@ -192,32 +288,24 @@ func (f *hmTFailingTempFile) Close() error {
 	return f.closeErr
 }
 
+func hmTSSHPublicKey(t *testing.T) ssh.PublicKey {
+	t.Helper()
+	public, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate SSH key: %v", err)
+	}
+	key, err := ssh.NewPublicKey(public)
+	if err != nil {
+		t.Fatalf("convert SSH key: %v", err)
+	}
+	return key
+}
+
 // hmTNewStore returns a store rooted in a fresh temp dir plus its path.
 func hmTNewStore(t *testing.T) (*hostKeyStore, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "known_hosts.json")
 	return newHostKeyStore(path), path
-}
-
-func TestHmGetHostKeyStoreDefaultPath(t *testing.T) {
-	origStore := globalHostKeys
-	defer func() {
-		hostKeysOnce = sync.Once{}
-		globalHostKeys = origStore
-	}()
-	hostKeysOnce = sync.Once{}
-	t.Setenv("TOWEROPS_HOST_KEYS_FILE", "")
-
-	store := getHostKeyStore()
-	if store == nil {
-		t.Fatal("expected non-nil store")
-	}
-	if store.path != "./known_hosts.json" {
-		t.Fatalf("expected default path ./known_hosts.json, got %q", store.path)
-	}
-	if getHostKeyStore() != store {
-		t.Fatal("getHostKeyStore should memoize the store")
-	}
 }
 
 func TestHmNewHostKeyStoreUnreadablePath(t *testing.T) {

@@ -65,6 +65,11 @@ func TestSnmpValueToString(t *testing.T) {
 			want: "12345678",
 		},
 		{
+			name: "uinteger32",
+			pdu:  gosnmp.SnmpPDU{Type: gosnmp.Uinteger32, Value: uint32(4294967295)},
+			want: "4294967295",
+		},
+		{
 			name: "ip address",
 			pdu:  gosnmp.SnmpPDU{Type: gosnmp.IPAddress, Value: "192.168.1.1"},
 			want: "192.168.1.1",
@@ -117,45 +122,59 @@ func TestSnmpValueToString(t *testing.T) {
 
 func TestMapAuthProtocol(t *testing.T) {
 	tests := []struct {
-		input string
-		want  gosnmp.SnmpV3AuthProtocol
+		input   string
+		want    gosnmp.SnmpV3AuthProtocol
+		wantErr bool
 	}{
-		{"MD5", gosnmp.MD5},
-		{"SHA", gosnmp.SHA},
-		{"SHA-1", gosnmp.SHA},
-		{"SHA-224", gosnmp.SHA224},
-		{"SHA-256", gosnmp.SHA256},
-		{"SHA-384", gosnmp.SHA384},
-		{"SHA-512", gosnmp.SHA512},
-		{"unknown", gosnmp.SHA},
+		{"", gosnmp.SHA, false},
+		{"MD5", gosnmp.MD5, false},
+		{"SHA", gosnmp.SHA, false},
+		{"SHA-1", gosnmp.SHA, false},
+		{"SHA-224", gosnmp.SHA224, false},
+		{"SHA-256", gosnmp.SHA256, false},
+		{"SHA-384", gosnmp.SHA384, false},
+		{"SHA-512", gosnmp.SHA512, false},
+		{"unknown", 0, true},
 	}
 	for _, tt := range tests {
-		got := mapAuthProtocol(tt.input)
-		if got != tt.want {
-			t.Errorf("mapAuthProtocol(%q) = %v, want %v", tt.input, got, tt.want)
-		}
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := mapAuthProtocol(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("mapAuthProtocol(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("mapAuthProtocol(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
 	}
 }
 
 func TestMapPrivProtocol(t *testing.T) {
 	tests := []struct {
-		input string
-		want  gosnmp.SnmpV3PrivProtocol
+		input   string
+		want    gosnmp.SnmpV3PrivProtocol
+		wantErr bool
 	}{
-		{"DES", gosnmp.DES},
-		{"AES", gosnmp.AES},
-		{"AES-128", gosnmp.AES},
-		{"AES-192", gosnmp.AES192},
-		{"AES-256", gosnmp.AES256},
-		{"AES-192-C", gosnmp.AES192C},
-		{"AES-256-C", gosnmp.AES256C},
-		{"unknown", gosnmp.AES},
+		{"", gosnmp.AES, false},
+		{"DES", gosnmp.DES, false},
+		{"AES", gosnmp.AES, false},
+		{"AES-128", gosnmp.AES, false},
+		{"AES-192", gosnmp.AES192, false},
+		{"AES-256", gosnmp.AES256, false},
+		{"AES-192-C", gosnmp.AES192C, false},
+		{"AES-256-C", gosnmp.AES256C, false},
+		{"unknown", 0, true},
 	}
 	for _, tt := range tests {
-		got := mapPrivProtocol(tt.input)
-		if got != tt.want {
-			t.Errorf("mapPrivProtocol(%q) = %v, want %v", tt.input, got, tt.want)
-		}
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := mapPrivProtocol(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("mapPrivProtocol(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("mapPrivProtocol(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -410,9 +429,9 @@ func (m *mockSnmpQuerier) BulkWalkAll(rootOid string) ([]gosnmp.SnmpPDU, error) 
 
 func TestExecuteSnmpJob(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
-		ch := make(chan *pb.SnmpResult, 1)
+		ch := make(resultQueue, 1)
 		executeSnmpJob(context.Background(), &pb.AgentJob{JobId: "1", JobType: pb.JobType_POLL}, ch)
-		result := <-ch
+		result := (<-ch).msg.(*pb.SnmpResult)
 		if len(result.OidValues) != 0 {
 			t.Errorf("expected empty oid values for nil device, got %d", len(result.OidValues))
 		}
@@ -425,12 +444,12 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return nil, nil, fmt.Errorf("connection refused")
 		}
 
-		ch := make(chan *pb.SnmpResult, 1)
+		ch := make(resultQueue, 1)
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		}, ch)
-		result := <-ch
+		result := (<-ch).msg.(*pb.SnmpResult)
 		if len(result.OidValues) != 0 {
 			t.Errorf("expected empty oid values on dial error, got %d", len(result.OidValues))
 		}
@@ -455,7 +474,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return mock, func() { mock.closeCalled = true }, nil
 		}
 
-		ch := make(chan *pb.SnmpResult, 1)
+		ch := make(resultQueue, 1)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		executeSnmpJob(ctx, &pb.AgentJob{
@@ -470,7 +489,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 		if len(ch) != 1 {
 			t.Fatal("expected one result")
 		}
-		result := <-ch
+		result := (<-ch).msg.(*pb.SnmpResult)
 		if gotCtx != ctx {
 			t.Fatal("snmpDial did not receive the job context")
 		}
@@ -501,7 +520,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := make(chan *pb.SnmpResult, 1)
+		ch := make(resultQueue, 1)
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
@@ -510,7 +529,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			},
 		}, ch)
 
-		result := <-ch
+		result := (<-ch).msg.(*pb.SnmpResult)
 		if len(result.OidValues) != 2 {
 			t.Errorf("got %d oid values, want 2", len(result.OidValues))
 		}
@@ -529,7 +548,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := make(chan *pb.SnmpResult, 1)
+		ch := make(resultQueue, 1)
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
@@ -538,7 +557,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			},
 		}, ch)
 
-		result := <-ch
+		result := (<-ch).msg.(*pb.SnmpResult)
 		if len(result.OidValues) != 0 {
 			t.Errorf("got %d oid values, want 0 on error", len(result.OidValues))
 		}
@@ -557,7 +576,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := make(chan *pb.SnmpResult, 1)
+		ch := make(resultQueue, 1)
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
@@ -566,7 +585,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			},
 		}, ch)
 
-		result := <-ch
+		result := (<-ch).msg.(*pb.SnmpResult)
 		if len(result.OidValues) != 0 {
 			t.Errorf("got %d oid values, want 0 on error", len(result.OidValues))
 		}
@@ -589,7 +608,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := make(chan *pb.SnmpResult, 1)
+		ch := make(resultQueue, 1)
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
@@ -598,7 +617,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			},
 		}, ch)
 
-		result := <-ch
+		result := (<-ch).msg.(*pb.SnmpResult)
 		if len(result.OidValues) != 0 {
 			t.Errorf("NoSuchObject should be skipped, got %d oid values", len(result.OidValues))
 		}
@@ -621,12 +640,12 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := make(chan *pb.SnmpResult, 1)
+		ch := make(resultQueue, 1)
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		}, ch)
-		result := <-ch
+		result := (<-ch).msg.(*pb.SnmpResult)
 		if len(result.OidValues) != 0 {
 			t.Errorf("expected empty oid values on dial error, got %d", len(result.OidValues))
 		}
@@ -647,7 +666,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := make(chan *pb.SnmpResult, 1)
+		ch := make(resultQueue, 1)
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: "1"},
@@ -656,7 +675,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			},
 		}, ch)
 
-		result := <-ch
+		result := (<-ch).msg.(*pb.SnmpResult)
 		if len(result.OidValues) != 1 {
 			t.Errorf("got %d oid values, want 1", len(result.OidValues))
 		}
@@ -683,7 +702,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := make(chan *pb.SnmpResult, 1)
+		ch := make(resultQueue, 1)
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: "2c"},
@@ -692,7 +711,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			},
 		}, ch)
 
-		result := <-ch
+		result := (<-ch).msg.(*pb.SnmpResult)
 		if len(result.OidValues) != 1 {
 			t.Errorf("got %d oid values, want 1", len(result.OidValues))
 		}
@@ -717,7 +736,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := make(chan *pb.SnmpResult) // unbuffered, no reader — will be full
+		ch := make(resultQueue) // unbuffered, no reader — will be full
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
@@ -751,7 +770,7 @@ func TestExecuteSnmpJobBatchesGets(t *testing.T) {
 		oids[i] = fmt.Sprintf(".1.3.6.1.2.1.1.%d.0", i)
 	}
 
-	ch := make(chan *pb.SnmpResult, 1)
+	ch := make(resultQueue, 1)
 	executeSnmpJob(context.Background(), &pb.AgentJob{
 		JobId:      "batch-test",
 		DeviceId:   "dev-1",
@@ -761,7 +780,7 @@ func TestExecuteSnmpJobBatchesGets(t *testing.T) {
 		},
 	}, ch)
 
-	result := <-ch
+	result := (<-ch).msg.(*pb.SnmpResult)
 	if len(result.OidValues) != 150 {
 		t.Errorf("got %d oid values, want 150", len(result.OidValues))
 	}
@@ -775,6 +794,118 @@ func TestExecuteSnmpJobBatchesGets(t *testing.T) {
 		if i == 2 && len(call) != 30 {
 			t.Errorf("batch %d: got %d oids, want 30", i, len(call))
 		}
+	}
+}
+func TestExecuteSnmpJobSplitsErrorStatusBatches(t *testing.T) {
+	const badOID = ".1.3.6.1.2.1.1.2.0"
+	oids := []string{
+		".1.3.6.1.2.1.1.1.0",
+		badOID,
+		".1.3.6.1.2.1.1.3.0",
+		".1.3.6.1.2.1.1.4.0",
+	}
+
+	tests := []struct {
+		name string
+		get  func([]string) (*gosnmp.SnmpPacket, error)
+		want map[string]string
+	}{
+		{
+			name: "noSuchName",
+			get: func(batch []string) (*gosnmp.SnmpPacket, error) {
+				containsBadOID := false
+				for _, oid := range batch {
+					if oid == badOID {
+						containsBadOID = true
+						break
+					}
+				}
+				if containsBadOID {
+					vars := make([]gosnmp.SnmpPDU, len(batch))
+					for i, oid := range batch {
+						vars[i] = gosnmp.SnmpPDU{Name: oid, Type: gosnmp.Null}
+					}
+					errorIndex := uint8(2)
+					if len(batch) == 1 {
+						errorIndex = 1
+					}
+					return &gosnmp.SnmpPacket{
+						Error:      gosnmp.NoSuchName,
+						ErrorIndex: errorIndex,
+						Variables:  vars,
+					}, nil
+				}
+				vars := make([]gosnmp.SnmpPDU, len(batch))
+				for i, oid := range batch {
+					vars[i] = gosnmp.SnmpPDU{Name: oid, Type: gosnmp.OctetString, Value: []byte("resolved")}
+				}
+				return &gosnmp.SnmpPacket{Variables: vars}, nil
+			},
+			want: map[string]string{
+				"1.3.6.1.2.1.1.1.0": "resolved",
+				"1.3.6.1.2.1.1.3.0": "resolved",
+				"1.3.6.1.2.1.1.4.0": "resolved",
+			},
+		},
+		{
+			name: "tooBig",
+			get: func(batch []string) (*gosnmp.SnmpPacket, error) {
+				if len(batch) > 2 {
+					return &gosnmp.SnmpPacket{Error: gosnmp.TooBig, ErrorIndex: 0}, nil
+				}
+				vars := make([]gosnmp.SnmpPDU, len(batch))
+				for i, oid := range batch {
+					vars[i] = gosnmp.SnmpPDU{Name: oid, Type: gosnmp.Integer, Value: 42}
+				}
+				return &gosnmp.SnmpPacket{Variables: vars}, nil
+			},
+			want: map[string]string{
+				"1.3.6.1.2.1.1.1.0": "42",
+				"1.3.6.1.2.1.1.2.0": "42",
+				"1.3.6.1.2.1.1.3.0": "42",
+				"1.3.6.1.2.1.1.4.0": "42",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			orig := snmpDial
+			defer func() { snmpDial = orig }()
+			mock := &mockSnmpQuerier{getFunc: tt.get}
+			snmpDial = func(_ context.Context, _ *pb.SnmpDevice) (snmpQuerier, func(), error) {
+				return mock, func() {}, nil
+			}
+
+			out := make(resultQueue, 1)
+			executeSnmpJob(context.Background(), &pb.AgentJob{
+				JobId:      "error-status",
+				DeviceId:   "dev-1",
+				SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: "1"},
+				Queries: []*pb.SnmpQuery{
+					{QueryType: pb.QueryType_GET, Oids: oids},
+				},
+			}, out)
+
+			o := <-out
+			if o.event != "result" {
+				t.Fatalf("event = %q, want result", o.event)
+			}
+			result := o.msg.(*pb.SnmpResult)
+			if len(result.OidValues) != len(tt.want) {
+				t.Fatalf("oid_values = %v, want %v", result.OidValues, tt.want)
+			}
+			for oid, want := range tt.want {
+				if got := result.OidValues[oid]; got != want {
+					t.Errorf("oid_values[%q] = %q, want %q", oid, got, want)
+				}
+			}
+			for oid, got := range result.OidValues {
+				if got == "null" {
+					t.Errorf("oid_values[%q] stored null error-status varbind", oid)
+				}
+			}
+		})
 	}
 }
 
@@ -793,7 +924,7 @@ func TestExecuteSnmpJobCtxCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel before queries run
 
-	ch := make(chan *pb.SnmpResult, 1)
+	ch := make(resultQueue, 1)
 	executeSnmpJob(ctx, &pb.AgentJob{
 		JobId:      "ctx-test",
 		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
@@ -815,9 +946,9 @@ func TestExecuteSnmpJobCtxCancelled(t *testing.T) {
 
 func TestExecuteCredentialTest(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
-		ch := make(chan *pb.CredentialTestResult, 1)
+		ch := make(resultQueue, 1)
 		executeCredentialTest(context.Background(), &pb.AgentJob{JobId: "1"}, ch)
-		result := <-ch
+		result := (<-ch).msg.(*pb.CredentialTestResult)
 		if result.Success {
 			t.Error("expected failure for nil device")
 		}
@@ -833,13 +964,13 @@ func TestExecuteCredentialTest(t *testing.T) {
 			return nil, nil, fmt.Errorf("connection refused")
 		}
 
-		ch := make(chan *pb.CredentialTestResult, 1)
+		ch := make(resultQueue, 1)
 		executeCredentialTest(context.Background(), &pb.AgentJob{
 			JobId:      "test-1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		}, ch)
 
-		result := <-ch
+		result := (<-ch).msg.(*pb.CredentialTestResult)
 		if result.Success {
 			t.Error("expected failure")
 		}
@@ -861,13 +992,13 @@ func TestExecuteCredentialTest(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := make(chan *pb.CredentialTestResult, 1)
+		ch := make(resultQueue, 1)
 		executeCredentialTest(context.Background(), &pb.AgentJob{
 			JobId:      "test-1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		}, ch)
 
-		result := <-ch
+		result := (<-ch).msg.(*pb.CredentialTestResult)
 		if result.Success {
 			t.Error("expected failure on get error")
 		}
@@ -892,7 +1023,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := make(chan *pb.CredentialTestResult, 1)
+		ch := make(resultQueue, 1)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		executeCredentialTest(ctx, &pb.AgentJob{
@@ -900,7 +1031,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		}, ch)
 
-		result := <-ch
+		result := (<-ch).msg.(*pb.CredentialTestResult)
 		if gotCtx != ctx {
 			t.Fatal("snmpDial did not receive the credential-test context")
 		}
@@ -925,13 +1056,13 @@ func TestExecuteCredentialTest(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := make(chan *pb.CredentialTestResult, 1)
+		ch := make(resultQueue, 1)
 		executeCredentialTest(context.Background(), &pb.AgentJob{
 			JobId:      "test-1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		}, ch)
 
-		result := <-ch
+		result := (<-ch).msg.(*pb.CredentialTestResult)
 		if !result.Success {
 			t.Error("expected success even with no variables")
 		}
@@ -959,13 +1090,13 @@ func TestExecuteCredentialTest(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := make(chan *pb.CredentialTestResult, 1)
+		ch := make(resultQueue, 1)
 		executeCredentialTest(context.Background(), &pb.AgentJob{
 			JobId:      "test-sentinel",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		}, ch)
 
-		result := <-ch
+		result := (<-ch).msg.(*pb.CredentialTestResult)
 		if !result.Success {
 			t.Error("expected successful credential test")
 		}
@@ -973,32 +1104,92 @@ func TestExecuteCredentialTest(t *testing.T) {
 			t.Fatalf("SystemDescription = %q, want empty", result.SystemDescription)
 		}
 	})
+	t.Run("error status leaves sysDescr empty", func(t *testing.T) {
+		orig := snmpDial
+		defer func() { snmpDial = orig }()
+
+		mock := &mockSnmpQuerier{
+			getFunc: func(_ []string) (*gosnmp.SnmpPacket, error) {
+				return &gosnmp.SnmpPacket{
+					Error:      gosnmp.NoSuchName,
+					ErrorIndex: 1,
+					Variables: []gosnmp.SnmpPDU{{
+						Name: ".1.3.6.1.2.1.1.1.0",
+						Type: gosnmp.Null,
+					}},
+				}, nil
+			},
+		}
+		snmpDial = func(_ context.Context, _ *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			return mock, func() {}, nil
+		}
+
+		out := make(resultQueue, 1)
+		executeCredentialTest(context.Background(), &pb.AgentJob{
+			JobId:      "test-error-status",
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: "1"},
+		}, out)
+
+		result := (<-out).msg.(*pb.CredentialTestResult)
+		if !result.Success {
+			t.Error("successful GET should prove the credentials")
+		}
+		if result.SystemDescription != "" {
+			t.Fatalf("SystemDescription = %q, want empty", result.SystemDescription)
+		}
+	})
+
+}
+func TestExecuteCredentialTestRejectsUnsupportedAuthProtocol(t *testing.T) {
+	out := make(resultQueue, 1)
+	executeCredentialTest(context.Background(), &pb.AgentJob{
+		JobId: "unsupported-auth",
+		SnmpDevice: &pb.SnmpDevice{
+			Ip:              "127.0.0.1",
+			Version:         "v3",
+			V3Username:      "user",
+			V3SecurityLevel: "authNoPriv",
+			V3AuthProtocol:  "SHA256",
+			V3AuthPassword:  "pass1234",
+		},
+	}, out)
+
+	o := <-out
+	if o.event != "credential_test_result" {
+		t.Fatalf("event = %q, want credential_test_result", o.event)
+	}
+	result := o.msg.(*pb.CredentialTestResult)
+	if result.Success {
+		t.Fatal("credential test succeeded with unsupported auth protocol")
+	}
+	if !strings.Contains(result.ErrorMessage, `unsupported SNMPv3 auth protocol "SHA256"`) {
+		t.Fatalf("ErrorMessage = %q, want unsupported protocol", result.ErrorMessage)
+	}
 }
 
-// TestSnmpValueToStringTypeMismatchFallbacks covers the fmt.Sprintf("%v", ...)
-// arms reached when a device (or a buggy decoder) hands us a Value whose Go
-// type is not the one gosnmp normally supplies for that Asn1BER type.
+// TestSnmpValueToStringTypeMismatchFallbacks covers malformed PDU values.
 func TestSnmpValueToStringTypeMismatchFallbacks(t *testing.T) {
 	tests := []struct {
 		name  string
 		typ   gosnmp.Asn1BER
 		value any
+		want  string
 	}{
-		{name: "octet string not bytes", typ: gosnmp.OctetString, value: 42},
-		{name: "object identifier not string", typ: gosnmp.ObjectIdentifier, value: struct{}{}},
-		{name: "counter32 not uint", typ: gosnmp.Counter32, value: struct{}{}},
-		{name: "counter64 not uint64", typ: gosnmp.Counter64, value: struct{}{}},
-		{name: "gauge32 not uint", typ: gosnmp.Gauge32, value: struct{}{}},
-		{name: "timeticks not uint32", typ: gosnmp.TimeTicks, value: struct{}{}},
-		{name: "ipaddress not string", typ: gosnmp.IPAddress, value: struct{}{}},
-		{name: "opaque not bytes", typ: gosnmp.Opaque, value: struct{}{}},
+		{name: "octet string not bytes", typ: gosnmp.OctetString, value: 42, want: "42"},
+		{name: "object identifier not string", typ: gosnmp.ObjectIdentifier, value: struct{}{}, want: "{}"},
+		{name: "counter32 not numeric", typ: gosnmp.Counter32, value: struct{}{}, want: "0"},
+		{name: "counter64 not numeric", typ: gosnmp.Counter64, value: struct{}{}, want: "0"},
+		{name: "gauge32 not numeric", typ: gosnmp.Gauge32, value: struct{}{}, want: "0"},
+		{name: "timeticks not numeric", typ: gosnmp.TimeTicks, value: struct{}{}, want: "0"},
+		{name: "uinteger32 not numeric", typ: gosnmp.Uinteger32, value: struct{}{}, want: "0"},
+		{name: "ipaddress not string", typ: gosnmp.IPAddress, value: struct{}{}, want: "{}"},
+		{name: "opaque not bytes", typ: gosnmp.Opaque, value: struct{}{}, want: "{}"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			want := fmt.Sprintf("%v", tt.value)
 			got := snmpValueToString(gosnmp.SnmpPDU{Name: ".1.3.6.1.2.1.1.1.0", Type: tt.typ, Value: tt.value})
-			if got != want {
-				t.Errorf("snmpValueToString = %q, want %q", got, want)
+			if got != tt.want {
+				t.Errorf("snmpValueToString = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -1025,7 +1216,7 @@ func TestExecuteSnmpJobWalkSkipsSentinelPDUs(t *testing.T) {
 		return mock, func() { mock.closeCalled = true }, nil
 	}
 
-	ch := make(chan *pb.SnmpResult, 1)
+	ch := make(resultQueue, 1)
 	executeSnmpJob(context.Background(), &pb.AgentJob{
 		JobId:      "walk-sentinels",
 		JobType:    pb.JobType_POLL,
@@ -1036,7 +1227,7 @@ func TestExecuteSnmpJobWalkSkipsSentinelPDUs(t *testing.T) {
 		}},
 	}, ch)
 
-	result := <-ch
+	result := (<-ch).msg.(*pb.SnmpResult)
 	if !mock.bulkWalkCalled {
 		t.Fatal("BulkWalkAll was not called for a v2c WALK")
 	}

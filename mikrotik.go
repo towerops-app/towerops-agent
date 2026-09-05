@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 const (
 	mikrotikConnTimeout  = 30 * time.Second
 	mikrotikReadTimeout  = 30 * time.Second
+	mikrotikCloseTimeout = 2 * time.Second
 	maxMikrotikWordSize  = 10 << 20 // 10 MB
 	maxMikrotikResponse  = 16 << 20 // 16 MB aggregate decoded response
 	maxMikrotikWords     = 10000
@@ -43,7 +45,7 @@ type mikrotikResponse struct {
 
 // mikrotikConnect connects and authenticates to a MikroTik device.
 func mikrotikConnect(ctx context.Context, ip string, port uint32, username, password string, useSSL bool) (*mikrotikClient, error) {
-	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+	addr := net.JoinHostPort(ip, strconv.Itoa(int(port)))
 	var conn net.Conn
 	var err error
 
@@ -111,8 +113,15 @@ func (c *mikrotikClient) execute(command string, args map[string]string) (*mikro
 	return c.readResponse()
 }
 
+// close sends /quit without reading the reply. RouterOS answers immediately,
+// but waiting for a full response under mikrotikReadTimeout let a wedged
+// device pin this worker for 30s per job; the write deadline keeps a device
+// that stopped reading from pinning it indefinitely instead.
 func (c *mikrotikClient) close() error {
-	_, _ = c.execute("/quit", nil) // best-effort
+	if conn, ok := c.conn.(net.Conn); ok {
+		_ = conn.SetWriteDeadline(time.Now().Add(mikrotikCloseTimeout))
+	}
+	_ = c.writeSentence([]string{"/quit"}) // best-effort
 	return c.conn.Close()
 }
 
@@ -182,7 +191,6 @@ func (c *mikrotikClient) readSentence() ([]string, error) {
 		}
 	}
 	words := make([]string, 0, 16)
-	totalBytes := 0
 	for len(words) < maxMikrotikWords {
 		word, err := c.readWord()
 		if err != nil {
@@ -190,10 +198,6 @@ func (c *mikrotikClient) readSentence() ([]string, error) {
 		}
 		if word == "" {
 			return words, nil
-		}
-		totalBytes += len(word)
-		if totalBytes > maxMikrotikResponse {
-			return nil, fmt.Errorf("sentence exceeds %d bytes", maxMikrotikResponse)
 		}
 		words = append(words, word)
 	}
@@ -292,17 +296,25 @@ func parseMikrotikAttrs(words []string) map[string]string {
 	return attrs
 }
 
+func mikrotikError(job *pb.AgentJob, msg string, ts int64) *pb.MikrotikResult {
+	return &pb.MikrotikResult{
+		DeviceId:  job.DeviceId,
+		JobId:     job.JobId,
+		Error:     msg,
+		Timestamp: ts,
+	}
+}
+
 // executeMikrotikJob handles a MikroTik API job including backup-via-SSH.
-func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.MikrotikResult) {
+func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out resultQueue) {
 	dev := job.MikrotikDevice
 	if dev == nil {
 		slog.Error("job missing mikrotik device", "job_id", job.JobId)
-		sendResult(ctx, resultCh, &pb.MikrotikResult{
-			DeviceId:  job.DeviceId,
-			JobId:     job.JobId,
-			Error:     "missing device configuration",
-			Timestamp: time.Now().Unix(),
-		}, job.JobId)
+		sendResult(ctx, out, "mikrotik_result", mikrotikError(
+			job,
+			"missing device configuration",
+			time.Now().Unix(),
+		), job.JobId)
 		return
 	}
 
@@ -310,7 +322,7 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *
 
 	// Backup jobs use SSH
 	if strings.HasPrefix(job.JobId, "backup:") {
-		executeMikrotikBackupViaSSH(ctx, job, dev, resultCh, timestamp)
+		executeMikrotikBackupViaSSH(ctx, job, dev, out, timestamp)
 		return
 	}
 
@@ -318,12 +330,11 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *
 
 	client, err := mikrotikDial(ctx, dev.Ip, dev.Port, dev.Username, dev.Password, dev.UseSsl)
 	if err != nil {
-		sendResult(ctx, resultCh, &pb.MikrotikResult{
-			DeviceId:  job.DeviceId,
-			JobId:     job.JobId,
-			Error:     fmt.Sprintf("connection failed: %v", err),
-			Timestamp: timestamp,
-		}, job.JobId)
+		sendResult(ctx, out, "mikrotik_result", mikrotikError(
+			job,
+			fmt.Sprintf("connection failed: %v", err),
+			timestamp,
+		), job.JobId)
 		return
 	}
 	defer func() { _ = client.close() }()
@@ -353,38 +364,44 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *
 		}
 	}
 
-	sendResult(ctx, resultCh, &pb.MikrotikResult{
+	if errorMessage != "" {
+		sendResult(ctx, out, "mikrotik_result", mikrotikError(job, errorMessage, timestamp), job.JobId)
+		return
+	}
+
+	slog.Info("mikrotik job complete", "device", job.DeviceId, "job", job.JobId)
+	sendResult(ctx, out, "mikrotik_result", &pb.MikrotikResult{
 		DeviceId:  job.DeviceId,
 		JobId:     job.JobId,
 		Sentences: allSentences,
-		Error:     errorMessage,
 		Timestamp: timestamp,
 	}, job.JobId)
 }
 
 // executeMikrotikBackupViaSSH runs /export compact over SSH.
-func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.MikrotikDevice, resultCh chan<- *pb.MikrotikResult, timestamp int64) {
+func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.MikrotikDevice, out resultQueue, timestamp int64) {
 	slog.Debug("executing backup via ssh", "device", job.DeviceId, "ip", dev.Ip, "ssh_port", dev.SshPort)
 	if dev.SshPort > 65535 {
-		sendResult(ctx, resultCh, &pb.MikrotikResult{
-			DeviceId: job.DeviceId, JobId: job.JobId,
-			Error: fmt.Sprintf("invalid SSH port %d", dev.SshPort), Timestamp: timestamp,
-		}, job.JobId)
+		sendResult(ctx, out, "mikrotik_result", mikrotikError(
+			job,
+			fmt.Sprintf("invalid SSH port %d", dev.SshPort),
+			timestamp,
+		), job.JobId)
 		return
 	}
 
 	config, err := sshBackup(ctx, dev.Ip, uint16(dev.SshPort), dev.Username, dev.Password)
 	if err != nil {
-		sendResult(ctx, resultCh, &pb.MikrotikResult{
-			DeviceId:  job.DeviceId,
-			JobId:     job.JobId,
-			Error:     fmt.Sprintf("SSH backup failed: %v", err),
-			Timestamp: timestamp,
-		}, job.JobId)
+		sendResult(ctx, out, "mikrotik_result", mikrotikError(
+			job,
+			fmt.Sprintf("SSH backup failed: %v", err),
+			timestamp,
+		), job.JobId)
 		return
 	}
 
-	sendResult(ctx, resultCh, &pb.MikrotikResult{
+	slog.Info("mikrotik job complete", "device", job.DeviceId, "job", job.JobId)
+	sendResult(ctx, out, "mikrotik_result", &pb.MikrotikResult{
 		DeviceId: job.DeviceId,
 		JobId:    job.JobId,
 		Sentences: []*pb.MikrotikSentence{

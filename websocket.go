@@ -6,6 +6,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"time"
 
 	"github.com/coder/websocket"
@@ -21,7 +23,8 @@ const (
 // wsConn keeps the small interface used by the agent while delegating the
 // WebSocket protocol to coder/websocket.
 type wsConn struct {
-	conn *websocket.Conn
+	conn      *websocket.Conn
+	localAddr string
 }
 
 // wsDial connects to a WebSocket endpoint and completes its opening handshake.
@@ -29,7 +32,25 @@ func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 	ctx, cancel := context.WithTimeout(ctx, wsHandshakeTimeout)
 	defer cancel()
 
-	conn, response, err := websocket.Dial(ctx, rawURL, nil)
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	dialContext := transport.DialContext
+	localAddr := make(chan string, 1)
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dialContext(ctx, network, address)
+		if err == nil {
+			select {
+			case localAddr <- conn.LocalAddr().String():
+			default:
+			}
+		}
+		return conn, err
+	}
+
+	opts := &websocket.DialOptions{
+		HTTPClient: &http.Client{Transport: transport},
+		HTTPHeader: http.Header{"User-Agent": {"towerops-agent/" + version}},
+	}
+	conn, response, err := websocket.Dial(ctx, rawURL, opts)
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()
 	}
@@ -37,7 +58,22 @@ func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 		return nil, fmt.Errorf("dial websocket: %w", err)
 	}
 	conn.SetReadLimit(maxMessageSize)
-	return &wsConn{conn: conn}, nil
+	var recordedAddr string
+	select {
+	case recordedAddr = <-localAddr:
+	default:
+	}
+	return &wsConn{conn: conn, localAddr: recordedAddr}, nil
+}
+
+// LocalIP returns the local address of the underlying TCP connection without
+// its port, or "" when the transport did not report one.
+func (ws *wsConn) LocalIP() string {
+	host, _, err := net.SplitHostPort(ws.localAddr)
+	if err != nil {
+		return ""
+	}
+	return host
 }
 
 // ReadMessage reads one complete text or binary message.

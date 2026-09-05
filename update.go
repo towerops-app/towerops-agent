@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -45,11 +46,43 @@ var httpDo = func(req *http.Request) (*http.Response, error) {
 var syscallExec = syscall.Exec
 var maxUpdateSize int64 = 100 << 20 // 100 MB
 
+var containerMarkerFiles = []string{"/.dockerenv", "/run/.containerenv"}
+var containerCgroupPath = "/proc/1/cgroup"
+
+// runningInContainer reports whether the agent runs inside a container image,
+// where the binary cannot be replaced in place. Result is computed once.
+var runningInContainer = sync.OnceValue(detectContainer)
+
+func detectContainer() bool {
+	for _, path := range containerMarkerFiles {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+	}
+
+	cgroup, err := os.ReadFile(containerCgroupPath)
+	if err != nil {
+		return false
+	}
+	cgroups := string(cgroup)
+	return strings.Contains(cgroups, "docker") ||
+		strings.Contains(cgroups, "containerd") ||
+		strings.Contains(cgroups, "kubepods") ||
+		strings.Contains(cgroups, "libpod")
+}
+
 // The response-header budget is separate from the transfer watchdog so a
 // progressing download is not rejected solely because the link is slow.
 var selfUpdateTimeout = 30 * time.Second
 var selfUpdateIdleTimeout = 30 * time.Second
 var errSelfUpdateIdleTimeout = errors.New("update download idle timeout")
+
+// errSelfUpdateInContainer explains a refusal the operator would otherwise see
+// as "create temp: permission denied": /usr/local/bin is root-owned in the
+// image, and even a writable directory would leave the replacement binary
+// without the cap_net_raw/cap_net_bind_service the image grants with setcap.
+var errSelfUpdateInContainer = errors.New(
+	"self-update unsupported in this deployment: the agent runs in a container image; update by pulling a new image")
 
 type updateIdleReader struct {
 	reader  io.Reader
@@ -68,6 +101,10 @@ func (r *updateIdleReader) Read(p []byte) (int, error) {
 // selfUpdateContext downloads a new binary, verifies its checksum, replaces
 // the current binary, and re-execs while honoring caller cancellation.
 func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string) error {
+	if runningInContainer() {
+		return errSelfUpdateInContainer
+	}
+
 	u, err := url.Parse(downloadURL)
 	if err != nil {
 		return fmt.Errorf("parse url: %w", err)
@@ -77,6 +114,10 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string
 	}
 	if expectedChecksum == "" {
 		return fmt.Errorf("checksum required for update")
+	}
+	expected, err := hex.DecodeString(expectedChecksum)
+	if err != nil || len(expected) != sha256.Size {
+		return fmt.Errorf("checksum must be exactly 64 hexadecimal characters")
 	}
 	slog.Info("downloading update", "url", sanitizeURL(downloadURL))
 
@@ -111,10 +152,6 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download failed: status %d", resp.StatusCode)
-	}
-	expected, err := hex.DecodeString(expectedChecksum)
-	if err != nil || len(expected) != sha256.Size {
-		return fmt.Errorf("checksum must be exactly 64 hexadecimal characters")
 	}
 
 	// Write to temp file in same directory as binary (ensures same filesystem for atomic rename)
@@ -174,6 +211,7 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string
 	if err := osRename(tempPath, currentExe); err != nil {
 		return fmt.Errorf("rename: %w", err)
 	}
+	slog.Warn("replaced binary does not inherit file capabilities granted with setcap", "path", currentExe)
 	if err := syncDirectory(filepath.Dir(currentExe)); err != nil {
 		return fmt.Errorf("sync executable directory: %w", err)
 	}

@@ -5,14 +5,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"math/rand/v2"
 	"net"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -36,6 +37,9 @@ var icmpListenPacket = func(network, address string) (icmpConn, error) {
 }
 
 var icmpMarshal = func(m *icmp.Message) ([]byte, error) { return m.Marshal(nil) }
+
+// pingSeq prevents concurrent workers from accepting one another's replies.
+var pingSeq atomic.Uint32
 
 // pingGOOS keeps platform-specific ping arguments testable on any host.
 var pingGOOS = runtime.GOOS
@@ -66,7 +70,8 @@ func icmpPing(ctx context.Context, ip string, timeoutMs int) (float64, error) {
 	if err == nil {
 		return ms, nil
 	}
-	if _, ok := err.(*errICMPUnavailable); !ok {
+	var unavailable *errICMPUnavailable
+	if !errors.As(err, &unavailable) {
 		return 0, err
 	}
 
@@ -101,7 +106,7 @@ func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, tim
 	}
 
 	id := os.Getpid() & 0xffff
-	seq := int(rand.Uint32() & 0xffff)
+	seq := int(pingSeq.Add(1) & 0xffff)
 
 	expectedID := id
 	matchID := true
@@ -150,9 +155,13 @@ func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, tim
 
 	rb := make([]byte, 1500)
 	for {
-		n, _, err := conn.ReadFrom(rb)
+		n, peer, err := conn.ReadFrom(rb)
 		if err != nil {
 			return 0, fmt.Errorf("icmp read: %w", err)
+		}
+		sourceIP := peerIP(peer)
+		if sourceIP == nil || !sourceIP.Equal(ip) {
+			continue
 		}
 		elapsed := time.Since(start)
 
@@ -172,11 +181,27 @@ func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, tim
 	}
 }
 
+func peerIP(addr net.Addr) net.IP {
+	switch addr := addr.(type) {
+	case *net.IPAddr:
+		if addr != nil {
+			return addr.IP
+		}
+	case *net.UDPAddr:
+		if addr != nil {
+			return addr.IP
+		}
+	}
+	return nil
+}
+
 // errICMPUnavailable is returned when the ICMP socket can't be opened.
 // This triggers a fallback to exec-based ping.
 type errICMPUnavailable struct{ err error }
 
 func (e *errICMPUnavailable) Error() string { return e.err.Error() }
+
+func (e *errICMPUnavailable) Unwrap() error { return e.err }
 
 // pingDevice pings an IP address and returns the response time in milliseconds.
 // Tries raw ICMP first for efficiency, falls back to exec-based ping only
@@ -188,7 +213,8 @@ func pingDevice(ctx context.Context, ip string, timeoutMs int) (float64, error) 
 	}
 
 	// Only fall back to exec if ICMP sockets aren't available
-	if _, ok := err.(*errICMPUnavailable); ok {
+	var unavailable *errICMPUnavailable
+	if errors.As(err, &unavailable) {
 		return execPing(ctx, ip, timeoutMs)
 	}
 	return 0, err

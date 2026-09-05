@@ -23,20 +23,41 @@ import (
 	"pgregory.net/rapid"
 )
 
-func TestEnvOrDefault(t *testing.T) {
-	key := "TOWEROPS_TEST_ENV_OR_DEFAULT"
-
-	// Unset case
-	_ = os.Unsetenv(key)
-	if got := envOrDefault(key, "fallback"); got != "fallback" {
-		t.Errorf("unset: got %q, want %q", got, "fallback")
+func TestEnvironmentFallbackPrecedence(t *testing.T) {
+	tests := []struct {
+		name, preferred, legacy string
+	}{
+		{"log level", "TOWEROPS_LOG_LEVEL", "LOG_LEVEL"},
+		{"log format", "TOWEROPS_LOG_FORMAT", "LOG_FORMAT"},
+		{"trap enabled", "TOWEROPS_TRAP_ENABLED", "TRAP_ENABLED"},
+		{"trap port", "TOWEROPS_TRAP_PORT", "TRAP_PORT"},
+		{"trap community", "TOWEROPS_TRAP_COMMUNITY", "TRAP_COMMUNITY"},
 	}
 
-	// Set case
-	t.Setenv(key, "custom")
-	if got := envOrDefault(key, "fallback"); got != "custom" {
-		t.Errorf("set: got %q, want %q", got, "custom")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(tt.preferred, "")
+			t.Setenv(tt.legacy, "legacy")
+			if got := envFirst(tt.preferred, tt.legacy); got != "legacy" {
+				t.Fatalf("legacy fallback = %q, want %q", got, "legacy")
+			}
+
+			t.Setenv(tt.preferred, "preferred")
+			if got := envFirst(tt.preferred, tt.legacy); got != "preferred" {
+				t.Fatalf("preferred value = %q, want %q", got, "preferred")
+			}
+		})
 	}
+
+	t.Setenv("TOWEROPS_TEST_UNSET", "")
+	if got := envOrDefault("fallback", "TOWEROPS_TEST_UNSET"); got != "fallback" {
+		t.Errorf("unset fallback = %q, want %q", got, "fallback")
+	}
+}
+
+func cliTHostKeysFlag(t *testing.T) string {
+	t.Helper()
+	return "--host-keys-file=" + filepath.Join(t.TempDir(), "known_hosts.json")
 }
 
 func TestSanitizeURL(t *testing.T) {
@@ -103,50 +124,46 @@ func TestStopSignalNotifierAfterShutdownStarts(t *testing.T) {
 
 func TestToWebSocketURL(t *testing.T) {
 	tests := []struct {
-		input, want string
+		name     string
+		input    string
+		insecure bool
+		want     string
+		wantErr  string
 	}{
-		{"http://localhost:4000", "ws://localhost:4000"},
-		{"HTTP://LocalHost:4000", "ws://LocalHost:4000"},
-		{"https://towerops.net", "wss://towerops.net"},
-		{"HTTPS://TowerOps.NET", "wss://TowerOps.NET"},
-		{"hTtPs://TowerOps.NET/Socket", "wss://TowerOps.NET/Socket"},
-		{"ws://localhost:4000", "ws://localhost:4000"},
-		{"WS://LocalHost:4000", "ws://LocalHost:4000"},
-		{"wss://towerops.net", "wss://towerops.net"},
-		{"WsS://TowerOps.NET", "wss://TowerOps.NET"},
-		{"towerops.net", "wss://towerops.net"},
-		{"localhost:4000", "wss://localhost:4000"},
+		{"http", "http://localhost:4000", true, "ws://localhost:4000", ""},
+		{"uppercase http", "HTTP://LocalHost:4000", true, "ws://LocalHost:4000", ""},
+		{"https", "https://towerops.net", false, "wss://towerops.net", ""},
+		{"uppercase https", "HTTPS://TowerOps.NET", false, "wss://TowerOps.NET", ""},
+		{"ws", "ws://localhost:4000", true, "ws://localhost:4000", ""},
+		{"uppercase ws", "WS://LocalHost:4000", true, "ws://LocalHost:4000", ""},
+		{"wss", "wss://towerops.net", false, "wss://towerops.net", ""},
+		{"uppercase wss", "WsS://TowerOps.NET", false, "wss://TowerOps.NET", ""},
+		{"bare host", "towerops.net", false, "wss://towerops.net", ""},
+		{"bare host with port", "localhost:4000", false, "wss://localhost:4000", ""},
+		{"unsupported scheme", "ftp://example.com", false, "", `unsupported URL scheme "ftp"`},
+		{"plaintext rejected", "ws://localhost:4000", false, "", "plaintext"},
 	}
-	for _, tt := range tests {
-		got, err := toWebSocketURL(tt.input, true)
-		if err != nil {
-			t.Errorf("toWebSocketURL(%q, true) unexpected error: %v", tt.input, err)
-			continue
-		}
-		if got != tt.want {
-			t.Errorf("toWebSocketURL(%q, true) = %q, want %q", tt.input, got, tt.want)
-		}
-	}
-}
 
-func TestToWebSocketURLRejectsPlaintext(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-	}{
-		{"ws:// scheme", "ws://localhost:4000"},
-		{"uppercase WS:// scheme", "WS://localhost:4000"},
-		{"http:// converts to ws://", "http://localhost:4000"},
-		{"uppercase HTTP:// converts to ws://", "HTTP://localhost:4000"},
-	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := toWebSocketURL(tt.input, false)
-			if err == nil {
-				t.Error("expected error for plaintext URL")
+			got, err := toWebSocketURL(tt.input, tt.insecure)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %q, want it to contain %q", err, tt.wantErr)
+				}
+				if got != "" {
+					t.Fatalf("result alongside error = %q, want empty", got)
+				}
+				return
 			}
-			if err != nil && !strings.Contains(err.Error(), "plaintext") {
-				t.Errorf("expected 'plaintext' in error, got: %v", err)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("result = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -184,6 +201,7 @@ func TestRunMainTokenFile(t *testing.T) {
 	code := runMain(ctx, []string{
 		"--api-url=wss://example.com",
 		"--token-file=" + tokenPath,
+		cliTHostKeysFlag(t),
 	})
 	if code != 0 {
 		t.Errorf("expected exit 0, got %d", code)
@@ -201,8 +219,6 @@ func TestRunMainTokenFileMissing(t *testing.T) {
 }
 
 func TestRunMainPlaintextRejected(t *testing.T) {
-	origInsecure := insecureFlag
-	defer func() { insecureFlag = origInsecure }()
 
 	t.Setenv("TOWEROPS_API_URL", "")
 	t.Setenv("TOWEROPS_AGENT_TOKEN", "")
@@ -210,6 +226,8 @@ func TestRunMainPlaintextRejected(t *testing.T) {
 	code := runMain(context.Background(), []string{
 		"--api-url=http://localhost:4000",
 		"--token=test-token",
+		"--insecure=false",
+		cliTHostKeysFlag(t),
 	})
 	if code != 1 {
 		t.Errorf("expected exit 1 for plaintext rejection, got %d", code)
@@ -217,8 +235,6 @@ func TestRunMainPlaintextRejected(t *testing.T) {
 }
 
 func TestRunMainPlaintextAllowedWithInsecureFlag(t *testing.T) {
-	origInsecure := insecureFlag
-	defer func() { insecureFlag = origInsecure }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -227,14 +243,30 @@ func TestRunMainPlaintextAllowedWithInsecureFlag(t *testing.T) {
 		"--api-url=HTTP://LocalHost:4000",
 		"--token=test-token",
 		"--insecure",
+		cliTHostKeysFlag(t),
 	})
 	if code != 0 {
 		t.Errorf("expected exit 0 with --insecure, got %d", code)
 	}
 }
 
+func TestRunMainPlaintextAllowedWithInsecureEnvironment(t *testing.T) {
+	t.Setenv("TOWEROPS_INSECURE", "true")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	code := runMain(ctx, []string{
+		"--api-url=http://localhost:4000",
+		"--token=test-token",
+		cliTHostKeysFlag(t),
+	})
+	if code != 0 {
+		t.Errorf("expected exit 0 with TOWEROPS_INSECURE, got %d", code)
+	}
+}
+
 func TestRunMainLogLevels(t *testing.T) {
-	for _, level := range []string{"debug", "warn", "warning", "error", "info", "unknown"} {
+	for _, level := range []string{"debug", "warn", "warning", "error", "info"} {
 		t.Run(level, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
@@ -243,6 +275,7 @@ func TestRunMainLogLevels(t *testing.T) {
 				"--api-url=wss://example.com",
 				"--token=test-token",
 				"--log-level=" + level,
+				cliTHostKeysFlag(t),
 			})
 			if code != 0 {
 				t.Errorf("log level %q: expected exit 0, got %d", level, code)
@@ -251,8 +284,70 @@ func TestRunMainLogLevels(t *testing.T) {
 	}
 }
 
+func TestRunMainInvalidLogLevelWarnsAndUsesInfo(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	originalStderr := os.Stderr
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		os.Stderr = originalStderr
+		slog.SetDefault(originalLogger)
+		_ = writer.Close()
+		_ = reader.Close()
+	})
+	os.Stderr = writer
+
+	// The token comes from the environment so runMain's process-table warning,
+	// which is plain text on stderr, does not appear in the JSON log stream.
+	t.Setenv("TOWEROPS_AGENT_TOKEN", "test-token")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	code := runMain(ctx, []string{
+		"--api-url=wss://example.com",
+		"--log-level=verbose",
+		"--log-format=json",
+		cliTHostKeysFlag(t),
+	})
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+	if !slog.Default().Enabled(context.Background(), slog.LevelInfo) {
+		t.Error("info logging is disabled after invalid log level")
+	}
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("debug logging is enabled after invalid log level")
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	os.Stderr = originalStderr
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+
+	var foundWarning bool
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("log line is not JSON: %q: %v", line, err)
+		}
+		if record["msg"] == "ignoring unrecognised log level" && record["value"] == "verbose" {
+			foundWarning = true
+		}
+	}
+	if !foundWarning {
+		t.Fatalf("logs missing invalid-level warning:\n%s", output)
+	}
+}
+
 func TestRunMainJSONLogFormat(t *testing.T) {
 	t.Setenv("LOG_FORMAT", "json")
+	t.Setenv("TOWEROPS_LOG_FORMAT", "")
 	t.Setenv("TOWEROPS_API_URL", "wss://example.com")
 	t.Setenv("TOWEROPS_AGENT_TOKEN", "test-token")
 
@@ -272,7 +367,7 @@ func TestRunMainJSONLogFormat(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	code := runMain(ctx, nil)
+	code := runMain(ctx, []string{cliTHostKeysFlag(t)})
 
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close stderr writer: %v", err)
@@ -309,6 +404,7 @@ func TestRunMainNormalRun(t *testing.T) {
 	code := runMain(ctx, []string{
 		"--api-url=wss://example.com",
 		"--token=test-token",
+		cliTHostKeysFlag(t),
 	})
 	if code != 0 {
 		t.Errorf("expected exit 0, got %d", code)
@@ -326,6 +422,7 @@ func TestRunMainTokenFlagWarning(t *testing.T) {
 	code := runMain(ctx, []string{
 		"--api-url=wss://example.com",
 		"--token=my-secret-token",
+		cliTHostKeysFlag(t),
 	})
 	if code != 0 {
 		t.Errorf("expected exit 0, got %d", code)
@@ -340,6 +437,7 @@ func TestRunMainWithRunAgent(t *testing.T) {
 	code := runMain(ctx, []string{
 		"--api-url=wss://127.0.0.1:1",
 		"--token=test-token",
+		cliTHostKeysFlag(t),
 	})
 	if code != 0 {
 		t.Errorf("expected exit 0, got %d", code)
@@ -388,6 +486,27 @@ func TestCliTMainSubprocess(t *testing.T) {
 	}
 }
 
+func TestRunMainUnwritableHostKeysPath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "readonly")
+	if err := os.Mkdir(dir, 0500); err != nil {
+		t.Fatalf("create read-only directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(dir, 0700); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("restore directory permissions: %v", err)
+		}
+	})
+
+	code := runMain(context.Background(), []string{
+		"--api-url=wss://example.com",
+		"--token=test-token",
+		"--host-keys-file=" + filepath.Join(dir, "known_hosts.json"),
+	})
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 for unwritable host key store", code)
+	}
+}
+
 // cliTFreeUDPPort returns a UDP port that was bindable a moment ago.
 func cliTFreeUDPPort(t *testing.T) int {
 	t.Helper()
@@ -403,8 +522,6 @@ func cliTFreeUDPPort(t *testing.T) int {
 }
 
 func TestCliTRunMainTrapPortOutOfRange(t *testing.T) {
-	origInsecure := insecureFlag
-	defer func() { insecureFlag = origInsecure }()
 
 	for _, port := range []string{"0", "65536"} {
 		t.Run("port"+port, func(t *testing.T) {
@@ -413,6 +530,7 @@ func TestCliTRunMainTrapPortOutOfRange(t *testing.T) {
 				"--token=test-token",
 				"--trap-enabled",
 				"--trap-port=" + port,
+				cliTHostKeysFlag(t),
 			})
 			if code != 1 {
 				t.Fatalf("trap-port %s: exit = %d, want 1", port, code)
@@ -422,8 +540,6 @@ func TestCliTRunMainTrapPortOutOfRange(t *testing.T) {
 }
 
 func TestCliTRunMainTrapListenerBindFailure(t *testing.T) {
-	origInsecure := insecureFlag
-	defer func() { insecureFlag = origInsecure }()
 
 	// Hold the port so the agent's trap listener cannot bind it.
 	conn, err := net.ListenPacket("udp", "0.0.0.0:0")
@@ -438,6 +554,7 @@ func TestCliTRunMainTrapListenerBindFailure(t *testing.T) {
 		"--token=test-token",
 		"--trap-enabled",
 		"--trap-port=" + strconv.Itoa(port),
+		cliTHostKeysFlag(t),
 	})
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1 when trap port is already bound", code)
@@ -445,8 +562,6 @@ func TestCliTRunMainTrapListenerBindFailure(t *testing.T) {
 }
 
 func TestCliTRunMainTrapListenerStarts(t *testing.T) {
-	origInsecure := insecureFlag
-	defer func() { insecureFlag = origInsecure }()
 
 	port := cliTFreeUDPPort(t)
 
@@ -459,6 +574,7 @@ func TestCliTRunMainTrapListenerStarts(t *testing.T) {
 		"--trap-enabled",
 		"--trap-port=" + strconv.Itoa(port),
 		"--trap-community=public",
+		cliTHostKeysFlag(t),
 	})
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0", code)
@@ -475,15 +591,15 @@ func TestCliTRunMainTrapListenerStarts(t *testing.T) {
 func TestCliTEnvBoolUnparseable(t *testing.T) {
 	key := "CLIT_ENV_BOOL"
 	t.Setenv(key, "not-a-bool")
-	if got := envBool(key, true); got != true {
+	if got := envBool(true, key); got != true {
 		t.Errorf("envBool = %v, want fallback true", got)
 	}
-	if got := envBool(key, false); got != false {
+	if got := envBool(false, key); got != false {
 		t.Errorf("envBool = %v, want fallback false", got)
 	}
 
 	t.Setenv(key, "true")
-	if got := envBool(key, false); got != true {
+	if got := envBool(false, key); got != true {
 		t.Errorf("envBool = %v, want parsed true", got)
 	}
 }
@@ -492,13 +608,13 @@ func TestCliTEnvUintUnparseable(t *testing.T) {
 	key := "CLIT_ENV_UINT"
 	for _, v := range []string{"not-a-number", "-1", "99999999999999999999"} {
 		t.Setenv(key, v)
-		if got := envUint(key, 162); got != 162 {
+		if got := envUint(162, key); got != 162 {
 			t.Errorf("envUint(%q) = %d, want fallback 162", v, got)
 		}
 	}
 
 	t.Setenv(key, "1162")
-	if got := envUint(key, 162); got != 1162 {
+	if got := envUint(162, key); got != 1162 {
 		t.Errorf("envUint = %d, want 1162", got)
 	}
 }

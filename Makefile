@@ -3,9 +3,7 @@
 all: vet lint test build
 
 proto:
-	protoc --go_out=. --go_opt=paths=source_relative proto/agent.proto
-	@# protoc outputs to proto/ due to go_package; move to pb/
-	mv proto/agent.pb.go pb/agent.pb.go
+	protoc --go_out=. --go_opt=module=github.com/towerops-app/towerops-agent proto/agent.proto
 
 test:
 	go test -race -v -count=1 -timeout 60s ./...

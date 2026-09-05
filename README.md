@@ -69,26 +69,28 @@ your API URL and token filled in.
 
 ## Configuration
 
-Every setting has an environment variable and an equivalent flag; the flag
-wins.
+Flags override their corresponding environment variables.
 
 | Variable | Flag | Description | Default |
 |----------|------|-------------|---------|
 | `TOWEROPS_API_URL` | `--api-url` | Towerops base URL, e.g. `https://towerops.net`. `http`/`https` is rewritten to `ws`/`wss`; a bare host is assumed `wss`. | Required |
 | `TOWEROPS_AGENT_TOKEN` | `--token` | Agent authentication token | Required |
-| `LOG_LEVEL` | `--log-level` | `error`, `warn`, `info` or `debug` | `info` |
-| `LOG_FORMAT` | `--log-format` | `text` for human-readable lines, coloured only on a terminal, or `json` for structured records | `text` |
-| `TOWEROPS_HOST_KEYS_FILE` | — | Path to the trust-on-first-use store for SSH host keys and MikroTik TLS fingerprints. Must be writable, or SSH and TLS connections are refused. | `./known_hosts.json` for a local binary; `/data/known_hosts.json` in the published image |
-| `TRAP_ENABLED` | `--trap-enabled` | Listen for SNMP traps | `false` |
-| `TRAP_PORT` | `--trap-port` | UDP port for the trap listener | `162` |
-| `TRAP_COMMUNITY` | `--trap-community` | Only accept traps carrying this community string. Unset accepts any community. | unset |
+| `TOWEROPS_LOG_LEVEL` | `--log-level` | `error`, `warn`, `info` or `debug` | `info` |
+| `TOWEROPS_LOG_FORMAT` | `--log-format` | `text` for human-readable lines, coloured only on a terminal, or `json` for structured records | `text` |
+| `TOWEROPS_INSECURE` | `--insecure` | Permit a plaintext `ws://` connection. Refused otherwise. | `false` |
+| `TOWEROPS_HOST_KEYS_FILE` | `--host-keys-file` | Path to the trust-on-first-use store for SSH host keys and MikroTik TLS fingerprints. The path is checked for writability at startup. | `./known_hosts.json` for a local binary; `/data/known_hosts.json` in the published image |
+| `TOWEROPS_TRAP_ENABLED` | `--trap-enabled` | Listen for SNMP traps | `false` |
+| `TOWEROPS_TRAP_BIND` | `--trap-bind` | Local address for the trap listener. Use `::` to receive traps from IPv6-only devices. | `0.0.0.0` |
+| `TOWEROPS_TRAP_PORT` | `--trap-port` | UDP port for the trap listener | `162` |
+| `TOWEROPS_TRAP_COMMUNITY` | `--trap-community` | Only accept traps carrying this community string. Unset accepts any community. | unset |
 
-Two flags have no environment variable:
+The legacy unprefixed variables `LOG_LEVEL`, `LOG_FORMAT`, `TRAP_ENABLED`,
+`TRAP_PORT` and `TRAP_COMMUNITY` remain accepted when the corresponding
+`TOWEROPS_` variable is unset.
 
-- `--token-file <path>` — read the token from a file instead of the
-  environment. Preferred over `--token`, which is visible in the process
-  table and warns on startup.
-- `--insecure` — permit a plaintext `ws://` connection. Refused otherwise.
+`--token-file <path>` has no environment variable. It reads the token from a
+file instead of the environment and is preferred over `--token`, which is
+visible in the process table and warns on startup.
 
 ## Architecture
 
@@ -115,20 +117,22 @@ carried inside the Phoenix channel envelope.
 
 ## SNMP trap listener
 
-Set `TRAP_ENABLED=true` to listen for traps, and point your devices at the
-agent's address on UDP 162. The agent parses SNMPv1 and SNMPv2c traps and
-informs, normalises them, and forwards each one to Towerops, which attaches it
-to the device whose management IP matches the trap's source address.
+Set `TOWEROPS_TRAP_ENABLED=true` to listen for traps, and point your devices at
+the agent's address on UDP 162. The listener binds `0.0.0.0` by default; set
+`TOWEROPS_TRAP_BIND=::` to receive traps from IPv6-only devices. The agent parses
+SNMPv1 and SNMPv2c traps and informs, normalises them, and forwards each one to
+Towerops, which attaches it to the device whose management IP matches the
+trap's source address.
 
 SNMPv1 header fields are mapped to a v2c-style trap OID following RFC 3584
 §3.1, so a trap has one identifier regardless of the version that delivered it.
 
 Traps are unauthenticated by design: anything that can reach the port can send
-one. Set `TRAP_COMMUNITY` to reject traps that do not carry the expected
-community string, and firewall the port to your device network. Each trap is
-capped at 128 variable bindings, and the agent queues at most 1000 traps while
-it has no server connection — beyond that further traps are dropped and the
-count is logged.
+one. Set `TOWEROPS_TRAP_COMMUNITY` to reject traps that do not carry the
+expected community string, and firewall the port to your device network. Each
+trap is capped at 128 variable bindings, and the agent queues at most 1000
+traps while it has no server connection — beyond that further traps are
+dropped and the count is logged.
 
 In Docker, publish the port. The image already grants the binary
 `cap_net_bind_service`, so binding the privileged port 162 as a non-root user
@@ -138,22 +142,23 @@ needs no extra Docker capability:
     ports:
       - "162:162/udp"
     environment:
-      - TRAP_ENABLED=true
+      - TOWEROPS_TRAP_ENABLED=true
 ```
 
 ## Updating
 
 Container deployments update by pulling a new image. Watchtower is the
 supported way to automate that, and the Compose file Towerops generates
-includes it.
+includes it. A containerised agent reports `container: true` in its heartbeat
+so the server can avoid sending binary updates. If one is sent, the agent
+refuses it with a clear `self-update unsupported in this deployment` error.
 
-The server can also push an update to a standalone binary: it sends a download
-URL and a SHA-256 digest, and the agent fetches the binary over HTTPS, verifies
-the digest before and after writing it, replaces itself atomically, and
-re-executes. This needs write access to the *directory* holding the binary, so
-it does not apply to the published image, where `/usr/local/bin` is root-owned
-and the process runs unprivileged. Note that a replaced binary loses any file
-capabilities granted with `setcap`.
+The server can push an update to a standalone binary: it sends a download URL
+and a SHA-256 digest, and the agent fetches the binary over HTTPS, verifies the
+digest before and after writing it, replaces itself atomically, and re-executes.
+This needs write access to the directory holding the binary. Replacing a binary
+that was granted file capabilities with `setcap` removes those capabilities;
+the agent logs a warning when it replaces itself so the loss is visible.
 
 The server can also ask an agent to restart, which drops the session and
 reconnects immediately.
@@ -176,21 +181,25 @@ container and that the token has not been revoked or disabled:
 
 **No metrics appearing.** Confirm equipment is assigned to this agent in
 Towerops, that its SNMP credentials are correct, and that the agent shows as
-connected on the Agents page. Run with `LOG_LEVEL=debug` to see per-job detail.
+connected on the Agents page. Run with `TOWEROPS_LOG_LEVEL=debug` to see
+per-job detail.
+
+**Host key store error at startup.** Check that the
+`TOWEROPS_HOST_KEYS_FILE` path is readable and its directory is writable. In
+the published image, `/data` must be mounted persistently and the path should
+be `/data/known_hosts.json`.
 
 **SSH or MikroTik TLS connections refused.** The host key or certificate
-changed since it was pinned, or the store is not writable. In the published
-image, check that `/data` is mounted persistently and that
-`TOWEROPS_HOST_KEYS_FILE` is `/data/known_hosts.json`.
+changed since it was pinned.
 
 **ICMP checks failing.** Standard Docker already grants `NET_RAW`, and the
 image binary carries `cap_net_raw+ep`. Under a hardened runtime that drops the
 capability, grant `NET_RAW` if its policy permits; otherwise the agent tries
 unprivileged UDP ping and `ping(8)` after raw sockets fail.
 
-**Traps not arriving.** Confirm `TRAP_ENABLED=true` and that UDP 162 is
-published and not blocked. Run with `LOG_LEVEL=debug`: every accepted trap is
-logged with its source and trap OID, and a community mismatch is logged as
+**Traps not arriving.** Confirm `TOWEROPS_TRAP_ENABLED=true` and that UDP 162 is
+published and not blocked. Run with `TOWEROPS_LOG_LEVEL=debug`: every accepted
+trap is logged with its source and trap OID. A community mismatch is logged as
 `dropping trap with unexpected community`. Towerops can only attach a trap to a
 device whose management IP equals the trap's source address; traps from unknown
 addresses are still recorded against the organization.
@@ -203,7 +212,7 @@ addresses are still recorded against the organization.
   `--insecure`.
 - The only listening socket is the optional trap listener. Traps are
   unauthenticated: restrict UDP 162 to your device network and set
-  `TRAP_COMMUNITY` to filter on the community string.
+  `TOWEROPS_TRAP_COMMUNITY` to filter on the community string.
 - SNMP community strings and SSH credentials are never logged.
 - Reporting a vulnerability: [SECURITY.md](SECURITY.md).
 

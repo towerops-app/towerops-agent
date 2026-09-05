@@ -20,7 +20,117 @@ import (
 	"pgregory.net/rapid"
 )
 
+func forceBareBinaryUpdate(t *testing.T) {
+	t.Helper()
+	orig := runningInContainer
+	runningInContainer = func() bool { return false }
+	t.Cleanup(func() { runningInContainer = orig })
+}
+
+func TestDetectContainer(t *testing.T) {
+	origMarkers := containerMarkerFiles
+	origCgroup := containerCgroupPath
+	t.Cleanup(func() {
+		containerMarkerFiles = origMarkers
+		containerCgroupPath = origCgroup
+	})
+
+	tests := []struct {
+		name        string
+		markerIndex int
+		cgroup      string
+		want        bool
+	}{
+		{name: "docker marker", markerIndex: 0, want: true},
+		{name: "podman marker", markerIndex: 1, want: true},
+		{name: "kubernetes cgroup", markerIndex: -1, cgroup: "0::/kubepods.slice/pod123", want: true},
+		{name: "no container evidence", markerIndex: -1, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			containerMarkerFiles = []string{
+				filepath.Join(dir, ".dockerenv"),
+				filepath.Join(dir, ".containerenv"),
+			}
+			containerCgroupPath = filepath.Join(dir, "cgroup")
+
+			if tt.markerIndex >= 0 {
+				if err := os.WriteFile(containerMarkerFiles[tt.markerIndex], nil, 0600); err != nil {
+					t.Fatalf("create container marker: %v", err)
+				}
+			}
+			if tt.cgroup != "" {
+				if err := os.WriteFile(containerCgroupPath, []byte(tt.cgroup), 0600); err != nil {
+					t.Fatalf("write cgroup fixture: %v", err)
+				}
+			}
+
+			if got := detectContainer(); got != tt.want {
+				t.Errorf("detectContainer() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSelfUpdateRejectsContainerBeforeDownload(t *testing.T) {
+	origContainer := runningInContainer
+	origDo := httpDo
+	origCreate := osCreateTemp
+	t.Cleanup(func() {
+		runningInContainer = origContainer
+		httpDo = origDo
+		osCreateTemp = origCreate
+	})
+
+	runningInContainer = func() bool { return true }
+	httpCalled := false
+	httpDo = func(*http.Request) (*http.Response, error) {
+		httpCalled = true
+		return nil, errors.New("unexpected download")
+	}
+	createTempCalled := false
+	osCreateTemp = func(string, string) (updateTempFile, error) {
+		createTempCalled = true
+		return nil, errors.New("unexpected temp file")
+	}
+
+	const want = "self-update unsupported in this deployment: the agent runs in a container image; update by pulling a new image"
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64))
+	if err == nil || err.Error() != want {
+		t.Fatalf("selfUpdate error = %v, want %q", err, want)
+	}
+	if httpCalled {
+		t.Error("httpDo called for a container self-update")
+	}
+	if createTempCalled {
+		t.Error("osCreateTemp called for a container self-update")
+	}
+}
+
+func TestSelfUpdateRejectsMalformedChecksumBeforeDownload(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	origDo := httpDo
+	t.Cleanup(func() { httpDo = origDo })
+
+	httpCalled := false
+	httpDo = func(*http.Request) (*http.Response, error) {
+		httpCalled = true
+		return nil, errors.New("unexpected download")
+	}
+
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", "not-a-checksum")
+	if err == nil || err.Error() != "checksum must be exactly 64 hexadecimal characters" {
+		t.Fatalf("selfUpdate error = %v, want malformed checksum rejection", err)
+	}
+	if httpCalled {
+		t.Error("httpDo called for a malformed checksum")
+	}
+}
+
 func TestSelfUpdateRejectsHTTP(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	err := selfUpdateContext(context.Background(), "http://example.com/agent", "abc123")
 	if err == nil {
 		t.Error("expected error for HTTP URL")
@@ -31,6 +141,7 @@ func TestSelfUpdateRejectsHTTP(t *testing.T) {
 }
 
 func TestSelfUpdateRejectsRedirectToHTTP(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	origDo := httpDo
 	defer func() { httpDo = origDo }()
 	httpDo = func(*http.Request) (*http.Response, error) {
@@ -52,6 +163,7 @@ func TestSelfUpdateRejectsRedirectToHTTP(t *testing.T) {
 }
 
 func TestSelfUpdateRequiresChecksum(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	err := selfUpdateContext(context.Background(), "https://example.com/agent", "")
 	if err == nil {
 		t.Error("expected error for empty checksum")
@@ -62,13 +174,15 @@ func TestSelfUpdateRequiresChecksum(t *testing.T) {
 }
 
 func TestSelfUpdateBadURL(t *testing.T) {
-	err := selfUpdateContext(context.Background(), "https://127.0.0.1:1/nonexistent", "abc123")
+	forceBareBinaryUpdate(t)
+	err := selfUpdateContext(context.Background(), "https://127.0.0.1:1/nonexistent", strings.Repeat("0", 64))
 	if err == nil {
 		t.Error("expected error for unreachable URL")
 	}
 }
 
 func TestSelfUpdateChecksumMismatch(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("fake binary"))
 	}))
@@ -85,6 +199,7 @@ func TestSelfUpdateChecksumMismatch(t *testing.T) {
 }
 
 func TestSelfUpdate404(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
@@ -94,7 +209,7 @@ func TestSelfUpdate404(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL)+"/missing", "abc123")
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL)+"/missing", strings.Repeat("0", 64))
 	if err == nil {
 		t.Error("expected error for 404 response")
 	}
@@ -104,6 +219,7 @@ func TestSelfUpdate404(t *testing.T) {
 }
 
 func TestSelfUpdateReadBodyError(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	// Server sends Content-Length header but closes connection prematurely
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "99999")
@@ -120,13 +236,14 @@ func TestSelfUpdateReadBodyError(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), "abc123")
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), strings.Repeat("0", 64))
 	// This may or may not error depending on io.ReadAll behavior with truncated body
 	// but we exercise the code path
 	_ = err
 }
 
 func TestSelfUpdateOsExecutableError(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	origExe := osExecutable
 	defer func() { osExecutable = origExe }()
 	osExecutable = func() (string, error) {
@@ -155,6 +272,7 @@ func TestSelfUpdateOsExecutableError(t *testing.T) {
 }
 
 func TestSelfUpdateCreateTempError(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	origExe := osExecutable
 	origCreate := osCreateTemp
 	defer func() {
@@ -188,6 +306,7 @@ func TestSelfUpdateCreateTempError(t *testing.T) {
 }
 
 func TestSelfUpdateRenameError(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	origExe := osExecutable
 	origRename := osRename
 	defer func() {
@@ -222,6 +341,7 @@ func TestSelfUpdateRenameError(t *testing.T) {
 }
 
 func TestSelfUpdateChecksumMatch(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	body := []byte("test binary content")
 	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
 
@@ -261,6 +381,7 @@ func TestSelfUpdateChecksumMatch(t *testing.T) {
 }
 
 func TestSelfUpdateFilePermissions(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	origExe := osExecutable
 	origRename := osRename
 	defer func() {
@@ -301,6 +422,7 @@ func TestSelfUpdateFilePermissions(t *testing.T) {
 }
 
 func TestSelfUpdateTooLarge(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	origMax := maxUpdateSize
 	defer func() { maxUpdateSize = origMax }()
 	maxUpdateSize = 100 // 100 bytes
@@ -366,6 +488,7 @@ func TestSanitizeArgs(t *testing.T) {
 }
 
 func TestSelfUpdateInvalidURL(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	err := selfUpdateContext(context.Background(), "://\x7f", "abc123")
 	if err == nil {
 		t.Error("expected error for invalid URL")
@@ -376,6 +499,7 @@ func TestSelfUpdateInvalidURL(t *testing.T) {
 }
 
 func TestSelfUpdateFullHappyPath(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	body := []byte("test binary content for full path")
 	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
 
@@ -413,6 +537,7 @@ func TestSelfUpdateFullHappyPath(t *testing.T) {
 }
 
 func TestSelfUpdateWriteError(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	body := []byte("binary")
 	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
 
@@ -452,6 +577,7 @@ func TestSelfUpdateWriteError(t *testing.T) {
 }
 
 func TestSelfUpdateResponseHeaderTimeout(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	origDo := httpDo
 	origTimeout := selfUpdateTimeout
 	defer func() {
@@ -475,6 +601,7 @@ func TestSelfUpdateResponseHeaderTimeout(t *testing.T) {
 }
 
 func TestSelfUpdateSlowProgressingDownloadCompletes(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	body := []byte("slow but steadily progressing update")
 	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
 
@@ -541,6 +668,7 @@ func TestSelfUpdateSlowProgressingDownloadCompletes(t *testing.T) {
 }
 
 func TestSelfUpdateStalledBodyTimesOut(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "1")
 		w.WriteHeader(http.StatusOK)
@@ -637,6 +765,7 @@ func (f *cliTFakeTempFile) Close() error {
 }
 
 func TestCliTSelfUpdateBuildRequestError(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	origNewRequest := httpNewRequest
 	origDo := httpDo
 	defer func() {
@@ -659,6 +788,7 @@ func TestCliTSelfUpdateBuildRequestError(t *testing.T) {
 }
 
 func TestCliTSelfUpdateTempFileFailures(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	tests := []struct {
 		name  string
 		want  string
@@ -725,6 +855,7 @@ func TestCliTSelfUpdateTempFileFailures(t *testing.T) {
 }
 
 func TestCliTSelfUpdateSyncDirectoryError(t *testing.T) {
+	forceBareBinaryUpdate(t)
 	body := []byte("payload for directory sync failure")
 	downloadURL, checksum := cliTUpdateServer(t, body)
 

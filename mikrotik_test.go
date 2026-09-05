@@ -400,28 +400,51 @@ func TestExecuteWithArgs(t *testing.T) {
 	}
 }
 
-func TestMikrotikClose(t *testing.T) {
-	clientR, serverW := io.Pipe()
-	serverR, clientW := io.Pipe()
+type quitBlockingConn struct {
+	bytes.Buffer
+	closed chan struct{}
+	once   sync.Once
+}
 
-	conn := &readWriteCloser{r: clientR, w: clientW}
-	c := &mikrotikClient{conn: conn}
+func (c *quitBlockingConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, io.EOF
+}
 
-	var receivedWords []string
-	done := make(chan struct{})
+func (c *quitBlockingConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestMikrotikCloseDoesNotWaitForResponse(t *testing.T) {
+	conn := &quitBlockingConn{closed: make(chan struct{})}
+	client := &mikrotikClient{conn: conn}
+	done := make(chan error, 1)
+
 	go func() {
-		defer close(done)
-		defer func() { _ = serverW.Close() }()
-		sc := &mikrotikClient{conn: &readWriteCloser{r: serverR, w: serverW}}
-		receivedWords, _ = sc.readSentence()
-		_ = sc.writeSentence([]string{"!fatal"})
+		done <- client.close()
 	}()
 
-	_ = c.close()
-	<-done
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(time.Second):
+		_ = conn.Close()
+		<-done
+		t.Fatal("close waited for a /quit response")
+	}
 
-	if len(receivedWords) == 0 || receivedWords[0] != "/quit" {
-		t.Errorf("expected /quit command, got: %v", receivedWords)
+	select {
+	case <-conn.closed:
+	default:
+		t.Fatal("connection was not closed")
+	}
+
+	want := encodeSentence([]string{"/quit"})
+	if !bytes.Equal(conn.Bytes(), want) {
+		t.Fatalf("written bytes = %x, want /quit sentence %x", conn.Bytes(), want)
 	}
 }
 
@@ -546,14 +569,9 @@ func TestMikrotikConnectSSLWithServer(t *testing.T) {
 	}
 	defer func() { _ = ln.Close() }()
 
-	// Reset host key store for this test
 	origStore := globalHostKeys
-	defer func() {
-		hostKeysOnce = sync.Once{}
-		globalHostKeys = origStore
-	}()
-	hostKeysOnce = sync.Once{}
-	t.Setenv("TOWEROPS_HOST_KEYS_FILE", filepath.Join(t.TempDir(), "hosts.json"))
+	t.Cleanup(func() { globalHostKeys = origStore })
+	globalHostKeys = newHostKeyStore(filepath.Join(t.TempDir(), "hosts.json"))
 
 	go func() {
 		conn, err := ln.Accept()
@@ -774,14 +792,10 @@ func TestMikrotikConnectSSLTOFUMismatch(t *testing.T) {
 	}
 	defer func() { _ = ln.Close() }()
 
-	// Reset host key store and pre-populate with wrong fingerprint
+	// Pre-populate the host key store with the wrong fingerprint.
 	origStore := globalHostKeys
-	defer func() {
-		hostKeysOnce = sync.Once{}
-		globalHostKeys = origStore
-	}()
-	hostKeysOnce = sync.Once{}
-	t.Setenv("TOWEROPS_HOST_KEYS_FILE", filepath.Join(t.TempDir(), "hosts.json"))
+	t.Cleanup(func() { globalHostKeys = origStore })
+	globalHostKeys = newHostKeyStore(filepath.Join(t.TempDir(), "hosts.json"))
 
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
 	var portNum uint32
@@ -860,8 +874,8 @@ func TestHmReadResponseTrapWithoutMessage(t *testing.T) {
 }
 
 func TestHmReadResponseExceedsMaxBytes(t *testing.T) {
-	// Two sentences that each fit the per-sentence budget but together exceed
-	// the aggregate response budget.
+	// Two individually valid words in separate sentences exceed the aggregate
+	// response budget.
 	const word = 9 << 20
 	var readers []io.Reader
 	for range 2 {
@@ -876,25 +890,6 @@ func TestHmReadResponseExceedsMaxBytes(t *testing.T) {
 		t.Fatal("expected aggregate response size error")
 	}
 	if !strings.Contains(err.Error(), fmt.Sprintf("response exceeds %d bytes", maxMikrotikResponse)) {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestHmReadSentenceExceedsMaxBytes(t *testing.T) {
-	// A single sentence whose words sum past the response budget.
-	const word = 9 << 20
-	var readers []io.Reader
-	for range 2 {
-		readers = append(readers, hmTFillerWord(word)...)
-	}
-	readers = append(readers, bytes.NewReader([]byte{0}))
-	c := &mikrotikClient{conn: &hmTReadConn{r: io.MultiReader(readers...)}}
-
-	_, err := c.readSentence()
-	if err == nil {
-		t.Fatal("expected per-sentence size error")
-	}
-	if !strings.Contains(err.Error(), fmt.Sprintf("sentence exceeds %d bytes", maxMikrotikResponse)) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -981,7 +976,7 @@ func TestHmExecuteMikrotikJobClosesConnOnContextCancel(t *testing.T) {
 	cancel()
 
 	// Unbuffered and unread: sendResult drops the result once ctx is done.
-	ch := make(chan *pb.MikrotikResult)
+	out := make(resultQueue)
 	// Reads block forever unless context.AfterFunc closes the connection, so
 	// returning at all proves the cancellation hook fired.
 	executeMikrotikJob(ctx, &pb.AgentJob{
@@ -989,7 +984,7 @@ func TestHmExecuteMikrotikJobClosesConnOnContextCancel(t *testing.T) {
 		DeviceId:         "dev-1",
 		MikrotikDevice:   &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
 		MikrotikCommands: []*pb.MikrotikCommand{{Command: "/interface/print"}},
-	}, ch)
+	}, out)
 
 	select {
 	case <-conn.closed:
@@ -1002,7 +997,6 @@ func TestHmExecuteMikrotikJobDeliversSentences(t *testing.T) {
 	var stream bytes.Buffer
 	stream.Write(encodeSentence([]string{"!re", "=name=ether1", "=mtu=1500"}))
 	stream.Write(encodeSentence([]string{"!done"}))
-	stream.Write(encodeSentence([]string{"!done"})) // reply to /quit in close()
 
 	origDial := mikrotikDial
 	defer func() { mikrotikDial = origDial }()
@@ -1010,15 +1004,22 @@ func TestHmExecuteMikrotikJobDeliversSentences(t *testing.T) {
 		return &mikrotikClient{conn: &nopCloser{readWriter: &stream}}, nil
 	}
 
-	ch := make(chan *pb.MikrotikResult, 1)
+	out := make(resultQueue, 1)
 	executeMikrotikJob(context.Background(), &pb.AgentJob{
 		JobId:            "m-ok",
 		DeviceId:         "dev-1",
 		MikrotikDevice:   &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
 		MikrotikCommands: []*pb.MikrotikCommand{{Command: "/interface/print"}},
-	}, ch)
+	}, out)
 
-	result := <-ch
+	o := <-out
+	if o.event != "mikrotik_result" {
+		t.Fatalf("event = %q, want mikrotik_result", o.event)
+	}
+	result, ok := o.msg.(*pb.MikrotikResult)
+	if !ok {
+		t.Fatalf("message type = %T, want *pb.MikrotikResult", o.msg)
+	}
 	if result.Error != "" {
 		t.Fatalf("unexpected error: %s", result.Error)
 	}

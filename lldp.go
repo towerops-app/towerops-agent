@@ -19,23 +19,24 @@ import (
 
 // LLDP-MIB OIDs (IEEE 802.1AB)
 const (
-	oidLocSysName  = "1.0.8802.1.1.2.1.3.3.0"
-	oidLocPortDesc = "1.0.8802.1.1.2.1.3.7.1.4"
-	oidRemPortId   = "1.0.8802.1.1.2.1.4.1.1.7"
-	oidRemPortDesc = "1.0.8802.1.1.2.1.4.1.1.8"
-	oidRemSysName  = "1.0.8802.1.1.2.1.4.1.1.9"
-	oidRemManAddr  = "1.0.8802.1.1.2.1.4.2.1.3"
+	oidLocSysName   = "1.0.8802.1.1.2.1.3.3.0"
+	oidLocPortDesc  = "1.0.8802.1.1.2.1.3.7.1.4"
+	oidRemChassisId = "1.0.8802.1.1.2.1.4.1.1.5"
+	oidRemPortId    = "1.0.8802.1.1.2.1.4.1.1.7"
+	oidRemPortDesc  = "1.0.8802.1.1.2.1.4.1.1.8"
+	oidRemSysName   = "1.0.8802.1.1.2.1.4.1.1.9"
+	oidRemManAddr   = "1.0.8802.1.1.2.1.4.2.1.3"
 )
 
 // executeLldpTopologyJob performs LLDP neighbor discovery via SNMP.
-func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.LldpTopologyResult) {
+func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, out resultQueue) {
 	deviceID := job.DeviceId
 	jobID := job.JobId
 	timestamp := time.Now().Unix()
 
 	if job.SnmpDevice == nil {
 		slog.Error("missing SNMP config for LLDP job", "job_id", jobID, "device_id", deviceID)
-		sendResult(ctx, resultCh, &pb.LldpTopologyResult{
+		sendResult(ctx, out, "lldp_topology_result", &pb.LldpTopologyResult{
 			DeviceId:  deviceID,
 			JobId:     jobID,
 			Timestamp: timestamp,
@@ -47,7 +48,7 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 	client, closeConn, err := snmpDial(ctx, snmpDev)
 	if err != nil {
 		slog.Error("failed to connect SNMP for LLDP", "job_id", jobID, "device_id", deviceID, "error", err)
-		sendResult(ctx, resultCh, &pb.LldpTopologyResult{
+		sendResult(ctx, out, "lldp_topology_result", &pb.LldpTopologyResult{
 			DeviceId:  deviceID,
 			JobId:     jobID,
 			Timestamp: timestamp,
@@ -56,10 +57,9 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, resultCh chan
 	}
 	defer closeConn()
 
-	useBulk := snmpDev.Version != "1" && snmpDev.Version != "v1"
-	result := discoverLldpNeighbors(client, deviceID, jobID, useBulk)
+	result := discoverLldpNeighbors(client, deviceID, jobID, !isSnmpV1(snmpDev.Version))
 
-	sendResult(ctx, resultCh, result, jobID)
+	sendResult(ctx, out, "lldp_topology_result", result, jobID)
 	slog.Info("LLDP topology discovered", "job_id", jobID, "device_id", deviceID, "neighbors", len(result.Neighbors))
 }
 
@@ -84,73 +84,42 @@ func discoverLldpNeighbors(client snmpQuerier, deviceID, jobID string, useBulk b
 		result.LocalSystemName = snmpValueToString(sysNamePkt.Variables[0])
 	}
 
-	// Walk local port descriptions (indexed by port number)
-	localPorts := make(map[string]string)
-	if err := walk(oidLocPortDesc, func(pdu gosnmp.SnmpPDU) error {
-		if !snmpValueUsable(pdu) {
-			return nil
-		}
-		portNum := extractSuffix(pdu.Name, oidLocPortDesc)
-		if portNum != "" {
-			localPorts[portNum] = snmpValueToString(pdu)
-		}
-		return nil
-	}); err != nil {
+	localPorts, err := walkTable(walk, oidLocPortDesc, func(oid string) string {
+		return extractSuffix(oid, oidLocPortDesc)
+	})
+	if err != nil {
 		slog.Warn("failed to walk local ports", "error", err)
 	}
 
-	// Walk remote system names (indexed by timeMark.portNum.remIndex)
-	sysNames := make(map[string]string)
-	if err := walk(oidRemSysName, func(pdu gosnmp.SnmpPDU) error {
-		if !snmpValueUsable(pdu) {
-			return nil
-		}
-		key := parseRemoteKey(pdu.Name, oidRemSysName)
-		if key != "" {
-			sysNames[key] = snmpValueToString(pdu)
-		}
-		return nil
-	}); err != nil {
+	chassisIDs, err := walkTable(walk, oidRemChassisId, func(oid string) string {
+		return parseRemoteKey(oid, oidRemChassisId)
+	})
+	if err != nil {
+		slog.Warn("failed to walk remote chassis IDs", "error", err)
+	}
+
+	sysNames, err := walkTable(walk, oidRemSysName, func(oid string) string {
+		return parseRemoteKey(oid, oidRemSysName)
+	})
+	if err != nil {
 		slog.Warn("failed to walk remote sys names", "error", err)
-		return result // Return empty result, not an error
 	}
 
-	// If no neighbors found, return early
-	if len(sysNames) == 0 {
-		return result
-	}
-
-	// Walk remote port descriptions
-	remotePorts := make(map[string]string)
-	if err := walk(oidRemPortDesc, func(pdu gosnmp.SnmpPDU) error {
-		if !snmpValueUsable(pdu) {
-			return nil
-		}
-		key := parseRemoteKey(pdu.Name, oidRemPortDesc)
-		if key != "" {
-			remotePorts[key] = snmpValueToString(pdu)
-		}
-		return nil
-	}); err != nil {
+	remotePorts, err := walkTable(walk, oidRemPortDesc, func(oid string) string {
+		return parseRemoteKey(oid, oidRemPortDesc)
+	})
+	if err != nil {
 		slog.Warn("failed to walk remote port descriptions", "error", err)
 	}
 
-	// Walk remote port IDs (fallback when description is empty)
-	remotePortIds := make(map[string]string)
-	if err := walk(oidRemPortId, func(pdu gosnmp.SnmpPDU) error {
-		if !snmpValueUsable(pdu) {
-			return nil
-		}
-		key := parseRemoteKey(pdu.Name, oidRemPortId)
-		if key != "" {
-			remotePortIds[key] = snmpValueToString(pdu)
-		}
-		return nil
-	}); err != nil {
+	remotePortIDs, err := walkTable(walk, oidRemPortId, func(oid string) string {
+		return parseRemoteKey(oid, oidRemPortId)
+	})
+	if err != nil {
 		slog.Warn("failed to walk remote port IDs", "error", err)
 	}
 
-	// Walk management addresses (indexed by timeMark.portNum.remIndex.addrSubtype.addrLen.addr[bytes])
+	// Management addresses have a variable-length index, so they cannot use walkTable.
 	mgmtAddrs := make(map[string][]string)
 	if err := walk(oidRemManAddr, func(pdu gosnmp.SnmpPDU) error {
 		if !snmpValueUsable(pdu) {
@@ -165,9 +134,14 @@ func discoverLldpNeighbors(client snmpQuerier, deviceID, jobID string, useBulk b
 		slog.Warn("failed to walk management addresses", "error", err)
 	}
 
-	// Assemble neighbor list
-	for _, key := range sortedLldpKeys(sysNames) {
+	for _, key := range sortedLldpKeys(chassisIDs) {
 		neighborName := sysNames[key]
+		if neighborName == "" {
+			neighborName = chassisIDs[key]
+		}
+		if neighborName == "" && len(mgmtAddrs[key]) > 0 {
+			neighborName = mgmtAddrs[key][0]
+		}
 		if neighborName == "" {
 			continue
 		}
@@ -185,14 +159,36 @@ func discoverLldpNeighbors(client snmpQuerier, deviceID, jobID string, useBulk b
 			NeighborName:        neighborName,
 			LocalPort:           localPort,
 			RemotePort:          remotePorts[key],
-			RemotePortId:        remotePortIds[key],
+			RemotePortId:        remotePortIDs[key],
 			ManagementAddresses: mgmtAddrs[key],
+			RemoteChassisId:     chassisIDs[key],
 		}
 
 		result.Neighbors = append(result.Neighbors, neighbor)
 	}
 
 	return result
+}
+
+// walkTable walks base and collects usable PDUs keyed by keyFn. It returns
+// partial results with any walk error so callers can degrade discovery.
+func walkTable(
+	walk func(string, gosnmp.WalkFunc) error,
+	base string,
+	keyFn func(oid string) string,
+) (map[string]string, error) {
+	values := make(map[string]string)
+	err := walk(base, func(pdu gosnmp.SnmpPDU) error {
+		if !snmpValueUsable(pdu) {
+			return nil
+		}
+		key := keyFn(pdu.Name)
+		if key != "" {
+			values[key] = snmpValueToString(pdu)
+		}
+		return nil
+	})
+	return values, err
 }
 
 func sortedLldpKeys(values map[string]string) []string {
@@ -206,16 +202,12 @@ func sortedLldpKeys(values map[string]string) []string {
 
 // extractSuffix strips the base OID prefix and returns the suffix.
 func extractSuffix(oid, base string) string {
-	prefix := "." + base + "."
-	if strings.HasPrefix(oid, prefix) {
-		return strings.TrimPrefix(oid, prefix)
+	oid = canonicalOID(oid)
+	prefix := canonicalOID(base) + "."
+	if !strings.HasPrefix(oid, prefix) {
+		return ""
 	}
-	// Try without leading dot on oid
-	prefix = base + "."
-	if strings.HasPrefix(oid, prefix) {
-		return strings.TrimPrefix(oid, prefix)
-	}
-	return ""
+	return strings.TrimPrefix(oid, prefix)
 }
 
 // parseRemoteKey extracts a remote table key from OID: timeMark.portNum.remIndex
@@ -250,13 +242,19 @@ func parseMgmtAddr(oid string) (key string, ip string) {
 	// timeMark.portNum.remIndex
 	key = parts[0] + "." + parts[1] + "." + parts[2]
 	addrSubtype := parts[3]
-	// parts[4] is addrLen (we trust the subtype to determine length)
+	addrLen, err := strconv.Atoi(parts[4])
+	if err != nil {
+		return key, ""
+	}
 
 	switch addrSubtype {
 	case "1": // IPv4
+		if addrLen != net.IPv4len {
+			return key, ""
+		}
 		ip = strings.Join(parts[5:9], ".")
 	case "2": // IPv6
-		if len(parts) < 21 {
+		if addrLen != net.IPv6len || len(parts) < 21 {
 			return key, ""
 		}
 		// Convert 16 octets to IPv6 hex format

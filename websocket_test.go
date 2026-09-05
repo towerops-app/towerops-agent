@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -48,6 +49,64 @@ func TestWSDialReadWriteAndClose(t *testing.T) {
 	}
 	if string(got) != string(want) {
 		t.Fatalf("ReadMessage = %q, want %q", got, want)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestWSDialSendsUserAgent(t *testing.T) {
+	userAgent := make(chan string, 1)
+	serverErr := make(chan error, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userAgent <- r.Header.Get("User-Agent")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- conn.CloseNow()
+	}))
+	defer srv.Close()
+
+	ws, err := wsDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"))
+	if err != nil {
+		t.Fatalf("wsDial: %v", err)
+	}
+	defer func() { _ = ws.Close() }()
+
+	if got, want := <-userAgent, "towerops-agent/"+version; got != want {
+		t.Errorf("User-Agent = %q, want %q", got, want)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+func TestWSConnLocalIP(t *testing.T) {
+	serverErr := make(chan error, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- conn.CloseNow()
+	}))
+	defer srv.Close()
+
+	ws, err := wsDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"))
+	if err != nil {
+		t.Fatalf("wsDial: %v", err)
+	}
+	defer func() { _ = ws.Close() }()
+
+	got := ws.LocalIP()
+	if net.ParseIP(got) == nil {
+		t.Errorf("LocalIP() = %q, want a valid IP address", got)
+	}
+	if got != "127.0.0.1" {
+		t.Errorf("LocalIP() = %q, want 127.0.0.1", got)
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("server: %v", err)

@@ -14,6 +14,12 @@ import (
 	"time"
 )
 
+type testLogValuer struct{}
+
+func (testLogValuer) LogValue() slog.Value {
+	return slog.StringValue("resolved")
+}
+
 func TestLevelColor(t *testing.T) {
 	tests := []struct {
 		level slog.Level
@@ -34,35 +40,15 @@ func TestLevelColor(t *testing.T) {
 
 func TestNewColorHandler(t *testing.T) {
 	var buf bytes.Buffer
-	h := newColorHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-	if h == nil {
-		t.Fatal("expected non-nil handler")
-	}
-}
-
-func TestNewColorHandlerNilOpts(t *testing.T) {
-	var buf bytes.Buffer
-	h := newColorHandler(&buf, nil)
-	if h == nil {
-		t.Fatal("expected non-nil handler")
-	}
-	// Default level should be Info
-	if h.level != slog.LevelInfo {
-		t.Errorf("default level: got %v, want %v", h.level, slog.LevelInfo)
-	}
-}
-
-func TestNewColorHandlerNilLevel(t *testing.T) {
-	var buf bytes.Buffer
-	h := newColorHandler(&buf, &slog.HandlerOptions{})
-	if h.level != slog.LevelInfo {
-		t.Errorf("default level: got %v, want %v", h.level, slog.LevelInfo)
+	h := newColorHandler(&buf, slog.LevelDebug)
+	if h.level != slog.LevelDebug {
+		t.Errorf("level = %v, want %v", h.level, slog.LevelDebug)
 	}
 }
 
 func TestColorHandlerEnabled(t *testing.T) {
 	var buf bytes.Buffer
-	h := newColorHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})
+	h := newColorHandler(&buf, slog.LevelWarn)
 
 	if h.Enabled(context.Background(), slog.LevelDebug) {
 		t.Error("expected Debug to be disabled with Warn level")
@@ -77,7 +63,7 @@ func TestColorHandlerEnabled(t *testing.T) {
 
 func TestColorHandlerHandle(t *testing.T) {
 	var buf bytes.Buffer
-	h := newColorHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	h := newColorHandler(&buf, slog.LevelDebug)
 
 	r := slog.NewRecord(time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC), slog.LevelInfo, "test message", 0)
 	r.AddAttrs(slog.String("key", "value"))
@@ -104,7 +90,7 @@ func TestColorHandlerHandle(t *testing.T) {
 
 func TestColorHandlerHandleWithColor(t *testing.T) {
 	var buf bytes.Buffer
-	h := newColorHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	h := newColorHandler(&buf, slog.LevelDebug)
 	h.color = true
 
 	r := slog.NewRecord(time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC), slog.LevelInfo, "colored", 0)
@@ -120,7 +106,7 @@ func TestColorHandlerHandleWithColor(t *testing.T) {
 
 func TestColorHandlerWithAttrs(t *testing.T) {
 	var buf bytes.Buffer
-	h := newColorHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	h := newColorHandler(&buf, slog.LevelDebug)
 
 	h2 := h.WithAttrs([]slog.Attr{slog.String("component", "test")})
 
@@ -138,7 +124,7 @@ func TestColorHandlerWithAttrs(t *testing.T) {
 
 func TestColorHandlerWithGroup(t *testing.T) {
 	var buf bytes.Buffer
-	h := newColorHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	h := newColorHandler(&buf, slog.LevelDebug)
 
 	h2 := h.WithGroup("mygroup")
 
@@ -157,7 +143,7 @@ func TestColorHandlerWithGroup(t *testing.T) {
 
 func TestColorHandlerAttrsKeepOriginalGroup(t *testing.T) {
 	var buf bytes.Buffer
-	h := newColorHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	h := newColorHandler(&buf, slog.LevelDebug)
 	derived := h.
 		WithAttrs([]slog.Attr{slog.String("a", "one")}).
 		WithGroup("g").
@@ -178,7 +164,7 @@ func TestColorHandlerAttrsKeepOriginalGroup(t *testing.T) {
 }
 
 func TestDerivedColorHandlersShareWriteLock(t *testing.T) {
-	h := newColorHandler(io.Discard, nil)
+	h := newColorHandler(io.Discard, slog.LevelInfo)
 	withAttrs := h.WithAttrs([]slog.Attr{slog.String("a", "b")}).(*colorHandler)
 	withGroup := h.WithGroup("group").(*colorHandler)
 	if h.mu != withAttrs.mu || h.mu != withGroup.mu {
@@ -188,7 +174,7 @@ func TestDerivedColorHandlersShareWriteLock(t *testing.T) {
 
 func TestColorHandlerWithGroupNested(t *testing.T) {
 	var buf bytes.Buffer
-	h := newColorHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	h := newColorHandler(&buf, slog.LevelDebug)
 
 	h2 := h.WithGroup("outer").WithGroup("inner")
 
@@ -239,17 +225,65 @@ func TestNewLogHandlerText(t *testing.T) {
 }
 
 func TestAppendAttr(t *testing.T) {
-	t.Run("no group", func(t *testing.T) {
-		buf := appendAttr(nil, "", slog.String("key", "value"))
-		if string(buf) != "key=value" {
-			t.Errorf("got %q, want %q", string(buf), "key=value")
-		}
-	})
+	tests := []struct {
+		name  string
+		group string
+		attr  slog.Attr
+		want  string
+	}{
+		{
+			name: "LogValuer",
+			attr: slog.Any("key", testLogValuer{}),
+			want: "key=resolved",
+		},
+		{
+			name: "space is quoted",
+			attr: slog.String("key", "two words"),
+			want: `key="two words"`,
+		},
+		{
+			name: "equals is quoted",
+			attr: slog.String("key", "left=right"),
+			want: `key="left=right"`,
+		},
+		{
+			name: "quote is quoted",
+			attr: slog.String("key", `say "hello"`),
+			want: `key="say \"hello\""`,
+		},
+		{
+			name: "empty is quoted",
+			attr: slog.String("key", ""),
+			want: `key=""`,
+		},
+		{
+			name: "control character is quoted",
+			attr: slog.String("key", "line\nbreak"),
+			want: `key="line\nbreak"`,
+		},
+		{
+			name: "ordinary value is unquoted",
+			attr: slog.String("key", "value"),
+			want: "key=value",
+		},
+		{
+			name: "group value qualifies its attributes",
+			attr: slog.Group("group", slog.String("key", "value")),
+			want: "group.key=value",
+		},
+		{
+			name:  "handler group qualifies the key",
+			group: "handler",
+			attr:  slog.String("key", "value"),
+			want:  "handler.key=value",
+		},
+	}
 
-	t.Run("with group", func(t *testing.T) {
-		buf := appendAttr(nil, "grp", slog.String("key", "value"))
-		if string(buf) != "grp.key=value" {
-			t.Errorf("got %q, want %q", string(buf), "grp.key=value")
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := string(appendAttr(nil, tt.group, tt.attr)); got != tt.want {
+				t.Errorf("appendAttr() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
