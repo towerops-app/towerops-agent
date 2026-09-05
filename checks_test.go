@@ -2002,7 +2002,10 @@ func TestChkTDNSAnswerMatches(t *testing.T) {
 		{"mx wrong preference", "MX", []string{"10 mx.example.com."}, "20 mx.example.com", false},
 		{"mx picks the matching record", "MX", []string{"10 a.example.com.", "20 b.example.com."}, "b.example.com", true},
 		{"txt is never split on spaces", "TXT", []string{"hello v=spf1"}, "v=spf1", false},
+		{"txt trailing dot belongs to the value", "TXT", []string{"mail.example.com."}, "mail.example.com", false},
+		{"txt exact value", "TXT", []string{"v=spf1 -all"}, "v=spf1 -all", true},
 		{"address record", "A", []string{"10.0.0.2", "10.0.0.1"}, "10.0.0.1", true},
+		{"address record with a stray dot", "A", []string{"10.0.0.1"}, "10.0.0.1.", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2014,23 +2017,28 @@ func TestChkTDNSAnswerMatches(t *testing.T) {
 	}
 }
 
-// The lookup seam is the only way to feed executeDNSCheck a fixed answer, and
-// it proves the trailing-dot handling is wired into the check itself.
-func TestChkTDNSCheckExpectedIgnoresTrailingDot(t *testing.T) {
+// The lookup seam is the only way to feed executeDNSCheck a fixed answer. TXT
+// values are compared exactly, so the trailing-dot handling must not leak out
+// of the hostname-valued record types.
+func TestChkTDNSCheckTXTExpectedIsExact(t *testing.T) {
 	orig := dnsLookupTXT
 	defer func() { dnsLookupTXT = orig }()
 	dnsLookupTXT = func(_ *net.Resolver, _ context.Context, _ string) ([]string, error) {
-		return []string{"mail.example.com."}, nil
+		return []string{"v=spf1 include:example.com"}, nil
 	}
 
-	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	config := &pb.DnsCheckConfig{
 		Hostname:   "chkt-dot.example",
 		RecordType: "TXT",
-		Expected:   "mail.example.com",
-	}, 5000)
+		Expected:   "v=spf1 include:example.com",
+	}
+	if status, output := executeDNSCheck(context.Background(), config, 5000); status != checkOK {
+		t.Fatalf("status = %d (%s), want OK for the exact TXT value", status, output)
+	}
 
-	if status != checkOK {
-		t.Fatalf("status = %d (%s), want OK for an answer differing only by the trailing dot", status, output)
+	config.Expected = "v=spf1 include:example.com."
+	if status, output := executeDNSCheck(context.Background(), config, 5000); status != checkCritical {
+		t.Fatalf("status = %d (%s), want CRITICAL: a trailing dot is part of a TXT value", status, output)
 	}
 }
 

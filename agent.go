@@ -50,8 +50,11 @@ var poolShutdownTimeout = 5 * time.Second
 const maxJobPayloadBytes = 4 << 20 // 4 MB — well above any legitimate job list
 
 // resultQueueSize is the session's outbound result backlog. Workers drop a
-// result rather than block once it is full; see resultSendTimeout.
-const resultQueueSize = 256
+// result rather than block once it is full; see resultSendTimeout. It is at
+// least the 420 slots the six per-type queues held together (100 snmp + 20
+// mikrotik + 100 credential test + 50 monitoring + 50 check + 100 lldp), so
+// collapsing them cannot drop results a mixed burst used to survive.
+const resultQueueSize = 512
 
 // channelMsg is the WebSocket channel message format (JSON wrapper around binary protobuf).
 type channelMsg struct {

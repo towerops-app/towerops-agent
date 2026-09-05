@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -442,7 +443,14 @@ func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs u
 // them verbatim made "example.com" a permanent CRITICAL. An MX answer is
 // formatted "<pref> <host>" and matches either that whole string or the host
 // on its own, which is how operators usually write it.
+//
+// Only those two record types hold hostnames. A, AAAA and TXT answers are
+// compared exactly: a trailing dot is part of a TXT value, not name syntax.
 func dnsAnswerMatches(recordType string, results []string, expected string) bool {
+	if recordType != "CNAME" && recordType != "MX" {
+		return slices.Contains(results, expected)
+	}
+
 	want := strings.TrimSuffix(expected, ".")
 	for _, result := range results {
 		if strings.TrimSuffix(result, ".") == want {

@@ -247,6 +247,12 @@ func parseMgmtAddr(oid string) (key string, ip string) {
 		return key, ""
 	}
 
+	// The index ends with exactly addrLen octets; anything longer is a row this
+	// walk should not have produced.
+	if len(parts) != 5+addrLen {
+		return key, ""
+	}
+
 	switch addrSubtype {
 	case "1": // IPv4
 		if addrLen != net.IPv4len {
@@ -254,7 +260,7 @@ func parseMgmtAddr(oid string) (key string, ip string) {
 		}
 		ip = strings.Join(parts[5:9], ".")
 	case "2": // IPv6
-		if addrLen != net.IPv6len || len(parts) < 21 {
+		if addrLen != net.IPv6len {
 			return key, ""
 		}
 		// Convert 16 octets to IPv6 hex format

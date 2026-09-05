@@ -601,6 +601,38 @@ func TestDispatchJob(t *testing.T) {
 	})
 }
 
+// A JobType this build does not know about used to fall through to the SNMP
+// pool, where it would run against a device config it may not even carry.
+func TestDispatchJobDropsUnknownJobType(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	origDial := snmpDial
+	defer func() { snmpDial = origDial }()
+	var dials atomic.Int32
+	snmpDial = func(context.Context, *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		dials.Add(1)
+		return nil, nil, errors.New("should not be dialled")
+	}
+
+	out := testQueue()
+	dispatchJob(context.Background(), &pb.AgentJob{
+		JobId:      "unknown-1",
+		JobType:    pb.JobType(99),
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+	}, testPools(t), out)
+
+	select {
+	case result := <-out:
+		t.Fatalf("unknown job type produced a %q result", result.event)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if got := dials.Load(); got != 0 {
+		t.Fatalf("unknown job type reached the SNMP executor %d times", got)
+	}
+	if !logs.has("job dropped, unknown job type") {
+		t.Fatalf("unknown job type was not logged:\n%s", logs.dump())
+	}
+}
+
 func TestRunSessionRejectsFailedJoin(t *testing.T) {
 	origTimeout := joinTimeout
 	defer func() { joinTimeout = origTimeout }()

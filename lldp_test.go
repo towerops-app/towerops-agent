@@ -186,6 +186,20 @@ func TestLldpTParseMgmtAddr(t *testing.T) {
 	}
 }
 
+// A row whose index carries more octets than addrLen announces is malformed;
+// truncating it to the first four would invent a management address.
+func TestLldpTParseMgmtAddrRejectsExtraOctets(t *testing.T) {
+	for _, oid := range []string{
+		"." + oidRemManAddr + ".0.5.1.1.4.10.0.0.1.99",
+		"." + oidRemManAddr + ".0.5.1.2.16.32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1.7",
+	} {
+		key, ip := parseMgmtAddr(oid)
+		if key != "0.5.1" || ip != "" {
+			t.Fatalf("parseMgmtAddr(%q) = (%q, %q), want (%q, %q)", oid, key, ip, "0.5.1", "")
+		}
+	}
+}
+
 // TestLldpTParseMgmtAddrIPv6NonNumeric covers the strconv.Atoi failure arm,
 // which needs a hand-built OID with a non-numeric octet.
 func TestLldpTParseMgmtAddrIPv6NonNumeric(t *testing.T) {
