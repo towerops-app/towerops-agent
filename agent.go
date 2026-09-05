@@ -116,10 +116,11 @@ func runAgent(ctx context.Context, wsURL, token string, traps <-chan *pb.SnmpTra
 // serialize its I/O, the worker pools that execute jobs for it, and the queue
 // their results come back on. Everything it owns is torn down by stop.
 type session struct {
-	ws       *wsConn
-	topic    string
-	hostname string
-	traps    <-chan *pb.SnmpTrap
+	ws        *wsConn
+	topic     string
+	hostname  string
+	traps     <-chan *pb.SnmpTrap
+	startedAt time.Time
 
 	// ctx is cancelled as soon as either I/O goroutine fails, so blocked pool
 	// submits unblock immediately instead of waiting for workers to finish.
@@ -169,6 +170,7 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 		topic:      "agent:" + agentID,
 		hostname:   hostname,
 		traps:      traps,
+		startedAt:  time.Now(),
 		ctx:        sessionCtx,
 		cancel:     sessionCancel,
 		writeCh:    make(chan []byte, 256),
@@ -201,6 +203,12 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 		checks:   newWorkerPool(50),
 	}
 	s.results = make(resultQueue, resultQueueSize)
+
+	// Publish update-critical deployment metadata as soon as the join is
+	// accepted. A full queue is non-fatal because the ticker will retry.
+	if s.sendBinary("heartbeat", s.heartbeat(time.Since(s.startedAt))) {
+		slog.Debug("sent heartbeat")
+	}
 
 	return s.loop(ctx)
 }
@@ -339,6 +347,17 @@ func (s *session) sessionErr() error {
 	return errSessionCancelled
 }
 
+func (s *session) heartbeat(uptime time.Duration) *pb.AgentHeartbeat {
+	return &pb.AgentHeartbeat{
+		Version:       version,
+		UptimeSeconds: uint64(uptime.Seconds()),
+		Arch:          runtime.GOARCH,
+		Hostname:      s.hostname,
+		IpAddress:     s.ws.LocalIP(),
+		Container:     runningInContainer(),
+	}
+}
+
 // loop is the session event loop. ctx is the agent-wide context; the session's
 // own context signals connection failure.
 func (s *session) loop(ctx context.Context) error {
@@ -346,7 +365,6 @@ func (s *session) loop(ctx context.Context) error {
 	defer heartbeatTicker.Stop()
 	channelHeartbeatTicker := time.NewTicker(channelHeartbeatInterval)
 	defer channelHeartbeatTicker.Stop()
-	startTime := time.Now()
 
 	for {
 		select {
@@ -394,14 +412,7 @@ func (s *session) loop(ctx context.Context) error {
 			}
 
 		case <-heartbeatTicker.C:
-			hb := &pb.AgentHeartbeat{
-				Version:       version,
-				UptimeSeconds: uint64(time.Since(startTime).Seconds()),
-				Arch:          runtime.GOARCH,
-				Hostname:      s.hostname,
-				IpAddress:     s.ws.LocalIP(),
-				Container:     runningInContainer(),
-			}
+			hb := s.heartbeat(time.Since(s.startedAt))
 			if s.sendBinary("heartbeat", hb) {
 				slog.Debug("sent heartbeat")
 			}

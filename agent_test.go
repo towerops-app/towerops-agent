@@ -1777,6 +1777,51 @@ func TestRunSessionRestartInMainLoop(t *testing.T) {
 	}
 }
 
+func TestRunSessionSendsImmediateHeartbeat(t *testing.T) {
+	origHostname := getHostname
+	origContainer := runningInContainer
+	defer func() {
+		getHostname = origHostname
+		runningInContainer = origContainer
+	}()
+
+	getHostname = func() (string, error) {
+		return "tower-agent-01", nil
+	}
+	runningInContainer = func() bool { return true }
+
+	ln := agtListen(t)
+	done := make(chan error, 1)
+	go func() { done <- runSession(context.Background(), agtURL(ln), "token", nil) }()
+
+	conn, topic := agtAccept(t, ln)
+	msgs := agtReadFrames(conn)
+	frame := agtWaitEvent(t, msgs, "heartbeat")
+	var heartbeat pb.AgentHeartbeat
+	agtDecodeBinary(t, frame.Payload, &heartbeat)
+
+	if heartbeat.Version != version {
+		t.Errorf("heartbeat version = %q, want %q", heartbeat.Version, version)
+	}
+	if heartbeat.Arch != runtime.GOARCH {
+		t.Errorf("heartbeat arch = %q, want %q", heartbeat.Arch, runtime.GOARCH)
+	}
+	if heartbeat.Hostname != "tower-agent-01" {
+		t.Errorf("heartbeat hostname = %q, want %q", heartbeat.Hostname, "tower-agent-01")
+	}
+	if net.ParseIP(heartbeat.IpAddress) == nil {
+		t.Errorf("heartbeat ip_address = %q, want the session's local address", heartbeat.IpAddress)
+	}
+	if !heartbeat.Container {
+		t.Error("heartbeat container = false, want the detected value")
+	}
+
+	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
+	if err := <-done; !errors.Is(err, errRestartRequested) {
+		t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
+	}
+}
+
 func TestRunSessionHeartbeats(t *testing.T) {
 	origHB := heartbeatInterval
 	origCHB := channelHeartbeatInterval
