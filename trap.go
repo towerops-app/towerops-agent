@@ -58,6 +58,7 @@ type trapListener struct {
 	done        chan struct{}
 	traps       chan *pb.SnmpTrap
 	community   string
+	bindAddr    string
 	dropped     atomic.Uint64
 	lastDropLog atomic.Int64
 	closed      chan struct{}
@@ -67,10 +68,18 @@ type trapListener struct {
 // startTrapListener binds the trap port and serves until Close is called.
 // A non-empty community rejects traps sent with any other community string;
 // gosnmp itself performs no community validation on receive.
-func startTrapListener(port uint16, community string) (*trapListener, error) {
+func startTrapListener(bindAddr string, port uint16, community string) (*trapListener, error) {
+	// Normalize an empty address to 0.0.0.0 rather than using :port — the bare
+	// form binds dual-stack, which makes the family depend on the host's IPv6
+	// configuration.
+	if bindAddr == "" {
+		bindAddr = "0.0.0.0"
+	}
+
 	t := &trapListener{
 		traps:     make(chan *pb.SnmpTrap, trapQueueSize),
 		community: community,
+		bindAddr:  bindAddr,
 		closed:    make(chan struct{}),
 		port:      port,
 	}
@@ -79,16 +88,12 @@ func startTrapListener(port uint16, community string) (*trapListener, error) {
 	t.done = make(chan struct{})
 	t.ready = trapReady(t.listener, t.done)
 
-	// 0.0.0.0 rather than :port — the bare form binds dual-stack, which makes
-	// the bound family depend on the host's IPv6 configuration.
-	addr := net.JoinHostPort("0.0.0.0", strconv.Itoa(int(port)))
-
 	errCh := make(chan error, 1)
-	go t.serve(t.listener, t.done, addr, errCh)
+	go t.serve(t.listener, t.done, errCh)
 
 	select {
 	case <-t.ready:
-		slog.Info("snmp trap listener started", "port", port, "community_filter", community != "")
+		slog.Info("snmp trap listener started", "bind_address", bindAddr, "port", port, "community_filter", community != "")
 		return t, nil
 	case err := <-errCh:
 		t.Close()
@@ -103,14 +108,12 @@ func (t *trapListener) newListener() *gosnmp.TrapListener {
 		Port:      t.port,
 		Transport: "udp",
 		Version:   gosnmp.Version2c,
-		Timeout:   5 * time.Second,
-		Retries:   1,
-		MaxOids:   gosnmp.MaxOids,
 	}
 	return listener
 }
 
-func (t *trapListener) serve(listener *gosnmp.TrapListener, done chan struct{}, addr string, startupErr chan<- error) {
+func (t *trapListener) serve(listener *gosnmp.TrapListener, done chan struct{}, startupErr chan<- error) {
+	addr := net.JoinHostPort(t.bindAddr, strconv.Itoa(int(t.port)))
 	for {
 		err := listener.Listen(addr)
 		close(done)

@@ -414,11 +414,14 @@ func freeUDPPort(t *testing.T) uint16 {
 func TestTrapListenerReceivesRealTrap(t *testing.T) {
 	port := freeUDPPort(t)
 
-	l, err := startTrapListener(port, "public")
+	l, err := startTrapListener("127.0.0.1", port, "public")
 	if err != nil {
 		t.Skipf("cannot bind trap port %d: %v", port, err)
 	}
 	defer l.Close()
+	if l.bindAddr != "127.0.0.1" {
+		t.Fatalf("listener bind address = %q, want 127.0.0.1", l.bindAddr)
+	}
 
 	sender := &gosnmp.GoSNMP{
 		Target:    "127.0.0.1",
@@ -476,7 +479,7 @@ func TestTrapListenerReceivesRealTrap(t *testing.T) {
 
 func TestTrapListenerRebindsAfterUnexpectedStop(t *testing.T) {
 	port := freeUDPPort(t)
-	l, err := startTrapListener(port, "public")
+	l, err := startTrapListener("127.0.0.1", port, "public")
 	if err != nil {
 		t.Skipf("cannot bind trap port %d: %v", port, err)
 	}
@@ -514,7 +517,7 @@ func TestTrapListenerRebindsAfterUnexpectedStop(t *testing.T) {
 func TestTrapListenerRejectsWrongCommunityOnTheWire(t *testing.T) {
 	port := freeUDPPort(t)
 
-	l, err := startTrapListener(port, "secret")
+	l, err := startTrapListener("127.0.0.1", port, "secret")
 	if err != nil {
 		t.Skipf("cannot bind trap port %d: %v", port, err)
 	}
@@ -612,7 +615,7 @@ func tpTWatchLog(t *testing.T, substr string, n int) <-chan struct{} {
 	prevFlags := log.Flags()
 
 	state := &tpTLogWatcherState{want: n, fired: make(chan struct{})}
-	sink := newColorHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})
+	sink := newColorHandler(os.Stderr, slog.LevelError)
 	slog.SetDefault(slog.New(&tpTLogWatcher{next: sink, substr: substr, state: state}))
 
 	t.Cleanup(func() {
@@ -656,7 +659,7 @@ func tpTV2cTrap(community string) *gosnmp.SnmpPacket {
 func TestTpTStartTrapListenerBindFailure(t *testing.T) {
 	port := tpTOccupiedUDPPort(t)
 
-	l, err := startTrapListener(port, "public")
+	l, err := startTrapListener("0.0.0.0", port, "public")
 	if err == nil {
 		l.Close()
 		t.Fatalf("startTrapListener succeeded on occupied port %d", port)
@@ -771,7 +774,12 @@ func TestTpTQueueFullWarnsAtMostOncePerInterval(t *testing.T) {
 func TestTpTServeStopsDuringRebindBackoff(t *testing.T) {
 	stopped := tpTWatchLog(t, "stopped unexpectedly", 1)
 
-	tl := &trapListener{traps: make(chan *pb.SnmpTrap, 1), closed: make(chan struct{})}
+	tl := &trapListener{
+		traps:    make(chan *pb.SnmpTrap, 1),
+		closed:   make(chan struct{}),
+		bindAddr: "nope://127.0.0.1",
+		port:     1,
+	}
 	listener := tl.newListener()
 	done := make(chan struct{})
 	tl.listener = listener
@@ -779,10 +787,10 @@ func TestTpTServeStopsDuringRebindBackoff(t *testing.T) {
 	tl.ready = trapReady(listener, done)
 
 	returned := make(chan struct{})
-	// "nope://" is rejected by gosnmp before it touches a socket, so Listen
-	// fails immediately and serve drops straight into its rebind backoff.
+	// The invalid bind address is rejected before gosnmp touches a socket, so
+	// Listen fails immediately and serve drops straight into its rebind backoff.
 	go func() {
-		tl.serve(listener, done, "nope://127.0.0.1:1", nil)
+		tl.serve(listener, done, nil)
 		close(returned)
 	}()
 
@@ -804,7 +812,12 @@ func TestTpTServeStopsDuringRebindBackoff(t *testing.T) {
 func TestTpTServeStopsWhileInstallingRebind(t *testing.T) {
 	stopped := tpTWatchLog(t, "stopped unexpectedly", 1)
 
-	tl := &trapListener{traps: make(chan *pb.SnmpTrap, 1), closed: make(chan struct{})}
+	tl := &trapListener{
+		traps:    make(chan *pb.SnmpTrap, 1),
+		closed:   make(chan struct{}),
+		bindAddr: "nope://127.0.0.1",
+		port:     1,
+	}
 	listener := tl.newListener()
 	done := make(chan struct{})
 	tl.listener = listener
@@ -817,7 +830,7 @@ func TestTpTServeStopsWhileInstallingRebind(t *testing.T) {
 
 	returned := make(chan struct{})
 	go func() {
-		tl.serve(listener, done, "nope://127.0.0.1:1", nil)
+		tl.serve(listener, done, nil)
 		close(returned)
 	}()
 
@@ -859,7 +872,12 @@ func TestTpTServeRebindMonitorStopsOnClose(t *testing.T) {
 	// spawned the readiness monitor) before failing to bind again.
 	stoppedTwice := tpTWatchLog(t, "stopped unexpectedly", 2)
 
-	tl := &trapListener{traps: make(chan *pb.SnmpTrap, 1), closed: make(chan struct{})}
+	tl := &trapListener{
+		traps:    make(chan *pb.SnmpTrap, 1),
+		closed:   make(chan struct{}),
+		bindAddr: "nope://127.0.0.1",
+		port:     1,
+	}
 	listener := tl.newListener()
 	done := make(chan struct{})
 	tl.listener = listener
@@ -868,7 +886,7 @@ func TestTpTServeRebindMonitorStopsOnClose(t *testing.T) {
 
 	returned := make(chan struct{})
 	go func() {
-		tl.serve(listener, done, "nope://127.0.0.1:1", nil)
+		tl.serve(listener, done, nil)
 		close(returned)
 	}()
 

@@ -8,7 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"strconv"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -38,18 +38,18 @@ var snmpDial = func(ctx context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(
 }
 
 // executeSnmpJob runs SNMP GET/WALK queries for a job and sends results.
-func executeSnmpJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.SnmpResult) {
+func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out resultQueue) {
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing snmp device", "job_id", job.JobId)
-		sendResult(ctx, resultCh, emptySnmpResult(job), job.JobId)
+		sendResult(ctx, out, "result", emptySnmpResult(job), job.JobId)
 		return
 	}
 
 	conn, closeFn, err := snmpDial(ctx, dev)
 	if err != nil {
 		slog.Error("snmp connect", "job_id", job.JobId, "device", dev.Ip, "error", err)
-		sendResult(ctx, resultCh, emptySnmpResult(job), job.JobId)
+		sendResult(ctx, out, "result", emptySnmpResult(job), job.JobId)
 		return
 	}
 	defer closeFn()
@@ -68,27 +68,12 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.S
 		}
 		switch q.QueryType {
 		case pb.QueryType_GET:
-			for i := 0; i < len(q.Oids); i += snmpMaxOIDsPerGet {
-				end := i + snmpMaxOIDsPerGet
-				if end > len(q.Oids) {
-					end = len(q.Oids)
-				}
-				batch := q.Oids[i:end]
-				result, err := conn.Get(batch)
-				if err != nil {
-					slog.Warn("snmp get failed", "device", dev.Ip, "oids", len(batch), "error", err)
-					continue
-				}
-				for _, v := range result.Variables {
-					if !snmpValueUsable(v) {
-						continue
-					}
-					oidValues[canonicalOID(v.Name)] = snmpValueToString(v)
-				}
+			for batch := range slices.Chunk(q.Oids, snmpMaxOIDsPerGet) {
+				snmpGetInto(conn, dev, batch, oidValues)
 			}
 		case pb.QueryType_WALK:
 			// SNMPv1 doesn't support GETBULK, use GETNEXT-based WalkAll instead
-			useV1Walk := dev.Version == "1" || dev.Version == "v1"
+			useV1Walk := isSnmpV1(dev.Version)
 			for _, baseOID := range q.Oids {
 				var results []gosnmp.SnmpPDU
 				if useV1Walk {
@@ -123,7 +108,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.S
 	}
 
 	slog.Info("snmp job complete", "job_id", job.JobId, "oids", len(oidValues))
-	sendResult(ctx, resultCh, result, job.JobId)
+	sendResult(ctx, out, "result", result, job.JobId)
 }
 
 func emptySnmpResult(job *pb.AgentJob) *pb.SnmpResult {
@@ -136,8 +121,47 @@ func emptySnmpResult(job *pb.AgentJob) *pb.SnmpResult {
 	}
 }
 
+// isSnmpV1 reports whether a device speaks SNMPv1, which has no GETBULK.
+func isSnmpV1(version string) bool { return version == "1" || version == "v1" }
+
+// snmpGetInto records one GET batch. gosnmp reports an SNMP error-status
+// response through result.Error with err == nil, and SNMPv1 answers a batch
+// containing any unknown OID with noSuchName plus every request varbind echoed
+// back as Null — so the batch is halved down to single OIDs to recover the
+// values that do resolve. tooBig is split for the same reason: the device
+// cannot fit the response in one PDU.
+func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[string]string) {
+	result, err := conn.Get(oids)
+	if err != nil {
+		slog.Warn("snmp get failed", "device", dev.Ip, "oids", len(oids), "error", err)
+		return
+	}
+
+	switch result.Error {
+	case gosnmp.NoError:
+		for _, v := range result.Variables {
+			if !snmpValueUsable(v) {
+				continue
+			}
+			into[canonicalOID(v.Name)] = snmpValueToString(v)
+		}
+	case gosnmp.NoSuchName, gosnmp.TooBig:
+		if len(oids) == 1 {
+			slog.Debug("snmp get oid skipped", "device", dev.Ip, "oid", oids[0], "status", result.Error, "error_index", result.ErrorIndex)
+			return
+		}
+		slog.Warn("snmp get batch split", "device", dev.Ip, "batch_size", len(oids), "status", result.Error, "error_index", result.ErrorIndex)
+		mid := len(oids) / 2
+		snmpGetInto(conn, dev, oids[:mid], into)
+		snmpGetInto(conn, dev, oids[mid:], into)
+	default:
+		slog.Warn("snmp get error status", "device", dev.Ip, "batch_size", len(oids), "status", result.Error, "error_index", result.ErrorIndex)
+	}
+}
+
 func snmpValueUsable(pdu gosnmp.SnmpPDU) bool {
-	return pdu.Type != gosnmp.NoSuchObject &&
+	return pdu.Type != gosnmp.Null &&
+		pdu.Type != gosnmp.NoSuchObject &&
 		pdu.Type != gosnmp.NoSuchInstance &&
 		pdu.Type != gosnmp.EndOfMibView
 }
@@ -147,16 +171,18 @@ func canonicalOID(oid string) string {
 }
 
 // executeCredentialTest tests SNMP credentials by reading sysDescr.0.
-func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<- *pb.CredentialTestResult) {
+func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out resultQueue) {
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing snmp device", "job_id", job.JobId)
-		sendResult(ctx, resultCh, &pb.CredentialTestResult{
+		result := &pb.CredentialTestResult{
 			TestId:       job.JobId,
 			Success:      false,
 			ErrorMessage: "missing device configuration",
 			Timestamp:    time.Now().Unix(),
-		}, job.JobId)
+		}
+		slog.Info("credential test complete", "test_id", result.TestId, "success", result.Success)
+		sendResult(ctx, out, "credential_test_result", result, job.JobId)
 		return
 	}
 
@@ -164,39 +190,47 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, resultCh chan<
 	timestamp := time.Now().Unix()
 
 	if err != nil {
-		sendResult(ctx, resultCh, &pb.CredentialTestResult{
+		result := &pb.CredentialTestResult{
 			TestId:       job.JobId,
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("connection failed: %v", err),
 			Timestamp:    timestamp,
-		}, job.JobId)
+		}
+		slog.Info("credential test complete", "test_id", result.TestId, "success", result.Success)
+		sendResult(ctx, out, "credential_test_result", result, job.JobId)
 		return
 	}
 	defer closeFn()
 
-	result, err := conn.Get([]string{"1.3.6.1.2.1.1.1.0"})
+	packet, err := conn.Get([]string{"1.3.6.1.2.1.1.1.0"})
 	if err != nil {
-		sendResult(ctx, resultCh, &pb.CredentialTestResult{
+		result := &pb.CredentialTestResult{
 			TestId:       job.JobId,
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("SNMP test failed: %v", err),
 			Timestamp:    timestamp,
-		}, job.JobId)
+		}
+		slog.Info("credential test complete", "test_id", result.TestId, "success", result.Success)
+		sendResult(ctx, out, "credential_test_result", result, job.JobId)
 		return
 	}
 
 	sysDescr := ""
-	if len(result.Variables) > 0 && snmpValueUsable(result.Variables[0]) {
-		sysDescr = snmpValueToString(result.Variables[0])
+	if packet.Error != gosnmp.NoError {
+		slog.Debug("snmp credential test error status", "device", dev.Ip, "status", packet.Error, "error_index", packet.ErrorIndex)
+	} else if len(packet.Variables) > 0 && snmpValueUsable(packet.Variables[0]) {
+		sysDescr = snmpValueToString(packet.Variables[0])
 	}
 	// A successful GET proves the credentials work even when sysDescr is unavailable.
 
-	sendResult(ctx, resultCh, &pb.CredentialTestResult{
+	result := &pb.CredentialTestResult{
 		TestId:            job.JobId,
 		Success:           true,
 		SystemDescription: sysDescr,
 		Timestamp:         timestamp,
-	}, job.JobId)
+	}
+	slog.Info("credential test complete", "test_id", result.TestId, "success", result.Success)
+	sendResult(ctx, out, "credential_test_result", result, job.JobId)
 }
 
 // newSnmpConn creates a gosnmp.GoSNMP connection from protobuf device config.
@@ -223,11 +257,11 @@ func newSnmpConn(ctx context.Context, dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error
 	}
 
 	// Version + auth
-	switch dev.Version {
-	case "1", "v1":
+	switch {
+	case isSnmpV1(dev.Version):
 		conn.Version = gosnmp.Version1
 		conn.Community = dev.Community
-	case "3", "v3":
+	case dev.Version == "3" || dev.Version == "v3":
 		conn.Version = gosnmp.Version3
 		conn.SecurityModel = gosnmp.UserSecurityModel
 		usmParams := &gosnmp.UsmSecurityParameters{
@@ -236,15 +270,27 @@ func newSnmpConn(ctx context.Context, dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error
 
 		switch dev.V3SecurityLevel {
 		case "authPriv":
+			authProtocol, err := mapAuthProtocol(dev.V3AuthProtocol)
+			if err != nil {
+				return nil, err
+			}
+			privProtocol, err := mapPrivProtocol(dev.V3PrivProtocol)
+			if err != nil {
+				return nil, err
+			}
 			conn.MsgFlags = gosnmp.AuthPriv
 			usmParams.AuthenticationPassphrase = dev.V3AuthPassword
 			usmParams.PrivacyPassphrase = dev.V3PrivPassword
-			usmParams.AuthenticationProtocol = mapAuthProtocol(dev.V3AuthProtocol)
-			usmParams.PrivacyProtocol = mapPrivProtocol(dev.V3PrivProtocol)
+			usmParams.AuthenticationProtocol = authProtocol
+			usmParams.PrivacyProtocol = privProtocol
 		case "authNoPriv":
+			authProtocol, err := mapAuthProtocol(dev.V3AuthProtocol)
+			if err != nil {
+				return nil, err
+			}
 			conn.MsgFlags = gosnmp.AuthNoPriv
 			usmParams.AuthenticationPassphrase = dev.V3AuthPassword
-			usmParams.AuthenticationProtocol = mapAuthProtocol(dev.V3AuthProtocol)
+			usmParams.AuthenticationProtocol = authProtocol
 		default: // noAuthNoPriv
 			conn.MsgFlags = gosnmp.NoAuthNoPriv
 		}
@@ -262,49 +308,49 @@ func newSnmpConn(ctx context.Context, dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error
 	return conn, nil
 }
 
-func mapAuthProtocol(p string) gosnmp.SnmpV3AuthProtocol {
+func mapAuthProtocol(p string) (gosnmp.SnmpV3AuthProtocol, error) {
 	switch p {
 	case "MD5":
-		return gosnmp.MD5
-	case "SHA", "SHA-1":
-		return gosnmp.SHA
+		return gosnmp.MD5, nil
+	case "", "SHA", "SHA-1":
+		return gosnmp.SHA, nil
 	case "SHA-224":
-		return gosnmp.SHA224
+		return gosnmp.SHA224, nil
 	case "SHA-256":
-		return gosnmp.SHA256
+		return gosnmp.SHA256, nil
 	case "SHA-384":
-		return gosnmp.SHA384
+		return gosnmp.SHA384, nil
 	case "SHA-512":
-		return gosnmp.SHA512
+		return gosnmp.SHA512, nil
 	default:
-		return gosnmp.SHA
+		return 0, fmt.Errorf("unsupported SNMPv3 auth protocol %q", p)
 	}
 }
 
-func mapPrivProtocol(p string) gosnmp.SnmpV3PrivProtocol {
+func mapPrivProtocol(p string) (gosnmp.SnmpV3PrivProtocol, error) {
 	switch p {
 	case "DES":
-		return gosnmp.DES
-	case "AES", "AES-128":
-		return gosnmp.AES
+		return gosnmp.DES, nil
+	case "", "AES", "AES-128":
+		return gosnmp.AES, nil
 	case "AES-192":
-		return gosnmp.AES192
+		return gosnmp.AES192, nil
 	case "AES-256":
-		return gosnmp.AES256
+		return gosnmp.AES256, nil
 	case "AES-192-C":
-		return gosnmp.AES192C
+		return gosnmp.AES192C, nil
 	case "AES-256-C":
-		return gosnmp.AES256C
+		return gosnmp.AES256C, nil
 	default:
-		return gosnmp.AES
+		return 0, fmt.Errorf("unsupported SNMPv3 privacy protocol %q", p)
 	}
 }
 
 // snmpValueToString converts a gosnmp PDU value to a string.
 func snmpValueToString(pdu gosnmp.SnmpPDU) string {
 	switch pdu.Type {
-	case gosnmp.Integer:
-		return strconv.FormatInt(gosnmp.ToBigInt(pdu.Value).Int64(), 10)
+	case gosnmp.Integer, gosnmp.Counter32, gosnmp.Counter64, gosnmp.Gauge32, gosnmp.TimeTicks, gosnmp.Uinteger32:
+		return gosnmp.ToBigInt(pdu.Value).String()
 	case gosnmp.OctetString:
 		b, ok := pdu.Value.([]byte)
 		if !ok {
@@ -322,26 +368,6 @@ func snmpValueToString(pdu gosnmp.SnmpPDU) string {
 	case gosnmp.ObjectIdentifier:
 		if s, ok := pdu.Value.(string); ok {
 			return s
-		}
-		return fmt.Sprintf("%v", pdu.Value)
-	case gosnmp.Counter32:
-		if v, ok := pdu.Value.(uint); ok {
-			return strconv.FormatUint(uint64(v), 10)
-		}
-		return fmt.Sprintf("%v", pdu.Value)
-	case gosnmp.Counter64:
-		if v, ok := pdu.Value.(uint64); ok {
-			return strconv.FormatUint(v, 10)
-		}
-		return fmt.Sprintf("%v", pdu.Value)
-	case gosnmp.Gauge32:
-		if v, ok := pdu.Value.(uint); ok {
-			return strconv.FormatUint(uint64(v), 10)
-		}
-		return fmt.Sprintf("%v", pdu.Value)
-	case gosnmp.TimeTicks:
-		if v, ok := pdu.Value.(uint32); ok {
-			return strconv.FormatUint(uint64(v), 10)
 		}
 		return fmt.Sprintf("%v", pdu.Value)
 	case gosnmp.IPAddress:

@@ -2143,6 +2143,10 @@ type AgentHeartbeat struct {
 	UptimeSeconds uint64                 `protobuf:"varint,3,opt,name=uptime_seconds,json=uptimeSeconds,proto3" json:"uptime_seconds,omitempty"`
 	IpAddress     string                 `protobuf:"bytes,4,opt,name=ip_address,json=ipAddress,proto3" json:"ip_address,omitempty"`
 	Arch          string                 `protobuf:"bytes,5,opt,name=arch,proto3" json:"arch,omitempty"`
+	// True when the agent runs inside a container image, where replacing the
+	// binary in place is impossible. The server must not push a self-update to
+	// these agents; they update by pulling a new image.
+	Container     bool `protobuf:"varint,6,opt,name=container,proto3" json:"container,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2210,6 +2214,13 @@ func (x *AgentHeartbeat) GetArch() string {
 		return x.Arch
 	}
 	return ""
+}
+
+func (x *AgentHeartbeat) GetContainer() bool {
+	if x != nil {
+		return x.Container
+	}
+	return false
 }
 
 type AgentError struct {
@@ -2695,8 +2706,12 @@ type LldpNeighbor struct {
 	RemotePort          string                 `protobuf:"bytes,3,opt,name=remote_port,json=remotePort,proto3" json:"remote_port,omitempty"`
 	RemotePortId        string                 `protobuf:"bytes,4,opt,name=remote_port_id,json=remotePortId,proto3" json:"remote_port_id,omitempty"`
 	ManagementAddresses []string               `protobuf:"bytes,5,rep,name=management_addresses,json=managementAddresses,proto3" json:"management_addresses,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Chassis ID of the neighbour, hex-formatted for MAC-address subtypes. The
+	// remote table is keyed on this rather than on the system name, which many
+	// devices never advertise.
+	RemoteChassisId string `protobuf:"bytes,6,opt,name=remote_chassis_id,json=remoteChassisId,proto3" json:"remote_chassis_id,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *LldpNeighbor) Reset() {
@@ -2762,6 +2777,13 @@ func (x *LldpNeighbor) GetManagementAddresses() []string {
 		return x.ManagementAddresses
 	}
 	return nil
+}
+
+func (x *LldpNeighbor) GetRemoteChassisId() string {
+	if x != nil {
+		return x.RemoteChassisId
+	}
+	return ""
 }
 
 // SNMP traps received by an agent's trap listener.
@@ -3060,14 +3082,15 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x06job_id\x18\x05 \x01(\tR\x05jobId\x1a<\n" +
 	"\x0eOidValuesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa0\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xbe\x01\n" +
 	"\x0eAgentHeartbeat\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x1a\n" +
 	"\bhostname\x18\x02 \x01(\tR\bhostname\x12%\n" +
 	"\x0euptime_seconds\x18\x03 \x01(\x04R\ruptimeSeconds\x12\x1d\n" +
 	"\n" +
 	"ip_address\x18\x04 \x01(\tR\tipAddress\x12\x12\n" +
-	"\x04arch\x18\x05 \x01(\tR\x04arch\"x\n" +
+	"\x04arch\x18\x05 \x01(\tR\x04arch\x12\x1c\n" +
+	"\tcontainer\x18\x06 \x01(\bR\tcontainer\"x\n" +
 	"\n" +
 	"AgentError\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12\x15\n" +
@@ -3111,7 +3134,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x06job_id\x18\x02 \x01(\tR\x05jobId\x12*\n" +
 	"\x11local_system_name\x18\x03 \x01(\tR\x0flocalSystemName\x12:\n" +
 	"\tneighbors\x18\x04 \x03(\v2\x1c.towerops.agent.LldpNeighborR\tneighbors\x12\x1c\n" +
-	"\ttimestamp\x18\x05 \x01(\x03R\ttimestamp\"\xcc\x01\n" +
+	"\ttimestamp\x18\x05 \x01(\x03R\ttimestamp\"\xf8\x01\n" +
 	"\fLldpNeighbor\x12#\n" +
 	"\rneighbor_name\x18\x01 \x01(\tR\fneighborName\x12\x1d\n" +
 	"\n" +
@@ -3119,7 +3142,8 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\vremote_port\x18\x03 \x01(\tR\n" +
 	"remotePort\x12$\n" +
 	"\x0eremote_port_id\x18\x04 \x01(\tR\fremotePortId\x121\n" +
-	"\x14management_addresses\x18\x05 \x03(\tR\x13managementAddresses\"\x86\x03\n" +
+	"\x14management_addresses\x18\x05 \x03(\tR\x13managementAddresses\x12*\n" +
+	"\x11remote_chassis_id\x18\x06 \x01(\tR\x0fremoteChassisId\"\x86\x03\n" +
 	"\bSnmpTrap\x12\x1b\n" +
 	"\tsource_ip\x18\x01 \x01(\tR\bsourceIp\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x19\n" +

@@ -29,6 +29,7 @@ var decodeBase64 = base64.StdEncoding.DecodeString
 
 var errRestartRequested = errors.New("restart requested")
 var errChannelReloaded = errors.New("channel reloaded")
+var errSessionCancelled = errors.New("session cancelled")
 var joinTimeout = 10 * time.Second
 var heartbeatInterval = 60 * time.Second
 var channelHeartbeatInterval = 25 * time.Second
@@ -47,6 +48,13 @@ var successfulConnectionThreshold = 30 * time.Second
 var poolShutdownTimeout = 5 * time.Second
 
 const maxJobPayloadBytes = 4 << 20 // 4 MB — well above any legitimate job list
+
+// resultQueueSize is the session's outbound result backlog. Workers drop a
+// result rather than block once it is full; see resultSendTimeout. It is at
+// least the 420 slots the six per-type queues held together (100 snmp + 20
+// mikrotik + 100 credential test + 50 monitoring + 50 check + 100 lldp), so
+// collapsing them cannot drop results a mixed burst used to survive.
+const resultQueueSize = 512
 
 // channelMsg is the WebSocket channel message format (JSON wrapper around binary protobuf).
 type channelMsg struct {
@@ -104,6 +112,35 @@ func runAgent(ctx context.Context, wsURL, token string, traps <-chan *pb.SnmpTra
 	}
 }
 
+// session owns one WebSocket connection: the reader and writer goroutines that
+// serialize its I/O, the worker pools that execute jobs for it, and the queue
+// their results come back on. Everything it owns is torn down by stop.
+type session struct {
+	ws       *wsConn
+	topic    string
+	hostname string
+	traps    <-chan *pb.SnmpTrap
+
+	// ctx is cancelled as soon as either I/O goroutine fails, so blocked pool
+	// submits unblock immediately instead of waiting for workers to finish.
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	writeCh    chan []byte
+	msgCh      chan []byte
+	errCh      chan error
+	writeErrCh chan error
+	readerDone chan struct{}
+	writerDone chan struct{}
+
+	// pools and results exist only once the channel join has been accepted;
+	// see runSession.
+	pools   *jobPools
+	results resultQueue
+
+	refCounter atomic.Uint64
+}
+
 // runSession runs a single WebSocket session. Returns when disconnected or ctx cancelled.
 func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.SnmpTrap) error {
 	endpoint := baseURL + "/socket/agent/websocket"
@@ -118,7 +155,6 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 	// Include nanoseconds and a process-local sequence so immediate reconnects
 	// cannot reuse a Phoenix topic, even when the clock has low resolution.
 	agentID := newAgentID()
-	topic := "agent:" + agentID
 
 	slog.Info("connected", "agent_id", agentID)
 
@@ -127,155 +163,190 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 		slog.Error("resolve hostname", "error", err)
 	}
 
-	// Session-scoped context: cancelled on write/read errors so blocked
-	// pool submits unblock immediately instead of waiting for workers to finish.
 	sessionCtx, sessionCancel := context.WithCancel(ctx)
-	defer sessionCancel()
+	s := &session{
+		ws:         ws,
+		topic:      "agent:" + agentID,
+		hostname:   hostname,
+		traps:      traps,
+		ctx:        sessionCtx,
+		cancel:     sessionCancel,
+		writeCh:    make(chan []byte, 256),
+		msgCh:      make(chan []byte, 100),
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		readerDone: make(chan struct{}),
+		writerDone: make(chan struct{}),
+	}
+	s.refCounter.Store(1)
 
-	// Channel for serializing WebSocket writes
-	writeCh := make(chan []byte, 256)
+	// The reader must run before the join so the reply can be received. Both
+	// goroutines are joined by stop, which is registered before either can
+	// fail.
+	go s.read()
+	go s.write()
+	defer s.stop()
 
-	// Worker pools — bounded concurrency for each job type
-	pools := &jobPools{
+	if err := s.join(token); err != nil {
+		return err
+	}
+
+	// Worker pools are created only now: 220 goroutines started before the
+	// join would be abandoned by every early return above, and a revoked token
+	// reconnects every few seconds.
+	s.pools = &jobPools{
 		snmp:     newWorkerPool(100),
 		mikrotik: newWorkerPool(20),
 		ping:     newWorkerPool(50),
 		checks:   newWorkerPool(50),
 	}
+	s.results = make(resultQueue, resultQueueSize)
 
-	results := &resultChannels{
-		snmp:       make(chan *pb.SnmpResult, 100),
-		mikrotik:   make(chan *pb.MikrotikResult, 20),
-		credTest:   make(chan *pb.CredentialTestResult, 100),
-		monitoring: make(chan *pb.MonitoringCheck, 50),
-		check:      make(chan *pb.CheckResult, 50),
-		lldp:       make(chan *pb.LldpTopologyResult, 100),
-	}
+	return s.loop(ctx)
+}
 
-	// Ref counter for outbound messages
-	var refCounter atomic.Uint64
-	refCounter.Store(1)
-
-	nextRef := func() string {
-		return strconv.FormatUint(refCounter.Add(1), 10)
-	}
-
-	sendMsg := func(event string, payload json.RawMessage) bool {
-		msg := channelMsg{
-			Topic:   topic,
-			Event:   event,
-			Payload: payload,
-		}
-		// Infallible: topic and event are strings and payload is always a
-		// valid json.RawMessage produced by sendBinaryResult.
-		data, _ := json.Marshal(msg)
-		return enqueueWrite(sessionCtx, writeCh, data, event)
-	}
-
-	sendBinaryResult := func(event string, msg proto.Message) bool {
-		bin, err := proto.Marshal(msg)
+// read pumps inbound messages until the connection fails.
+func (s *session) read() {
+	defer close(s.readerDone)
+	for {
+		data, err := s.ws.ReadMessage(s.ctx)
 		if err != nil {
-			slog.Error("marshal protobuf", "error", err)
-			return false
+			s.fail(s.errCh, err)
+			return
 		}
-		encoded := base64.StdEncoding.EncodeToString(bin)
-		payload, _ := json.Marshal(map[string]string{"binary": encoded})
-		return sendMsg(event, payload)
+		select {
+		case s.msgCh <- data:
+		case <-s.ctx.Done():
+			return
+		}
 	}
+}
 
-	// Reader goroutine — must start before join so we can receive the reply
-	msgCh := make(chan []byte, 100)
-	errCh := make(chan error, 1)
-	readerDone := make(chan struct{})
-	go func() {
-		defer close(readerDone)
-		for {
-			data, err := ws.ReadMessage(sessionCtx)
-			if err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-				sessionCancel()
-				return
-			}
-			select {
-			case msgCh <- data:
-			case <-sessionCtx.Done():
-				return
-			}
+// write serializes every outbound frame; the session loop is its only producer.
+func (s *session) write() {
+	defer close(s.writerDone)
+	for data := range s.writeCh {
+		if err := s.ws.WriteText(s.ctx, data); err != nil {
+			slog.Error("websocket write", "error", err)
+			s.fail(s.writeErrCh, err)
+			return
 		}
-	}()
+	}
+}
 
-	go func() {
-		<-sessionCtx.Done()
-		_ = ws.Close()
-	}()
+// fail publishes err — dropping it when an earlier error is already queued —
+// and only then cancels the session. Publishing first is what lets a loop that
+// wakes on the cancellation still report the real cause instead of racing the
+// error channel.
+func (s *session) fail(ch chan<- error, err error) {
+	select {
+	case ch <- err:
+	default:
+	}
+	s.cancel()
+}
 
-	// Join channel
+// stop tears the session down: socket I/O first, so a reader blocked on a
+// server-requested reconnect returns, then the pools, then both goroutines.
+func (s *session) stop() {
+	s.cancel()
+	_ = s.ws.Close()
+
+	if s.pools != nil {
+		for _, name := range s.pools.stop(poolShutdownTimeout) {
+			slog.Warn("worker pool shutdown timed out, abandoning in-flight jobs", "pool", name)
+		}
+	}
+	close(s.writeCh)
+	<-s.writerDone
+	<-s.readerDone
+}
+
+// join performs the phx_join exchange and validates the reply.
+func (s *session) join(token string) error {
 	joinPayload, _ := json.Marshal(map[string]string{"token": token})
 	joinMsg := channelMsg{
-		Topic:   topic,
+		Topic:   s.topic,
 		Event:   "phx_join",
 		Payload: joinPayload,
-		Ref:     strPtr("1"),
+		Ref:     new("1"),
 	}
 	joinData, _ := json.Marshal(joinMsg)
-	if err := ws.WriteText(sessionCtx, joinData); err != nil {
+	if err := s.ws.WriteText(s.ctx, joinData); err != nil {
 		return fmt.Errorf("send join: %w", err)
 	}
 	slog.Debug("sent channel join request")
 
-	// Wait for join reply before entering main loop
+	timer := time.NewTimer(joinTimeout)
+	defer timer.Stop()
 	select {
-	case data := <-msgCh:
+	case data := <-s.msgCh:
 		if err := validateJoinReply(data); err != nil {
 			return err
 		}
 		slog.Info("channel joined")
-	case err := <-errCh:
+		return nil
+	case err := <-s.errCh:
 		return fmt.Errorf("read during join: %w", err)
-	case <-time.After(joinTimeout):
-		return fmt.Errorf("join timeout")
+	case <-timer.C:
+		return errors.New("join timeout")
 	}
+}
 
-	// Writer goroutine - serializes all writes to the WebSocket
-	writerDone := make(chan struct{})
-	writeErrCh := make(chan error, 1)
-	go func() {
-		defer close(writerDone)
-		for data := range writeCh {
-			if err := ws.WriteText(sessionCtx, data); err != nil {
-				slog.Error("websocket write", "error", err)
-				select {
-				case writeErrCh <- err:
-				default:
-				}
-				sessionCancel() // Unblock any stuck pool submits
-				return
-			}
-		}
-	}()
+func (s *session) nextRef() string {
+	return strconv.FormatUint(s.refCounter.Add(1), 10)
+}
 
+// sendMsg queues a channel message for the writer.
+func (s *session) sendMsg(event string, payload json.RawMessage) bool {
+	msg := channelMsg{
+		Topic:   s.topic,
+		Event:   event,
+		Payload: payload,
+	}
+	// Infallible: topic and event are strings and payload is always a valid
+	// json.RawMessage produced by sendBinary.
+	data, _ := json.Marshal(msg)
+	return enqueueWrite(s.ctx, s.writeCh, data, event)
+}
+
+// sendBinary queues a protobuf message inside the channel envelope.
+func (s *session) sendBinary(event string, msg proto.Message) bool {
+	bin, err := proto.Marshal(msg)
+	if err != nil {
+		slog.Error("marshal protobuf", "error", err)
+		return false
+	}
+	encoded := base64.StdEncoding.EncodeToString(bin)
+	payload, _ := json.Marshal(map[string]string{"binary": encoded})
+	return s.sendMsg(event, payload)
+}
+
+// sessionErr reports why the session context was cancelled. Both I/O
+// goroutines publish their error before cancelling, so a non-blocking drain
+// returns the real cause rather than whichever select case happened to win.
+func (s *session) sessionErr() error {
+	select {
+	case err := <-s.errCh:
+		return fmt.Errorf("read: %w", err)
+	default:
+	}
+	select {
+	case err := <-s.writeErrCh:
+		return fmt.Errorf("write: %w", err)
+	default:
+	}
+	return errSessionCancelled
+}
+
+// loop is the session event loop. ctx is the agent-wide context; the session's
+// own context signals connection failure.
+func (s *session) loop(ctx context.Context) error {
 	heartbeatTicker := time.NewTicker(heartbeatInterval)
 	defer heartbeatTicker.Stop()
 	channelHeartbeatTicker := time.NewTicker(channelHeartbeatInterval)
 	defer channelHeartbeatTicker.Stop()
 	startTime := time.Now()
-
-	defer func() {
-		// Stop socket I/O before waiting for either goroutine. In particular,
-		// server-requested reconnects return while the reader is still blocked.
-		sessionCancel()
-		_ = ws.Close()
-
-		for _, name := range pools.stop(poolShutdownTimeout) {
-			slog.Warn("worker pool shutdown timed out, abandoning in-flight jobs", "pool", name)
-		}
-		close(writeCh)
-		<-writerDone
-		<-readerDone
-	}()
 
 	for {
 		select {
@@ -283,65 +354,42 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 			slog.Info("shutdown signal, closing connection")
 			return nil
 
-		case <-sessionCtx.Done():
-			return fmt.Errorf("session cancelled")
+		case <-s.ctx.Done():
+			return s.sessionErr()
 
-		case err := <-errCh:
+		case err := <-s.errCh:
 			return fmt.Errorf("read: %w", err)
 
-		case err := <-writeErrCh:
+		case err := <-s.writeErrCh:
 			return fmt.Errorf("write: %w", err)
 
-		case data := <-msgCh:
+		case data := <-s.msgCh:
 			var msg channelMsg
 			if err := json.Unmarshal(data, &msg); err != nil {
 				slog.Debug("invalid message", "error", err)
 				continue
 			}
-			shouldEnd, endErr := handleMessage(sessionCtx, msg, topic, pools, results)
+			shouldEnd, endErr := handleMessage(s.ctx, msg, s.topic, s.pools, s.results)
 			if shouldEnd {
 				return endErr
 			}
 
-		case result := <-results.snmp:
-			sendBinaryResult("result", result)
-
-		case result := <-results.mikrotik:
-			if sendBinaryResult("mikrotik_result", result) {
-				slog.Info("sent mikrotik result", "device", result.DeviceId, "job", result.JobId)
+		case result := <-s.results:
+			if s.sendBinary(result.event, result.msg) {
+				slog.Debug("sent result", "event", result.event)
 			}
 
-		case result := <-results.credTest:
-			if sendBinaryResult("credential_test_result", result) {
-				slog.Info("sent credential test result", "test_id", result.TestId, "success", result.Success)
-			}
-
-		case result := <-results.monitoring:
-			if sendBinaryResult("monitoring_check", result) {
-				slog.Info("sent monitoring check", "device", result.DeviceId, "status", result.Status)
-			}
-
-		case result := <-results.check:
-			if sendBinaryResult("check_result", result) {
-				slog.Info("sent check result", "check", result.CheckId, "status", result.Status)
-			}
-
-		case result := <-results.lldp:
-			if sendBinaryResult("lldp_topology_result", result) {
-				slog.Info("sent LLDP topology result", "device", result.DeviceId, "neighbors", len(result.Neighbors))
-			}
-
-		case trap, ok := <-traps:
+		case trap, ok := <-s.traps:
 			if !ok {
 				slog.Warn("snmp trap listener stopped")
-				traps = nil
+				s.traps = nil
 				continue
 			}
 			if trap == nil {
 				slog.Warn("ignoring nil snmp trap")
 				continue
 			}
-			if sendBinaryResult("trap", trap) {
+			if s.sendBinary("trap", trap) {
 				slog.Info("sent snmp trap", "source", trap.SourceIp, "trap_oid", trap.TrapOid)
 			}
 
@@ -350,14 +398,16 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 				Version:       version,
 				UptimeSeconds: uint64(time.Since(startTime).Seconds()),
 				Arch:          runtime.GOARCH,
-				Hostname:      hostname,
+				Hostname:      s.hostname,
+				IpAddress:     s.ws.LocalIP(),
+				Container:     runningInContainer(),
 			}
-			if sendBinaryResult("heartbeat", hb) {
+			if s.sendBinary("heartbeat", hb) {
 				slog.Debug("sent heartbeat")
 			}
 
 		case <-channelHeartbeatTicker.C:
-			ref := nextRef()
+			ref := s.nextRef()
 			msg := channelMsg{
 				Topic:   "phoenix",
 				Event:   "heartbeat",
@@ -365,7 +415,7 @@ func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.Snm
 				Ref:     &ref,
 			}
 			data, _ := json.Marshal(msg)
-			if enqueueWrite(sessionCtx, writeCh, data, "heartbeat") {
+			if enqueueWrite(s.ctx, s.writeCh, data, "heartbeat") {
 				slog.Debug("sent channel heartbeat", "ref", ref)
 			}
 		}
@@ -438,7 +488,7 @@ func handleMessage(
 	msg channelMsg,
 	topic string,
 	pools *jobPools,
-	results *resultChannels,
+	out resultQueue,
 ) (bool, error) {
 	// Ignore messages not addressed to our topic (except Phoenix control messages)
 	if msg.Topic != topic && msg.Topic != "phoenix" {
@@ -463,7 +513,7 @@ func handleMessage(
 		}
 		slog.Info("received jobs", "count", len(jobList.Jobs))
 		for _, job := range jobList.Jobs {
-			dispatchJob(ctx, job, pools, results)
+			dispatchJob(ctx, job, pools, out)
 		}
 
 	case "check_jobs":
@@ -473,7 +523,7 @@ func handleMessage(
 		}
 		slog.Info("received checks", "count", len(checkList.Checks))
 		for _, check := range checkList.Checks {
-			executeCheck(ctx, check, pools, results)
+			executeCheck(ctx, check, pools, out)
 		}
 
 	case "restart":
@@ -528,7 +578,10 @@ func decodeBinaryPayload(event string, raw json.RawMessage, msg proto.Message) b
 		slog.Error("decode base64", "event", event, "error", err)
 		return false
 	}
-	defer zeroBytes(bin)
+	// Clear the decoded buffer after unmarshalling job credentials. The
+	// protobuf fields themselves are Go strings and remain immutable until the
+	// protocol represents credentials as byte slices.
+	defer clear(bin)
 	if err := proto.Unmarshal(bin, msg); err != nil {
 		slog.Error("unmarshal payload", "event", event, "error", err)
 		return false
@@ -536,15 +589,15 @@ func decodeBinaryPayload(event string, raw json.RawMessage, msg proto.Message) b
 	return true
 }
 
-// resultChannels groups the session-scoped result queues workers publish to.
-type resultChannels struct {
-	snmp       chan *pb.SnmpResult
-	mikrotik   chan *pb.MikrotikResult
-	credTest   chan *pb.CredentialTestResult
-	monitoring chan *pb.MonitoringCheck
-	check      chan *pb.CheckResult
-	lldp       chan *pb.LldpTopologyResult
+// outbound is one protobuf result addressed to a Phoenix channel event.
+type outbound struct {
+	event string
+	msg   proto.Message
 }
+
+// resultQueue carries every worker result back to the session loop, which is
+// the only goroutine allowed to write to the WebSocket.
+type resultQueue chan outbound
 
 // jobPools holds the worker pools for each job type.
 type jobPools struct {
@@ -589,22 +642,27 @@ func dispatchJob(
 	ctx context.Context,
 	job *pb.AgentJob,
 	pools *jobPools,
-	results *resultChannels,
+	out resultQueue,
 ) {
 	slog.Info("starting job", "job_id", job.JobId, "type", job.JobType)
 
 	var ok bool
 	switch job.JobType {
 	case pb.JobType_MIKROTIK:
-		ok = pools.mikrotik.submit(ctx, func() { executeMikrotikJob(ctx, job, results.mikrotik) })
+		ok = pools.mikrotik.submit(ctx, func() { executeMikrotikJob(ctx, job, out) })
 	case pb.JobType_TEST_CREDENTIALS:
-		ok = pools.snmp.submit(ctx, func() { executeCredentialTest(ctx, job, results.credTest) })
+		ok = pools.snmp.submit(ctx, func() { executeCredentialTest(ctx, job, out) })
 	case pb.JobType_PING:
-		ok = pools.ping.submit(ctx, func() { executePingJob(ctx, job, results.monitoring) })
+		ok = pools.ping.submit(ctx, func() { executePingJob(ctx, job, out) })
 	case pb.JobType_LLDP_TOPOLOGY:
-		ok = pools.snmp.submit(ctx, func() { executeLldpTopologyJob(ctx, job, results.lldp) })
+		ok = pools.snmp.submit(ctx, func() { executeLldpTopologyJob(ctx, job, out) })
+	case pb.JobType_DISCOVER, pb.JobType_POLL:
+		ok = pools.snmp.submit(ctx, func() { executeSnmpJob(ctx, job, out) })
 	default:
-		ok = pools.snmp.submit(ctx, func() { executeSnmpJob(ctx, job, results.snmp) })
+		// A job type this build does not know about would otherwise be run as
+		// an SNMP job, against a device config it may not even carry.
+		slog.Error("job dropped, unknown job type", "job_id", job.JobId, "type", job.JobType)
+		return
 	}
 	if !ok {
 		slog.Warn("job dropped, pool full", "job_id", job.JobId)
@@ -628,40 +686,34 @@ func nextBackoff(current, maxDelay time.Duration) time.Duration {
 	return next + jitter
 }
 
-// zeroBytes overwrites a byte slice with zeros. It is used to clear decoded
-// inbound protobuf buffers after unmarshalling job credentials. The protobuf
-// fields themselves are Go strings and remain immutable until the protocol
-// represents credentials as byte slices.
-func zeroBytes(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
-}
-
 // resultSendTimeout bounds how long a worker waits to hand a result to the
 // session loop. Exceeding it means the writer cannot keep up; dropping the
 // result is better than pinning the worker.
 const resultSendTimeout = 5 * time.Second
 
 // sendResult queues a job result for the session's writer, or drops it if the
-// result channel stays full for resultSendTimeout.
-func sendResult[T proto.Message](ctx context.Context, resultCh chan<- T, result T, jobID string) {
+// queue stays full for resultSendTimeout.
+func sendResult(ctx context.Context, out resultQueue, event string, msg proto.Message, jobID string) {
 	sendCtx, cancel := context.WithTimeout(ctx, resultSendTimeout)
 	defer cancel()
 	select {
-	case resultCh <- result:
+	case out <- outbound{event: event, msg: msg}:
 	case <-sendCtx.Done():
-		slog.Error("result send timeout - agent overloaded", "job_id", jobID)
+		if ctx.Err() != nil {
+			// Normal shutdown: the session ended while this job was running.
+			slog.Debug("result dropped, session ended", "job_id", jobID, "event", event)
+			return
+		}
+		slog.Error("result send timeout - agent overloaded", "job_id", jobID, "event", event)
 	}
 }
 
-func strPtr(s string) *string { return &s }
-
 // executeCheck dispatches a check to the worker pool.
-func executeCheck(ctx context.Context, check *pb.Check, pools *jobPools, results *resultChannels) {
+func executeCheck(ctx context.Context, check *pb.Check, pools *jobPools, out resultQueue) {
 	ok := pools.checks.submit(ctx, func() {
 		result := ExecuteCheck(ctx, check)
-		sendResult(ctx, results.check, result, check.Id)
+		slog.Info("check complete", "check", result.CheckId, "status", result.Status)
+		sendResult(ctx, out, "check_result", result, check.Id)
 	})
 	if !ok {
 		slog.Warn("check rejected (pool full)", "check_id", check.Id, "type", check.CheckType)

@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,6 +69,14 @@ var (
 	}
 )
 
+// Check exit statuses, matching the Nagios convention the server stores.
+const (
+	checkOK       uint32 = 0
+	checkWarning  uint32 = 1
+	checkCritical uint32 = 2
+	checkUnknown  uint32 = 3
+)
+
 const (
 	maxHTTPRegexBody         = 1 << 20
 	maxHTTPRegexCacheEntries = 64
@@ -96,34 +105,34 @@ func ExecuteCheck(ctx context.Context, check *pb.Check) *pb.CheckResult {
 	switch check.CheckType {
 	case "http":
 		if httpConfig := check.GetHttp(); httpConfig != nil {
-			status, output, _ = executeHTTPCheck(ctx, httpConfig, check.TimeoutMs)
+			status, output = executeHTTPCheck(ctx, httpConfig, check.TimeoutMs)
 		} else {
-			status, output = 3, "Missing HTTP config"
+			status, output = checkUnknown, "Missing HTTP config"
 		}
 
 	case "tcp":
 		if tcpConfig := check.GetTcp(); tcpConfig != nil {
-			status, output, _ = executeTCPCheck(ctx, tcpConfig, check.TimeoutMs)
+			status, output = executeTCPCheck(ctx, tcpConfig, check.TimeoutMs)
 		} else {
-			status, output = 3, "Missing TCP config"
+			status, output = checkUnknown, "Missing TCP config"
 		}
 
 	case "dns":
 		if dnsConfig := check.GetDns(); dnsConfig != nil {
-			status, output, _ = executeDNSCheck(ctx, dnsConfig, check.TimeoutMs)
+			status, output = executeDNSCheck(ctx, dnsConfig, check.TimeoutMs)
 		} else {
-			status, output = 3, "Missing DNS config"
+			status, output = checkUnknown, "Missing DNS config"
 		}
 
 	case "ssl":
 		if sslConfig := check.GetSsl(); sslConfig != nil {
-			status, output, _ = executeSSLCheck(ctx, sslConfig, check.TimeoutMs)
+			status, output = executeSSLCheck(ctx, sslConfig, check.TimeoutMs)
 		} else {
-			status, output = 3, "Missing SSL config"
+			status, output = checkUnknown, "Missing SSL config"
 		}
 
 	default:
-		status, output = 3, fmt.Sprintf("Unknown check type: %s", check.CheckType)
+		status, output = checkUnknown, fmt.Sprintf("Unknown check type: %s", check.CheckType)
 	}
 
 	// Always calculate elapsed from the outer startTime for consistency.
@@ -148,8 +157,7 @@ func checkTimeout(timeoutMs uint32) time.Duration {
 }
 
 // executeHTTPCheck performs an HTTP/HTTPS check
-func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs uint32) (uint32, string, float64) {
-	// The server always sends verify_ssl explicitly: true unless the operator
+func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs uint32) (uint32, string) { // The server always sends verify_ssl explicitly: true unless the operator
 	// opts out. A false zero value only skips verification for callers that
 	// bypass the server's check builder.
 	transport := defaultHTTPTransport
@@ -177,7 +185,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 
 	req, err := http.NewRequestWithContext(ctx, method, config.Url, strings.NewReader(config.Body))
 	if err != nil {
-		return 2, fmt.Sprintf("Failed to create request: %v", err), 0
+		return checkCritical, fmt.Sprintf("Failed to create request: %v", err)
 	}
 
 	// Add headers
@@ -185,12 +193,9 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 		req.Header.Set(key, value)
 	}
 
-	startTime := time.Now()
 	resp, err := client.Do(req)
-	responseTime := float64(time.Since(startTime).Milliseconds())
-
 	if err != nil {
-		return 2, fmt.Sprintf("Request failed: %v", err), responseTime
+		return checkCritical, fmt.Sprintf("Request failed: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -204,7 +209,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 		// Drain the response before returning so repeated failing checks can
 		// still reuse the shared transport connection.
 		_, _ = io.Copy(io.Discard, resp.Body)
-		return 2, fmt.Sprintf("HTTP %d, expected %d", resp.StatusCode, expectedStatus), responseTime
+		return checkCritical, fmt.Sprintf("HTTP %d, expected %d", resp.StatusCode, expectedStatus)
 	}
 
 	// Check content regex if provided
@@ -212,31 +217,31 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 		re, err := cachedHTTPRegex(config.Regex)
 		if err != nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
-			return 3, fmt.Sprintf("Invalid regex: %v", err), responseTime
+			return checkUnknown, fmt.Sprintf("Invalid regex: %v", err)
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPRegexBody+1))
 		if err != nil {
-			return 2, fmt.Sprintf("Failed to read body: %v", err), responseTime
+			return checkCritical, fmt.Sprintf("Failed to read body: %v", err)
 		}
 		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-			return 2, fmt.Sprintf("Failed to read body: %v", err), responseTime
+			return checkCritical, fmt.Sprintf("Failed to read body: %v", err)
 		}
 		if len(body) > maxHTTPRegexBody {
-			return 3, fmt.Sprintf("Response body exceeds regex limit of %d bytes", maxHTTPRegexBody), responseTime
+			return checkUnknown, fmt.Sprintf("Response body exceeds regex limit of %d bytes", maxHTTPRegexBody)
 		}
 
 		if !re.Match(body) {
-			return 2, fmt.Sprintf("Content does not match pattern: %s", config.Regex), responseTime
+			return checkCritical, fmt.Sprintf("Content does not match pattern: %s", config.Regex)
 		}
 	} else {
 		// Consume successful response bodies so the shared transport can reuse
 		// the underlying connection for subsequent checks.
 		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-			return 2, fmt.Sprintf("Failed to read body: %v", err), responseTime
+			return checkCritical, fmt.Sprintf("Failed to read body: %v", err)
 		}
 	}
 
-	return 0, fmt.Sprintf("HTTP %d OK", resp.StatusCode), responseTime
+	return checkOK, fmt.Sprintf("HTTP %d OK", resp.StatusCode)
 }
 
 // cachedHTTPRegex uses a small FIFO cache: regexes are reused across frequent
@@ -266,7 +271,7 @@ func cachedHTTPRegex(pattern string) (*regexp.Regexp, error) {
 }
 
 // executeTCPCheck performs a TCP port connectivity check
-func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs uint32) (uint32, string, float64) {
+func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs uint32) (uint32, string) {
 	timeout := checkTimeout(timeoutMs)
 	address := net.JoinHostPort(config.Host, strconv.Itoa(int(config.Port)))
 
@@ -275,10 +280,8 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
 	defer dialCancel()
 	conn, err := tcpDialContext(dialCtx, "tcp", address)
-	responseTime := float64(time.Since(startTime).Milliseconds())
-
 	if err != nil {
-		return 2, fmt.Sprintf("Connection failed: %v", err), responseTime
+		return checkCritical, fmt.Sprintf("Connection failed: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -287,12 +290,12 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 	if config.Send != "" || config.Expect != "" {
 		if err := conn.SetDeadline(deadline); err != nil {
 			_ = conn.Close()
-			return 2, fmt.Sprintf("Set deadline failed: %v", err), responseTime
+			return checkCritical, fmt.Sprintf("Set deadline failed: %v", err)
 		}
 
 		if config.Send != "" {
 			if err := writeAll(conn, []byte(config.Send)); err != nil {
-				return 2, fmt.Sprintf("Send failed: %v", err), responseTime
+				return checkCritical, fmt.Sprintf("Send failed: %v", err)
 			}
 		}
 
@@ -309,18 +312,18 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 				}
 				if readErr != nil {
 					if len(received) > 0 {
-						return 2, fmt.Sprintf("Unexpected response: %s", tcpResponseForOutput(received)), responseTime
+						return checkCritical, fmt.Sprintf("Unexpected response: %s", tcpResponseForOutput(received))
 					}
-					return 2, fmt.Sprintf("Receive failed: %v", readErr), responseTime
+					return checkCritical, fmt.Sprintf("Receive failed: %v", readErr)
 				}
 			}
 			if !bytes.Contains(received, want) {
-				return 2, fmt.Sprintf("Unexpected response: %s", tcpResponseForOutput(received)), responseTime
+				return checkCritical, fmt.Sprintf("Unexpected response: %s", tcpResponseForOutput(received))
 			}
 		}
 	}
 
-	return 0, fmt.Sprintf("TCP port %d open", config.Port), responseTime
+	return checkOK, fmt.Sprintf("TCP port %d open", config.Port)
 }
 
 func tcpResponseForOutput(response []byte) string {
@@ -362,7 +365,7 @@ func writeAll(w io.Writer, data []byte) error {
 }
 
 // executeDNSCheck performs a DNS resolution check
-func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs uint32) (uint32, string, float64) {
+func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs uint32) (uint32, string) {
 	timeout := checkTimeout(timeoutMs)
 
 	resolver := &net.Resolver{}
@@ -377,8 +380,6 @@ func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs u
 	if recordType == "" {
 		recordType = "A"
 	}
-
-	startTime := time.Now()
 
 	var results []string
 	var err error
@@ -418,35 +419,50 @@ func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs u
 		results = txts
 
 	default:
-		return 3, fmt.Sprintf("Unsupported record type: %s", recordType), 0
+		return checkUnknown, fmt.Sprintf("Unsupported record type: %s", recordType)
 	}
 
-	responseTime := float64(time.Since(startTime).Milliseconds())
-
 	if err != nil {
-		return 2, fmt.Sprintf("DNS query failed: %v", err), responseTime
+		return checkCritical, fmt.Sprintf("DNS query failed: %v", err)
 	}
 
 	if len(results) == 0 {
-		return 2, fmt.Sprintf("No %s records found", recordType), responseTime
+		return checkCritical, fmt.Sprintf("No %s records found", recordType)
 	}
 
 	// Check expected result if provided
-	if config.Expected != "" {
-		found := false
-		for _, result := range results {
-			if result == config.Expected {
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			return 2, fmt.Sprintf("Expected '%s', got: %s", config.Expected, strings.Join(results, ", ")), responseTime
-		}
+	if config.Expected != "" && !dnsAnswerMatches(recordType, results, config.Expected) {
+		return checkCritical, fmt.Sprintf("Expected '%s', got: %s", config.Expected, strings.Join(results, ", "))
 	}
 
-	return 0, fmt.Sprintf("Resolved to: %s", strings.Join(results, ", ")), responseTime
+	return checkOK, fmt.Sprintf("Resolved to: %s", strings.Join(results, ", "))
+}
+
+// dnsAnswerMatches reports whether any answer is the one the operator expects.
+// Go returns CNAME and MX names as FQDNs with a trailing dot, so comparing
+// them verbatim made "example.com" a permanent CRITICAL. An MX answer is
+// formatted "<pref> <host>" and matches either that whole string or the host
+// on its own, which is how operators usually write it.
+//
+// Only those two record types hold hostnames. A, AAAA and TXT answers are
+// compared exactly: a trailing dot is part of a TXT value, not name syntax.
+func dnsAnswerMatches(recordType string, results []string, expected string) bool {
+	if recordType != "CNAME" && recordType != "MX" {
+		return slices.Contains(results, expected)
+	}
+
+	want := strings.TrimSuffix(expected, ".")
+	for _, result := range results {
+		if strings.TrimSuffix(result, ".") == want {
+			return true
+		}
+		if recordType == "MX" {
+			if _, host, found := strings.Cut(result, " "); found && strings.TrimSuffix(host, ".") == want {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func resolverForServer(server string, timeout time.Duration) *net.Resolver {
@@ -469,7 +485,7 @@ func resolverForServer(server string, timeout time.Duration) *net.Resolver {
 // UNKNOWN. Expired, not-yet-valid, untrusted, and hostname-mismatched
 // certificates are CRITICAL. A trusted certificate inside warning_days is
 // WARNING; every other trusted certificate is OK.
-func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs uint32) (uint32, string, float64) {
+func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs uint32) (uint32, string) {
 	timeout := checkTimeout(timeoutMs)
 
 	host := config.Host
@@ -487,7 +503,7 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 	dialer := &net.Dialer{Timeout: timeout}
 	rootCAs, err := sslRootCAs()
 	if err != nil {
-		return 3, fmt.Sprintf("Failed to load system root CAs: %v", err), 0
+		return checkUnknown, fmt.Sprintf("Failed to load system root CAs: %v", err)
 	}
 	// Standard verification is deferred so invalid certificates remain
 	// available for the status policy below.
@@ -498,24 +514,21 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 		InsecureSkipVerify: true,
 	}
 
-	startTime := time.Now()
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	conn, err := sslDialTLS(dialCtx, dialer, tlsConfig, "tcp", address)
-	responseTime := float64(time.Since(startTime).Milliseconds())
-
 	if err != nil {
-		return 3, fmt.Sprintf("Connection failed: %v", err), responseTime
+		return checkUnknown, fmt.Sprintf("Connection failed: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
 
 	tlsConn, ok := conn.(*tls.Conn)
 	if !ok {
-		return 3, "Connection did not negotiate TLS", responseTime
+		return checkUnknown, "Connection did not negotiate TLS"
 	}
 	certs := tlsConn.ConnectionState().PeerCertificates
 	if len(certs) == 0 {
-		return 3, fmt.Sprintf("No certificate presented by %s:%d", host, port), responseTime
+		return checkUnknown, fmt.Sprintf("No certificate presented by %s:%d", host, port)
 	}
 
 	now := time.Now()
@@ -525,10 +538,10 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 	expiresStr := notAfter.Format("2006-01-02")
 
 	if now.Before(cert.NotBefore) {
-		return 2, fmt.Sprintf("CRITICAL: Certificate for %s:%d is not valid until %s", host, port, cert.NotBefore.Format("2006-01-02")), responseTime
+		return checkCritical, fmt.Sprintf("CRITICAL: Certificate for %s:%d is not valid until %s", host, port, cert.NotBefore.Format("2006-01-02"))
 	}
 	if expired {
-		return 2, fmt.Sprintf("CRITICAL: Certificate for %s:%d expired %d days ago (%s)", host, port, -daysRemaining, expiresStr), responseTime
+		return checkCritical, fmt.Sprintf("CRITICAL: Certificate for %s:%d expired %d days ago (%s)", host, port, -daysRemaining, expiresStr)
 	}
 
 	intermediates := x509.NewCertPool()
@@ -541,13 +554,13 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 		DNSName:       host,
 		CurrentTime:   now,
 	}); err != nil {
-		return 2, fmt.Sprintf("CRITICAL: Certificate for %s:%d is not trusted: %v", host, port, err), responseTime
+		return checkCritical, fmt.Sprintf("CRITICAL: Certificate for %s:%d is not trusted: %v", host, port, err)
 	}
 
 	if daysRemaining <= int(warningDays) {
-		return 1, fmt.Sprintf("WARNING: Certificate for %s:%d expires in %d days (%s)", host, port, daysRemaining, expiresStr), responseTime
+		return checkWarning, fmt.Sprintf("WARNING: Certificate for %s:%d expires in %d days (%s)", host, port, daysRemaining, expiresStr)
 	}
-	return 0, fmt.Sprintf("OK: Certificate for %s:%d valid for %d days (%s)", host, port, daysRemaining, expiresStr), responseTime
+	return checkOK, fmt.Sprintf("OK: Certificate for %s:%d valid for %d days (%s)", host, port, daysRemaining, expiresStr)
 }
 
 func certificateDaysRemaining(now, notAfter time.Time) (days int, expired bool) {

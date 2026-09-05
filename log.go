@@ -8,7 +8,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"sync"
+	"unicode"
 )
 
 // colorHandler formats slog records and colorizes the level label on terminals.
@@ -34,11 +36,7 @@ const (
 	colorRed    = "\033[31m"
 )
 
-func newColorHandler(w io.Writer, opts *slog.HandlerOptions) *colorHandler {
-	level := slog.LevelInfo
-	if opts != nil && opts.Level != nil {
-		level = opts.Level.Level()
-	}
+func newColorHandler(w io.Writer, level slog.Level) *colorHandler {
 	return &colorHandler{
 		w:     w,
 		level: level,
@@ -52,7 +50,7 @@ func newLogHandler(w io.Writer, level slog.Level, format string) slog.Handler {
 	if format == "json" {
 		return slog.NewJSONHandler(w, opts)
 	}
-	return newColorHandler(w, opts)
+	return newColorHandler(w, level)
 }
 
 func writerSupportsColor(w io.Writer) bool {
@@ -116,14 +114,48 @@ func (h *colorHandler) Handle(_ context.Context, r slog.Record) error {
 }
 
 func appendAttr(buf []byte, group string, a slog.Attr) []byte {
+	a.Value = a.Value.Resolve()
+	if a.Value.Kind() == slog.KindGroup {
+		if a.Key != "" {
+			if group == "" {
+				group = a.Key
+			} else {
+				group += "." + a.Key
+			}
+		}
+		for i, attr := range a.Value.Group() {
+			if i > 0 {
+				buf = append(buf, ' ')
+			}
+			buf = appendAttr(buf, group, attr)
+		}
+		return buf
+	}
+
 	if group != "" {
 		buf = append(buf, group...)
 		buf = append(buf, '.')
 	}
 	buf = append(buf, a.Key...)
 	buf = append(buf, '=')
-	buf = append(buf, a.Value.String()...)
-	return buf
+
+	value := a.Value.String()
+	if attrValueNeedsQuote(value) {
+		return append(buf, strconv.Quote(value)...)
+	}
+	return append(buf, value...)
+}
+
+func attrValueNeedsQuote(value string) bool {
+	if value == "" {
+		return true
+	}
+	for _, r := range value {
+		if r == ' ' || r == '=' || r == '"' || unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *colorHandler) WithAttrs(attrs []slog.Attr) slog.Handler {

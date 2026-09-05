@@ -186,7 +186,7 @@ func TestHTTPCheck_SuccessfulGET(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, rt := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url: srv.URL,
 	}, 5000)
 
@@ -195,9 +195,6 @@ func TestHTTPCheck_SuccessfulGET(t *testing.T) {
 	}
 	if !strings.Contains(output, "HTTP 200 OK") {
 		t.Fatalf("expected HTTP 200 OK in output, got %s", output)
-	}
-	if rt < 0 {
-		t.Fatalf("expected non-negative response time, got %f", rt)
 	}
 }
 
@@ -212,7 +209,7 @@ func TestHTTPCheck_CustomMethod_POST(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:    srv.URL,
 		Method: "post",
 	}, 5000)
@@ -228,7 +225,7 @@ func TestHTTPCheck_CustomExpectedStatus(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:            srv.URL,
 		ExpectedStatus: 201,
 	}, 5000)
@@ -244,7 +241,7 @@ func TestHTTPCheck_WrongStatusCode(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url: srv.URL,
 	}, 5000)
 
@@ -267,7 +264,7 @@ func TestHTTPCheck_DefaultMethodIsGET(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:    srv.URL,
 		Method: "", // should default to GET
 	}, 5000)
@@ -283,7 +280,7 @@ func TestHTTPCheck_DefaultExpectedStatusIs200(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:            srv.URL,
 		ExpectedStatus: 0, // should default to 200
 	}, 5000)
@@ -300,7 +297,7 @@ func TestHTTPCheck_VerifySslFalseWithSelfSigned(t *testing.T) {
 	defer srv.Close()
 
 	// With VerifySsl=false (InsecureSkipVerify=true), the self-signed cert should be accepted
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:       srv.URL,
 		VerifySsl: false,
 	}, 5000)
@@ -317,7 +314,7 @@ func TestHTTPCheck_VerifySslTrueRejectsSelfSigned(t *testing.T) {
 	defer srv.Close()
 
 	// With VerifySsl=true (InsecureSkipVerify=false), self-signed cert should fail
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:       srv.URL,
 		VerifySsl: true,
 	}, 5000)
@@ -366,7 +363,7 @@ func TestHTTPCheck_FollowRedirectsTrue(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:             srv.URL + "/redirect",
 		FollowRedirects: true,
 	}, 5000)
@@ -390,7 +387,7 @@ func TestHTTPCheck_FollowRedirectsFalse(t *testing.T) {
 	defer srv.Close()
 
 	// When FollowRedirects is false, we should see the 301 directly
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:             srv.URL + "/redirect",
 		FollowRedirects: false,
 		ExpectedStatus:  301,
@@ -408,7 +405,7 @@ func TestHTTPCheck_FollowRedirectsFalse_DefaultExpects200(t *testing.T) {
 	defer srv.Close()
 
 	// FollowRedirects=false and default expected=200, but we get 301 → CRITICAL
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:             srv.URL + "/redirect",
 		FollowRedirects: false,
 	}, 5000)
@@ -425,7 +422,7 @@ func TestHTTPCheck_RegexMatchSucceeds(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:   srv.URL,
 		Regex: `Version \d+\.\d+\.\d+`,
 	}, 5000)
@@ -442,7 +439,7 @@ func TestHTTPCheck_RegexMatchFails(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:   srv.URL,
 		Regex: `Version \d+`,
 	}, 5000)
@@ -462,7 +459,7 @@ func TestHTTPCheck_InvalidRegex(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:   srv.URL,
 		Regex: `[invalid`,
 	}, 5000)
@@ -532,7 +529,7 @@ func TestHTTPCheck_CustomHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url: srv.URL,
 		Headers: map[string]string{
 			"X-Custom":      "test-value",
@@ -547,7 +544,7 @@ func TestHTTPCheck_CustomHeaders(t *testing.T) {
 
 func TestHTTPCheck_UnreachableServer(t *testing.T) {
 	// Use a non-routable address to guarantee failure
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url: "http://192.0.2.1:1/unreachable",
 	}, 1000)
 
@@ -560,7 +557,7 @@ func TestHTTPCheck_UnreachableServer(t *testing.T) {
 }
 
 func TestHTTPCheck_InvalidURL(t *testing.T) {
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url: "://not-a-url",
 	}, 5000)
 
@@ -586,7 +583,7 @@ func TestHTTPCheck_RequestWithBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:    srv.URL,
 		Method: "POST",
 		Body:   `{"key":"value"}`,
@@ -611,7 +608,7 @@ func TestHTTPCheck_ContextCancellation(t *testing.T) {
 		cancel()
 	}()
 
-	status, output, _ := executeHTTPCheck(ctx, &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(ctx, &pb.HttpCheckConfig{
 		Url: srv.URL,
 	}, 30000) // long timeout so the context cancel hits first
 
@@ -633,7 +630,7 @@ func TestHTTPCheck_LargeResponseBodyWithRegex(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:   srv.URL,
 		Regex: `MARKER_FOUND_HERE`,
 	}, 5000)
@@ -650,7 +647,7 @@ func TestHTTPCheck_RegexBodyOverLimitIsExplicit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url: srv.URL, Regex: `MARKER_BEYOND_LIMIT`,
 	}, 5000)
 	if status != 3 || !strings.Contains(output, "exceeds regex limit") {
@@ -665,7 +662,7 @@ func TestHTTPCheck_SlowServerTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url: srv.URL,
 	}, 50) // 50ms timeout, server takes 500ms
 
@@ -680,7 +677,7 @@ func TestHTTPCheck_EmptyBody_NoRegex(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url: srv.URL,
 	}, 5000)
 
@@ -713,7 +710,7 @@ func TestTCPCheck_PortOpen(t *testing.T) {
 
 	port := parsePort(portFromListener(ln))
 
-	status, output, rt := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host: "127.0.0.1",
 		Port: port,
 	}, 5000)
@@ -723,9 +720,6 @@ func TestTCPCheck_PortOpen(t *testing.T) {
 	}
 	if !strings.Contains(output, fmt.Sprintf("TCP port %d open", port)) {
 		t.Fatalf("expected port open message, got %s", output)
-	}
-	if rt < 0 {
-		t.Fatalf("expected non-negative response time, got %f", rt)
 	}
 }
 
@@ -738,7 +732,7 @@ func TestTCPCheck_PortClosed(t *testing.T) {
 	port := parsePort(portFromListener(ln))
 	_ = ln.Close() // close immediately so port is refused
 
-	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host: "127.0.0.1",
 		Port: port,
 	}, 2000)
@@ -778,7 +772,7 @@ func TestTCPCheck_SendExpectSuccess(t *testing.T) {
 
 	port := parsePort(portFromListener(ln))
 
-	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host:   "127.0.0.1",
 		Port:   port,
 		Send:   "hello\n",
@@ -806,7 +800,7 @@ func TestTCPCheck_ExpectBannerWithoutSend(t *testing.T) {
 		_, _ = conn.Write([]byte("220 smtp.example ready\r\n"))
 	}()
 
-	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host: "127.0.0.1", Port: parsePort(portFromListener(ln)), Expect: "ready",
 	}, 1000)
 	if status != 0 {
@@ -834,7 +828,7 @@ func TestTCPCheck_ExpectMaySpanReads(t *testing.T) {
 		_, _ = conn.Write([]byte("TED"))
 	}()
 
-	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host: "127.0.0.1", Port: parsePort(portFromListener(ln)), Send: "hello", Expect: "EXPECTED",
 	}, 1000)
 	if status != 0 {
@@ -866,7 +860,7 @@ func TestTCPCheck_SendExpectMismatch(t *testing.T) {
 
 	port := parsePort(portFromListener(ln))
 
-	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host:   "127.0.0.1",
 		Port:   port,
 		Send:   "hello",
@@ -905,7 +899,7 @@ func TestTCPCheck_SendWithEmptyExpect(t *testing.T) {
 
 	port := parsePort(portFromListener(ln))
 
-	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host:   "127.0.0.1",
 		Port:   port,
 		Send:   "data\n",
@@ -936,7 +930,7 @@ func TestTCPCheck_IPv6Localhost(t *testing.T) {
 
 	port := parsePort(portFromListener(ln))
 
-	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host: "::1",
 		Port: port,
 	}, 5000)
@@ -972,7 +966,7 @@ func TestTCPCheck_ReadTimeoutOnExpect(t *testing.T) {
 
 	port := parsePort(portFromListener(ln))
 
-	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host:   "127.0.0.1",
 		Port:   port,
 		Send:   "hello",
@@ -989,7 +983,7 @@ func TestTCPCheck_ReadTimeoutOnExpect(t *testing.T) {
 
 func TestTCPCheck_VeryShortTimeout(t *testing.T) {
 	// Use TEST-NET address that won't respond
-	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host: "192.0.2.1",
 		Port: 80,
 	}, 1) // 1ms timeout - should fail
@@ -1029,7 +1023,7 @@ func TestTCPCheck_BinaryDataSendExpect(t *testing.T) {
 
 	// Send some binary-ish data
 	sendData := "BIN\x00\x01\x02DATA"
-	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host:   "127.0.0.1",
 		Port:   port,
 		Send:   sendData,
@@ -1046,7 +1040,7 @@ func TestTCPCheck_BinaryDataSendExpect(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDNSCheck_ARecord(t *testing.T) {
-	status, output, rt := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "localhost",
 		RecordType: "A",
 	}, 5000)
@@ -1061,13 +1055,10 @@ func TestDNSCheck_ARecord(t *testing.T) {
 	if !strings.Contains(output, "Resolved to:") {
 		t.Fatalf("expected 'Resolved to:' in output, got %s", output)
 	}
-	if rt < 0 {
-		t.Fatalf("expected non-negative response time, got %f", rt)
-	}
 }
 
 func TestDNSCheck_AAAARecord(t *testing.T) {
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "localhost",
 		RecordType: "AAAA",
 	}, 5000)
@@ -1081,7 +1072,7 @@ func TestDNSCheck_AAAARecord(t *testing.T) {
 
 func TestDNSCheck_CNAMERecord(t *testing.T) {
 	// Use a well-known domain that has a CNAME
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "www.google.com",
 		RecordType: "CNAME",
 	}, 5000)
@@ -1096,7 +1087,7 @@ func TestDNSCheck_CNAMERecord(t *testing.T) {
 }
 
 func TestDNSCheck_MXRecord(t *testing.T) {
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "google.com",
 		RecordType: "MX",
 	}, 5000)
@@ -1113,7 +1104,7 @@ func TestDNSCheck_MXRecord(t *testing.T) {
 }
 
 func TestDNSCheck_TXTRecord(t *testing.T) {
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "google.com",
 		RecordType: "TXT",
 	}, 5000)
@@ -1127,7 +1118,7 @@ func TestDNSCheck_TXTRecord(t *testing.T) {
 }
 
 func TestDNSCheck_UnsupportedRecordType(t *testing.T) {
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "example.com",
 		RecordType: "SRV",
 	}, 5000)
@@ -1141,7 +1132,7 @@ func TestDNSCheck_UnsupportedRecordType(t *testing.T) {
 }
 
 func TestDNSCheck_ExpectedMatchesResult(t *testing.T) {
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "localhost",
 		RecordType: "A",
 		Expected:   "127.0.0.1",
@@ -1156,7 +1147,7 @@ func TestDNSCheck_ExpectedMatchesResult(t *testing.T) {
 }
 
 func TestDNSCheck_ExpectedDoesNotMatch(t *testing.T) {
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "localhost",
 		RecordType: "A",
 		Expected:   "10.99.99.99",
@@ -1175,7 +1166,7 @@ func TestDNSCheck_ExpectedDoesNotMatch(t *testing.T) {
 }
 
 func TestDNSCheck_NonexistentDomain(t *testing.T) {
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "this-domain-does-not-exist-towerops-test.invalid",
 		RecordType: "A",
 	}, 5000)
@@ -1186,7 +1177,7 @@ func TestDNSCheck_NonexistentDomain(t *testing.T) {
 }
 
 func TestDNSCheck_DefaultRecordTypeIsA(t *testing.T) {
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "localhost",
 		RecordType: "", // should default to A
 	}, 5000)
@@ -1208,7 +1199,7 @@ func TestDNSCheck_CustomDNSServer(t *testing.T) {
 	}
 	_ = conn.Close()
 
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "example.com",
 		RecordType: "A",
 		Server:     "8.8.8.8",
@@ -1236,7 +1227,7 @@ func TestResolverForServerUsesRequestedNetwork(t *testing.T) {
 
 func TestDNSCheck_RecordTypeCaseInsensitive(t *testing.T) {
 	// The code does strings.ToUpper, so lowercase should work
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "localhost",
 		RecordType: "a", // lowercase
 	}, 5000)
@@ -1252,7 +1243,7 @@ func TestDNSCheck_RecordTypeCaseInsensitive(t *testing.T) {
 func TestDNSCheck_NoRecordsFound(t *testing.T) {
 	// AAAA for a domain that likely only has A records
 	// Use a known domain that almost certainly won't have AAAA
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "this-domain-does-not-exist-towerops-test.invalid",
 		RecordType: "AAAA",
 	}, 5000)
@@ -1264,7 +1255,7 @@ func TestDNSCheck_NoRecordsFound(t *testing.T) {
 
 func TestDNSCheck_VeryShortTimeout(t *testing.T) {
 	// Use a custom DNS server with 1ms timeout - should timeout
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "example.com",
 		RecordType: "A",
 		Server:     "8.8.8.8",
@@ -1304,7 +1295,7 @@ func TestTCPCheck_SendFailsOnClosedConnection(t *testing.T) {
 	// Give the server time to close the connection
 	time.Sleep(50 * time.Millisecond)
 
-	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host:   "127.0.0.1",
 		Port:   port,
 		Send:   largePayload,
@@ -1332,57 +1323,13 @@ func TestHTTPCheck_MethodUppercased(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:    srv.URL,
 		Method: "put", // lowercase
 	}, 5000)
 
 	if status != 0 {
 		t.Fatalf("expected status 0, got %d: %s", status, output)
-	}
-}
-
-func TestHTTPCheck_ResponseTimeIsPositive(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(10 * time.Millisecond)
-		w.WriteHeader(200)
-	}))
-	defer srv.Close()
-
-	_, _, rt := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
-		Url: srv.URL,
-	}, 5000)
-
-	if rt <= 0 {
-		t.Fatalf("expected positive response time, got %f", rt)
-	}
-}
-
-func TestTCPCheck_ResponseTimeReported(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = ln.Close() }()
-
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			_ = conn.Close()
-		}
-	}()
-
-	port := parsePort(portFromListener(ln))
-	_, _, rt := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
-		Host: "127.0.0.1",
-		Port: port,
-	}, 5000)
-
-	if rt < 0 {
-		t.Fatalf("expected non-negative response time, got %f", rt)
 	}
 }
 
@@ -1409,7 +1356,7 @@ func TestHTTPCheck_TLSServerNoVerify(t *testing.T) {
 	srv.StartTLS()
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:       srv.URL,
 		VerifySsl: false,
 		Regex:     "secure",
@@ -1429,7 +1376,7 @@ func TestHTTPCheck_HeadMethod(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:    srv.URL,
 		Method: "HEAD",
 	}, 5000)
@@ -1448,7 +1395,7 @@ func TestHTTPCheck_DeleteMethod(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:            srv.URL,
 		Method:         "DELETE",
 		ExpectedStatus: 204,
@@ -1466,7 +1413,7 @@ func TestHTTPCheck_RegexOnEmptyBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:   srv.URL,
 		Regex: "something",
 	}, 5000)
@@ -1490,7 +1437,7 @@ func TestHTTPCheck_MultipleRedirects(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:             srv.URL + "/a",
 		FollowRedirects: true,
 	}, 5000)
@@ -1506,7 +1453,7 @@ func TestHTTPCheck_EmptyHeadersMap(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:     srv.URL,
 		Headers: map[string]string{},
 	}, 5000)
@@ -1583,7 +1530,7 @@ func TestSSLCheck_ValidCert(t *testing.T) {
 
 	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
 
-	status, output, rt := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
 		Host:        "127.0.0.1",
 		Port:        parsePort(portStr),
 		WarningDays: 1,
@@ -1595,9 +1542,6 @@ func TestSSLCheck_ValidCert(t *testing.T) {
 	}
 	if !strings.Contains(output, "OK: Certificate") {
 		t.Fatalf("expected OK message, got %s", output)
-	}
-	if rt < 0 {
-		t.Fatalf("expected non-negative response time, got %f", rt)
 	}
 }
 
@@ -1612,7 +1556,7 @@ func TestSSLCheck_WarningThreshold(t *testing.T) {
 
 	// httptest certs typically expire within a few years.
 	// Set warning_days very high to trigger WARNING.
-	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
 		Host:        "127.0.0.1",
 		Port:        parsePort(portStr),
 		WarningDays: 999999,
@@ -1628,7 +1572,7 @@ func TestSSLCheck_WarningThreshold(t *testing.T) {
 
 func TestSSLCheck_ConnectionFailure(t *testing.T) {
 	// Use non-routable address
-	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
 		Host: "192.0.2.1",
 		Port: 443,
 	}, 1000)
@@ -1659,7 +1603,7 @@ func TestSSLCheck_HonorsCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	start := time.Now()
-	status, _, _ := executeSSLCheck(ctx, &pb.SslCheckConfig{
+	status, _ := executeSSLCheck(ctx, &pb.SslCheckConfig{
 		Host: "127.0.0.1",
 		Port: parsePort(portFromListener(ln)),
 	}, 5000)
@@ -1686,7 +1630,7 @@ func TestSSLCheck_ClosedPort(t *testing.T) {
 	port := parsePort(portFromListener(ln))
 	_ = ln.Close()
 
-	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
 		Host: "127.0.0.1",
 		Port: port,
 	}, 2000)
@@ -1699,7 +1643,7 @@ func TestSSLCheck_ClosedPort(t *testing.T) {
 func TestSSLCheck_DefaultPort443(t *testing.T) {
 	// When port is 0 (unset), should default to 443.
 	// We just verify it doesn't crash.
-	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
 		Host: "192.0.2.1",
 		Port: 0,
 	}, 500)
@@ -1720,7 +1664,7 @@ func TestSSLCheck_DefaultWarningDays30(t *testing.T) {
 	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
 
 	// warning_days=0 should default to 30
-	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
 		Host:        "127.0.0.1",
 		Port:        parsePort(portStr),
 		WarningDays: 0,
@@ -1740,7 +1684,7 @@ func TestSSLCheck_SelfSignedCertificateIsCritical(t *testing.T) {
 
 	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
 
-	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
 		Host:        "127.0.0.1",
 		Port:        parsePort(portStr),
 		WarningDays: 7,
@@ -1835,7 +1779,7 @@ func TestChkTHTTPCheckBodyReadErrorWithRegex(t *testing.T) {
 		"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n",
 		[]byte("truncated"))
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:       url,
 		Regex:     "truncated",
 		VerifySsl: true,
@@ -1857,7 +1801,7 @@ func TestChkTHTTPCheckDrainErrorAfterRegexLimit(t *testing.T) {
 		fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", maxHTTPRegexBody*4),
 		body)
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:       url,
 		Regex:     "aaa",
 		VerifySsl: true,
@@ -1876,7 +1820,7 @@ func TestChkTHTTPCheckDrainErrorWithoutRegex(t *testing.T) {
 		"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n",
 		[]byte("truncated"))
 
-	status, output, _ := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
 		Url:       url,
 		VerifySsl: true,
 	}, 5000)
@@ -1908,7 +1852,7 @@ func TestChkTTCPCheckSetDeadlineFailure(t *testing.T) {
 		return &chkTDeadlineErrConn{Conn: client}, nil
 	}
 
-	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host: "127.0.0.1",
 		Port: 1234,
 		Send: "PING\r\n",
@@ -1948,7 +1892,7 @@ func TestTCPCheck_LongBinaryMismatchOutputIsBoundedAndPrintable(t *testing.T) {
 		}
 	}()
 
-	status, output, _ := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
 		Host:   "127.0.0.1",
 		Port:   parsePort(portFromListener(ln)),
 		Expect: "chkT-never-sent",
@@ -2024,7 +1968,7 @@ func TestChkTDNSCheckNoRecordsFound(t *testing.T) {
 		return nil, nil
 	}
 
-	status, output, _ := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
 		Hostname:   "chkt-empty.example",
 		RecordType: "txt",
 	}, 5000)
@@ -2037,6 +1981,64 @@ func TestChkTDNSCheckNoRecordsFound(t *testing.T) {
 	}
 	if gotHost != "chkt-empty.example" {
 		t.Fatalf("expected the configured hostname to be looked up, got %q", gotHost)
+	}
+}
+
+// Go returns CNAME and MX names as FQDNs with a trailing dot, so an operator
+// who enters "example.com" used to get a permanent CRITICAL.
+func TestChkTDNSAnswerMatches(t *testing.T) {
+	tests := []struct {
+		name       string
+		recordType string
+		results    []string
+		expected   string
+		want       bool
+	}{
+		{"cname answer keeps its trailing dot", "CNAME", []string{"example.com."}, "example.com", true},
+		{"expected carries the trailing dot", "CNAME", []string{"example.com"}, "example.com.", true},
+		{"cname mismatch", "CNAME", []string{"other.example.com."}, "example.com", false},
+		{"mx preference and host", "MX", []string{"10 mx.example.com."}, "10 mx.example.com", true},
+		{"mx host alone", "MX", []string{"10 mx.example.com."}, "mx.example.com", true},
+		{"mx wrong preference", "MX", []string{"10 mx.example.com."}, "20 mx.example.com", false},
+		{"mx picks the matching record", "MX", []string{"10 a.example.com.", "20 b.example.com."}, "b.example.com", true},
+		{"txt is never split on spaces", "TXT", []string{"hello v=spf1"}, "v=spf1", false},
+		{"txt trailing dot belongs to the value", "TXT", []string{"mail.example.com."}, "mail.example.com", false},
+		{"txt exact value", "TXT", []string{"v=spf1 -all"}, "v=spf1 -all", true},
+		{"address record", "A", []string{"10.0.0.2", "10.0.0.1"}, "10.0.0.1", true},
+		{"address record with a stray dot", "A", []string{"10.0.0.1"}, "10.0.0.1.", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := dnsAnswerMatches(tt.recordType, tt.results, tt.expected); got != tt.want {
+				t.Fatalf("dnsAnswerMatches(%q, %v, %q) = %v, want %v",
+					tt.recordType, tt.results, tt.expected, got, tt.want)
+			}
+		})
+	}
+}
+
+// The lookup seam is the only way to feed executeDNSCheck a fixed answer. TXT
+// values are compared exactly, so the trailing-dot handling must not leak out
+// of the hostname-valued record types.
+func TestChkTDNSCheckTXTExpectedIsExact(t *testing.T) {
+	orig := dnsLookupTXT
+	defer func() { dnsLookupTXT = orig }()
+	dnsLookupTXT = func(_ *net.Resolver, _ context.Context, _ string) ([]string, error) {
+		return []string{"v=spf1 include:example.com"}, nil
+	}
+
+	config := &pb.DnsCheckConfig{
+		Hostname:   "chkt-dot.example",
+		RecordType: "TXT",
+		Expected:   "v=spf1 include:example.com",
+	}
+	if status, output := executeDNSCheck(context.Background(), config, 5000); status != checkOK {
+		t.Fatalf("status = %d (%s), want OK for the exact TXT value", status, output)
+	}
+
+	config.Expected = "v=spf1 include:example.com."
+	if status, output := executeDNSCheck(context.Background(), config, 5000); status != checkCritical {
+		t.Fatalf("status = %d (%s), want CRITICAL: a trailing dot is part of a TXT value", status, output)
 	}
 }
 
@@ -2071,7 +2073,7 @@ func TestChkTSSLCheckRootCALoadFailure(t *testing.T) {
 		return nil, errors.New("chkT root store unavailable")
 	}
 
-	status, output, rt := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
 		Host: "127.0.0.1",
 		Port: 443,
 	}, 5000)
@@ -2081,9 +2083,6 @@ func TestChkTSSLCheckRootCALoadFailure(t *testing.T) {
 	}
 	if !strings.Contains(output, "Failed to load system root CAs") {
 		t.Fatalf("expected root CA failure output, got %s", output)
-	}
-	if rt != 0 {
-		t.Fatalf("expected zero response time before dialing, got %f", rt)
 	}
 }
 
@@ -2096,7 +2095,7 @@ func TestChkTSSLCheckNonTLSConnection(t *testing.T) {
 		return client, nil
 	}
 
-	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
 		Host: "127.0.0.1",
 		Port: 8443,
 	}, 5000)
@@ -2122,7 +2121,7 @@ func TestChkTSSLCheckNoPeerCertificates(t *testing.T) {
 		}), nil
 	}
 
-	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
 		Host: "certless.chkt.test",
 		Port: 9443,
 	}, 5000)
@@ -2195,7 +2194,7 @@ func TestChkTSSLCheckExpiredCertificate(t *testing.T) {
 		return client, nil
 	}
 
-	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
 		Host:        "expired.chkt.test",
 		Port:        443,
 		WarningDays: 30,
@@ -2227,7 +2226,7 @@ func TestSSLCheck_ExpiredCertificateHandshakeIsCritical(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
 		Host:        "127.0.0.1",
 		Port:        parsePort(portStr),
 		WarningDays: 30,
@@ -2257,7 +2256,7 @@ func TestSSLCheck_NotYetValidCertificateIsCritical(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	status, output, _ := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
 		Host:        "127.0.0.1",
 		Port:        parsePort(portStr),
 		WarningDays: 30,

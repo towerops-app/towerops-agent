@@ -142,6 +142,16 @@ func TestLldpTParseMgmtAddr(t *testing.T) {
 			wantKey: "0.5.1",
 		},
 		{
+			name:    "ipv4 address length mismatch",
+			oid:     lldpTMgmtOid(true, "0.5.1", "1", 16, []int{10, 0, 0, 7}),
+			wantKey: "0.5.1",
+		},
+		{
+			name:    "non-numeric address length",
+			oid:     "." + oidRemManAddr + ".0.5.1.1.xx.10.0.0.7",
+			wantKey: "0.5.1",
+		},
+		{
 			name:    "ipv6 truncated",
 			oid:     lldpTMgmtOid(true, "0.5.1", "2", 16, []int{32, 1, 13, 184}),
 			wantKey: "0.5.1",
@@ -152,6 +162,12 @@ func TestLldpTParseMgmtAddr(t *testing.T) {
 				[]int{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}),
 			wantKey: "0.5.1",
 			wantIP:  "2001:db8:0:0:0:0:0:1",
+		},
+		{
+			name: "ipv6 address length mismatch",
+			oid: lldpTMgmtOid(true, "0.5.1", "2", 4,
+				[]int{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}),
+			wantKey: "0.5.1",
 		},
 		{
 			name:    "unknown subtype",
@@ -167,6 +183,20 @@ func TestLldpTParseMgmtAddr(t *testing.T) {
 					tt.oid, key, ip, tt.wantKey, tt.wantIP)
 			}
 		})
+	}
+}
+
+// A row whose index carries more octets than addrLen announces is malformed;
+// truncating it to the first four would invent a management address.
+func TestLldpTParseMgmtAddrRejectsExtraOctets(t *testing.T) {
+	for _, oid := range []string{
+		"." + oidRemManAddr + ".0.5.1.1.4.10.0.0.1.99",
+		"." + oidRemManAddr + ".0.5.1.2.16.32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1.7",
+	} {
+		key, ip := parseMgmtAddr(oid)
+		if key != "0.5.1" || ip != "" {
+			t.Fatalf("parseMgmtAddr(%q) = (%q, %q), want (%q, %q)", oid, key, ip, "0.5.1", "")
+		}
 	}
 }
 
@@ -242,10 +272,11 @@ func TestLldpTDiscoverNeighborsLocalSystemName(t *testing.T) {
 
 func TestLldpTDiscoverNeighborsWalkErrors(t *testing.T) {
 	fullTable := map[string][]gosnmp.SnmpPDU{
-		oidLocPortDesc: {lldpTPdu("."+oidLocPortDesc+".5", "ether5")},
-		oidRemSysName:  {lldpTPdu("."+oidRemSysName+".0.5.1", "peer-a")},
-		oidRemPortDesc: {lldpTPdu("."+oidRemPortDesc+".0.5.1", "eth0")},
-		oidRemPortId:   {lldpTPdu("."+oidRemPortId+".0.5.1", "aa:bb:cc")},
+		oidLocPortDesc:  {lldpTPdu("."+oidLocPortDesc+".5", "ether5")},
+		oidRemChassisId: {lldpTPdu("."+oidRemChassisId+".0.5.1", "chassis-a")},
+		oidRemSysName:   {lldpTPdu("."+oidRemSysName+".0.5.1", "peer-a")},
+		oidRemPortDesc:  {lldpTPdu("."+oidRemPortDesc+".0.5.1", "eth0")},
+		oidRemPortId:    {lldpTPdu("."+oidRemPortId+".0.5.1", "aa:bb:cc")},
 		oidRemManAddr: {lldpTPdu(
 			lldpTMgmtOid(true, "0.5.1", "1", 4, []int{10, 1, 2, 3}), "")},
 	}
@@ -269,22 +300,25 @@ func TestLldpTDiscoverNeighborsWalkErrors(t *testing.T) {
 		}
 	})
 
-	t.Run("remote sys name walk error returns early", func(t *testing.T) {
+	t.Run("remote sys name walk error continues with chassis ID", func(t *testing.T) {
 		m := &mockSnmpQuerier{
 			getFunc:      lldpTSysNameOK("switch-a"),
 			walkStepFunc: lldpTWalk(fullTable),
 			walkErrs:     map[string]error{oidRemSysName: errors.New("remsys boom")},
 		}
 		result := discoverLldpNeighbors(m, "dev", "job", false)
-		if len(result.Neighbors) != 0 {
-			t.Fatalf("Neighbors = %v, want empty", result.Neighbors)
+		if len(result.Neighbors) != 1 {
+			t.Fatalf("Neighbors = %v, want one", result.Neighbors)
+		}
+		if result.Neighbors[0].NeighborName != "chassis-a" {
+			t.Fatalf("NeighborName = %q, want chassis-a", result.Neighbors[0].NeighborName)
 		}
 		if result.LocalSystemName != "switch-a" {
 			t.Fatalf("LocalSystemName = %q, want %q", result.LocalSystemName, "switch-a")
 		}
 	})
 
-	t.Run("no neighbors returns early", func(t *testing.T) {
+	t.Run("no chassis rows returns no neighbors", func(t *testing.T) {
 		m := &mockSnmpQuerier{
 			getFunc: lldpTSysNameOK("switch-a"),
 			walkStepFunc: lldpTWalk(map[string][]gosnmp.SnmpPDU{
@@ -359,11 +393,18 @@ func TestLldpTDiscoverNeighborsAssembly(t *testing.T) {
 				// Suffix-less OID -> extractSuffix "" -> skipped.
 				lldpTPdu(oidLocPortDesc, "ignored"),
 			},
+			oidRemChassisId: {
+				lldpTPdu("."+oidRemChassisId+".0.5.1", "chassis-a"),
+				lldpTPdu(oidRemChassisId+".0.9.1", "chassis-b"),
+				lldpTPdu("."+oidRemChassisId+".0.7.1", ""),
+				lldpTPdu(oidRemChassisId, "ignored"),
+			},
 			oidRemSysName: {
 				lldpTPdu("."+oidRemSysName+".0.5.1", "peer-a"),
 				// No local port description for port 9 -> "port-9" fallback.
 				lldpTPdu(oidRemSysName+".0.9.1", "peer-b"),
-				// Empty sysName value -> skipped in assembly loop.
+				// A row with no system name, chassis ID, or management address has
+				// no useful identity and is skipped.
 				lldpTPdu("."+oidRemSysName+".0.7.1", ""),
 				// Unparsable key -> not recorded at all.
 				lldpTPdu(".1.2.3.4", "bogus"),
@@ -410,6 +451,9 @@ func TestLldpTDiscoverNeighborsAssembly(t *testing.T) {
 	if first.RemotePortId != "aa:bb:cc:dd:ee:ff" {
 		t.Fatalf("Neighbors[0].RemotePortId = %q, want aa:bb:cc:dd:ee:ff", first.RemotePortId)
 	}
+	if first.RemoteChassisId != "chassis-a" {
+		t.Fatalf("Neighbors[0].RemoteChassisId = %q, want chassis-a", first.RemoteChassisId)
+	}
 	if !slices.Equal(first.ManagementAddresses, []string{"10.1.2.3", "10.1.2.4"}) {
 		t.Fatalf("Neighbors[0].ManagementAddresses = %v, want [10.1.2.3 10.1.2.4]",
 			first.ManagementAddresses)
@@ -422,6 +466,9 @@ func TestLldpTDiscoverNeighborsAssembly(t *testing.T) {
 	if second.LocalPort != "port-9" {
 		t.Fatalf("Neighbors[1].LocalPort = %q, want port-9", second.LocalPort)
 	}
+	if second.RemoteChassisId != "chassis-b" {
+		t.Fatalf("Neighbors[1].RemoteChassisId = %q, want chassis-b", second.RemoteChassisId)
+	}
 	if second.RemotePort != "" || second.RemotePortId != "" {
 		t.Fatalf("Neighbors[1] remote fields = (%q, %q), want empty",
 			second.RemotePort, second.RemotePortId)
@@ -431,13 +478,105 @@ func TestLldpTDiscoverNeighborsAssembly(t *testing.T) {
 	}
 }
 
-// TestLldpTDiscoverNeighborsEmptyIndexParts pins the behaviour for a degenerate
-// remote index whose sub-identifiers are empty: parseRemoteKey still produces a
-// 3-part key, so the neighbor is emitted with an empty port number.
+func TestLldpTDiscoverNeighborsWithoutSystemNames(t *testing.T) {
+	tests := []struct {
+		name        string
+		systemNames []gosnmp.SnmpPDU
+		wantNames   []string
+	}{
+		{
+			name: "one row has no system name",
+			systemNames: []gosnmp.SnmpPDU{
+				lldpTPdu("."+oidRemSysName+".0.5.1", "peer-a"),
+			},
+			wantNames: []string{"peer-a", "chassis-b"},
+		},
+		{
+			name:      "no rows have system names",
+			wantNames: []string{"chassis-a", "chassis-b"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &mockSnmpQuerier{
+				getFunc: lldpTSysNameOK("switch-a"),
+				walkStepFunc: lldpTWalk(map[string][]gosnmp.SnmpPDU{
+					oidLocPortDesc: {
+						lldpTPdu("."+oidLocPortDesc+".5", "ether5"),
+						lldpTPdu("."+oidLocPortDesc+".9", "ether9"),
+					},
+					oidRemChassisId: {
+						lldpTPdu("."+oidRemChassisId+".0.5.1", "chassis-a"),
+						lldpTPdu("."+oidRemChassisId+".0.9.1", "chassis-b"),
+					},
+					oidRemSysName: tt.systemNames,
+					oidRemPortDesc: {
+						lldpTPdu("."+oidRemPortDesc+".0.9.1", "wifi0"),
+					},
+					oidRemManAddr: {
+						lldpTPdu(lldpTMgmtOid(true, "0.9.1", "1", 4, []int{10, 1, 2, 9}), ""),
+					},
+				}),
+			}
+
+			result := discoverLldpNeighbors(m, "dev", "job", false)
+			if len(result.Neighbors) != 2 {
+				t.Fatalf("Neighbors = %d (%+v), want 2", len(result.Neighbors), result.Neighbors)
+			}
+			gotNames := []string{result.Neighbors[0].NeighborName, result.Neighbors[1].NeighborName}
+			if !slices.Equal(gotNames, tt.wantNames) {
+				t.Fatalf("neighbor names = %v, want %v", gotNames, tt.wantNames)
+			}
+
+			unnamed := result.Neighbors[1]
+			if unnamed.RemoteChassisId != "chassis-b" {
+				t.Fatalf("RemoteChassisId = %q, want chassis-b", unnamed.RemoteChassisId)
+			}
+			if unnamed.LocalPort != "ether9" {
+				t.Fatalf("LocalPort = %q, want ether9", unnamed.LocalPort)
+			}
+			if unnamed.RemotePort != "wifi0" {
+				t.Fatalf("RemotePort = %q, want wifi0", unnamed.RemotePort)
+			}
+			if !slices.Equal(unnamed.ManagementAddresses, []string{"10.1.2.9"}) {
+				t.Fatalf("ManagementAddresses = %v, want [10.1.2.9]", unnamed.ManagementAddresses)
+			}
+		})
+	}
+
+	t.Run("management address is final identity fallback", func(t *testing.T) {
+		m := &mockSnmpQuerier{
+			getFunc: lldpTSysNameOK("switch-a"),
+			walkStepFunc: lldpTWalk(map[string][]gosnmp.SnmpPDU{
+				oidRemChassisId: {
+					lldpTPdu("."+oidRemChassisId+".0.5.1", ""),
+					lldpTPdu("."+oidRemChassisId+".0.9.1", ""),
+				},
+				oidRemManAddr: {
+					lldpTPdu(lldpTMgmtOid(true, "0.5.1", "1", 4, []int{10, 1, 2, 5}), ""),
+				},
+			}),
+		}
+
+		result := discoverLldpNeighbors(m, "dev", "job", false)
+		if len(result.Neighbors) != 1 {
+			t.Fatalf("Neighbors = %d (%+v), want 1", len(result.Neighbors), result.Neighbors)
+		}
+		if result.Neighbors[0].NeighborName != "10.1.2.5" {
+			t.Fatalf("NeighborName = %q, want 10.1.2.5", result.Neighbors[0].NeighborName)
+		}
+	})
+}
+
 func TestLldpTDiscoverNeighborsEmptyIndexParts(t *testing.T) {
 	m := &mockSnmpQuerier{
 		getFunc: lldpTSysNameOK("sw"),
 		walkStepFunc: lldpTWalk(map[string][]gosnmp.SnmpPDU{
+			oidRemChassisId: {
+				lldpTPdu("."+oidRemChassisId+"...", "chassis-weird"),
+				lldpTPdu("."+oidRemChassisId+".0.5.1", "chassis-a"),
+			},
 			oidRemSysName: {
 				lldpTPdu("."+oidRemSysName+"...", "weird"),
 				lldpTPdu("."+oidRemSysName+".0.5.1", "peer-a"),
@@ -458,10 +597,17 @@ func TestLldpTDiscoverNeighborsEmptyIndexParts(t *testing.T) {
 
 func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 	t.Run("nil snmp device", func(t *testing.T) {
-		resultCh := make(chan *pb.LldpTopologyResult, 1)
+		out := make(resultQueue, 1)
 		executeLldpTopologyJob(context.Background(),
-			&pb.AgentJob{DeviceId: "dev-1", JobId: "job-1"}, resultCh)
-		got := <-resultCh
+			&pb.AgentJob{DeviceId: "dev-1", JobId: "job-1"}, out)
+		o := <-out
+		if o.event != "lldp_topology_result" {
+			t.Fatalf("event = %q, want lldp_topology_result", o.event)
+		}
+		got, ok := o.msg.(*pb.LldpTopologyResult)
+		if !ok {
+			t.Fatalf("message type = %T, want *pb.LldpTopologyResult", o.msg)
+		}
 		if got.DeviceId != "dev-1" || got.JobId != "job-1" {
 			t.Fatalf("result ids = (%q, %q), want (dev-1, job-1)", got.DeviceId, got.JobId)
 		}
@@ -480,13 +626,20 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 			return nil, nil, errors.New("dial refused")
 		}
 
-		resultCh := make(chan *pb.LldpTopologyResult, 1)
+		out := make(resultQueue, 1)
 		executeLldpTopologyJob(context.Background(), &pb.AgentJob{
 			DeviceId:   "dev-2",
 			JobId:      "job-2",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
-		}, resultCh)
-		got := <-resultCh
+		}, out)
+		o := <-out
+		if o.event != "lldp_topology_result" {
+			t.Fatalf("event = %q, want lldp_topology_result", o.event)
+		}
+		got, ok := o.msg.(*pb.LldpTopologyResult)
+		if !ok {
+			t.Fatalf("message type = %T, want *pb.LldpTopologyResult", o.msg)
+		}
 		if got.DeviceId != "dev-2" || got.JobId != "job-2" {
 			t.Fatalf("result ids = (%q, %q), want (dev-2, job-2)", got.DeviceId, got.JobId)
 		}
@@ -503,10 +656,11 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 		m := &mockSnmpQuerier{
 			getFunc: lldpTSysNameOK("core-sw"),
 			walkStepFunc: lldpTWalk(map[string][]gosnmp.SnmpPDU{
-				oidLocPortDesc: {lldpTPdu("."+oidLocPortDesc+".5", "ether5")},
-				oidRemSysName:  {lldpTPdu("."+oidRemSysName+".0.5.1", "peer-a")},
-				oidRemPortDesc: {lldpTPdu("."+oidRemPortDesc+".0.5.1", "eth0")},
-				oidRemPortId:   {lldpTPdu("."+oidRemPortId+".0.5.1", "aa:bb")},
+				oidLocPortDesc:  {lldpTPdu("."+oidLocPortDesc+".5", "ether5")},
+				oidRemChassisId: {lldpTPdu("."+oidRemChassisId+".0.5.1", "chassis-a")},
+				oidRemSysName:   {lldpTPdu("."+oidRemSysName+".0.5.1", "peer-a")},
+				oidRemPortDesc:  {lldpTPdu("."+oidRemPortDesc+".0.5.1", "eth0")},
+				oidRemPortId:    {lldpTPdu("."+oidRemPortId+".0.5.1", "aa:bb")},
 				oidRemManAddr: {lldpTPdu(
 					lldpTMgmtOid(true, "0.5.1", "1", 4, []int{10, 1, 2, 3}), "")},
 			}),
@@ -519,7 +673,7 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 			return m, func() { closed = true }, nil
 		}
 
-		resultCh := make(chan *pb.LldpTopologyResult, 1)
+		out := make(resultQueue, 1)
 		dev := &pb.SnmpDevice{Ip: "10.0.0.1", Version: "2c"}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -527,7 +681,7 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 			DeviceId:   "dev-3",
 			JobId:      "job-3",
 			SnmpDevice: dev,
-		}, resultCh)
+		}, out)
 
 		if gotDev != dev {
 			t.Fatalf("snmpDial got device %+v, want %+v", gotDev, dev)
@@ -539,7 +693,14 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 			t.Fatal("close function was not called")
 		}
 
-		got := <-resultCh
+		o := <-out
+		if o.event != "lldp_topology_result" {
+			t.Fatalf("event = %q, want lldp_topology_result", o.event)
+		}
+		got, ok := o.msg.(*pb.LldpTopologyResult)
+		if !ok {
+			t.Fatalf("message type = %T, want *pb.LldpTopologyResult", o.msg)
+		}
 		if got.DeviceId != "dev-3" || got.JobId != "job-3" {
 			t.Fatalf("result ids = (%q, %q), want (dev-3, job-3)", got.DeviceId, got.JobId)
 		}
@@ -551,8 +712,9 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 		}
 		n := got.Neighbors[0]
 		if n.NeighborName != "peer-a" || n.LocalPort != "ether5" ||
-			n.RemotePort != "eth0" || n.RemotePortId != "aa:bb" {
-			t.Fatalf("neighbor = %+v, want peer-a/ether5/eth0/aa:bb", n)
+			n.RemotePort != "eth0" || n.RemotePortId != "aa:bb" ||
+			n.RemoteChassisId != "chassis-a" {
+			t.Fatalf("neighbor = %+v, want peer-a/ether5/eth0/aa:bb/chassis-a", n)
 		}
 		if !slices.Equal(n.ManagementAddresses, []string{"10.1.2.3"}) {
 			t.Fatalf("ManagementAddresses = %v, want [10.1.2.3]", n.ManagementAddresses)
@@ -571,6 +733,7 @@ func TestLldpTExecuteLldpTopologyJobWalkStrategy(t *testing.T) {
 	}
 	wantRoots := []string{
 		oidLocPortDesc,
+		oidRemChassisId,
 		oidRemSysName,
 		oidRemPortDesc,
 		oidRemPortId,
@@ -585,20 +748,21 @@ func TestLldpTExecuteLldpTopologyJobWalkStrategy(t *testing.T) {
 			m := &mockSnmpQuerier{
 				getFunc: lldpTSysNameOK("core-sw"),
 				walkStepFunc: lldpTWalk(map[string][]gosnmp.SnmpPDU{
-					oidRemSysName: {lldpTPdu("."+oidRemSysName+".0.5.1", "peer-a")},
+					oidRemSysName:   {lldpTPdu("."+oidRemSysName+".0.5.1", "peer-a")},
+					oidRemChassisId: {lldpTPdu("."+oidRemChassisId+".0.5.1", "chassis-a")},
 				}),
 			}
 			snmpDial = func(context.Context, *pb.SnmpDevice) (snmpQuerier, func(), error) {
 				return m, func() {}, nil
 			}
 
-			resultCh := make(chan *pb.LldpTopologyResult, 1)
+			out := make(resultQueue, 1)
 			executeLldpTopologyJob(context.Background(), &pb.AgentJob{
 				DeviceId:   "dev-walk",
 				JobId:      "job-walk",
 				SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: tt.version},
-			}, resultCh)
-			<-resultCh
+			}, out)
+			<-out
 
 			if tt.wantBulk {
 				if !slices.Equal(m.bulkWalkRoots, wantRoots) {

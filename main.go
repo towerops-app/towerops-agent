@@ -21,11 +21,8 @@ import (
 var version = "dev"
 var buildDate = "unknown"
 
-var insecureFlag bool
-
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
 	// NotifyContext keeps intercepting signals after it cancels the context.
 	// Stop it when shutdown begins so a second signal uses the default handler.
 	go stopSignalNotifier(ctx, stop)
@@ -43,12 +40,14 @@ func runMain(ctx context.Context, args []string) int {
 	apiURL := fs.String("api-url", os.Getenv("TOWEROPS_API_URL"), "API URL (e.g., wss://towerops.net)")
 	token := fs.String("token", os.Getenv("TOWEROPS_AGENT_TOKEN"), "Agent authentication token")
 	tokenFile := fs.String("token-file", "", "Path to file containing agent token (preferred over --token)")
-	logLevel := fs.String("log-level", envOrDefault("LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
-	logFormat := fs.String("log-format", envOrDefault("LOG_FORMAT", "text"), "Log output format (text, json)")
-	fs.BoolVar(&insecureFlag, "insecure", false, "Allow plaintext ws:// connections (insecure)")
-	trapEnabled := fs.Bool("trap-enabled", envBool("TRAP_ENABLED", false), "Listen for SNMP traps")
-	trapPort := fs.Uint("trap-port", envUint("TRAP_PORT", 162), "UDP port for the SNMP trap listener")
-	trapCommunity := fs.String("trap-community", os.Getenv("TRAP_COMMUNITY"), "Only accept traps carrying this community string (default: any)")
+	logLevel := fs.String("log-level", envOrDefault("info", "TOWEROPS_LOG_LEVEL", "LOG_LEVEL"), "Log level (debug, info, warn, error)")
+	logFormat := fs.String("log-format", envOrDefault("text", "TOWEROPS_LOG_FORMAT", "LOG_FORMAT"), "Log output format (text, json)")
+	insecure := fs.Bool("insecure", envBool(false, "TOWEROPS_INSECURE"), "Allow plaintext ws:// connections (insecure)")
+	trapEnabled := fs.Bool("trap-enabled", envBool(false, "TOWEROPS_TRAP_ENABLED", "TRAP_ENABLED"), "Listen for SNMP traps")
+	trapBind := fs.String("trap-bind", envOrDefault("0.0.0.0", "TOWEROPS_TRAP_BIND"), "Address for the SNMP trap listener")
+	trapPort := fs.Uint("trap-port", envUint(162, "TOWEROPS_TRAP_PORT", "TRAP_PORT"), "UDP port for the SNMP trap listener")
+	trapCommunity := fs.String("trap-community", envFirst("TOWEROPS_TRAP_COMMUNITY", "TRAP_COMMUNITY"), "Only accept traps carrying this community string (default: any)")
+	hostKeysFile := fs.String("host-keys-file", envOrDefault(defaultHostKeysPath, "TOWEROPS_HOST_KEYS_FILE"), "Path to the SSH and TLS trust-on-first-use store")
 
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -70,30 +69,26 @@ func runMain(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "WARNING: --token flag exposes the token in the process table. Use TOWEROPS_AGENT_TOKEN env var or --token-file instead.")
 	}
 
-	// Setup structured logging
-	var level slog.Level
-	switch strings.ToLower(*logLevel) {
-	case "debug":
-		level = slog.LevelDebug
-	case "warn", "warning":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		level = slog.LevelInfo
-	}
+	level, validLogLevel := resolveLogLevel(*logLevel)
 	slog.SetDefault(slog.New(newLogHandler(os.Stderr, level, *logFormat)))
+	if !validLogLevel {
+		slog.Warn("ignoring unrecognised log level", "value", *logLevel)
+	}
 
 	if *apiURL == "" || *token == "" {
 		fmt.Fprintln(os.Stderr, "error: --api-url and --token are required (or set TOWEROPS_API_URL and TOWEROPS_AGENT_TOKEN)")
 		fs.Usage()
 		return 1
 	}
+	if err := initHostKeyStore(*hostKeysFile); err != nil {
+		slog.Error("host key store", "error", err)
+		return 1
+	}
 
 	slog.Info("towerops agent starting", "version", version, "built", buildDate)
 
 	// Convert HTTP(S) to WebSocket URL
-	wsURL, err := toWebSocketURL(*apiURL, insecureFlag)
+	wsURL, err := toWebSocketURL(*apiURL, *insecure)
 	if err != nil {
 		slog.Error(err.Error())
 		return 1
@@ -108,7 +103,7 @@ func runMain(ctx context.Context, args []string) int {
 			fmt.Fprintf(os.Stderr, "error: --trap-port must be 1-65535, got %d\n", *trapPort)
 			return 1
 		}
-		listener, err := startTrapListener(uint16(*trapPort), *trapCommunity)
+		listener, err := startTrapListener(*trapBind, uint16(*trapPort), *trapCommunity)
 		if err != nil {
 			slog.Error("trap listener", "error", err)
 			return 1
@@ -139,7 +134,7 @@ func toWebSocketURL(rawURL string, insecure bool) (string, error) {
 		case "https", "wss":
 			result = "wss://" + remainder
 		default:
-			result = "wss://" + rawURL
+			return "", fmt.Errorf("unsupported URL scheme %q", scheme)
 		}
 	}
 
@@ -178,29 +173,66 @@ func sanitizeURL(rawURL string) string {
 	return u.String()
 }
 
-func envOrDefault(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+// resolveLogLevel maps a level name to its slog level, reporting whether the
+// name was recognised so the caller can warn instead of silently using info.
+func resolveLogLevel(value string) (slog.Level, bool) {
+	switch strings.ToLower(value) {
+	case "debug":
+		return slog.LevelDebug, true
+	case "info":
+		return slog.LevelInfo, true
+	case "warn", "warning":
+		return slog.LevelWarn, true
+	case "error":
+		return slog.LevelError, true
+	default:
+		return slog.LevelInfo, false
+	}
+}
+
+// envFirst returns the first non-empty environment value in priority order.
+func envFirst(keys ...string) string {
+	for _, key := range keys {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func envOrDefault(fallback string, keys ...string) string {
+	if value := envFirst(keys...); value != "" {
+		return value
 	}
 	return fallback
 }
 
-// envBool reads a boolean environment variable, ignoring unparseable values.
-func envBool(key string, fallback bool) bool {
-	v, err := strconv.ParseBool(envOrDefault(key, strconv.FormatBool(fallback)))
-	if err != nil {
-		slog.Warn("ignoring unparseable environment variable", "key", key)
+// envBool reads the first set boolean environment variable, ignoring
+// unparseable values.
+func envBool(fallback bool, keys ...string) bool {
+	value := envFirst(keys...)
+	if value == "" {
 		return fallback
 	}
-	return v
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		slog.Warn("ignoring unparseable environment variable", "keys", strings.Join(keys, ","))
+		return fallback
+	}
+	return parsed
 }
 
-// envUint reads an unsigned environment variable, ignoring unparseable values.
-func envUint(key string, fallback uint) uint {
-	v, err := strconv.ParseUint(envOrDefault(key, strconv.FormatUint(uint64(fallback), 10)), 10, 32)
-	if err != nil {
-		slog.Warn("ignoring unparseable environment variable", "key", key)
+// envUint reads the first set unsigned environment variable, ignoring
+// unparseable values.
+func envUint(fallback uint, keys ...string) uint {
+	value := envFirst(keys...)
+	if value == "" {
 		return fallback
 	}
-	return uint(v)
+	parsed, err := strconv.ParseUint(value, 10, 32)
+	if err != nil {
+		slog.Warn("ignoring unparseable environment variable", "keys", strings.Join(keys, ","))
+		return fallback
+	}
+	return uint(parsed)
 }

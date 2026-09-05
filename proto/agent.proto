@@ -258,6 +258,10 @@ message AgentHeartbeat {
   uint64 uptime_seconds = 3;
   string ip_address = 4;
   string arch = 5;
+  // True when the agent runs inside a container image, where replacing the
+  // binary in place is impossible. The server must not push a self-update to
+  // these agents; they update by pulling a new image.
+  bool container = 6;
 }
 
 message AgentError {
@@ -319,6 +323,10 @@ message LldpNeighbor {
   string remote_port = 3;
   string remote_port_id = 4;
   repeated string management_addresses = 5;
+  // Chassis ID of the neighbour, hex-formatted for MAC-address subtypes. The
+  // remote table is keyed on this rather than on the system name, which many
+  // devices never advertise.
+  string remote_chassis_id = 6;
 }
 
 // SNMP traps received by an agent's trap listener.

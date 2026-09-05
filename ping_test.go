@@ -5,11 +5,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -96,9 +98,19 @@ func TestIcmpPingInvalidIP(t *testing.T) {
 }
 
 func TestErrICMPUnavailableError(t *testing.T) {
-	err := &errICMPUnavailable{err: fmt.Errorf("permission denied")}
+	cause := errors.New("permission denied")
+	err := &errICMPUnavailable{err: cause}
 	if err.Error() != "permission denied" {
 		t.Errorf("got %q, want %q", err.Error(), "permission denied")
+	}
+
+	wrapped := fmt.Errorf("open socket: %w", err)
+	var unavailable *errICMPUnavailable
+	if !errors.As(wrapped, &unavailable) {
+		t.Errorf("errors.As(%v) did not find *errICMPUnavailable", wrapped)
+	}
+	if !errors.Is(wrapped, cause) {
+		t.Errorf("errors.Is(%v, %v) = false, want true", wrapped, cause)
 	}
 }
 
@@ -403,6 +415,7 @@ type tpTFakeICMPConn struct {
 	request     []byte
 	replies     []func(req []byte) []byte
 	consumed    int
+	peers       []net.Addr
 	readErr     error
 	writeErr    error
 	deadlineErr error
@@ -444,9 +457,13 @@ func (c *tpTFakeICMPConn) ReadFrom(b []byte) (int, net.Addr, error) {
 		}
 		return 0, nil, fmt.Errorf("tpT: no scripted reply #%d", c.consumed+1)
 	}
-	pkt := c.replies[c.consumed](c.request)
+	replyIndex := c.consumed
+	pkt := c.replies[replyIndex](c.request)
 	c.consumed++
 	n := copy(b, pkt)
+	if replyIndex < len(c.peers) {
+		return n, c.peers[replyIndex], nil
+	}
 	return n, &net.IPAddr{IP: net.IPv4(127, 0, 0, 1)}, nil
 }
 
@@ -622,8 +639,134 @@ func TestTpTDoICMPPingSkipsUnusableReplies(t *testing.T) {
 	}
 }
 
+func TestTpTDoICMPPingRejectsReplyFromWrongPeer(t *testing.T) {
+	readFailure := errors.New("scripted read failure")
+	target := net.ParseIP("127.0.0.1")
+	tests := []struct {
+		name     string
+		peers    []net.Addr
+		replies  int
+		wantRead int
+		wantErr  bool
+	}{
+		{
+			name: "skips wrong host before genuine reply",
+			peers: []net.Addr{
+				&net.IPAddr{IP: net.ParseIP("192.0.2.10")},
+				&net.UDPAddr{IP: target},
+			},
+			replies:  2,
+			wantRead: 2,
+		},
+		{
+			name: "wrong host alone cannot satisfy ping",
+			peers: []net.Addr{
+				&net.IPAddr{IP: net.ParseIP("192.0.2.10")},
+			},
+			replies:  1,
+			wantRead: 1,
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			replies := make([]func(req []byte) []byte, tt.replies)
+			for i := range replies {
+				replies[i] = tpTEchoReplyFor(t, true, 0, 0)
+			}
+			conn := tpTNewFakeICMPConn(replies...)
+			conn.peers = tt.peers
+			conn.readErr = readFailure
+			tpTUseFakeICMPConn(t, conn)
+
+			ms, err := doICMPPing(context.Background(), target, "ip4:icmp", true, 1000)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("doICMPPing accepted a reply from the wrong host")
+				}
+				if !errors.Is(err, readFailure) {
+					t.Errorf("error = %v, want wrapped %v", err, readFailure)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("doICMPPing: %v", err)
+				}
+				if ms < 0 {
+					t.Errorf("round-trip = %v ms, want >= 0 from the genuine reply", ms)
+				}
+			}
+			if got := conn.readsConsumed(); got != tt.wantRead {
+				t.Errorf("consumed %d replies, want %d", got, tt.wantRead)
+			}
+		})
+	}
+}
+
+func TestTpTDoICMPPingUsesDistinctSequences(t *testing.T) {
+	originalSeq := pingSeq.Load()
+	t.Cleanup(func() { pingSeq.Store(originalSeq) })
+	pingSeq.Store(100)
+
+	conns := []*tpTFakeICMPConn{
+		tpTNewFakeICMPConn(tpTEchoReplyFor(t, true, 0, 0)),
+		tpTNewFakeICMPConn(tpTEchoReplyFor(t, true, 0, 0)),
+	}
+	origListen := icmpListenPacket
+	t.Cleanup(func() { icmpListenPacket = origListen })
+	var nextConn atomic.Uint32
+	icmpListenPacket = func(string, string) (icmpConn, error) {
+		index := nextConn.Add(1) - 1
+		return conns[index], nil
+	}
+
+	origMarshal := icmpMarshal
+	t.Cleanup(func() { icmpMarshal = origMarshal })
+	var sequencesMu sync.Mutex
+	var sequences []int
+	icmpMarshal = func(m *icmp.Message) ([]byte, error) {
+		echo, ok := m.Body.(*icmp.Echo)
+		if !ok {
+			return nil, fmt.Errorf("marshalled body = %T, want *icmp.Echo", m.Body)
+		}
+		sequencesMu.Lock()
+		sequences = append(sequences, echo.Seq)
+		sequencesMu.Unlock()
+		return m.Marshal(nil)
+	}
+
+	target := net.ParseIP("127.0.0.1")
+	results := make(chan error, len(conns))
+	for range conns {
+		go func() {
+			_, err := doICMPPing(context.Background(), target, "ip4:icmp", true, 1000)
+			results <- err
+		}()
+	}
+	var pingErrors []error
+	for range conns {
+		if err := <-results; err != nil {
+			pingErrors = append(pingErrors, err)
+		}
+	}
+	if len(pingErrors) != 0 {
+		t.Fatalf("doICMPPing errors: %v", pingErrors)
+	}
+
+	sequencesMu.Lock()
+	defer sequencesMu.Unlock()
+	if len(sequences) != 2 {
+		t.Fatalf("observed %d sequences, want 2", len(sequences))
+	}
+	slices.Sort(sequences)
+	if sequences[0] != 101 || sequences[1] != 102 {
+		t.Errorf("sequences = %v, want counter values 101 and 102", sequences)
+	}
+}
+
 func TestTpTDoICMPPingIPv6ScriptedReply(t *testing.T) {
 	conn := tpTNewFakeICMPConn(tpTEchoReplyFor(t, false, 0, 0))
+	conn.peers = []net.Addr{&net.IPAddr{IP: net.ParseIP("::1")}}
 	networks := tpTUseFakeICMPConn(t, conn)
 
 	ms, err := doICMPPing(context.Background(), net.ParseIP("::1"), "ip6:ipv6-icmp", false, 1000)
