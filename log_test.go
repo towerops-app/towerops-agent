@@ -191,6 +191,40 @@ func TestColorHandlerWithGroupNested(t *testing.T) {
 	}
 }
 
+func TestColorHandlerGroupValueUnderHandlerGroup(t *testing.T) {
+	var buf bytes.Buffer
+	h := newColorHandler(&buf, slog.LevelDebug)
+
+	h2 := h.WithGroup("outer")
+
+	r := slog.NewRecord(time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC), slog.LevelInfo, "msg", 0)
+	r.AddAttrs(slog.Group("inner", slog.String("k", "v")))
+	if err := h2.Handle(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "outer.inner.k=v") {
+		t.Errorf("Handle() wrote %q, want it to contain %q", output, "outer.inner.k=v")
+	}
+}
+
+func TestColorHandlerGroupValueSeparatesMembers(t *testing.T) {
+	var buf bytes.Buffer
+	h := newColorHandler(&buf, slog.LevelDebug)
+
+	r := slog.NewRecord(time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC), slog.LevelInfo, "msg", 0)
+	r.AddAttrs(slog.Group("g", slog.String("a", "one"), slog.String("b", "two")))
+	if err := h.Handle(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, " g.a=one g.b=two\n") {
+		t.Errorf("Handle() wrote %q, want it to contain %q", output, " g.a=one g.b=two\n")
+	}
+}
+
 func TestNewLogHandlerJSON(t *testing.T) {
 	var buf bytes.Buffer
 	h := newLogHandler(&buf, slog.LevelInfo, "json")

@@ -297,6 +297,53 @@ func TestNewSnmpConnRejectsPortOverflow(t *testing.T) {
 	}
 }
 
+// TestNewSnmpConnRejectsUnsupportedV3Protocols pins that an authPriv device
+// with an unknown auth or privacy protocol is rejected before any socket is
+// opened, and that the returned error names the offending protocol.
+func TestNewSnmpConnRejectsUnsupportedV3Protocols(t *testing.T) {
+	tests := []struct {
+		name    string
+		dev     *pb.SnmpDevice
+		wantErr string
+	}{
+		{
+			name: "authPriv unsupported auth protocol",
+			dev: &pb.SnmpDevice{
+				Ip: "127.0.0.1", Version: "v3",
+				V3Username: "user", V3SecurityLevel: "authPriv",
+				V3AuthProtocol: "SHA-3", V3AuthPassword: "pass1234",
+				V3PrivProtocol: "AES-256", V3PrivPassword: "priv1234",
+			},
+			wantErr: `unsupported SNMPv3 auth protocol "SHA-3"`,
+		},
+		{
+			name: "authPriv unsupported privacy protocol",
+			dev: &pb.SnmpDevice{
+				Ip: "127.0.0.1", Version: "v3",
+				V3Username: "user", V3SecurityLevel: "authPriv",
+				V3AuthProtocol: "SHA-256", V3AuthPassword: "pass1234",
+				V3PrivProtocol: "3DES", V3PrivPassword: "priv1234",
+			},
+			wantErr: `unsupported SNMPv3 privacy protocol "3DES"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conn, err := newSnmpConn(context.Background(), tt.dev)
+			if err == nil {
+				_ = conn.Conn.Close()
+				t.Fatalf("newSnmpConn error = nil, want %s", tt.wantErr)
+			}
+			if err.Error() != tt.wantErr {
+				t.Errorf("newSnmpConn error = %q, want %q", err.Error(), tt.wantErr)
+			}
+			if conn != nil {
+				t.Errorf("newSnmpConn conn = %v, want nil on error", conn)
+			}
+		})
+	}
+}
+
 // snwTFreeUDPPort binds an ephemeral UDP socket on loopback and keeps it open
 // for the duration of the test, so the returned port is stable and cannot be
 // re-bound by a concurrently running test.
@@ -906,6 +953,38 @@ func TestExecuteSnmpJobSplitsErrorStatusBatches(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSnmpGetIntoUnhandledErrorStatus pins the default arm of the error-status
+// switch: an error status other than noSuchName/tooBig (here genErr) discards
+// the whole batch — no varbind from the failed response is recorded — and the
+// batch is NOT halved and retried the way noSuchName/tooBig are.
+func TestSnmpGetIntoUnhandledErrorStatus(t *testing.T) {
+	oids := []string{".1.3.6.1.2.1.1.1.0", ".1.3.6.1.2.1.1.3.0"}
+	var batches [][]string
+	mock := &mockSnmpQuerier{
+		getFunc: func(batch []string) (*gosnmp.SnmpPacket, error) {
+			batches = append(batches, append([]string(nil), batch...))
+			vars := make([]gosnmp.SnmpPDU, len(batch))
+			for i, oid := range batch {
+				vars[i] = gosnmp.SnmpPDU{Name: oid, Type: gosnmp.OctetString, Value: []byte("stale")}
+			}
+			return &gosnmp.SnmpPacket{Error: gosnmp.GenErr, ErrorIndex: 1, Variables: vars}, nil
+		},
+	}
+
+	into := map[string]string{}
+	snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, oids, into)
+
+	if len(into) != 0 {
+		t.Errorf("into = %v, want empty on genErr response", into)
+	}
+	if len(batches) != 1 {
+		t.Fatalf("Get called %d times (%v), want 1 — genErr must not split the batch", len(batches), batches)
+	}
+	if got := strings.Join(batches[0], ","); got != strings.Join(oids, ",") {
+		t.Errorf("batch = %q, want %q", got, strings.Join(oids, ","))
 	}
 }
 

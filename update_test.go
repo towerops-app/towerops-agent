@@ -600,6 +600,81 @@ func TestSelfUpdateResponseHeaderTimeout(t *testing.T) {
 	}
 }
 
+// tpTTrackingBody records that the caller closed the response body.
+type tpTTrackingBody struct {
+	io.Reader
+	closed chan struct{}
+}
+
+func (b *tpTTrackingBody) Close() error {
+	close(b.closed)
+	return nil
+}
+
+func TestSelfUpdateHeaderTimeoutClosesLateResponseBody(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	origDo := httpDo
+	origTimeout := selfUpdateTimeout
+	origCreate := osCreateTemp
+	t.Cleanup(func() {
+		httpDo = origDo
+		selfUpdateTimeout = origTimeout
+		osCreateTemp = origCreate
+	})
+
+	body := &tpTTrackingBody{Reader: strings.NewReader("late payload"), closed: make(chan struct{})}
+	httpDo = func(req *http.Request) (*http.Response, error) {
+		// Return only after the header watchdog has already fired, so the
+		// response arrives too late to be used but still owns a live body.
+		<-req.Context().Done()
+		return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+	}
+	selfUpdateTimeout = 10 * time.Millisecond
+	osCreateTemp = func(string, string) (updateTempFile, error) {
+		t.Error("osCreateTemp called after the header timeout")
+		return nil, errors.New("unexpected temp file")
+	}
+
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context.DeadlineExceeded", err)
+	}
+	select {
+	case <-body.closed:
+	default:
+		t.Error("late response body was not closed")
+	}
+}
+
+func TestSelfUpdateDownloadErrorReportsCancellationCause(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	origDo := httpDo
+	origCreate := osCreateTemp
+	t.Cleanup(func() {
+		httpDo = origDo
+		osCreateTemp = origCreate
+	})
+
+	cause := errors.New("caller shut down the agent")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(cause)
+
+	transportErr := errors.New("transport gave up")
+	httpDo = func(*http.Request) (*http.Response, error) { return nil, transportErr }
+	osCreateTemp = func(string, string) (updateTempFile, error) {
+		t.Error("osCreateTemp called after a failed download")
+		return nil, errors.New("unexpected temp file")
+	}
+
+	err := selfUpdateContext(ctx, "https://example.com/agent", strings.Repeat("0", 64))
+	if !errors.Is(err, cause) {
+		t.Fatalf("got %v, want cancellation cause %v", err, cause)
+	}
+	if errors.Is(err, transportErr) {
+		t.Errorf("got %v, want the cancellation cause instead of the transport error", err)
+	}
+}
+
 func TestSelfUpdateSlowProgressingDownloadCompletes(t *testing.T) {
 	forceBareBinaryUpdate(t)
 	body := []byte("slow but steadily progressing update")

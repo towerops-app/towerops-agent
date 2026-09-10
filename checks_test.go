@@ -479,7 +479,10 @@ func TestHTTPCheck_InvalidRegex(t *testing.T) {
 	}
 }
 
-func TestHTTPRegexCache_ReusesCompiledPattern(t *testing.T) {
+// chkTResetHTTPRegexCache installs an empty HTTP regex cache for one test and
+// restores the process-wide cache afterwards.
+func chkTResetHTTPRegexCache(t *testing.T) {
+	t.Helper()
 	httpRegexCacheMu.Lock()
 	originalCache := httpRegexCache
 	originalOrder := httpRegexCacheOrder
@@ -492,6 +495,10 @@ func TestHTTPRegexCache_ReusesCompiledPattern(t *testing.T) {
 		httpRegexCacheOrder = originalOrder
 		httpRegexCacheMu.Unlock()
 	})
+}
+
+func TestHTTPRegexCache_ReusesCompiledPattern(t *testing.T) {
+	chkTResetHTTPRegexCache(t)
 
 	first, err := cachedHTTPRegex(`Version \d+`)
 	if err != nil {
@@ -2346,5 +2353,194 @@ func TestPropChkCheckTimeout(t *testing.T) {
 
 	if got := checkTimeout(0); got != 10*time.Second {
 		t.Fatalf("checkTimeout(0) = %v, want 10s", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// chkT: regex cache eviction and certificate chain building
+// ---------------------------------------------------------------------------
+
+func TestChkTHTTPRegexCacheEvictsOldestPattern(t *testing.T) {
+	chkTResetHTTPRegexCache(t)
+
+	oldest, err := cachedHTTPRegex(`chkT-pattern-0`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fill the rest of the capacity so `oldest` is the head of the FIFO.
+	var newest *regexp.Regexp
+	for i := 1; i < maxHTTPRegexCacheEntries; i++ {
+		newest, err = cachedHTTPRegex(fmt.Sprintf(`chkT-pattern-%d`, i))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// At capacity nothing has been dropped yet.
+	atCapacity, err := cachedHTTPRegex(`chkT-pattern-0`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if atCapacity != oldest {
+		t.Fatalf("got a fresh regex %p at capacity, want the cached instance %p", atCapacity, oldest)
+	}
+
+	// One pattern beyond capacity evicts the oldest entry.
+	if _, err := cachedHTTPRegex(`chkT-pattern-overflow`); err != nil {
+		t.Fatal(err)
+	}
+
+	recompiled, err := cachedHTTPRegex(`chkT-pattern-0`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recompiled == oldest {
+		t.Fatalf("got the pre-eviction instance %p, want a recompiled regex", recompiled)
+	}
+	if !recompiled.MatchString("chkT-pattern-0") {
+		t.Fatal("recompiled regex does not match its own pattern")
+	}
+
+	// Eviction is FIFO: the newest survivor is still served from the cache.
+	survivor, err := cachedHTTPRegex(fmt.Sprintf(`chkT-pattern-%d`, maxHTTPRegexCacheEntries-1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if survivor != newest {
+		t.Fatalf("got a fresh regex %p for the newest pattern, want the cached instance %p", survivor, newest)
+	}
+}
+
+// chkTChainedCert builds a root CA, an intermediate CA signed by that root, and
+// a loopback leaf signed by the intermediate. The returned tls.Certificate
+// presents leaf+intermediate, so the chain only verifies against the returned
+// root when the verifier collects the presented intermediate.
+func chkTChainedCert(t *testing.T, notAfter time.Time) (tls.Certificate, *x509.Certificate) {
+	t.Helper()
+
+	newKey := func() *ecdsa.PrivateKey {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return key
+	}
+	issue := func(tmpl, parent *x509.Certificate, pub *ecdsa.PublicKey, signer *ecdsa.PrivateKey) ([]byte, *x509.Certificate) {
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, pub, signer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return der, cert
+	}
+
+	notBefore := time.Now().Add(-time.Hour)
+	caTemplate := func(serial int64, cn string) *x509.Certificate {
+		return &x509.Certificate{
+			SerialNumber:          big.NewInt(serial),
+			Subject:               pkix.Name{CommonName: cn},
+			NotBefore:             notBefore,
+			NotAfter:              notAfter.Add(24 * time.Hour),
+			KeyUsage:              x509.KeyUsageCertSign,
+			BasicConstraintsValid: true,
+			IsCA:                  true,
+		}
+	}
+
+	rootKey := newKey()
+	rootTmpl := caTemplate(20260910, "chkT root CA")
+	_, root := issue(rootTmpl, rootTmpl, &rootKey.PublicKey, rootKey)
+
+	interKey := newKey()
+	interDER, inter := issue(caTemplate(20260911, "chkT intermediate CA"), root, &interKey.PublicKey, rootKey)
+
+	leafKey := newKey()
+	leafDER, leaf := issue(&x509.Certificate{
+		SerialNumber:          big.NewInt(20260912),
+		Subject:               pkix.Name{CommonName: "chkT chained leaf"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}, inter, &leafKey.PublicKey, interKey)
+
+	return tls.Certificate{
+		Certificate: [][]byte{leafDER, interDER},
+		PrivateKey:  leafKey,
+		Leaf:        leaf,
+	}, root
+}
+
+func TestChkTSSLCheckUsesPresentedIntermediates(t *testing.T) {
+	notAfter := time.Now().Add(200 * 24 * time.Hour)
+	chain, root := chkTChainedCert(t, notAfter)
+	withTestSSLRootCA(t, root)
+
+	leafOnly := tls.Certificate{
+		Certificate: chain.Certificate[:1],
+		PrivateKey:  chain.PrivateKey,
+		Leaf:        chain.Leaf,
+	}
+
+	tests := []struct {
+		name       string
+		presented  tls.Certificate
+		wantStatus uint32
+		wantOutput string // %d is the loopback server port
+	}{
+		{
+			name:       "leaf with intermediate",
+			presented:  chain,
+			wantStatus: 0,
+			wantOutput: "OK: Certificate for 127.0.0.1:%d valid for ",
+		},
+		{
+			name:       "leaf without intermediate",
+			presented:  leafOnly,
+			wantStatus: 2,
+			wantOutput: "CRITICAL: Certificate for 127.0.0.1:%d is not trusted:",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			srv.TLS = &tls.Config{
+				MinVersion:   tls.VersionTLS12,
+				Certificates: []tls.Certificate{tc.presented},
+			}
+			srv.StartTLS()
+			defer srv.Close()
+
+			_, portStr, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			port := parsePort(portStr)
+
+			status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+				Host:        "127.0.0.1",
+				Port:        port,
+				WarningDays: 30,
+			}, 5000)
+
+			if status != tc.wantStatus {
+				t.Fatalf("got status %d, want %d: %s", status, tc.wantStatus, output)
+			}
+			want := fmt.Sprintf(tc.wantOutput, port)
+			if !strings.Contains(output, want) {
+				t.Fatalf("got output %q, want it to contain %q", output, want)
+			}
+			if tc.wantStatus == 0 && !strings.Contains(output, notAfter.Format("2006-01-02")) {
+				t.Fatalf("got output %q, want the expiry date %s", output, notAfter.Format("2006-01-02"))
+			}
+		})
 	}
 }

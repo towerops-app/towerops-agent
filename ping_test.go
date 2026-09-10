@@ -957,3 +957,42 @@ func TestPropTpParsePingTimeRoundtrip(t *testing.T) {
 		}
 	})
 }
+
+// tpTOpaqueAddr is a net.Addr implementation peerIP does not recognise.
+type tpTOpaqueAddr struct{}
+
+func (tpTOpaqueAddr) Network() string { return "opaque" }
+func (tpTOpaqueAddr) String() string  { return "opaque-addr" }
+
+func TestTpTPeerIPMapsAddrKinds(t *testing.T) {
+	tests := []struct {
+		name string
+		addr net.Addr
+		want net.IP
+	}{
+		{name: "ip addr v4", addr: &net.IPAddr{IP: net.ParseIP("192.0.2.5")}, want: net.ParseIP("192.0.2.5")},
+		{name: "ip addr v6", addr: &net.IPAddr{IP: net.ParseIP("2001:db8::1")}, want: net.ParseIP("2001:db8::1")},
+		{name: "udp addr", addr: &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 33434}, want: net.ParseIP("198.51.100.7")},
+		{name: "nil ip addr pointer", addr: (*net.IPAddr)(nil), want: nil},
+		{name: "nil udp addr pointer", addr: (*net.UDPAddr)(nil), want: nil},
+		{name: "tcp addr is unrecognised", addr: &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 80}, want: nil},
+		{name: "unix addr is unrecognised", addr: &net.UnixAddr{Name: "/tmp/sock", Net: "unix"}, want: nil},
+		{name: "custom addr is unrecognised", addr: tpTOpaqueAddr{}, want: nil},
+		{name: "nil addr", addr: nil, want: nil},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := peerIP(tc.addr)
+			if tc.want == nil {
+				if got != nil {
+					t.Fatalf("peerIP(%v) = %v, want nil", tc.addr, got)
+				}
+				return
+			}
+			if !got.Equal(tc.want) {
+				t.Fatalf("peerIP(%v) = %v, want %v", tc.addr, got, tc.want)
+			}
+		})
+	}
+}

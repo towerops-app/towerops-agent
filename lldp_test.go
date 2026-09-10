@@ -23,6 +23,12 @@ func lldpTPdu(name, value string) gosnmp.SnmpPDU {
 	return gosnmp.SnmpPDU{Name: name, Type: gosnmp.OctetString, Value: []byte(value)}
 }
 
+// lldpTUnusablePdu builds a PDU carrying an SNMP sentinel type, which
+// snmpValueUsable rejects.
+func lldpTUnusablePdu(name string) gosnmp.SnmpPDU {
+	return gosnmp.SnmpPDU{Name: name, Type: gosnmp.NoSuchInstance}
+}
+
 // lldpTPacket wraps variables in an SNMP packet for mockSnmpQuerier.getFunc.
 func lldpTPacket(pdus ...gosnmp.SnmpPDU) *gosnmp.SnmpPacket {
 	return &gosnmp.SnmpPacket{Variables: pdus}
@@ -147,6 +153,13 @@ func TestLldpTParseMgmtAddr(t *testing.T) {
 			wantKey: "0.5.1",
 		},
 		{
+			// addrLen agrees with the octet count, so the length check passes,
+			// but five octets cannot be an IPv4 address.
+			name:    "ipv4 subtype with five octets",
+			oid:     lldpTMgmtOid(true, "0.5.1", "1", 5, []int{10, 0, 0, 7, 1}),
+			wantKey: "0.5.1",
+		},
+		{
 			name:    "non-numeric address length",
 			oid:     "." + oidRemManAddr + ".0.5.1.1.xx.10.0.0.7",
 			wantKey: "0.5.1",
@@ -167,6 +180,12 @@ func TestLldpTParseMgmtAddr(t *testing.T) {
 			name: "ipv6 address length mismatch",
 			oid: lldpTMgmtOid(true, "0.5.1", "2", 4,
 				[]int{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}),
+			wantKey: "0.5.1",
+		},
+		{
+			// Consistent index, wrong family: four octets cannot be IPv6.
+			name:    "ipv6 subtype with four octets",
+			oid:     lldpTMgmtOid(true, "0.5.1", "2", 4, []int{32, 1, 13, 184}),
 			wantKey: "0.5.1",
 		},
 		{
@@ -380,6 +399,70 @@ func TestLldpTDiscoverNeighborsWalkErrors(t *testing.T) {
 		}
 		if got := result.Neighbors[0].ManagementAddresses; len(got) != 0 {
 			t.Fatalf("ManagementAddresses = %v, want empty", got)
+		}
+	})
+
+	t.Run("remote chassis id walk error yields no neighbors", func(t *testing.T) {
+		m := &mockSnmpQuerier{
+			getFunc:      lldpTSysNameOK("switch-a"),
+			walkStepFunc: lldpTWalk(fullTable),
+			walkErrs:     map[string]error{oidRemChassisId: errors.New("chassis boom")},
+		}
+		result := discoverLldpNeighbors(m, "dev", "job", false)
+		// Chassis IDs key the neighbor loop, so losing that table loses every
+		// neighbor even though the other tables answered.
+		if len(result.Neighbors) != 0 {
+			t.Fatalf("Neighbors = %v, want empty", result.Neighbors)
+		}
+		if result.LocalSystemName != "switch-a" {
+			t.Fatalf("LocalSystemName = %q, want %q", result.LocalSystemName, "switch-a")
+		}
+	})
+}
+
+// Rows carrying SNMP sentinel types (noSuchInstance and friends) are not real
+// values; discovery must drop them instead of stringifying the sentinel.
+func TestLldpTDiscoverNeighborsSkipsUnusableRows(t *testing.T) {
+	t.Run("unusable chassis row", func(t *testing.T) {
+		m := &mockSnmpQuerier{
+			getFunc: lldpTSysNameOK("switch-a"),
+			walkStepFunc: lldpTWalk(map[string][]gosnmp.SnmpPDU{
+				oidRemChassisId: {
+					lldpTPdu("."+oidRemChassisId+".0.5.1", "chassis-a"),
+					lldpTUnusablePdu("." + oidRemChassisId + ".0.9.1"),
+				},
+			}),
+		}
+		result := discoverLldpNeighbors(m, "dev", "job", false)
+		if len(result.Neighbors) != 1 {
+			t.Fatalf("Neighbors = %v, want only the usable chassis row", result.Neighbors)
+		}
+		if got := result.Neighbors[0].RemoteChassisId; got != "chassis-a" {
+			t.Fatalf("RemoteChassisId = %q, want %q", got, "chassis-a")
+		}
+		if got := result.Neighbors[0].LocalPort; got != "port-5" {
+			t.Fatalf("LocalPort = %q, want %q", got, "port-5")
+		}
+	})
+
+	t.Run("unusable management address row", func(t *testing.T) {
+		m := &mockSnmpQuerier{
+			getFunc: lldpTSysNameOK("switch-a"),
+			walkStepFunc: lldpTWalk(map[string][]gosnmp.SnmpPDU{
+				oidRemChassisId: {lldpTPdu("."+oidRemChassisId+".0.5.1", "chassis-a")},
+				oidRemManAddr: {
+					lldpTUnusablePdu(lldpTMgmtOid(true, "0.5.1", "1", 4, []int{10, 9, 9, 9})),
+					lldpTPdu(lldpTMgmtOid(true, "0.5.1", "1", 4, []int{10, 1, 2, 3}), ""),
+				},
+			}),
+		}
+		result := discoverLldpNeighbors(m, "dev", "job", false)
+		if len(result.Neighbors) != 1 {
+			t.Fatalf("Neighbors = %v, want one", result.Neighbors)
+		}
+		got := result.Neighbors[0].ManagementAddresses
+		if !slices.Equal(got, []string{"10.1.2.3"}) {
+			t.Fatalf("ManagementAddresses = %v, want [10.1.2.3]", got)
 		}
 	})
 }
