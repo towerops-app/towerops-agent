@@ -799,6 +799,38 @@ func TestSessionErrWithoutPublishedError(t *testing.T) {
 	}
 }
 
+// The write-failure arm of the loop select. In production `fail` publishes the
+// error before cancelling, so the cancellation arm and this one are ready
+// together and Go picks between them at random — coverage of the write arm was
+// a coin flip on whichever integration test closed the connection. Both arms
+// return the same "write: ..." error by design, so the behaviour is pinned here
+// with the session context left alive: that makes this arm the only ready case,
+// and every iteration must surface the published write failure.
+func TestSessionLoopReportsWriteFailureWhileContextAlive(t *testing.T) {
+	for run := range 20 {
+		sessionCtx, cancel := context.WithCancel(context.Background())
+		s := &session{
+			ctx:        sessionCtx,
+			cancel:     cancel,
+			writeCh:    make(chan []byte, 1),
+			errCh:      make(chan error, 1),
+			writeErrCh: make(chan error, 1),
+		}
+		// Exactly what the writer does when the connection fails.
+		s.fail(s.writeErrCh, errors.New("broken pipe"))
+
+		err := s.loop(context.Background())
+		cancel()
+
+		if err == nil {
+			t.Fatalf("run %d: loop returned nil, want the write error", run)
+		}
+		if !strings.HasPrefix(err.Error(), "write:") || !strings.Contains(err.Error(), "broken pipe") {
+			t.Fatalf("run %d: loop error = %v, want it to name the write failure", run, err)
+		}
+	}
+}
+
 func TestNewAgentIDIsUnique(t *testing.T) {
 	seen := make(map[string]struct{}, 1000)
 	for range 1000 {
@@ -2613,6 +2645,109 @@ func TestEnqueueWriteFullQueueDoesNotCancelSession(t *testing.T) {
 	}
 	if !logs.has("write channel full, dropping message event=result") {
 		t.Fatalf("expected a write queue timeout log, got:\n%s", logs.dump())
+	}
+}
+
+// agtStagedCtx drives enqueueWrite's two-stage select deterministically. The
+// select statement evaluates ctx.Done() once per stage, so done(1) governs the
+// non-blocking first attempt and done(2) the timed second attempt.
+type agtStagedCtx struct {
+	context.Context
+	stage int
+	done  func(stage int) <-chan struct{}
+}
+
+func (c *agtStagedCtx) Done() <-chan struct{} {
+	c.stage++
+	return c.done(c.stage)
+}
+
+func agtNeverDone() <-chan struct{} { return make(chan struct{}) }
+
+func agtAlreadyDone() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+func TestEnqueueWriteCancelledSessionRefusesImmediately(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	origTimeout := writeQueueTimeout
+	t.Cleanup(func() { writeQueueTimeout = origTimeout })
+	writeQueueTimeout = time.Minute
+
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	sessionCancel()
+	writeCh := make(chan []byte, 1)
+	queued := []byte("already queued")
+	writeCh <- queued
+
+	if enqueueWrite(sessionCtx, writeCh, []byte("too late"), "result") {
+		t.Fatal("enqueueWrite accepted a message on a cancelled session")
+	}
+	if got := <-writeCh; string(got) != string(queued) {
+		t.Fatalf("queued message = %q, want original %q", got, queued)
+	}
+	if logs.has("write channel full, dropping message") {
+		t.Fatalf("cancelled session logged a queue-full drop, got:\n%s", logs.dump())
+	}
+}
+
+func TestEnqueueWriteAcceptedAfterQueueDrains(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	origTimeout := writeQueueTimeout
+	t.Cleanup(func() { writeQueueTimeout = origTimeout })
+	writeQueueTimeout = time.Minute
+
+	writeCh := make(chan []byte, 1)
+	writeCh <- []byte("already queued")
+	ctx := &agtStagedCtx{Context: context.Background()}
+	ctx.done = func(stage int) <-chan struct{} {
+		if stage == 2 {
+			// The writer drains the queue between the two attempts.
+			<-writeCh
+		}
+		return agtNeverDone()
+	}
+
+	data := []byte("accepted on retry")
+	if !enqueueWrite(ctx, writeCh, data, "result") {
+		t.Fatal("enqueueWrite dropped a message the drained queue could accept")
+	}
+	if got := <-writeCh; string(got) != string(data) {
+		t.Fatalf("queued message = %q, want %q", got, data)
+	}
+	if logs.has("write channel full, dropping message") {
+		t.Fatalf("accepted message logged a queue-full drop, got:\n%s", logs.dump())
+	}
+}
+
+func TestEnqueueWriteCancelledWhileWaitingForQueue(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	origTimeout := writeQueueTimeout
+	t.Cleanup(func() { writeQueueTimeout = origTimeout })
+	writeQueueTimeout = time.Minute
+
+	writeCh := make(chan []byte, 1)
+	queued := []byte("already queued")
+	writeCh <- queued
+	ctx := &agtStagedCtx{Context: context.Background()}
+	ctx.done = func(stage int) <-chan struct{} {
+		if stage == 1 {
+			return agtNeverDone()
+		}
+		// The session is cancelled while the message waits for queue space.
+		return agtAlreadyDone()
+	}
+
+	if enqueueWrite(ctx, writeCh, []byte("abandoned"), "result") {
+		t.Fatal("enqueueWrite accepted a message after the session was cancelled")
+	}
+	if got := <-writeCh; string(got) != string(queued) {
+		t.Fatalf("queued message = %q, want original %q", got, queued)
+	}
+	if logs.has("write channel full, dropping message") {
+		t.Fatalf("cancelled wait logged a queue-full drop, got:\n%s", logs.dump())
 	}
 }
 

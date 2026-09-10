@@ -113,6 +113,26 @@ func TestWSConnLocalIP(t *testing.T) {
 	}
 }
 
+func TestWSConnLocalIPUnparsableAddress(t *testing.T) {
+	tests := []struct {
+		name      string
+		localAddr string
+	}{
+		{name: "transport reported nothing", localAddr: ""},
+		{name: "address without a port", localAddr: "192.0.2.10"},
+		{name: "address with too many colons", localAddr: "::1:80"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ws := &wsConn{localAddr: tt.localAddr}
+			if got := ws.LocalIP(); got != "" {
+				t.Errorf("LocalIP() = %q, want %q", got, "")
+			}
+		})
+	}
+}
+
 func TestWSDialRejectsNonWebSocketURL(t *testing.T) {
 	if _, err := wsDial(context.Background(), "ftp://example.com/socket"); err == nil {
 		t.Fatal("wsDial accepted an ftp URL")

@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -478,6 +479,12 @@ func TestTrapListenerReceivesRealTrap(t *testing.T) {
 }
 
 func TestTrapListenerRebindsAfterUnexpectedStop(t *testing.T) {
+	// The rebind announcement comes from a goroutine that selects on the new
+	// listener's readiness and on the shutdown signal, so returning as soon as
+	// `ready` closes leaves the deferred Close racing that select — a coin flip
+	// over whether the rebind is ever announced. Synchronise on the record.
+	rebound := tpTWatchLog(t, "rebound", 1)
+
 	port := freeUDPPort(t)
 	l, err := startTrapListener("127.0.0.1", port, "public")
 	if err != nil {
@@ -503,9 +510,14 @@ func TestTrapListenerRebindsAfterUnexpectedStop(t *testing.T) {
 			if current != original {
 				select {
 				case <-ready:
-					return
 				case <-deadline:
 					t.Fatal("replacement trap listener did not start")
+				}
+				select {
+				case <-rebound:
+					return
+				case <-deadline:
+					t.Fatal("replacement trap listener never announced the rebind")
 				}
 			}
 		case <-deadline:
@@ -1033,4 +1045,92 @@ func TestPropTpTrapVersion(t *testing.T) {
 			t.Fatalf("trapVersion(%#x) = %d, want %d", uint8(v), got, want)
 		}
 	})
+}
+
+// TestTpTStartTrapListenerDefaultsBindAddress pins the normalization of an
+// empty bind address: the bare ":port" form binds dual-stack, so which family
+// the trap port ends up on would depend on the host's IPv6 configuration. The
+// bind error names the address that was attempted, which makes the substituted
+// 0.0.0.0 visible to the caller without needing a socket of our own.
+func TestTpTStartTrapListenerDefaultsBindAddress(t *testing.T) {
+	port := tpTOccupiedUDPPort(t)
+
+	l, err := startTrapListener("", port, "public")
+	if err == nil {
+		l.Close()
+		t.Fatalf("startTrapListener succeeded on occupied port %d", port)
+	}
+	if l != nil {
+		t.Errorf("listener = %v, want nil on bind failure", l)
+	}
+	want := net.JoinHostPort("0.0.0.0", strconv.Itoa(int(port)))
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to name address %q", err.Error(), want)
+	}
+}
+
+// TestTpTQueueFullDropsCoalesceUnderContention covers the losing side of the
+// rate limit's compare-and-swap: when several drops decide to warn at the same
+// instant, only one record is emitted and the rest stay silent, because one
+// line is the whole point of the rate limit.
+func TestTpTQueueFullDropsCoalesceUnderContention(t *testing.T) {
+	prevInterval := trapDropLogInterval
+	t.Cleanup(func() { trapDropLogInterval = prevInterval })
+	// A negative interval disables the rate limit outright, so every drop gets
+	// as far as the compare-and-swap. A drop that emits no record can then only
+	// be one that lost that swap to a concurrent drop.
+	trapDropLogInterval = -time.Hour
+
+	// The losing branch needs two drops in the swap window at once, which needs
+	// more than one runnable thread.
+	if prev := runtime.GOMAXPROCS(0); prev < 4 {
+		runtime.GOMAXPROCS(4)
+		t.Cleanup(func() { runtime.GOMAXPROCS(prev) })
+	}
+
+	const (
+		rounds    = 32
+		perWorker = 500
+	)
+	workers := 4 * runtime.GOMAXPROCS(0)
+	drops := workers * perWorker
+
+	for range rounds {
+		// Fires only if every single drop warned, i.e. no drop lost the swap.
+		everyDropWarned := tpTWatchLog(t, "snmp trap queue full", drops)
+
+		tl := &trapListener{
+			traps:  make(chan *pb.SnmpTrap, 1),
+			closed: make(chan struct{}),
+			done:   make(chan struct{}),
+			ready:  make(chan struct{}),
+		}
+		close(tl.done)
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				for range perWorker {
+					tl.reportDrop(tl.dropped.Add(1))
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		// Every reportDrop has returned and slog handlers run inline on the
+		// calling goroutine, so this round's records are all accounted for: the
+		// check is a plain read, never a timeout.
+		select {
+		case <-everyDropWarned:
+			// Nothing raced this round; hammer again.
+		default:
+			return
+		}
+	}
+	t.Fatalf("every one of %d concurrent drops warned in all %d rounds, want at least one drop coalesced", drops, rounds)
 }

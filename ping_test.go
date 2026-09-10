@@ -798,6 +798,26 @@ func TestTpTIcmpPingReturnsRawResult(t *testing.T) {
 	}
 }
 
+func TestTpTPingDeviceReturnsICMPResultWithoutExecFallback(t *testing.T) {
+	// pingDevice must hand back the ICMP round-trip time as soon as the ICMP
+	// socket works, and must not shell out to the system ping. Driven through
+	// the scripted connection so this path does not depend on whether the
+	// machine running the tests permits ICMP sockets at all.
+	conn := tpTNewFakeICMPConn(tpTEchoReplyFor(t, true, 0, 0))
+	networks := tpTUseFakeICMPConn(t, conn)
+
+	ms, err := pingDevice(context.Background(), "127.0.0.1", 1000)
+	if err != nil {
+		t.Fatalf("pingDevice: %v", err)
+	}
+	if ms < 0 {
+		t.Errorf("round-trip = %v ms, want >= 0", ms)
+	}
+	if len(*networks) != 1 || (*networks)[0] != "ip4:icmp" {
+		t.Errorf("listened on %v, want exactly [ip4:icmp]", *networks)
+	}
+}
+
 func TestTpTDoICMPPingMarshalError(t *testing.T) {
 	conn := tpTNewFakeICMPConn()
 	tpTUseFakeICMPConn(t, conn)
@@ -936,4 +956,43 @@ func TestPropTpParsePingTimeRoundtrip(t *testing.T) {
 			t.Fatalf("parsePingTime(%q) = %v, want an error", noTime, v)
 		}
 	})
+}
+
+// tpTOpaqueAddr is a net.Addr implementation peerIP does not recognise.
+type tpTOpaqueAddr struct{}
+
+func (tpTOpaqueAddr) Network() string { return "opaque" }
+func (tpTOpaqueAddr) String() string  { return "opaque-addr" }
+
+func TestTpTPeerIPMapsAddrKinds(t *testing.T) {
+	tests := []struct {
+		name string
+		addr net.Addr
+		want net.IP
+	}{
+		{name: "ip addr v4", addr: &net.IPAddr{IP: net.ParseIP("192.0.2.5")}, want: net.ParseIP("192.0.2.5")},
+		{name: "ip addr v6", addr: &net.IPAddr{IP: net.ParseIP("2001:db8::1")}, want: net.ParseIP("2001:db8::1")},
+		{name: "udp addr", addr: &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 33434}, want: net.ParseIP("198.51.100.7")},
+		{name: "nil ip addr pointer", addr: (*net.IPAddr)(nil), want: nil},
+		{name: "nil udp addr pointer", addr: (*net.UDPAddr)(nil), want: nil},
+		{name: "tcp addr is unrecognised", addr: &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 80}, want: nil},
+		{name: "unix addr is unrecognised", addr: &net.UnixAddr{Name: "/tmp/sock", Net: "unix"}, want: nil},
+		{name: "custom addr is unrecognised", addr: tpTOpaqueAddr{}, want: nil},
+		{name: "nil addr", addr: nil, want: nil},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := peerIP(tc.addr)
+			if tc.want == nil {
+				if got != nil {
+					t.Fatalf("peerIP(%v) = %v, want nil", tc.addr, got)
+				}
+				return
+			}
+			if !got.Equal(tc.want) {
+				t.Fatalf("peerIP(%v) = %v, want %v", tc.addr, got, tc.want)
+			}
+		})
+	}
 }

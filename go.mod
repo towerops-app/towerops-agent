@@ -5,10 +5,10 @@ go 1.27.0
 require (
 	github.com/coder/websocket v1.8.15
 	github.com/gosnmp/gosnmp v1.44.0
-	golang.org/x/crypto v0.55.0
-	golang.org/x/net v0.58.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.59.0
 	google.golang.org/protobuf v1.36.12
 	pgregory.net/rapid v1.3.0
 )
 
-require golang.org/x/sys v0.47.0 // indirect
+require golang.org/x/sys v0.48.0 // indirect
