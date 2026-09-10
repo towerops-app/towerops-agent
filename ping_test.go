@@ -798,6 +798,26 @@ func TestTpTIcmpPingReturnsRawResult(t *testing.T) {
 	}
 }
 
+func TestTpTPingDeviceReturnsICMPResultWithoutExecFallback(t *testing.T) {
+	// pingDevice must hand back the ICMP round-trip time as soon as the ICMP
+	// socket works, and must not shell out to the system ping. Driven through
+	// the scripted connection so this path does not depend on whether the
+	// machine running the tests permits ICMP sockets at all.
+	conn := tpTNewFakeICMPConn(tpTEchoReplyFor(t, true, 0, 0))
+	networks := tpTUseFakeICMPConn(t, conn)
+
+	ms, err := pingDevice(context.Background(), "127.0.0.1", 1000)
+	if err != nil {
+		t.Fatalf("pingDevice: %v", err)
+	}
+	if ms < 0 {
+		t.Errorf("round-trip = %v ms, want >= 0", ms)
+	}
+	if len(*networks) != 1 || (*networks)[0] != "ip4:icmp" {
+		t.Errorf("listened on %v, want exactly [ip4:icmp]", *networks)
+	}
+}
+
 func TestTpTDoICMPPingMarshalError(t *testing.T) {
 	conn := tpTNewFakeICMPConn()
 	tpTUseFakeICMPConn(t, conn)
