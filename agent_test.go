@@ -98,6 +98,12 @@ func testPools(t *testing.T) *jobPools {
 	return p
 }
 
+// newResultQueue supplies an active agent context to tests that do not need to
+// distinguish session cancellation from process shutdown.
+func newResultQueue(size int) *resultQueue {
+	return newResultQueueForAgent(context.Background(), size)
+}
+
 // testQueue returns a buffered result queue for tests that only need to see
 // what an executor published.
 func testQueue() *resultQueue {
@@ -1907,6 +1913,7 @@ func TestExecuteCheckPoolFull(t *testing.T) {
 		mikrotik: newWorkerPool(4),
 		ping:     newWorkerPool(4),
 		checks:   newWorkerPool(1),
+		notices:  make(chan outbound, 1),
 	}
 	t.Cleanup(func() { p.snmp.stop(); p.mikrotik.stop(); p.ping.stop(); p.checks.stop() })
 
@@ -2922,8 +2929,8 @@ func TestCompletedResultWriteDrainsAcknowledgment(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		ack := make(chan error, 1)
 		ack <- nil
-		if err, ok := completedResultWrite("result", ack); !ok || err != nil {
-			t.Fatalf("completedResultWrite = (%v, %t), want (nil, true)", err, ok)
+		if ok, err := completedResultWrite("result", ack); !ok || err != nil {
+			t.Fatalf("completedResultWrite = (%t, %v), want (true, nil)", ok, err)
 		}
 	})
 
@@ -2931,15 +2938,15 @@ func TestCompletedResultWriteDrainsAcknowledgment(t *testing.T) {
 		wantErr := errors.New("broken pipe")
 		ack := make(chan error, 1)
 		ack <- wantErr
-		err, ok := completedResultWrite("result", ack)
+		ok, err := completedResultWrite("result", ack)
 		if !ok || !errors.Is(err, wantErr) {
-			t.Fatalf("completedResultWrite = (%v, %t), want wrapped error", err, ok)
+			t.Fatalf("completedResultWrite = (%t, %v), want true with wrapped error", ok, err)
 		}
 	})
 
 	t.Run("pending", func(t *testing.T) {
-		if err, ok := completedResultWrite("result", make(chan error)); ok || err != nil {
-			t.Fatalf("completedResultWrite = (%v, %t), want (nil, false)", err, ok)
+		if ok, err := completedResultWrite("result", make(chan error)); ok || err != nil {
+			t.Fatalf("completedResultWrite = (%t, %v), want (false, nil)", ok, err)
 		}
 	})
 }
