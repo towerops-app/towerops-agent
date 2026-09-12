@@ -21,22 +21,15 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # Feature branches and pull requests share one global group, so a new push
-  # cancels every one of them still in flight rather than only the runs on its
-  # own branch. Three Dependabot PRs used to leave six runs going at once.
+  # Group by Git ref. A branch push and its pull_request event use different
+  # refs (`refs/heads/...` and `refs/pull/.../merge`), so they cannot cancel
+  # each other's Test job. New pushes to the same branch or pull request still
+  # supersede older runs for that ref.
   #
-  # Anything that publishes gets its own group and is never cancelled by
-  # unrelated work:
-  #
-  #   main  - cancel-in-progress still applies within the group, so a newer
-  #           push to main supersedes an older one. Without that, two rapid
-  #           pushes race to move the :latest tag.
-  #   v*    - never cancelled at all. A release build killed partway can leave
-  #           the per-arch images pushed but the manifest job never run, which
-  #           publishes a broken :latest.
-  group: >-
-    ci-${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-           && github.ref || 'global' }}
+  # Main and each tag also keep their own groups. Main pushes may supersede an
+  # older main build before it publishes, while tag releases are never
+  # cancelled once they start.
+  group: ci-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 env:
