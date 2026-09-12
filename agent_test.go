@@ -767,6 +767,7 @@ func TestSessionLoopReportsPublishedErrorOverCancellation(t *testing.T) {
 			msgCh:      make(chan []byte, 1),
 			errCh:      make(chan error, 1),
 			writeErrCh: make(chan error, 1),
+			results:    newResultQueue(1),
 		}
 		// Exactly what the reader does when the connection fails.
 		s.fail(s.errCh, errors.New("connection reset"))
@@ -821,6 +822,7 @@ func TestSessionLoopReportsWriteFailureWhileContextAlive(t *testing.T) {
 			writeCh:    make(chan writeRequest, 1),
 			errCh:      make(chan error, 1),
 			writeErrCh: make(chan error, 1),
+			results:    newResultQueue(1),
 		}
 		// Exactly what the writer does when the connection fails.
 		s.fail(s.writeErrCh, errors.New("broken pipe"))

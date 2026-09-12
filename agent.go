@@ -412,10 +412,6 @@ func (s *session) loop(ctx context.Context) error {
 	defer heartbeatTicker.Stop()
 	channelHeartbeatTicker := time.NewTicker(channelHeartbeatInterval)
 	defer channelHeartbeatTicker.Stop()
-	var results <-chan outbound
-	if s.results != nil {
-		results = s.results.items
-	}
 
 	for {
 		select {
@@ -443,7 +439,7 @@ func (s *session) loop(ctx context.Context) error {
 				return endErr
 			}
 
-		case result := <-results:
+		case result := <-s.results.items:
 			if err := s.sendResultMsg(result); err != nil {
 				s.results.retry(result)
 				return err

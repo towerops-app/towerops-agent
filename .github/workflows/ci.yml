@@ -74,6 +74,7 @@ jobs:
 
       - name: Test with full statement coverage
         run: |
+          # The root package is the coverage contract; pb/agent.pb.go is generated.
           go test -race -count=1 -coverprofile=coverage.out .
           go tool cover -func=coverage.out
           awk 'NR > 1 && $2 > 0 && $3 == 0 { print "uncovered:", $0; missing = 1 } END { exit missing }' coverage.out
