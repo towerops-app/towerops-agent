@@ -12,6 +12,10 @@
 // this protocol without taking on copyleft obligations. Speaking the
 // protocol should never be what makes something a derivative work of the
 // agent.
+//
+// The Towerops server's copy at priv/proto/agent.proto is canonical: this
+// file mirrors its body, everything from `syntax` down, verbatim, so the two
+// differ only in this header.
 
 syntax = "proto3";
 
@@ -137,10 +141,6 @@ message HttpCheckConfig {
   string url = 1;
   string method = 2;  // GET, POST, etc.
   uint32 expected_status = 3;
-  // Verify the server's TLS chain. The server always sets this field
-  // explicitly — true unless the operator opted out — so an agent that
-  // receives it unset (proto3 default false) is talking to a producer that
-  // bypassed that contract, and skips verification.
   bool verify_ssl = 4;
   map<string, string> headers = 5;
   string body = 6;
@@ -200,6 +200,7 @@ enum JobType {
   TEST_CREDENTIALS = 3;
   PING = 4;
   LLDP_TOPOLOGY = 5;  // Discover all LLDP neighbors for topology mapping
+  NETWORK_SWEEP = 6;  // Discover reachable hosts and their SNMP identities
 }
 
 enum QueryType {
@@ -252,6 +253,38 @@ message SnmpResult {
   string job_id = 5;
 }
 
+// Network sweep results use the same correlated batch envelope as
+// MikrotikResult: device/job identifiers, repeated rows, error, and timestamp.
+//
+// The server validates every row before accepting any of them: one
+// over-length field aborts the whole message with an error naming the field,
+// and no rows are stored. There is no partial batch and the error does not
+// identify which host was at fault, so **the agent must truncate to the
+// bounds below rather than send an over-length value** - a single 3 KB Cisco
+// IOS sysDescr would otherwise discard the other 2,047 rows.
+//
+// At most 2,048 rows per message. That bound and the two string bounds
+// together size a maximal message at 8,437,820 base64 bytes, inside the
+// channel's 10 MiB limit; a wider sweep must be split across messages sharing
+// one job_id.
+message NetworkSweepResult {
+  string device_id = 1;
+  string job_id = 2;
+  repeated SweepResult results = 3;  // Maximum 2,048 rows
+  string error = 4;
+  int64 timestamp = 5;
+}
+
+message SweepResult {
+  string ip = 1;             // Maximum 255 bytes
+  string mac = 2;            // Maximum 255 bytes
+  string sys_name = 3;       // Maximum 255 bytes (SNMPv2-TC DisplayString); truncate
+  string sys_object_id = 4;  // Maximum 255 bytes
+  string sys_descr = 5;      // Maximum 2,048 bytes; truncate at the agent
+  bool responded_to = 6;
+  bool community_ok = 7;
+}
+
 message AgentHeartbeat {
   string version = 1;
   string hostname = 2;
@@ -262,6 +295,11 @@ message AgentHeartbeat {
   // binary in place is impossible. The server must not push a self-update to
   // these agents; they update by pulling a new image.
   bool container = 6;
+  repeated string local_ips = 7;
+  repeated string interface_subnets = 8;
+  // True when the agent retains recurring jobs and checks and schedules them
+  // locally. Servers may stop resending unchanged credential-bearing lists.
+  bool schedules_jobs = 9;
 }
 
 message AgentError {
@@ -324,8 +362,8 @@ message LldpNeighbor {
   string remote_port_id = 4;
   repeated string management_addresses = 5;
   // Chassis ID of the neighbour, hex-formatted for MAC-address subtypes. The
-  // remote table is keyed on this rather than on the system name, which many
-  // devices never advertise.
+  // agent keys the remote table on this rather than on the system name, which
+  // many devices never advertise.
   string remote_chassis_id = 6;
 }
 
