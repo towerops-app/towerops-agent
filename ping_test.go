@@ -372,20 +372,17 @@ func TestDoICMPPingIPv6Timeout(t *testing.T) {
 }
 
 func TestIcmpPingNonICMPUnavailableError(t *testing.T) {
-	// When raw ICMP returns a non-errICMPUnavailable error, icmpPing should
-	// return that error without falling back to UDP.
-	origListen := icmpListenPacket
-	defer func() { icmpListenPacket = origListen }()
+	readFailure := errors.New("scripted read failure")
+	conn := tpTNewFakeICMPConn()
+	conn.readErr = readFailure
+	networks := tpTUseFakeICMPConn(t, conn)
 
-	// Raw ICMP succeeds (opens a connection), but pinging unreachable IP will timeout.
-	// The timeout error is NOT errICMPUnavailable, so icmpPing returns it directly.
-	icmpListenPacket = func(network, address string) (icmpConn, error) {
-		return icmp.ListenPacket("udp4", address)
+	_, err := icmpPing(context.Background(), "127.0.0.1", 1000)
+	if !errors.Is(err, readFailure) {
+		t.Fatalf("icmpPing error = %v, want wrapped %v", err, readFailure)
 	}
-
-	_, err := icmpPing(context.Background(), "192.0.2.1", 100) // TEST-NET-1, 100ms timeout
-	if err == nil {
-		t.Error("expected error for unreachable host")
+	if len(*networks) != 1 || (*networks)[0] != "ip4:icmp" {
+		t.Errorf("listened on %v, want raw ICMP only", *networks)
 	}
 }
 
