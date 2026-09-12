@@ -383,18 +383,18 @@ func (s *session) sendResultMsg(result outbound) error {
 }
 
 func (s *session) resultWriteAfterCancellation(event string, ack <-chan error) error {
-	if err, ok := completedResultWrite(event, ack); ok {
+	if ok, err := completedResultWrite(event, ack); ok {
 		return err
 	}
 	return s.sessionErr()
 }
 
-func completedResultWrite(event string, ack <-chan error) (error, bool) {
+func completedResultWrite(event string, ack <-chan error) (bool, error) {
 	select {
 	case err := <-ack:
-		return resultWriteError(event, err), true
+		return true, resultWriteError(event, err)
 	default:
-		return nil, false
+		return false, nil
 	}
 }
 
@@ -726,10 +726,6 @@ type resultQueue struct {
 	retries  chan outbound
 	slots    chan struct{}
 	agentCtx context.Context
-}
-
-func newResultQueue(size int) *resultQueue {
-	return newResultQueueForAgent(context.Background(), size)
 }
 
 func newResultQueueForAgent(agentCtx context.Context, size int) *resultQueue {
