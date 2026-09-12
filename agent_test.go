@@ -92,6 +92,7 @@ func testPools(t *testing.T) *jobPools {
 		mikrotik: newWorkerPool(4),
 		ping:     newWorkerPool(4),
 		checks:   newWorkerPool(4),
+		notices:  make(chan outbound, overloadNoticeQueueSize),
 	}
 	t.Cleanup(func() { p.snmp.stop(); p.mikrotik.stop(); p.ping.stop(); p.checks.stop() })
 	return p
@@ -1028,12 +1029,14 @@ func TestDispatchJobCancelledContext(t *testing.T) {
 	close(done)
 }
 
-func TestPoolOverloadReportsEveryJobClass(t *testing.T) {
+func TestPoolOverloadReportsEveryJobClassWithoutUsingResultSpool(t *testing.T) {
+	notices := make(chan outbound, 4)
 	p := &jobPools{
 		snmp:     newWorkerPool(1),
 		mikrotik: newWorkerPool(1),
 		ping:     newWorkerPool(1),
 		checks:   newWorkerPool(1),
+		notices:  notices,
 	}
 	t.Cleanup(func() { p.snmp.stop(); p.mikrotik.stop(); p.ping.stop(); p.checks.stop() })
 
@@ -1056,7 +1059,7 @@ func TestPoolOverloadReportsEveryJobClass(t *testing.T) {
 	fill(p.ping)
 	fill(p.checks)
 
-	out := newResultQueue(4)
+	out := newResultQueue(1)
 	dispatchJob(context.Background(), &pb.AgentJob{
 		JobId: "snmp-overload", DeviceId: "device-1", JobType: pb.JobType_POLL,
 	}, p, out)
@@ -1068,6 +1071,13 @@ func TestPoolOverloadReportsEveryJobClass(t *testing.T) {
 	}, p, out)
 	executeCheck(context.Background(), &pb.Check{Id: "check-overload"}, p, out)
 
+	if len(out.items) != 0 || len(out.slots) != 0 {
+		t.Fatal("pool rejection notices consumed completed-result spool capacity")
+	}
+	if !out.enqueue(outbound{event: "real-result"}) {
+		t.Fatal("pool rejection notices prevented a real result from being queued")
+	}
+
 	want := map[string]string{
 		"snmp-overload":     "device-1",
 		"mikrotik-overload": "device-2",
@@ -1075,7 +1085,11 @@ func TestPoolOverloadReportsEveryJobClass(t *testing.T) {
 		"check-overload":    "",
 	}
 	for range want {
-		result := wantResult[*pb.AgentError](t, out, "error", time.Second)
+		notice := <-notices
+		if notice.event != "error" {
+			t.Fatalf("notice event = %q, want error", notice.event)
+		}
+		result := decodeQueuedResult[*pb.AgentError](t, notice)
 		deviceID, ok := want[result.JobId]
 		if !ok {
 			t.Fatalf("unexpected rejected job %q", result.JobId)
@@ -1088,28 +1102,76 @@ func TestPoolOverloadReportsEveryJobClass(t *testing.T) {
 		}
 		delete(want, result.JobId)
 	}
+
+	logs := agtCaptureLogs(t)
+	reportPoolRejection(context.Background(), make(chan outbound), "", "dropped-notice", "CHECK")
+	if !logs.has("overload notice queue full") {
+		t.Fatal("dropped overload notice was not logged")
+	}
+
+	invalidNotices := make(chan outbound, 1)
+	reportPoolRejection(context.Background(), invalidNotices, "", "\xff", "CHECK")
+	if len(invalidNotices) != 0 || !logs.has("marshal protobuf") {
+		t.Fatal("unencodable overload notice was not rejected and logged")
+	}
 }
 
-func TestResultQueueKeepsInFlightSlotForRetry(t *testing.T) {
-	queue := newResultQueue(1)
-	first := outbound{event: "result", payload: json.RawMessage(`{"binary":"first"}`)}
+func TestResultQueueKeepsRetryAheadOfNewerResults(t *testing.T) {
+	queue := newResultQueue(2)
+	first := outbound{event: "first", payload: json.RawMessage(`{"binary":"first"}`)}
 	if !queue.enqueue(first) {
 		t.Fatal("result queue rejected its first result")
 	}
 
 	inFlight := <-queue.items
-	if queue.enqueue(outbound{event: "result"}) {
-		t.Fatal("result queue reused a slot before the in-flight result was acknowledged")
+	newer := outbound{event: "newer"}
+	if !queue.enqueue(newer) {
+		t.Fatal("result queue rejected a newer result despite one free slot")
+	}
+	if queue.enqueue(outbound{event: "overflow"}) {
+		t.Fatal("result queue reused the in-flight result's reserved slot")
 	}
 
 	queue.retry(inFlight)
-	retried := <-queue.items
-	if string(retried.payload) != string(first.payload) {
-		t.Fatalf("retried payload = %s, want %s", retried.payload, first.payload)
+	retried, ok := queue.takeRetry()
+	if !ok || string(retried.payload) != string(first.payload) {
+		t.Fatalf("retried result = %+v, want first result", retried)
 	}
 	queue.ack()
-	if !queue.enqueue(outbound{event: "result"}) {
-		t.Fatal("acknowledging a result did not release its queue slot")
+
+	if got := <-queue.items; got.event != newer.event {
+		t.Fatalf("queued result = %q, want %q after retry", got.event, newer.event)
+	}
+	queue.ack()
+	if _, ok := queue.takeRetry(); ok {
+		t.Fatal("retry lane retained an acknowledged result")
+	}
+}
+
+func TestSendResultUsesAgentContextForDropSeverity(t *testing.T) {
+	logs := agtCaptureLogs(t)
+	agentCtx, stopAgent := context.WithCancel(context.Background())
+	out := newResultQueueForAgent(agentCtx, 0)
+	sessionCtx, stopSession := context.WithCancel(context.Background())
+	stopSession()
+
+	sendResult(sessionCtx, out, "result", &pb.SnmpResult{JobId: "during-reconnect"}, "during-reconnect")
+	if !logs.has("ERROR result buffer full during reconnect - result dropped") {
+		t.Fatal("result loss during reconnect was not logged at error level")
+	}
+	if logs.has("result dropped, agent stopped") {
+		t.Fatal("session cancellation was misreported as agent shutdown")
+	}
+
+	sendResult(context.Background(), out, "result", &pb.SnmpResult{JobId: "while-connected"}, "while-connected")
+	if !logs.has("ERROR result buffer full - agent overloaded") {
+		t.Fatal("connected result loss was not reported as agent overload")
+	}
+
+	stopAgent()
+	sendResult(sessionCtx, out, "result", &pb.SnmpResult{JobId: "during-shutdown"}, "during-shutdown")
+	if !logs.has("DEBUG result dropped, agent stopped") {
+		t.Fatal("agent shutdown result drop was not logged at debug level")
 	}
 }
 
@@ -1896,25 +1958,6 @@ func TestJobPoolsStopUsesSingleTimeout(t *testing.T) {
 	if elapsed >= 150*time.Millisecond {
 		t.Fatalf("parallel pool stop took %v, want one timeout window", elapsed)
 	}
-}
-
-func TestExecuteCheckCtxDoneInClosure(t *testing.T) {
-	// sendResult must stop waiting on a blocked result channel when the check's
-	// context is cancelled.
-	p := testPools(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	out := newResultQueue(0) // no capacity or reader
-
-	check := &pb.Check{Id: "c1", CheckType: "tcp", TimeoutMs: 100,
-		Config: &pb.Check_Tcp{Tcp: &pb.TcpCheckConfig{Host: "127.0.0.1", Port: 1}}}
-
-	executeCheck(ctx, check, p, out)
-
-	// Wait for the check to complete (TCP to port 1 fails fast), then cancel
-	// the send context so the blocked result handoff returns.
-	time.Sleep(20 * time.Millisecond)
-	cancel()
-	time.Sleep(10 * time.Millisecond)
 }
 
 func TestRunSessionRestartInMainLoop(t *testing.T) {
@@ -2773,8 +2816,44 @@ func TestSessionLoopRetriesResultWhenWriterQueueStalls(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "queue result result") {
 		t.Fatalf("session loop error = %v, want result queue timeout", err)
 	}
-	if len(results.items) != 1 || len(results.slots) != 1 {
-		t.Fatal("failed write did not restore the result and its reservation")
+	retried, ok := results.takeRetry()
+	if !ok || retried.event != result.event || len(results.items) != 0 || len(results.slots) != 1 {
+		t.Fatal("failed write did not restore the result at the head with its reservation")
+	}
+}
+
+func TestSessionLoopRetainsRetryWhenWriterQueueStalls(t *testing.T) {
+	origTimeout := writeQueueTimeout
+	t.Cleanup(func() { writeQueueTimeout = origTimeout })
+	writeQueueTimeout = 5 * time.Millisecond
+
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	results := newResultQueue(1)
+	result := outbound{event: "retried", payload: json.RawMessage(`{}`)}
+	if !results.enqueue(result) {
+		t.Fatal("failed to seed result queue")
+	}
+	results.retry(<-results.items)
+
+	writeCh := make(chan writeRequest, 1)
+	writeCh <- writeRequest{data: []byte("writer is stalled")}
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     cancel,
+		writeCh:    writeCh,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		results:    results,
+	}
+
+	err := s.loop(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "queue retried result") {
+		t.Fatalf("session loop error = %v, want retried result queue timeout", err)
+	}
+	retried, ok := results.takeRetry()
+	if !ok || retried.event != result.event {
+		t.Fatal("failed retried write was not retained at the queue head")
 	}
 }
 
@@ -2837,6 +2916,158 @@ func TestSendResultMsgObservesSessionCancellation(t *testing.T) {
 			t.Fatalf("sendResultMsg error = %v, want %v", err, errSessionCancelled)
 		}
 	})
+}
+
+func TestCompletedResultWriteDrainsAcknowledgment(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		ack := make(chan error, 1)
+		ack <- nil
+		if err, ok := completedResultWrite("result", ack); !ok || err != nil {
+			t.Fatalf("completedResultWrite = (%v, %t), want (nil, true)", err, ok)
+		}
+	})
+
+	t.Run("write failure", func(t *testing.T) {
+		wantErr := errors.New("broken pipe")
+		ack := make(chan error, 1)
+		ack <- wantErr
+		err, ok := completedResultWrite("result", ack)
+		if !ok || !errors.Is(err, wantErr) {
+			t.Fatalf("completedResultWrite = (%v, %t), want wrapped error", err, ok)
+		}
+	})
+
+	t.Run("pending", func(t *testing.T) {
+		if err, ok := completedResultWrite("result", make(chan error)); ok || err != nil {
+			t.Fatalf("completedResultWrite = (%v, %t), want (nil, false)", err, ok)
+		}
+	})
+}
+
+func TestResultWriteAfterCancellationPrefersAcknowledgment(t *testing.T) {
+	s := &session{
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+	}
+
+	ack := make(chan error, 1)
+	ack <- nil
+	if err := s.resultWriteAfterCancellation("result", ack); err != nil {
+		t.Fatalf("completed write lost to cancellation: %v", err)
+	}
+
+	readErr := errors.New("connection reset")
+	s.errCh <- readErr
+	if err := s.resultWriteAfterCancellation("result", make(chan error)); !errors.Is(err, readErr) {
+		t.Fatalf("pending write cancellation error = %v, want %v", err, readErr)
+	}
+}
+
+func TestSessionLoopSendsRetriedResultBeforeNewerResult(t *testing.T) {
+	results := newResultQueue(2)
+	if !results.enqueue(outbound{event: "older", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("failed to queue older result")
+	}
+	older := <-results.items
+	if !results.enqueue(outbound{event: "newer", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("failed to queue newer result")
+	}
+	results.retry(older)
+
+	agentCtx, stopAgent := context.WithCancel(context.Background())
+	sessionCtx, stopSession := context.WithCancel(context.Background())
+	defer stopSession()
+	writeCh := make(chan writeRequest)
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     stopSession,
+		writeCh:    writeCh,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		results:    results,
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.loop(agentCtx) }()
+
+	for _, want := range []string{"older", "newer"} {
+		request := <-writeCh
+		var msg channelMsg
+		if err := json.Unmarshal(request.data, &msg); err != nil {
+			t.Fatal(err)
+		}
+		if msg.Event != want {
+			t.Fatalf("result event = %q, want %q", msg.Event, want)
+		}
+		request.ack <- nil
+	}
+
+	stopAgent()
+	if err := <-done; err != nil {
+		t.Fatalf("session loop returned %v after agent shutdown", err)
+	}
+}
+
+func TestSessionLoopSendsOverloadNoticeOutsideResultSpool(t *testing.T) {
+	notices := make(chan outbound, 1)
+	notices <- outbound{event: "error", payload: json.RawMessage(`{}`)}
+
+	agentCtx, stopAgent := context.WithCancel(context.Background())
+	sessionCtx, stopSession := context.WithCancel(context.Background())
+	defer stopSession()
+	writeCh := make(chan writeRequest)
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     stopSession,
+		writeCh:    writeCh,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		results:    newResultQueue(1),
+		notices:    notices,
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.loop(agentCtx) }()
+
+	request := <-writeCh
+	var msg channelMsg
+	if err := json.Unmarshal(request.data, &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.Event != "error" {
+		t.Fatalf("notice event = %q, want error", msg.Event)
+	}
+	request.ack <- nil
+
+	stopAgent()
+	if err := <-done; err != nil {
+		t.Fatalf("session loop returned %v after agent shutdown", err)
+	}
+}
+
+func TestSessionLoopReportsOverloadNoticeWriteFailure(t *testing.T) {
+	origTimeout := writeQueueTimeout
+	t.Cleanup(func() { writeQueueTimeout = origTimeout })
+	writeQueueTimeout = 5 * time.Millisecond
+
+	notices := make(chan outbound, 1)
+	notices <- outbound{event: "error", payload: json.RawMessage(`{}`)}
+	writeCh := make(chan writeRequest, 1)
+	writeCh <- writeRequest{data: []byte("writer is stalled")}
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     cancel,
+		writeCh:    writeCh,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		results:    newResultQueue(1),
+		notices:    notices,
+	}
+
+	err := s.loop(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "queue error result") {
+		t.Fatalf("session loop error = %v, want overload notice queue timeout", err)
+	}
 }
 
 // ---------------------------------------------------------------------------
