@@ -2538,8 +2538,9 @@ func TestChkTSSLCheckUsesPresentedIntermediates(t *testing.T) {
 			if !strings.Contains(output, want) {
 				t.Fatalf("got output %q, want it to contain %q", output, want)
 			}
-			if tc.wantStatus == 0 && !strings.Contains(output, notAfter.Format("2006-01-02")) {
-				t.Fatalf("got output %q, want the expiry date %s", output, notAfter.Format("2006-01-02"))
+			expiryDate := notAfter.UTC().Format("2006-01-02")
+			if tc.wantStatus == 0 && !strings.Contains(output, expiryDate) {
+				t.Fatalf("got output %q, want the expiry date %s", output, expiryDate)
 			}
 		})
 	}

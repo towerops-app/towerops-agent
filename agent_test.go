@@ -1847,6 +1847,53 @@ func TestRunSessionSendsImmediateHeartbeat(t *testing.T) {
 	if !heartbeat.Container {
 		t.Error("heartbeat container = false, want the detected value")
 	}
+	if !heartbeat.SchedulesJobs {
+		t.Error("heartbeat schedules_jobs = false, want local scheduling capability")
+	}
+
+	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
+	if err := <-done; !errors.Is(err, errRestartRequested) {
+		t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
+	}
+}
+
+func TestRunSessionSchedulesRecurringJobsLocally(t *testing.T) {
+	origInterval := jobScheduleInterval
+	origDial := snmpDial
+	defer func() {
+		jobScheduleInterval = origInterval
+		snmpDial = origDial
+	}()
+
+	jobScheduleInterval = 25 * time.Millisecond
+	snmpDial = func(_ context.Context, _ *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		return &mockSnmpQuerier{
+			getFunc: func(_ []string) (*gosnmp.SnmpPacket, error) {
+				return &gosnmp.SnmpPacket{}, nil
+			},
+		}, func() {}, nil
+	}
+
+	ln := agtListen(t)
+	done := make(chan error, 1)
+	go func() { done <- runSession(context.Background(), agtURL(ln), "token", nil) }()
+
+	conn, topic := agtAccept(t, ln)
+	msgs := agtReadFrames(conn)
+	agtSendEvent(t, conn, topic, "jobs", makeJobPayload(&pb.AgentJob{
+		JobId:      "scheduled-poll",
+		JobType:    pb.JobType_POLL,
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+	}))
+
+	for range 2 {
+		frame := agtWaitEvent(t, msgs, "result")
+		var result pb.SnmpResult
+		agtDecodeBinary(t, frame.Payload, &result)
+		if result.JobId != "scheduled-poll" {
+			t.Fatalf("result job_id = %q, want scheduled-poll", result.JobId)
+		}
+	}
 
 	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
 	if err := <-done; !errors.Is(err, errRestartRequested) {

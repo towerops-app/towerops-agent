@@ -262,6 +262,13 @@ message AgentHeartbeat {
   // binary in place is impossible. The server must not push a self-update to
   // these agents; they update by pulling a new image.
   bool container = 6;
+  // Fields 7 and 8 are emitted by agents that report their local vantage
+  // point; retain their allocation even when this build sends empty lists.
+  repeated string local_ips = 7;
+  repeated string interface_subnets = 8;
+  // True when the agent retains recurring jobs and checks and schedules them
+  // locally. Servers may stop resending unchanged credential-bearing lists.
+  bool schedules_jobs = 9;
 }
 
 message AgentError {

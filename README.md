@@ -100,8 +100,10 @@ Towerops server ──WebSocket/TLS──▶ agent ──▶ SNMP / ICMP / SSH /
 
 1. The agent connects to `{TOWEROPS_API_URL}/socket/agent/websocket` and joins
    the `agent:<id>` channel with its token. A rejected token ends the session.
-2. The server immediately pushes the agent's job list, and pushes it again
-   whenever assignments, credentials or checks change.
+2. The server immediately pushes the recurring job and check lists, then sends
+   complete replacements whenever assignments, credentials, or checks change.
+   The agent retains those lists for the authenticated session and executes
+   them every minute. Discovery and backup requests remain one-shot.
 3. Jobs are executed on bounded worker pools — one per protocol — so a slow
    or unreachable device cannot stall the rest.
 4. Results are streamed back as they complete. SNMP results are batched for up

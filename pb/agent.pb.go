@@ -2146,7 +2146,14 @@ type AgentHeartbeat struct {
 	// True when the agent runs inside a container image, where replacing the
 	// binary in place is impossible. The server must not push a self-update to
 	// these agents; they update by pulling a new image.
-	Container     bool `protobuf:"varint,6,opt,name=container,proto3" json:"container,omitempty"`
+	Container bool `protobuf:"varint,6,opt,name=container,proto3" json:"container,omitempty"`
+	// Fields 7 and 8 are emitted by agents that report their local vantage
+	// point; retain their allocation even when this build sends empty lists.
+	LocalIps         []string `protobuf:"bytes,7,rep,name=local_ips,json=localIps,proto3" json:"local_ips,omitempty"`
+	InterfaceSubnets []string `protobuf:"bytes,8,rep,name=interface_subnets,json=interfaceSubnets,proto3" json:"interface_subnets,omitempty"`
+	// True when the agent retains recurring jobs and checks and schedules them
+	// locally. Servers may stop resending unchanged credential-bearing lists.
+	SchedulesJobs bool `protobuf:"varint,9,opt,name=schedules_jobs,json=schedulesJobs,proto3" json:"schedules_jobs,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2219,6 +2226,27 @@ func (x *AgentHeartbeat) GetArch() string {
 func (x *AgentHeartbeat) GetContainer() bool {
 	if x != nil {
 		return x.Container
+	}
+	return false
+}
+
+func (x *AgentHeartbeat) GetLocalIps() []string {
+	if x != nil {
+		return x.LocalIps
+	}
+	return nil
+}
+
+func (x *AgentHeartbeat) GetInterfaceSubnets() []string {
+	if x != nil {
+		return x.InterfaceSubnets
+	}
+	return nil
+}
+
+func (x *AgentHeartbeat) GetSchedulesJobs() bool {
+	if x != nil {
+		return x.SchedulesJobs
 	}
 	return false
 }
@@ -3082,7 +3110,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x06job_id\x18\x05 \x01(\tR\x05jobId\x1a<\n" +
 	"\x0eOidValuesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xbe\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xaf\x02\n" +
 	"\x0eAgentHeartbeat\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x1a\n" +
 	"\bhostname\x18\x02 \x01(\tR\bhostname\x12%\n" +
@@ -3090,7 +3118,10 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\n" +
 	"ip_address\x18\x04 \x01(\tR\tipAddress\x12\x12\n" +
 	"\x04arch\x18\x05 \x01(\tR\x04arch\x12\x1c\n" +
-	"\tcontainer\x18\x06 \x01(\bR\tcontainer\"x\n" +
+	"\tcontainer\x18\x06 \x01(\bR\tcontainer\x12\x1b\n" +
+	"\tlocal_ips\x18\a \x03(\tR\blocalIps\x12+\n" +
+	"\x11interface_subnets\x18\b \x03(\tR\x10interfaceSubnets\x12%\n" +
+	"\x0eschedules_jobs\x18\t \x01(\bR\rschedulesJobs\"x\n" +
 	"\n" +
 	"AgentError\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12\x15\n" +

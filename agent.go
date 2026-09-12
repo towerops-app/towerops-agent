@@ -135,9 +135,10 @@ type session struct {
 	writerDone chan struct{}
 
 	// pools and results exist only once the channel join has been accepted;
-	// see runSession.
-	pools   *jobPools
-	results resultQueue
+	// see runSession. The schedule retains recurring work for this connection.
+	pools    *jobPools
+	results  resultQueue
+	schedule jobSchedule
 
 	refCounter atomic.Uint64
 }
@@ -355,6 +356,7 @@ func (s *session) heartbeat(uptime time.Duration) *pb.AgentHeartbeat {
 		Hostname:      s.hostname,
 		IpAddress:     s.ws.LocalIP(),
 		Container:     runningInContainer(),
+		SchedulesJobs: true,
 	}
 }
 
@@ -365,6 +367,8 @@ func (s *session) loop(ctx context.Context) error {
 	defer heartbeatTicker.Stop()
 	channelHeartbeatTicker := time.NewTicker(channelHeartbeatInterval)
 	defer channelHeartbeatTicker.Stop()
+	jobTicker := time.NewTicker(jobScheduleInterval)
+	defer jobTicker.Stop()
 
 	for {
 		select {
@@ -387,7 +391,7 @@ func (s *session) loop(ctx context.Context) error {
 				slog.Debug("invalid message", "error", err)
 				continue
 			}
-			shouldEnd, endErr := handleMessage(s.ctx, msg, s.topic, s.pools, s.results)
+			shouldEnd, endErr := handleScheduledMessage(s.ctx, msg, s.topic, s.pools, s.results, &s.schedule)
 			if shouldEnd {
 				return endErr
 			}
@@ -410,6 +414,9 @@ func (s *session) loop(ctx context.Context) error {
 			if s.sendBinary("trap", trap) {
 				slog.Info("sent snmp trap", "source", trap.SourceIp, "trap_oid", trap.TrapOid)
 			}
+
+		case <-jobTicker.C:
+			s.schedule.dispatch(s.ctx, s.pools, s.results)
 
 		case <-heartbeatTicker.C:
 			hb := s.heartbeat(time.Since(s.startedAt))
@@ -501,6 +508,17 @@ func handleMessage(
 	pools *jobPools,
 	out resultQueue,
 ) (bool, error) {
+	return handleScheduledMessage(ctx, msg, topic, pools, out, nil)
+}
+
+func handleScheduledMessage(
+	ctx context.Context,
+	msg channelMsg,
+	topic string,
+	pools *jobPools,
+	out resultQueue,
+	schedule *jobSchedule,
+) (bool, error) {
 	// Ignore messages not addressed to our topic (except Phoenix control messages)
 	if msg.Topic != topic && msg.Topic != "phoenix" {
 		slog.Debug("ignoring message for different topic", "got", msg.Topic, "want", topic)
@@ -517,12 +535,26 @@ func handleMessage(
 			"topic", msg.Topic)
 		return true, errChannelReloaded
 
-	case "jobs", "discovery_job", "backup_job":
+	case "jobs":
 		var jobList pb.AgentJobList
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &jobList) {
 			return false, nil
 		}
-		slog.Info("received jobs", "count", len(jobList.Jobs))
+		if schedule != nil && !schedule.replaceJobs(&jobList) {
+			slog.Debug("recurring jobs unchanged", "count", len(jobList.Jobs))
+			return false, nil
+		}
+		slog.Info("received recurring jobs", "count", len(jobList.Jobs))
+		for _, job := range jobList.Jobs {
+			dispatchJob(ctx, job, pools, out)
+		}
+
+	case "discovery_job", "backup_job":
+		var jobList pb.AgentJobList
+		if !decodeBinaryPayload(msg.Event, msg.Payload, &jobList) {
+			return false, nil
+		}
+		slog.Info("received one-shot jobs", "count", len(jobList.Jobs))
 		for _, job := range jobList.Jobs {
 			dispatchJob(ctx, job, pools, out)
 		}
@@ -532,11 +564,14 @@ func handleMessage(
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &checkList) {
 			return false, nil
 		}
-		slog.Info("received checks", "count", len(checkList.Checks))
+		if schedule != nil && !schedule.replaceChecks(&checkList) {
+			slog.Debug("recurring checks unchanged", "count", len(checkList.Checks))
+			return false, nil
+		}
+		slog.Info("received recurring checks", "count", len(checkList.Checks))
 		for _, check := range checkList.Checks {
 			executeCheck(ctx, check, pools, out)
 		}
-
 	case "restart":
 		slog.Info("restart requested by server")
 		return true, errRestartRequested
