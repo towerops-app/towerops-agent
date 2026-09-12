@@ -54,6 +54,10 @@ const maxJobPayloadBytes = 4 << 20 // 4 MB — well above any legitimate job lis
 // result queues held together.
 const resultQueueSize = 512
 
+// overloadNoticeQueueSize bounds best-effort pool rejection notices separately
+// from completed results, so a large job push cannot consume the result spool.
+const overloadNoticeQueueSize = 64
+
 // channelMsg is the WebSocket channel message format (JSON wrapper around binary protobuf).
 type channelMsg struct {
 	Topic   string          `json:"topic"`
@@ -70,7 +74,7 @@ type writeRequest struct {
 // traps may be nil when the trap listener is disabled.
 func runAgent(ctx context.Context, wsURL, token string, traps <-chan *pb.SnmpTrap) {
 	baseURL := strings.TrimRight(wsURL, "/")
-	results := newResultQueue(resultQueueSize)
+	results := newResultQueueForAgent(ctx, resultQueueSize)
 	retryDelay := initialRetryDelay
 	maxRetry := 10 * time.Second
 
@@ -141,6 +145,7 @@ type session struct {
 	// see runSession.
 	pools   *jobPools
 	results *resultQueue
+	notices <-chan outbound
 
 	refCounter atomic.Uint64
 }
@@ -149,7 +154,7 @@ type session struct {
 // The reconnect loop uses runSessionWithResults so completed results survive
 // between sessions.
 func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.SnmpTrap) error {
-	return runSessionWithResults(ctx, baseURL, token, traps, newResultQueue(resultQueueSize))
+	return runSessionWithResults(ctx, baseURL, token, traps, newResultQueueForAgent(ctx, resultQueueSize))
 }
 
 func runSessionWithResults(
@@ -210,13 +215,16 @@ func runSessionWithResults(
 	// Worker pools are created only now: 220 goroutines started before the
 	// join would be abandoned by every early return above, and a revoked token
 	// reconnects every few seconds.
+	notices := make(chan outbound, overloadNoticeQueueSize)
 	s.pools = &jobPools{
 		snmp:     newWorkerPool(100),
 		mikrotik: newWorkerPool(20),
 		ping:     newWorkerPool(50),
 		checks:   newWorkerPool(50),
+		notices:  notices,
 	}
 	s.results = results
+	s.notices = notices
 
 	// Publish update-critical deployment metadata as soon as the join is
 	// accepted. A full queue is non-fatal because the ticker will retry.
@@ -368,13 +376,43 @@ func (s *session) sendResultMsg(result outbound) error {
 
 	select {
 	case err := <-ack:
-		if err != nil {
-			return fmt.Errorf("write %s result: %w", result.event, err)
-		}
-		return nil
+		return resultWriteError(result.event, err)
 	case <-s.ctx.Done():
-		return s.sessionErr()
+		return s.resultWriteAfterCancellation(result.event, ack)
 	}
+}
+
+func (s *session) resultWriteAfterCancellation(event string, ack <-chan error) error {
+	if err, ok := completedResultWrite(event, ack); ok {
+		return err
+	}
+	return s.sessionErr()
+}
+
+func completedResultWrite(event string, ack <-chan error) (error, bool) {
+	select {
+	case err := <-ack:
+		return resultWriteError(event, err), true
+	default:
+		return nil, false
+	}
+}
+
+func resultWriteError(event string, err error) error {
+	if err != nil {
+		return fmt.Errorf("write %s result: %w", event, err)
+	}
+	return nil
+}
+
+func (s *session) deliverResult(result outbound) error {
+	if err := s.sendResultMsg(result); err != nil {
+		s.results.retry(result)
+		return err
+	}
+	s.results.ack()
+	slog.Debug("sent result", "event", result.event)
+	return nil
 }
 
 // sessionErr reports why the session context was cancelled. Both I/O
@@ -418,6 +456,20 @@ func (s *session) loop(ctx context.Context) error {
 		case <-ctx.Done():
 			slog.Info("shutdown signal, closing connection")
 			return nil
+		default:
+		}
+
+		if result, ok := s.results.takeRetry(); ok {
+			if err := s.deliverResult(result); err != nil {
+				return err
+			}
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			slog.Info("shutdown signal, closing connection")
+			return nil
 
 		case <-s.ctx.Done():
 			return s.sessionErr()
@@ -440,12 +492,15 @@ func (s *session) loop(ctx context.Context) error {
 			}
 
 		case result := <-s.results.items:
-			if err := s.sendResultMsg(result); err != nil {
-				s.results.retry(result)
+			if err := s.deliverResult(result); err != nil {
 				return err
 			}
-			s.results.ack()
-			slog.Debug("sent result", "event", result.event)
+
+		case notice := <-s.notices:
+			if err := s.sendResultMsg(notice); err != nil {
+				return err
+			}
+			slog.Debug("sent overload notice", "event", notice.event)
 
 		case trap, ok := <-s.traps:
 			if !ok {
@@ -664,17 +719,25 @@ type outbound struct {
 }
 
 // resultQueue is a bounded process-wide spool. A slot remains reserved while
-// the session writer has a result in flight, which guarantees retry can put it
-// back even if producers fill every other slot concurrently.
+// the session writer has a result in flight. Failed writes use a dedicated
+// one-item retry lane so they remain ahead of newer queued measurements.
 type resultQueue struct {
-	items chan outbound
-	slots chan struct{}
+	items    chan outbound
+	retries  chan outbound
+	slots    chan struct{}
+	agentCtx context.Context
 }
 
 func newResultQueue(size int) *resultQueue {
+	return newResultQueueForAgent(context.Background(), size)
+}
+
+func newResultQueueForAgent(agentCtx context.Context, size int) *resultQueue {
 	return &resultQueue{
-		items: make(chan outbound, size),
-		slots: make(chan struct{}, size),
+		items:    make(chan outbound, size),
+		retries:  make(chan outbound, 1),
+		slots:    make(chan struct{}, size),
+		agentCtx: agentCtx,
 	}
 }
 
@@ -693,7 +756,16 @@ func (q *resultQueue) ack() {
 }
 
 func (q *resultQueue) retry(result outbound) {
-	q.items <- result
+	q.retries <- result
+}
+
+func (q *resultQueue) takeRetry() (outbound, bool) {
+	select {
+	case result := <-q.retries:
+		return result, true
+	default:
+		return outbound{}, false
+	}
 }
 
 // jobPools holds the worker pools for each job type.
@@ -702,6 +774,7 @@ type jobPools struct {
 	mikrotik *workerPool
 	ping     *workerPool
 	checks   *workerPool
+	notices  chan<- outbound
 }
 
 func (p *jobPools) stop(timeout time.Duration) []string {
@@ -762,7 +835,7 @@ func dispatchJob(
 		return
 	}
 	if !ok {
-		reportPoolRejection(ctx, out, job.DeviceId, job.JobId, job.JobType.String())
+		reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
 	}
 }
 
@@ -783,20 +856,32 @@ func nextBackoff(current, maxDelay time.Duration) time.Duration {
 	return next + jitter
 }
 
-// sendResult encodes and queues a job result for confirmed WebSocket delivery.
-func sendResult(ctx context.Context, out *resultQueue, event string, msg proto.Message, jobID string) {
+func encodeOutbound(event string, msg proto.Message, jobID string) (outbound, bool) {
 	bin, err := proto.Marshal(msg)
 	if err != nil {
 		slog.Error("marshal protobuf", "job_id", jobID, "event", event, "error", err)
-		return
+		return outbound{}, false
 	}
 	encoded := base64.StdEncoding.EncodeToString(bin)
 	payload, _ := json.Marshal(map[string]string{"binary": encoded})
-	if out.enqueue(outbound{event: event, payload: payload}) {
+	return outbound{event: event, payload: payload}, true
+}
+
+// sendResult encodes and queues a job result for confirmed WebSocket delivery.
+func sendResult(ctx context.Context, out *resultQueue, event string, msg proto.Message, jobID string) {
+	result, ok := encodeOutbound(event, msg, jobID)
+	if !ok {
+		return
+	}
+	if out.enqueue(result) {
+		return
+	}
+	if out.agentCtx.Err() != nil {
+		slog.Debug("result dropped, agent stopped", "job_id", jobID, "event", event)
 		return
 	}
 	if ctx.Err() != nil {
-		slog.Debug("result dropped, agent stopped", "job_id", jobID, "event", event)
+		slog.Error("result buffer full during reconnect - result dropped", "job_id", jobID, "event", event)
 		return
 	}
 	slog.Error("result buffer full - agent overloaded", "job_id", jobID, "event", event)
@@ -804,7 +889,7 @@ func sendResult(ctx context.Context, out *resultQueue, event string, msg proto.M
 
 func reportPoolRejection(
 	ctx context.Context,
-	out *resultQueue,
+	notices chan<- outbound,
 	deviceID, jobID, jobType string,
 ) {
 	if ctx.Err() != nil {
@@ -813,12 +898,20 @@ func reportPoolRejection(
 	}
 	message := "worker pool overloaded; retry " + jobType + " job"
 	slog.Warn("job rejected, pool full", "job_id", jobID, "type", jobType)
-	sendResult(ctx, out, "error", &pb.AgentError{
+	notice, ok := encodeOutbound("error", &pb.AgentError{
 		DeviceId:  deviceID,
 		JobId:     jobID,
 		Message:   message,
 		Timestamp: time.Now().Unix(),
 	}, jobID)
+	if !ok {
+		return
+	}
+	select {
+	case notices <- notice:
+	default:
+		slog.Warn("overload notice queue full, notification dropped", "job_id", jobID, "type", jobType)
+	}
 }
 
 // executeCheck dispatches a check to the worker pool.
@@ -829,6 +922,6 @@ func executeCheck(ctx context.Context, check *pb.Check, pools *jobPools, out *re
 		sendResult(ctx, out, "check_result", result, check.Id)
 	})
 	if !ok {
-		reportPoolRejection(ctx, out, "", check.Id, "CHECK")
+		reportPoolRejection(ctx, pools.notices, "", check.Id, "CHECK")
 	}
 }
