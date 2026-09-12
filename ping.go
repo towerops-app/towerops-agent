@@ -48,6 +48,12 @@ var pingGOOS = runtime.GOOS
 // choice is testable on hosts that do or do not ship ping6.
 var pingLookPath = exec.LookPath
 
+// pingCommandOutput runs the final ping(8) fallback. Tests replace it so
+// command success and failure do not depend on the host network.
+var pingCommandOutput = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
+
 // icmpPing sends a single ICMP echo request and returns the round-trip time in milliseconds.
 // Tries raw ICMP sockets first (requires CAP_NET_RAW or root), then falls back to
 // unprivileged UDP-based ICMP (requires ping_group_range sysctl).
@@ -237,8 +243,7 @@ func execPing(parent context.Context, ip string, timeoutMs int) (float64, error)
 	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutMs+1000)*time.Millisecond)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, pingCmd, "-c", "1", "-W", strconv.Itoa(timeoutArg), ip)
-	output, err := cmd.CombinedOutput()
+	output, err := pingCommandOutput(ctx, pingCmd, "-c", "1", "-W", strconv.Itoa(timeoutArg), ip)
 	if err != nil {
 		return 0, fmt.Errorf("ping failed: %s", strings.TrimSpace(string(output)))
 	}

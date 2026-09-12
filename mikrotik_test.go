@@ -976,7 +976,7 @@ func TestHmExecuteMikrotikJobClosesConnOnContextCancel(t *testing.T) {
 	cancel()
 
 	// Unbuffered and unread: sendResult drops the result once ctx is done.
-	out := make(resultQueue)
+	out := newResultQueue(0)
 	// Reads block forever unless context.AfterFunc closes the connection, so
 	// returning at all proves the cancellation hook fired.
 	executeMikrotikJob(ctx, &pb.AgentJob{
@@ -1004,7 +1004,7 @@ func TestHmExecuteMikrotikJobDeliversSentences(t *testing.T) {
 		return &mikrotikClient{conn: &nopCloser{readWriter: &stream}}, nil
 	}
 
-	out := make(resultQueue, 1)
+	out := newResultQueue(1)
 	executeMikrotikJob(context.Background(), &pb.AgentJob{
 		JobId:            "m-ok",
 		DeviceId:         "dev-1",
@@ -1012,14 +1012,11 @@ func TestHmExecuteMikrotikJobDeliversSentences(t *testing.T) {
 		MikrotikCommands: []*pb.MikrotikCommand{{Command: "/interface/print"}},
 	}, out)
 
-	o := <-out
+	o := <-out.items
 	if o.event != "mikrotik_result" {
 		t.Fatalf("event = %q, want mikrotik_result", o.event)
 	}
-	result, ok := o.msg.(*pb.MikrotikResult)
-	if !ok {
-		t.Fatalf("message type = %T, want *pb.MikrotikResult", o.msg)
-	}
+	result := decodeQueuedResult[*pb.MikrotikResult](t, o)
 	if result.Error != "" {
 		t.Fatalf("unexpected error: %s", result.Error)
 	}
@@ -1038,6 +1035,8 @@ func TestHmExecuteMikrotikJobDeliversSentences(t *testing.T) {
 }
 
 func TestPropHmEncodeLengthRoundtrip(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		n := rapid.IntRange(0, 0x0FFFFFFF).Draw(t, "n")
 		enc := encodeLength(n)
@@ -1053,6 +1052,8 @@ func TestPropHmEncodeLengthRoundtrip(t *testing.T) {
 }
 
 func TestPropHmEncodeLengthPrefixFree(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		n := rapid.IntRange(0, 0x7FFFFFFF).Draw(t, "n")
 		enc := encodeLength(n)
@@ -1082,6 +1083,8 @@ func TestPropHmEncodeLengthPrefixFree(t *testing.T) {
 }
 
 func TestPropHmParseMikrotikAttrs(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		attrs := rapid.MapOf(
 			rapid.StringMatching(`[a-zA-Z0-9._\-]{1,12}`),
@@ -1110,6 +1113,8 @@ func TestPropHmParseMikrotikAttrs(t *testing.T) {
 }
 
 func TestPropHmWriteSentenceRoundtrip(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		// An empty word terminates a sentence, so words must be non-empty.
 		words := rapid.SliceOfN(rapid.StringN(1, 24, 48), 0, 16).Draw(t, "words")

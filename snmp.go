@@ -38,7 +38,7 @@ var snmpDial = func(ctx context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(
 }
 
 // executeSnmpJob runs SNMP GET/WALK queries for a job and sends results.
-func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out resultQueue) {
+func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing snmp device", "job_id", job.JobId)
@@ -171,7 +171,7 @@ func canonicalOID(oid string) string {
 }
 
 // executeCredentialTest tests SNMP credentials by reading sysDescr.0.
-func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out resultQueue) {
+func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing snmp device", "job_id", job.JobId)

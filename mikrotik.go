@@ -306,7 +306,7 @@ func mikrotikError(job *pb.AgentJob, msg string, ts int64) *pb.MikrotikResult {
 }
 
 // executeMikrotikJob handles a MikroTik API job including backup-via-SSH.
-func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out resultQueue) {
+func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	dev := job.MikrotikDevice
 	if dev == nil {
 		slog.Error("job missing mikrotik device", "job_id", job.JobId)
@@ -379,7 +379,7 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out resultQueue) 
 }
 
 // executeMikrotikBackupViaSSH runs /export compact over SSH.
-func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.MikrotikDevice, out resultQueue, timestamp int64) {
+func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.MikrotikDevice, out *resultQueue, timestamp int64) {
 	slog.Debug("executing backup via ssh", "device", job.DeviceId, "ip", dev.Ip, "ssh_port", dev.SshPort)
 	if dev.SshPort > 65535 {
 		sendResult(ctx, out, "mikrotik_result", mikrotikError(

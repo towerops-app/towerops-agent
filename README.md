@@ -37,6 +37,8 @@ Operational properties:
 - **Trap forwarding survives reconnects** — the trap listener runs independently
   of the WebSocket session and queues up to 1000 traps while the agent is
   reconnecting
+- **Reconnect result buffering** — up to 512 completed job results remain in
+  memory across temporary WebSocket disconnects and are retried after reconnect
 
 ## Quick start
 
@@ -104,8 +106,8 @@ Towerops server ──WebSocket/TLS──▶ agent ──▶ SNMP / ICMP / SSH /
    whenever assignments, credentials or checks change.
 3. Jobs are executed on bounded worker pools — one per protocol — so a slow
    or unreachable device cannot stall the rest.
-4. Results are streamed back as they complete. SNMP results are batched for up
-   to 100ms to keep message volume down.
+4. Results are streamed back as they complete. The server batches ICMP result
+   persistence for up to 100ms; the agent does not batch SNMP results on the wire.
 5. The agent sends a heartbeat every 60s carrying its version, uptime and
    architecture, plus a channel keepalive every 25s. The server drops an agent
    that goes 5 minutes without a heartbeat.
@@ -114,6 +116,16 @@ Towerops server ──WebSocket/TLS──▶ agent ──▶ SNMP / ICMP / SSH /
 
 Messages are Protocol Buffers ([`proto/agent.proto`](proto/agent.proto))
 carried inside the Phoenix channel envelope.
+
+### Resilience details
+
+- SNMPv1 `noSuchName` and `tooBig` responses recursively halve a GET batch,
+  recovering every individually valid OID instead of discarding the whole
+  response.
+- ICMP tries a raw socket, then an unprivileged UDP socket, then `ping(8)`.
+- Standalone self-updates compare SHA-256 digests in constant time, atomically
+  replace the binary, and re-exec the process. Container deployments refuse
+  self-update because their binary comes from the image.
 
 ## SNMP trap listener
 

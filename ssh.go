@@ -76,7 +76,7 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 }
 
 // executePingJob pings a device and sends a monitoring check result.
-func executePingJob(ctx context.Context, job *pb.AgentJob, out resultQueue) {
+func executePingJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing device info for ping", "job_id", job.JobId)
