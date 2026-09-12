@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # rebuilds continuously and ships busybox 1.38, so the image scans clean.
 #
 # Deliberately unpinned. Only `:latest` is available on Chainguard's free
-# tier, and tracking it is the point — pinning a digest would freeze us on a
+# tier, and tracking it is the point - pinning a digest would freeze us on a
 # snapshot that goes stale, which is the problem this base was chosen to
 # solve. The Grype gate in CI is what catches a bad upstream push.
 FROM cgr.dev/chainguard/wolfi-base:latest
@@ -26,7 +26,7 @@ FROM cgr.dev/chainguard/wolfi-base:latest
 RUN apk upgrade --no-cache && apk add --no-cache iputils libcap-utils
 COPY --from=builder /app/towerops-agent /usr/local/bin/towerops-agent
 # wolfi's iputils ships no separate ping6 binary, and its `ping` resolves IPv6
-# targets itself — which is what the agent's exec fallback uses when ping6 is
+# targets itself - which is what the agent's exec fallback uses when ping6 is
 # absent. /data holds the trust-on-first-use store, so the unprivileged runtime
 # user must own it.
 RUN adduser -D -u 1000 towerops && \

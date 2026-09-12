@@ -2,13 +2,11 @@
 
 ## Licensing and the DCO
 
-This project is licensed **GPL-3.0-or-later**, with one exception:
-`proto/agent.proto` and the generated bindings in `pb/` are **Apache-2.0**, so
-that implementing the wire protocol does not drag anything into copyleft. See
-[LICENSE](LICENSE) and [LICENSE.Apache-2.0](LICENSE.Apache-2.0).
+This project, including `proto/agent.proto` and its generated bindings in
+`pb/`, is licensed **GPL-3.0-or-later**. See [LICENSE](LICENSE).
 
-Contributions are accepted under the license of the file you are changing. We
-use the [Developer Certificate of Origin](https://developercertificate.org/)
+Contributions are accepted under GPL-3.0-or-later. We use the
+[Developer Certificate of Origin](https://developercertificate.org/)
 rather than a CLA: you keep your copyright, and you certify that you have the
 right to contribute the work. Sign off every commit:
 

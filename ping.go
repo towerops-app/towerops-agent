@@ -252,7 +252,7 @@ func execPing(parent context.Context, ip string, timeoutMs int) (float64, error)
 }
 
 // ipv6PingCommand prefers ping6 where it exists (macOS ships it separately)
-// and otherwise uses ping, whose iputils build — the one in the agent image —
+// and otherwise uses ping, whose iputils build - the one in the agent image -
 // handles IPv6 addresses itself and is the only capable binary present.
 func ipv6PingCommand() string {
 	if _, err := pingLookPath("ping6"); err == nil {

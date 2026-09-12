@@ -139,7 +139,7 @@ func toWebSocketURL(rawURL string, insecure bool) (string, error) {
 	}
 
 	if strings.HasPrefix(result, "ws://") && !insecure {
-		return "", fmt.Errorf("plaintext ws:// connection rejected — use wss:// or pass --insecure to allow")
+		return "", fmt.Errorf("plaintext ws:// connection rejected - use wss:// or pass --insecure to allow")
 	}
 	return result, nil
 }

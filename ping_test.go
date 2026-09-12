@@ -306,7 +306,7 @@ func TestPingDeviceFallbackToExec(t *testing.T) {
 
 func TestPingDeviceNonICMPError(t *testing.T) {
 	// When icmpPing returns a non-errICMPUnavailable error, pingDevice should NOT
-	// fall back to exec — it should return the error directly.
+	// fall back to exec - it should return the error directly.
 	origListen := icmpListenPacket
 	defer func() { icmpListenPacket = origListen }()
 
@@ -351,7 +351,7 @@ func TestDoICMPPingUDPNetwork(t *testing.T) {
 
 func TestDoICMPPingTimeout(t *testing.T) {
 	// Ping unreachable IP with short timeout → covers icmp read timeout error
-	ip := net.ParseIP("192.0.2.1") // TEST-NET-1 — unreachable
+	ip := net.ParseIP("192.0.2.1") // TEST-NET-1 - unreachable
 	_, err := doICMPPing(context.Background(), ip, "udp4", true, 100)
 	if err == nil {
 		t.Error("expected timeout error for unreachable host")
@@ -362,7 +362,7 @@ func TestDoICMPPingTimeout(t *testing.T) {
 }
 
 func TestDoICMPPingIPv6Timeout(t *testing.T) {
-	// IPv6 unreachable — covers the ipv6 branch in doICMPPing
+	// IPv6 unreachable - covers the ipv6 branch in doICMPPing
 	ip := net.ParseIP("100::1") // Unreachable IPv6
 	_, err := doICMPPing(context.Background(), ip, "udp6", false, 100)
 	if err != nil {

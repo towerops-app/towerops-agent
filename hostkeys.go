@@ -134,7 +134,7 @@ func (s *hostKeyStore) verify(host, fingerprint string) error {
 	}
 
 	if stored != fingerprint {
-		return fmt.Errorf("TOFU: host key changed for %s (stored=%s, got=%s) — possible MITM", host, stored, fingerprint)
+		return fmt.Errorf("TOFU: host key changed for %s (stored=%s, got=%s) - possible MITM", host, stored, fingerprint)
 	}
 	return nil
 }

@@ -47,7 +47,7 @@ var successfulConnectionThreshold = 30 * time.Second
 // to drain before abandoning their in-flight jobs.
 var poolShutdownTimeout = 5 * time.Second
 
-const maxJobPayloadBytes = 4 << 20 // 4 MB — well above any legitimate job list
+const maxJobPayloadBytes = 4 << 20 // 4 MB - well above any legitimate job list
 
 // resultQueueSize bounds the process-wide in-memory result backlog retained
 // across WebSocket reconnects. It exceeds the 420 slots the former per-type
@@ -268,7 +268,7 @@ func (s *session) write() {
 	}
 }
 
-// fail publishes err — dropping it when an earlier error is already queued —
+// fail publishes err - dropping it when an earlier error is already queued -
 // and only then cancels the session. Publishing first is what lets a loop that
 // wakes on the cancellation still report the real cause instead of racing the
 // error channel.

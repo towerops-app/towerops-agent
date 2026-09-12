@@ -527,7 +527,7 @@ func TestSelfUpdateFullHappyPath(t *testing.T) {
 		return os.Rename(oldpath, newpath) // real rename within temp dir
 	}
 	syscallExec = func(argv0 string, argv []string, envv []string) error {
-		return nil // success — don't actually re-exec
+		return nil // success - don't actually re-exec
 	}
 
 	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)

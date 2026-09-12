@@ -52,7 +52,7 @@ var (
 	}
 
 	// sslRootCAs returns the system cert pool, cached after first successful load.
-	// Errors are not cached — subsequent calls will retry loading.
+	// Errors are not cached - subsequent calls will retry loading.
 	// Overridable for tests.
 	sslRootCAs = func() (*x509.CertPool, error) {
 		sslRootCAsMu.Lock()

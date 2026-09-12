@@ -783,12 +783,12 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := newResultQueue(0) // no capacity — will remain full
+		ch := newResultQueue(0) // no capacity - will remain full
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		}, ch)
-		// Should not block — the result is dropped
+		// Should not block - the result is dropped
 	})
 }
 
@@ -811,7 +811,7 @@ func TestExecuteSnmpJobBatchesGets(t *testing.T) {
 		return mock, func() {}, nil
 	}
 
-	// Create 150 OIDs — should be split into 3 batches of 60, 60, 30
+	// Create 150 OIDs - should be split into 3 batches of 60, 60, 30
 	oids := make([]string, 150)
 	for i := range oids {
 		oids[i] = fmt.Sprintf(".1.3.6.1.2.1.1.%d.0", i)
@@ -958,7 +958,7 @@ func TestExecuteSnmpJobSplitsErrorStatusBatches(t *testing.T) {
 
 // TestSnmpGetIntoUnhandledErrorStatus pins the default arm of the error-status
 // switch: an error status other than noSuchName/tooBig (here genErr) discards
-// the whole batch — no varbind from the failed response is recorded — and the
+// the whole batch - no varbind from the failed response is recorded - and the
 // batch is NOT halved and retried the way noSuchName/tooBig are.
 func TestSnmpGetIntoUnhandledErrorStatus(t *testing.T) {
 	oids := []string{".1.3.6.1.2.1.1.1.0", ".1.3.6.1.2.1.1.3.0"}
@@ -981,7 +981,7 @@ func TestSnmpGetIntoUnhandledErrorStatus(t *testing.T) {
 		t.Errorf("into = %v, want empty on genErr response", into)
 	}
 	if len(batches) != 1 {
-		t.Fatalf("Get called %d times (%v), want 1 — genErr must not split the batch", len(batches), batches)
+		t.Fatalf("Get called %d times (%v), want 1 - genErr must not split the batch", len(batches), batches)
 	}
 	if got := strings.Join(batches[0], ","); got != strings.Join(oids, ",") {
 		t.Errorf("batch = %q, want %q", got, strings.Join(oids, ","))
@@ -1019,7 +1019,7 @@ func TestExecuteSnmpJobCtxCancelled(t *testing.T) {
 	case <-ch.items:
 		// Might get a result if the first query ran before ctx check
 	default:
-		// Expected — returned early
+		// Expected - returned early
 	}
 }
 
