@@ -680,17 +680,14 @@ func TestLldpTDiscoverNeighborsEmptyIndexParts(t *testing.T) {
 
 func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 	t.Run("nil snmp device", func(t *testing.T) {
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executeLldpTopologyJob(context.Background(),
 			&pb.AgentJob{DeviceId: "dev-1", JobId: "job-1"}, out)
-		o := <-out
+		o := <-out.items
 		if o.event != "lldp_topology_result" {
 			t.Fatalf("event = %q, want lldp_topology_result", o.event)
 		}
-		got, ok := o.msg.(*pb.LldpTopologyResult)
-		if !ok {
-			t.Fatalf("message type = %T, want *pb.LldpTopologyResult", o.msg)
-		}
+		got := decodeQueuedResult[*pb.LldpTopologyResult](t, o)
 		if got.DeviceId != "dev-1" || got.JobId != "job-1" {
 			t.Fatalf("result ids = (%q, %q), want (dev-1, job-1)", got.DeviceId, got.JobId)
 		}
@@ -709,20 +706,17 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 			return nil, nil, errors.New("dial refused")
 		}
 
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executeLldpTopologyJob(context.Background(), &pb.AgentJob{
 			DeviceId:   "dev-2",
 			JobId:      "job-2",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		}, out)
-		o := <-out
+		o := <-out.items
 		if o.event != "lldp_topology_result" {
 			t.Fatalf("event = %q, want lldp_topology_result", o.event)
 		}
-		got, ok := o.msg.(*pb.LldpTopologyResult)
-		if !ok {
-			t.Fatalf("message type = %T, want *pb.LldpTopologyResult", o.msg)
-		}
+		got := decodeQueuedResult[*pb.LldpTopologyResult](t, o)
 		if got.DeviceId != "dev-2" || got.JobId != "job-2" {
 			t.Fatalf("result ids = (%q, %q), want (dev-2, job-2)", got.DeviceId, got.JobId)
 		}
@@ -756,7 +750,7 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 			return m, func() { closed = true }, nil
 		}
 
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		dev := &pb.SnmpDevice{Ip: "10.0.0.1", Version: "2c"}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -776,14 +770,11 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 			t.Fatal("close function was not called")
 		}
 
-		o := <-out
+		o := <-out.items
 		if o.event != "lldp_topology_result" {
 			t.Fatalf("event = %q, want lldp_topology_result", o.event)
 		}
-		got, ok := o.msg.(*pb.LldpTopologyResult)
-		if !ok {
-			t.Fatalf("message type = %T, want *pb.LldpTopologyResult", o.msg)
-		}
+		got := decodeQueuedResult[*pb.LldpTopologyResult](t, o)
 		if got.DeviceId != "dev-3" || got.JobId != "job-3" {
 			t.Fatalf("result ids = (%q, %q), want (dev-3, job-3)", got.DeviceId, got.JobId)
 		}
@@ -839,13 +830,13 @@ func TestLldpTExecuteLldpTopologyJobWalkStrategy(t *testing.T) {
 				return m, func() {}, nil
 			}
 
-			out := make(resultQueue, 1)
+			out := newResultQueue(1)
 			executeLldpTopologyJob(context.Background(), &pb.AgentJob{
 				DeviceId:   "dev-walk",
 				JobId:      "job-walk",
 				SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: tt.version},
 			}, out)
-			<-out
+			<-out.items
 
 			if tt.wantBulk {
 				if !slices.Equal(m.bulkWalkRoots, wantRoots) {
@@ -879,6 +870,8 @@ func lldpTNumericOID(t *rapid.T, label string, minParts, maxParts int) string {
 }
 
 func TestPropLldpExtractSuffix(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		base := lldpTNumericOID(t, "base", 1, 8)
 		suffix := lldpTNumericOID(t, "suffix", 1, 6)
@@ -904,6 +897,8 @@ func TestPropLldpExtractSuffix(t *testing.T) {
 }
 
 func TestPropLldpParseRemoteKey(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		base := lldpTNumericOID(t, "base", 1, 8)
 		nParts := rapid.IntRange(1, 6).Draw(t, "nParts")
@@ -924,6 +919,8 @@ func TestPropLldpParseRemoteKey(t *testing.T) {
 }
 
 func TestPropLldpParseMgmtAddrIPv4(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		octets := make([]int, 4)
 		for i := range octets {
@@ -952,6 +949,8 @@ func TestPropLldpParseMgmtAddrIPv4(t *testing.T) {
 }
 
 func TestPropLldpParseMgmtAddrIPv6(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		octets := make([]int, 16)
 		for i := range octets {
@@ -984,6 +983,8 @@ func TestPropLldpParseMgmtAddrIPv6(t *testing.T) {
 }
 
 func TestPropLldpSortedKeys(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		m := rapid.MapOf(rapid.String(), rapid.String()).Draw(t, "values")
 

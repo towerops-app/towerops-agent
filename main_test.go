@@ -620,6 +620,8 @@ func TestCliTEnvUintUnparseable(t *testing.T) {
 }
 
 func TestPropCliSanitizeURL(t *testing.T) {
+	t.Parallel()
+
 	if got := sanitizeURL(""); got != "" {
 		t.Fatalf("sanitizeURL(%q) = %q, want empty string", "", got)
 	}
@@ -679,6 +681,8 @@ func TestPropCliSanitizeURL(t *testing.T) {
 }
 
 func TestPropCliToWebSocketURL(t *testing.T) {
+	t.Parallel()
+
 	// The suffix alphabet excludes '/', so a masked-out "http://" can never
 	// reappear from the caller-supplied remainder.
 	suffix := rapid.StringMatching(`[a-z0-9.:-]{0,20}`)

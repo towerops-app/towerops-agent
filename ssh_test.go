@@ -23,7 +23,7 @@ import (
 
 func TestExecutePingJob(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executePingJob(context.Background(), &pb.AgentJob{JobId: "p1"}, out)
 		result := sshTReceiveMonitoringResult(t, out)
 		if result.Status != "failure" {
@@ -38,7 +38,7 @@ func TestExecutePingJob(t *testing.T) {
 			return 3.14, nil
 		}
 
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executePingJob(context.Background(), &pb.AgentJob{
 			JobId:      "p1",
 			DeviceId:   "dev-1",
@@ -64,7 +64,7 @@ func TestExecutePingJob(t *testing.T) {
 			return 0, fmt.Errorf("request timeout")
 		}
 
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executePingJob(context.Background(), &pb.AgentJob{
 			JobId:      "p2",
 			DeviceId:   "dev-2",
@@ -78,36 +78,28 @@ func TestExecutePingJob(t *testing.T) {
 	})
 }
 
-func sshTReceiveMonitoringResult(t *testing.T, out resultQueue) *pb.MonitoringCheck {
+func sshTReceiveMonitoringResult(t *testing.T, out *resultQueue) *pb.MonitoringCheck {
 	t.Helper()
 	select {
-	case queued := <-out:
+	case queued := <-out.items:
 		if queued.event != "monitoring_check" {
 			t.Fatalf("event = %q, want monitoring_check", queued.event)
 		}
-		result, ok := queued.msg.(*pb.MonitoringCheck)
-		if !ok {
-			t.Fatalf("message type = %T, want *pb.MonitoringCheck", queued.msg)
-		}
-		return result
+		return decodeQueuedResult[*pb.MonitoringCheck](t, queued)
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for monitoring result")
 		return nil
 	}
 }
 
-func sshTReceiveMikrotikResult(t *testing.T, out resultQueue) *pb.MikrotikResult {
+func sshTReceiveMikrotikResult(t *testing.T, out *resultQueue) *pb.MikrotikResult {
 	t.Helper()
 	select {
-	case queued := <-out:
+	case queued := <-out.items:
 		if queued.event != "mikrotik_result" {
 			t.Fatalf("event = %q, want mikrotik_result", queued.event)
 		}
-		result, ok := queued.msg.(*pb.MikrotikResult)
-		if !ok {
-			t.Fatalf("message type = %T, want *pb.MikrotikResult", queued.msg)
-		}
-		return result
+		return decodeQueuedResult[*pb.MikrotikResult](t, queued)
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for MikroTik result")
 		return nil
@@ -116,7 +108,7 @@ func sshTReceiveMikrotikResult(t *testing.T, out resultQueue) *pb.MikrotikResult
 
 func TestExecuteMikrotikJob(t *testing.T) {
 	t.Run("nil device", func(t *testing.T) {
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executeMikrotikJob(context.Background(), &pb.AgentJob{JobId: "m1"}, out)
 		result := sshTReceiveMikrotikResult(t, out)
 		if result.Error == "" {
@@ -134,7 +126,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 			return nil, fmt.Errorf("connection refused")
 		}
 
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executeMikrotikJob(context.Background(), &pb.AgentJob{
 			JobId:          "m1",
 			DeviceId:       "dev-1",
@@ -158,7 +150,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 			}), nil
 		}
 
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executeMikrotikJob(context.Background(), &pb.AgentJob{
 			JobId:    "m1",
 			DeviceId: "dev-1",
@@ -193,7 +185,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 			}), nil
 		}
 
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executeMikrotikJob(context.Background(), &pb.AgentJob{
 			JobId:          "m1",
 			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
@@ -219,7 +211,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 			}), nil
 		}
 
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executeMikrotikJob(context.Background(), &pb.AgentJob{
 			JobId:          "m1",
 			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
@@ -242,7 +234,7 @@ func TestExecuteMikrotikJob(t *testing.T) {
 			return "/ip address\nadd address=10.0.0.1/24", nil
 		}
 
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executeMikrotikJob(context.Background(), &pb.AgentJob{
 			JobId:          "backup:dev1",
 			DeviceId:       "dev-1",
@@ -271,7 +263,7 @@ func TestExecuteMikrotikBackupViaSSH(t *testing.T) {
 			return "# test config", nil
 		}
 
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executeMikrotikBackupViaSSH(
 			context.Background(),
 			&pb.AgentJob{JobId: "backup:1", DeviceId: "d1"},
@@ -296,7 +288,7 @@ func TestExecuteMikrotikBackupViaSSH(t *testing.T) {
 			return "", fmt.Errorf("ssh connection refused")
 		}
 
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executeMikrotikBackupViaSSH(
 			context.Background(),
 			&pb.AgentJob{JobId: "backup:2", DeviceId: "d2"},
@@ -319,7 +311,7 @@ func TestExecuteMikrotikBackupViaSSH(t *testing.T) {
 			return "", nil
 		}
 
-		out := make(resultQueue, 1)
+		out := newResultQueue(1)
 		executeMikrotikBackupViaSSH(
 			context.Background(),
 			&pb.AgentJob{JobId: "backup:3", DeviceId: "d3"},

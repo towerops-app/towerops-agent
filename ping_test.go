@@ -252,17 +252,32 @@ func TestExecPingIPv6Localhost(t *testing.T) {
 	}
 }
 
-func TestExecPingUnreachable(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skipping on windows")
-	}
-	_, err := execPing(context.Background(), "192.0.2.1", 1000) // TEST-NET-1 — unreachable
-	if err == nil {
-		t.Error("expected error for unreachable host")
-	}
-	if err != nil && !strings.Contains(err.Error(), "ping failed") {
-		t.Errorf("expected 'ping failed' in error, got: %v", err)
-	}
+func TestExecPingCommandResult(t *testing.T) {
+	origCommand := pingCommandOutput
+	t.Cleanup(func() { pingCommandOutput = origCommand })
+
+	t.Run("failure", func(t *testing.T) {
+		pingCommandOutput = func(context.Context, string, ...string) ([]byte, error) {
+			return []byte("100% packet loss"), errors.New("exit status 1")
+		}
+		_, err := execPing(context.Background(), "192.0.2.1", 1000)
+		if err == nil || !strings.Contains(err.Error(), "ping failed: 100% packet loss") {
+			t.Fatalf("execPing error = %v, want packet-loss failure", err)
+		}
+	})
+
+	t.Run("success", func(t *testing.T) {
+		pingCommandOutput = func(context.Context, string, ...string) ([]byte, error) {
+			return []byte("64 bytes from 192.0.2.1: time=12.345 ms"), nil
+		}
+		got, err := execPing(context.Background(), "192.0.2.1", 1000)
+		if err != nil {
+			t.Fatalf("execPing returned error: %v", err)
+		}
+		if got != 12.345 {
+			t.Fatalf("execPing response time = %v, want 12.345", got)
+		}
+	})
 }
 
 func TestPingDeviceFallbackToExec(t *testing.T) {
@@ -357,20 +372,17 @@ func TestDoICMPPingIPv6Timeout(t *testing.T) {
 }
 
 func TestIcmpPingNonICMPUnavailableError(t *testing.T) {
-	// When raw ICMP returns a non-errICMPUnavailable error, icmpPing should
-	// return that error without falling back to UDP.
-	origListen := icmpListenPacket
-	defer func() { icmpListenPacket = origListen }()
+	readFailure := errors.New("scripted read failure")
+	conn := tpTNewFakeICMPConn()
+	conn.readErr = readFailure
+	networks := tpTUseFakeICMPConn(t, conn)
 
-	// Raw ICMP succeeds (opens a connection), but pinging unreachable IP will timeout.
-	// The timeout error is NOT errICMPUnavailable, so icmpPing returns it directly.
-	icmpListenPacket = func(network, address string) (icmpConn, error) {
-		return icmp.ListenPacket("udp4", address)
+	_, err := icmpPing(context.Background(), "127.0.0.1", 1000)
+	if !errors.Is(err, readFailure) {
+		t.Fatalf("icmpPing error = %v, want wrapped %v", err, readFailure)
 	}
-
-	_, err := icmpPing(context.Background(), "192.0.2.1", 100) // TEST-NET-1, 100ms timeout
-	if err == nil {
-		t.Error("expected error for unreachable host")
+	if len(*networks) != 1 || (*networks)[0] != "ip4:icmp" {
+		t.Errorf("listened on %v, want raw ICMP only", *networks)
 	}
 }
 
@@ -920,6 +932,8 @@ func TestTpTIcmpPingListenFailureFallsBack(t *testing.T) {
 var tpTPingNoiseAlphabet = []rune("abcXYZ 0123.:/-()")
 
 func TestPropTpParsePingTimeRoundtrip(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		want := rapid.Float64Range(0.001, 9999.0).Draw(t, "ms")
 		formatted := strconv.FormatFloat(want, 'f', 3, 64)

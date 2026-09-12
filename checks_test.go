@@ -1275,43 +1275,33 @@ func TestDNSCheck_VeryShortTimeout(t *testing.T) {
 	}
 }
 
-func TestTCPCheck_SendFailsOnClosedConnection(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+type chkTWriteErrConn struct {
+	net.Conn
+}
+
+func (c *chkTWriteErrConn) Write([]byte) (int, error) {
+	return 0, errors.New("chkT write failed")
+}
+
+func TestTCPCheckSendFailure(t *testing.T) {
+	origDial := tcpDialContext
+	t.Cleanup(func() { tcpDialContext = origDial })
+	tcpDialContext = func(context.Context, string, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		t.Cleanup(func() { _ = server.Close() })
+		return &chkTWriteErrConn{Conn: client}, nil
 	}
-	defer func() { _ = ln.Close() }()
-
-	// Server accepts and immediately closes the connection
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			_ = conn.Close()
-		}
-	}()
-
-	port := parsePort(portFromListener(ln))
-
-	// Send a large payload to trigger a write error on a closed connection.
-	// The first small write might succeed (kernel buffer), but a large write
-	// after the peer has closed should fail with a broken pipe or similar.
-	largePayload := strings.Repeat("x", 1024*1024) // 1MB
-	// Give the server time to close the connection
-	time.Sleep(50 * time.Millisecond)
 
 	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{
-		Host:   "127.0.0.1",
-		Port:   port,
-		Send:   largePayload,
-		Expect: "something",
+		Host: "127.0.0.1",
+		Port: 1234,
+		Send: "PING\r\n",
 	}, 5000)
-
-	// This may hit either "Send failed" or "Receive failed" depending on timing
-	if status != 2 {
-		t.Fatalf("expected status 2 for write to closed conn, got %d: %s", status, output)
+	if status != checkCritical {
+		t.Fatalf("TCP send failure status = %d, want %d", status, checkCritical)
+	}
+	if !strings.Contains(output, "Send failed: chkT write failed") {
+		t.Fatalf("TCP send failure output = %q", output)
 	}
 }
 
@@ -2307,6 +2297,8 @@ func (w *chkTChunkWriter) Write(p []byte) (int, error) {
 }
 
 func TestPropChkWriteAll(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		data := rapid.SliceOf(rapid.Byte()).Draw(t, "data")
 		chunk := rapid.IntRange(1, 64).Draw(t, "chunk")
@@ -2339,6 +2331,8 @@ func TestPropChkWriteAll(t *testing.T) {
 }
 
 func TestPropChkCheckTimeout(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		ms := rapid.IntRange(1, 4_000_000).Draw(t, "timeoutMs")
 

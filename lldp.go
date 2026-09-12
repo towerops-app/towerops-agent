@@ -29,7 +29,7 @@ const (
 )
 
 // executeLldpTopologyJob performs LLDP neighbor discovery via SNMP.
-func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, out resultQueue) {
+func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	deviceID := job.DeviceId
 	jobID := job.JobId
 	timestamp := time.Now().Unix()

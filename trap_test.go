@@ -943,6 +943,8 @@ func tpTIsDottedNumeric(s string) bool {
 }
 
 func TestPropTpV1TrapOID(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		generic := rapid.IntRange(-5, 12).Draw(t, "generic")
 		specific := rapid.IntRange(0, 1_000_000).Draw(t, "specific")
@@ -978,6 +980,8 @@ func TestPropTpV1TrapOID(t *testing.T) {
 }
 
 func TestPropTpUptimeTicks(t *testing.T) {
+	t.Parallel()
+
 	kinds := []string{"uint32", "uint", "uint64", "int", "negative-int", "letters", "digit-string"}
 	rapid.Check(t, func(t *rapid.T) {
 		var pdu gosnmp.SnmpPDU
@@ -1022,6 +1026,8 @@ func TestPropTpUptimeTicks(t *testing.T) {
 }
 
 func TestPropTpTrapVersion(t *testing.T) {
+	t.Parallel()
+
 	rapid.Check(t, func(t *rapid.T) {
 		v := gosnmp.SnmpVersion(rapid.Byte().Draw(t, "wireVersion"))
 

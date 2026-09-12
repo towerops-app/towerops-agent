@@ -970,6 +970,8 @@ func TestCliTSelfUpdateSyncDirectoryError(t *testing.T) {
 }
 
 func TestPropCliSanitizeArgs(t *testing.T) {
+	t.Parallel()
+
 	// Other arguments are lowercase-only, so the digit-bearing secret can never
 	// appear in them by chance, nor can they look like a token flag.
 	filler := rapid.SliceOfN(rapid.StringMatching(`[a-z]{0,8}`), 0, 6)
