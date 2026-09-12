@@ -453,8 +453,8 @@ func cliTCoverDir() string {
 	return ""
 }
 
-// TestCliTMainSubprocess re-execs the test binary so main() — which ends in
-// os.Exit — can be exercised without terminating the test process.
+// TestCliTMainSubprocess re-execs the test binary so main() - which ends in
+// os.Exit - can be exercised without terminating the test process.
 func TestCliTMainSubprocess(t *testing.T) {
 	if os.Getenv("CLIT_RUN_MAIN") == "1" {
 		os.Args = []string{"towerops-agent"}

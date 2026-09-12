@@ -14,30 +14,30 @@ except the optional SNMP trap listener.
 
 Jobs the server can dispatch:
 
-- **SNMP polling** — GET and WALK against SNMPv1, v2c and v3 devices
-- **SNMP discovery** — walks a device to enumerate sensors, interfaces and neighbours
-- **SNMP credential testing** — validates a credential set against a device before you save it
-- **ICMP monitoring** — reachability and round-trip time
-- **MikroTik RouterOS** — polling over the binary API, and configuration backup over the API or SSH `/export`
-- **LLDP topology** — LLDP-MIB walks that feed link discovery
-- **Service checks** — HTTP(S), TCP, DNS and TLS-certificate-expiry checks
+- **SNMP polling** - GET and WALK against SNMPv1, v2c and v3 devices
+- **SNMP discovery** - walks a device to enumerate sensors, interfaces and neighbours
+- **SNMP credential testing** - validates a credential set against a device before you save it
+- **ICMP monitoring** - reachability and round-trip time
+- **MikroTik RouterOS** - polling over the binary API, and configuration backup over the API or SSH `/export`
+- **LLDP topology** - LLDP-MIB walks that feed link discovery
+- **Service checks** - HTTP(S), TCP, DNS and TLS-certificate-expiry checks
 
 It also accepts unsolicited input, when enabled:
 
-- **SNMP trap receiver** — SNMPv1 and v2c traps and informs on UDP 162,
+- **SNMP trap receiver** - SNMPv1 and v2c traps and informs on UDP 162,
   forwarded to Towerops and attached to the device that sent them
 
 Operational properties:
 
-- **Outbound only** — one WebSocket over TLS, authenticated with an agent token; no inbound connections unless the trap listener is enabled
-- **Server driven** — assignment, schedule and credential changes take effect without restarting the agent
-- **Automatic reconnection** — exponential backoff with jitter, 1s to 10s
-- **Server-triggered update and restart** — see [Updating](#updating)
-- **Trust on first use** — SSH host keys and MikroTik TLS certificates are pinned on first contact
-- **Trap forwarding survives reconnects** — the trap listener runs independently
+- **Outbound only** - one WebSocket over TLS, authenticated with an agent token; no inbound connections unless the trap listener is enabled
+- **Server driven** - assignment, schedule and credential changes take effect without restarting the agent
+- **Automatic reconnection** - exponential backoff with jitter, 1s to 10s
+- **Server-triggered update and restart** - see [Updating](#updating)
+- **Trust on first use** - SSH host keys and MikroTik TLS certificates are pinned on first contact
+- **Trap forwarding survives reconnects** - the trap listener runs independently
   of the WebSocket session and queues up to 1000 traps while the agent is
   reconnecting
-- **Reconnect result buffering** — up to 512 completed job results remain in
+- **Reconnect result buffering** - up to 512 completed job results remain in
   memory across temporary WebSocket disconnects and are retried after reconnect
 
 ## Quick start
@@ -104,7 +104,7 @@ Towerops server ──WebSocket/TLS──▶ agent ──▶ SNMP / ICMP / SSH /
    the `agent:<id>` channel with its token. A rejected token ends the session.
 2. The server immediately pushes the agent's job list, and pushes it again
    whenever assignments, credentials or checks change.
-3. Jobs are executed on bounded worker pools — one per protocol — so a slow
+3. Jobs are executed on bounded worker pools - one per protocol - so a slow
    or unreachable device cannot stall the rest.
 4. Results are streamed back as they complete. The server batches ICMP result
    persistence for up to 100ms; the agent does not batch SNMP results on the wire.
@@ -143,7 +143,7 @@ Traps are unauthenticated by design: anything that can reach the port can send
 one. Set `TOWEROPS_TRAP_COMMUNITY` to reject traps that do not carry the
 expected community string, and firewall the port to your device network. Each
 trap is capped at 128 variable bindings, and the agent queues at most 1000
-traps while it has no server connection — beyond that further traps are
+traps while it has no server connection - beyond that further traps are
 dropped and the count is logged.
 
 In Docker, publish the port. The image already grants the binary
@@ -178,7 +178,7 @@ reconnects immediately.
 ## Building from source
 
 Requires Go 1.27 or later. A Nix dev shell with the pinned toolchain, linter
-and protobuf compiler is included — see [CONTRIBUTING.md](CONTRIBUTING.md).
+and protobuf compiler is included - see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
 make build          # or: go build -o towerops-agent .
@@ -240,13 +240,6 @@ version. See [LICENSE](LICENSE).
 It is distributed in the hope that it will be useful, but WITHOUT ANY
 WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
 A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-**One exception:** `proto/agent.proto` and the Go bindings generated from it
-in `pb/` are licensed **Apache-2.0** ([LICENSE.Apache-2.0](LICENSE.Apache-2.0)).
-That file is the wire contract between the agent and the server rather than
-part of the agent itself, so anyone can implement this protocol — in any
-language, under any license — without taking on copyleft obligations.
-Speaking the protocol is not what makes something a derivative work.
 
 Contributions are accepted under the Developer Certificate of Origin; see
 [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -448,7 +448,7 @@ func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
 	case <-out.items:
 		t.Error("expected no SNMP result for oversized payload")
 	case <-time.After(100 * time.Millisecond):
-		// Good — nothing dispatched
+		// Good - nothing dispatched
 	}
 }
 
@@ -678,7 +678,7 @@ func TestRunSessionRejectsFailedJoin(t *testing.T) {
 		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
 		_, _ = conn.Write([]byte(resp))
 
-		// Read the join message (masked WebSocket frame) — just consume it
+		// Read the join message (masked WebSocket frame) - just consume it
 		frameBuf := make([]byte, 4096)
 		_, _ = conn.Read(frameBuf)
 
@@ -708,7 +708,7 @@ func TestRunSessionRejectsFailedJoin(t *testing.T) {
 
 // TestRunSessionRejectedJoinStartsNoWorkerPools pins B1: the four worker pools
 // total 220 goroutines, and creating them before the join reply was validated
-// abandoned every one of them on each rejected token — which the reconnect
+// abandoned every one of them on each rejected token - which the reconnect
 // loop retries within 10s.
 func TestRunSessionRejectedJoinStartsNoWorkerPools(t *testing.T) {
 	origTimeout := joinTimeout
@@ -815,7 +815,7 @@ func TestSessionErrWithoutPublishedError(t *testing.T) {
 
 // The write-failure arm of the loop select. In production `fail` publishes the
 // error before cancelling, so the cancellation arm and this one are ready
-// together and Go picks between them at random — coverage of the write arm was
+// together and Go picks between them at random - coverage of the write arm was
 // a coin flip on whichever integration test closed the connection. Both arms
 // return the same "write: ..." error by design, so the behaviour is pinned here
 // with the session context left alive: that makes this arm the only ready case,
@@ -1369,7 +1369,7 @@ func TestRunSessionInvalidMessage(t *testing.T) {
 
 	go func() {
 		srv.acceptAndJoin(t)
-		// Send invalid JSON — should be logged but not crash
+		// Send invalid JSON - should be logged but not crash
 		time.Sleep(100 * time.Millisecond)
 		_, _ = srv.conn.Write(makeTextFrame([]byte("not json")))
 		// Then close to end session
@@ -1932,7 +1932,7 @@ func TestExecuteCheckPoolFull(t *testing.T) {
 		p.checks.submit(context.Background(), func() { <-done })
 	}
 
-	// Pool is now truly full — submit with cancelled ctx will reliably fail
+	// Pool is now truly full - submit with cancelled ctx will reliably fail
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -1976,7 +1976,7 @@ func TestRunSessionRestartInMainLoop(t *testing.T) {
 		go drainFrames(srv.conn, stopDrain)
 
 		time.Sleep(50 * time.Millisecond)
-		// Send restart event — exercised in the main loop select
+		// Send restart event - exercised in the main loop select
 		srv.sendEvent("restart", json.RawMessage(`{}`))
 		time.Sleep(200 * time.Millisecond)
 		close(stopDrain)
@@ -2163,7 +2163,7 @@ func TestRunSessionWriteError(t *testing.T) {
 		// Send a bulk of events so the client tries to write back
 		time.Sleep(100 * time.Millisecond)
 
-		// Close the connection from the server side — any writes by the
+		// Close the connection from the server side - any writes by the
 		// client's writer goroutine will fail, triggering writeErrCh.
 		srv.close()
 	}()

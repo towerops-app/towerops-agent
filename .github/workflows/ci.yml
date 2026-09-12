@@ -28,10 +28,10 @@ concurrency:
   # Anything that publishes gets its own group and is never cancelled by
   # unrelated work:
   #
-  #   main  — cancel-in-progress still applies within the group, so a newer
+  #   main  - cancel-in-progress still applies within the group, so a newer
   #           push to main supersedes an older one. Without that, two rapid
   #           pushes race to move the :latest tag.
-  #   v*    — never cancelled at all. A release build killed partway can leave
+  #   v*    - never cancelled at all. A release build killed partway can leave
   #           the per-arch images pushed but the manifest job never run, which
   #           publishes a broken :latest.
   group: >-

@@ -552,7 +552,7 @@ func TestMikrotikConnectRefused(t *testing.T) {
 }
 
 func TestMikrotikConnectSSL(t *testing.T) {
-	// SSL connect to a port with nothing listening — tests the TLS dialer path
+	// SSL connect to a port with nothing listening - tests the TLS dialer path
 	_, err := mikrotikConnect(context.Background(), "127.0.0.1", 1, "admin", "pass", true)
 	if err == nil {
 		t.Error("expected connection error with SSL")
@@ -730,7 +730,7 @@ func TestReadWordExceedsMaxSize(t *testing.T) {
 	oversize := maxMikrotikWordSize + 1
 	var buf bytes.Buffer
 	buf.Write(encodeLength(oversize))
-	// Don't need to write the payload — should reject before reading it
+	// Don't need to write the payload - should reject before reading it
 	c := &mikrotikClient{conn: &nopCloser{readWriter: &buf}}
 	_, err := c.readWord()
 	if err == nil {

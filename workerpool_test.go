@@ -106,7 +106,7 @@ func TestWorkerPoolRecoversPanic(t *testing.T) {
 	// Give the panic time to be processed
 	time.Sleep(50 * time.Millisecond)
 
-	// Submit a normal function — the worker should still be alive
+	// Submit a normal function - the worker should still be alive
 	done := make(chan struct{})
 	ok := pool.submit(context.Background(), func() { close(done) })
 	if !ok {
@@ -117,7 +117,7 @@ func TestWorkerPoolRecoversPanic(t *testing.T) {
 	case <-done:
 		// Worker survived the panic
 	case <-time.After(2 * time.Second):
-		t.Error("timed out — worker did not survive panic")
+		t.Error("timed out - worker did not survive panic")
 	}
 }
 

@@ -127,7 +127,7 @@ func isSnmpV1(version string) bool { return version == "1" || version == "v1" }
 // snmpGetInto records one GET batch. gosnmp reports an SNMP error-status
 // response through result.Error with err == nil, and SNMPv1 answers a batch
 // containing any unknown OID with noSuchName plus every request varbind echoed
-// back as Null — so the batch is halved down to single OIDs to recover the
+// back as Null - so the batch is halved down to single OIDs to recover the
 // values that do resolve. tooBig is split for the same reason: the device
 // cannot fit the response in one PDU.
 func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[string]string) {

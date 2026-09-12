@@ -36,7 +36,7 @@ const (
 	trapQueueSize = 1000
 
 	// trapReadBuffer is the UDP read buffer. gosnmp defaults to 4096, which
-	// truncates — and therefore silently discards — larger traps.
+	// truncates - and therefore silently discards - larger traps.
 	trapReadBuffer = 65535
 )
 
@@ -69,7 +69,7 @@ type trapListener struct {
 // A non-empty community rejects traps sent with any other community string;
 // gosnmp itself performs no community validation on receive.
 func startTrapListener(bindAddr string, port uint16, community string) (*trapListener, error) {
-	// Normalize an empty address to 0.0.0.0 rather than using :port — the bare
+	// Normalize an empty address to 0.0.0.0 rather than using :port - the bare
 	// form binds dual-stack, which makes the family depend on the host's IPv6
 	// configuration.
 	if bindAddr == "" {

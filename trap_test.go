@@ -481,7 +481,7 @@ func TestTrapListenerReceivesRealTrap(t *testing.T) {
 func TestTrapListenerRebindsAfterUnexpectedStop(t *testing.T) {
 	// The rebind announcement comes from a goroutine that selects on the new
 	// listener's readiness and on the shutdown signal, so returning as soon as
-	// `ready` closes leaves the deferred Close racing that select — a coin flip
+	// `ready` closes leaves the deferred Close racing that select - a coin flip
 	// over whether the rebind is ever announced. Synchronise on the record.
 	rebound := tpTWatchLog(t, "rebound", 1)
 
