@@ -87,6 +87,7 @@ func TestChannelMsgNullRef(t *testing.T) {
 
 func testPools(t *testing.T) *jobPools {
 	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
 	p := &jobPools{
 		snmp:     newWorkerPool(4),
 		mikrotik: newWorkerPool(4),
@@ -94,7 +95,18 @@ func testPools(t *testing.T) *jobPools {
 		checks:   newWorkerPool(4),
 		notices:  make(chan outbound, overloadNoticeQueueSize),
 	}
-	t.Cleanup(func() { p.snmp.stop(); p.mikrotik.stop(); p.ping.stop(); p.checks.stop() })
+	p.scheduler = newRecurringScheduler(ctx, realScheduleClock{})
+	t.Cleanup(func() {
+		cancel()
+		p.scheduler.cancelAll()
+		p.snmp.stop()
+		p.mikrotik.stop()
+		p.ping.stop()
+		p.checks.stop()
+		if !p.scheduler.wait(time.Second) {
+			t.Error("scheduler did not stop")
+		}
+	})
 	return p
 }
 
@@ -151,7 +163,7 @@ func TestHandleMessage(t *testing.T) {
 		// Just verify it doesn't panic
 	})
 
-	t.Run("jobs valid protobuf", func(t *testing.T) {
+	t.Run("jobs reconcile recurring work without retaining one-shot polls", func(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
 
@@ -164,16 +176,34 @@ func TestHandleMessage(t *testing.T) {
 		}
 
 		out := testQueue()
-
-		payload := makeJobPayload(&pb.AgentJob{
-			JobId:      "j1",
+		pools := testPools(t)
+		recurring := makeJobPayload(&pb.AgentJob{
+			JobId:      "poll:device-1",
 			JobType:    pb.JobType_POLL,
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		})
 
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), out)
-		// Wait for goroutine to finish
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: recurring}, "agent:test", pools, out)
 		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
+		if _, ok := pools.scheduler.jobs["poll:device-1"]; !ok {
+			t.Fatal("recurring poll was not retained")
+		}
+
+		oneShot := makeJobPayload(&pb.AgentJob{
+			JobId:      "live_poll:device-1:topic",
+			JobType:    pb.JobType_POLL,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+		})
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: oneShot}, "agent:test", pools, out)
+		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
+		if len(pools.scheduler.jobs) != 1 {
+			t.Fatalf("one-shot poll changed recurring inventory size to %d", len(pools.scheduler.jobs))
+		}
+
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: makeJobPayload()}, "agent:test", pools, out)
+		if len(pools.scheduler.jobs) != 0 {
+			t.Fatalf("empty recurring list retained %d jobs", len(pools.scheduler.jobs))
+		}
 	})
 
 	t.Run("invalid payload json", func(t *testing.T) {
@@ -408,6 +438,20 @@ func TestHandleMessage(t *testing.T) {
 		})
 		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "discovery_job", Payload: payload}, "agent:test", testPools(t), out)
 		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
+	})
+
+	t.Run("discovery_job invalid payload", func(t *testing.T) {
+		_, _ = handleMessage(
+			context.Background(),
+			channelMsg{
+				Topic:   "agent:test",
+				Event:   "discovery_job",
+				Payload: json.RawMessage(`not json`),
+			},
+			"agent:test",
+			testPools(t),
+			testQueue(),
+		)
 	})
 
 	t.Run("backup_job event", func(t *testing.T) {
@@ -2027,8 +2071,8 @@ func TestRunSessionSendsImmediateHeartbeat(t *testing.T) {
 	if !heartbeat.Container {
 		t.Error("heartbeat container = false, want the detected value")
 	}
-	if heartbeat.SchedulesJobs {
-		t.Error("heartbeat schedules_jobs = true, but this agent has no local scheduler")
+	if !heartbeat.SchedulesJobs {
+		t.Error("heartbeat schedules_jobs = false with local scheduler enabled")
 	}
 
 	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
@@ -2048,7 +2092,7 @@ func TestRunSessionHeartbeats(t *testing.T) {
 		getHostname = origHostname
 		runningInContainer = origContainer
 	}()
-	heartbeatInterval = 10 * time.Millisecond
+	heartbeatInterval = 50 * time.Millisecond
 	channelHeartbeatInterval = time.Hour
 	// The server suppresses pushed self-updates for containerised agents, so
 	// the heartbeat has to carry what the detector found.
@@ -2078,6 +2122,9 @@ func TestRunSessionHeartbeats(t *testing.T) {
 		}
 		if !heartbeat.Container {
 			t.Fatal("heartbeat container = false, want the detected value")
+		}
+		if !heartbeat.SchedulesJobs {
+			t.Fatal("heartbeat schedules_jobs = false with local scheduler enabled")
 		}
 	}
 	if got := hostnameCalls.Load(); got != 1 {
