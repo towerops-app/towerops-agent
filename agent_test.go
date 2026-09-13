@@ -2027,6 +2027,9 @@ func TestRunSessionSendsImmediateHeartbeat(t *testing.T) {
 	if !heartbeat.Container {
 		t.Error("heartbeat container = false, want the detected value")
 	}
+	if heartbeat.SchedulesJobs {
+		t.Error("heartbeat schedules_jobs = true, but this agent has no local scheduler")
+	}
 
 	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
 	if err := <-done; !errors.Is(err, errRestartRequested) {
