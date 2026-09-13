@@ -1103,8 +1103,8 @@ func TestPoolOverloadReportsEveryJobClassWithoutUsingResultSpool(t *testing.T) {
 		if result.DeviceId != deviceID {
 			t.Fatalf("rejected job %q device = %q, want %q", result.JobId, result.DeviceId, deviceID)
 		}
-		if !strings.Contains(result.Message, "retry") {
-			t.Fatalf("rejected job %q error does not request retry: %q", result.JobId, result.Message)
+		if !strings.HasPrefix(result.Message, "worker pool overloaded; retry ") {
+			t.Fatalf("rejected job %q error broke the server telemetry contract: %q", result.JobId, result.Message)
 		}
 		delete(want, result.JobId)
 	}
