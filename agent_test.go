@@ -440,6 +440,20 @@ func TestHandleMessage(t *testing.T) {
 		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
 	})
 
+	t.Run("discovery_job invalid payload", func(t *testing.T) {
+		_, _ = handleMessage(
+			context.Background(),
+			channelMsg{
+				Topic:   "agent:test",
+				Event:   "discovery_job",
+				Payload: json.RawMessage(`not json`),
+			},
+			"agent:test",
+			testPools(t),
+			testQueue(),
+		)
+	})
+
 	t.Run("backup_job event", func(t *testing.T) {
 		origDial := mikrotikDial
 		origSSH := sshBackup

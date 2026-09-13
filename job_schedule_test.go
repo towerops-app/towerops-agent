@@ -116,6 +116,7 @@ func TestSplitRecurringJobsCoversEveryRecurringType(t *testing.T) {
 		{JobId: "credential:test", JobType: pb.JobType_TEST_CREDENTIALS},
 		{JobId: "lldp:device-1", JobType: pb.JobType_LLDP_TOPOLOGY},
 		{JobId: "sweep:subnet-1", JobType: pb.JobType_NETWORK_SWEEP},
+		nil,
 	}
 
 	recurring, oneShot := splitRecurringJobs(jobs)
@@ -144,6 +145,34 @@ func jobIDs(jobs []*pb.AgentJob) []string {
 		ids[i] = job.JobId
 	}
 	return ids
+}
+
+func TestRecurringSchedulerRejectsInvalidAndPostDisconnectAssignments(t *testing.T) {
+	scheduler := newRecurringScheduler(context.Background(), newManualScheduleClock())
+	scheduler.replaceJobs([]*pb.AgentJob{
+		nil,
+		{JobType: pb.JobType_POLL},
+	}, nil, nil)
+	scheduler.replaceChecks([]*pb.Check{
+		nil,
+		{CheckType: "http"},
+	}, nil, nil)
+	if len(scheduler.jobs) != 0 || len(scheduler.checks) != 0 {
+		t.Fatal("scheduler retained assignment without a stable ID")
+	}
+
+	scheduler.cancelAll()
+	scheduler.replaceJobs([]*pb.AgentJob{{
+		JobId:   "poll:device-1",
+		JobType: pb.JobType_POLL,
+	}}, nil, nil)
+	if len(scheduler.jobs) != 0 {
+		t.Fatal("disconnected scheduler accepted a new assignment")
+	}
+	scheduler.cancelAll()
+	if !scheduler.wait(time.Second) {
+		t.Fatal("scheduler did not stop")
+	}
 }
 
 func TestRecurringSchedulerIntervalAndNonOverlap(t *testing.T) {
@@ -184,15 +213,24 @@ func TestRecurringSchedulerReplacementAndRemoval(t *testing.T) {
 	_ = nextManualTimer(t, clock)
 
 	scheduler.replace(&scheduler.jobs, []scheduleSpec{
-		testScheduleSpec("job-1", "new", time.Minute, runs),
+		testScheduleSpec("job-1", "intermediate", time.Minute, runs),
 	})
+	intermediate := scheduler.jobs["job-1"]
 	select {
 	case <-oldRun.ctx.Done():
 	case <-time.After(time.Second):
 		t.Fatal("replacement did not cancel old assignment")
 	}
+	scheduler.replace(&scheduler.jobs, []scheduleSpec{
+		testScheduleSpec("job-1", "new", time.Minute, runs),
+	})
 	assertNoInvocation(t, runs)
 	close(oldRun.done)
+	select {
+	case <-intermediate.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("superseded replacement did not stop")
+	}
 
 	newRun := nextInvocation(t, runs)
 	_ = nextManualTimer(t, clock)
@@ -310,8 +348,18 @@ func TestRecurringSchedulerReportsPoolBackpressure(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("rejected scheduled tick did not emit overload notice")
 	}
-	if timer := nextManualTimer(t, clock); timer.interval != 29*time.Second {
+	timer := nextManualTimer(t, clock)
+	if timer.interval != 29*time.Second {
 		t.Fatalf("job timer interval = %s, want 29s", timer.interval)
+	}
+	fireManualTimer(t, timer.timer)
+	select {
+	case notice := <-notices:
+		if errorMessage := decodeAgentError(t, notice); errorMessage.JobId != "poll:device-1" {
+			t.Fatalf("retry overload notice job_id = %q", errorMessage.JobId)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("rejected scheduled tick was not retried on its next interval")
 	}
 
 	scheduler.cancelAll()

@@ -179,10 +179,8 @@ func (s *recurringScheduler) run(
 	defer close(entry.stopped)
 
 	if predecessor != nil {
-		select {
-		case <-predecessor:
-		case <-ctx.Done():
-			<-predecessor
+		<-predecessor
+		if ctx.Err() != nil {
 			return
 		}
 	}
