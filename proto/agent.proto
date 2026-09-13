@@ -2,9 +2,10 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The Towerops server's copy at priv/proto/agent.proto is canonical: this
-// file mirrors its body, everything from `syntax` down, verbatim, so the two
-// differ only in this header.
+// The Towerops server's copy at priv/proto/agent.proto is canonical for shared
+// fields. AgentJob.interval_seconds (field 8) is the forward-compatible agent
+// scheduler extension that server 0.2.0 must populate before agent 1.5.0 is
+// deployed; see README.md's scheduler rollout compatibility table.
 
 syntax = "proto3";
 
@@ -209,6 +210,7 @@ message AgentJob {
   repeated SnmpQuery queries = 5;
   MikrotikDevice mikrotik_device = 6;
   repeated MikrotikCommand mikrotik_commands = 7;
+  uint32 interval_seconds = 8;
 }
 
 message SnmpDevice {

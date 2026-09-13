@@ -102,17 +102,45 @@ Towerops server ──WebSocket/TLS──▶ agent ──▶ SNMP / ICMP / SSH /
 
 1. The agent connects to `{TOWEROPS_API_URL}/socket/agent/websocket` and joins
    the `agent:<id>` channel with its token. A rejected token ends the session.
-2. The server immediately pushes the agent's job list, and pushes it again
-   whenever assignments, credentials or checks change.
-3. Jobs are executed on bounded worker pools - one per protocol - so a slow
-   or unreachable device cannot stall the rest.
-4. Results are streamed back as they complete. The server batches ICMP result
+2. The server pushes the connection's complete recurring `jobs` and
+   `check_jobs` inventories on join, then pushes replacements whenever
+   assignments, credentials, or intervals change. Interactive `live_poll:*`
+   and `probe:*` jobs remain one-shot work.
+3. Newly assigned recurring work runs promptly, then at its configured
+   interval. `AgentJob.interval_seconds = 0` falls back to the legacy 60-second
+   cadence for older payloads. One stable assignment ID never overlaps itself;
+   a changed assignment waits for its predecessor to stop before starting.
+4. Jobs execute on bounded worker pools - one per protocol - so a slow or
+   unreachable device cannot stall the rest. Pool rejection remains visible to
+   the server as an `AgentError`; it is not counted as a successful tick.
+5. Results are streamed back as they complete. The server batches ICMP result
    persistence for up to 100ms; the agent does not batch SNMP results on the wire.
-5. The agent sends a heartbeat every 60s carrying its version, uptime and
-   architecture, plus a channel keepalive every 25s. The server drops an agent
-   that goes 5 minutes without a heartbeat.
-6. On any disconnect the agent reconnects with exponential backoff (1s to 10s,
-   plus up to 25% jitter). A session that lasts 30s resets the backoff.
+6. The agent sends a heartbeat every 60s carrying its version, uptime and
+   architecture, plus a channel keepalive every 25s. Version 1.5.0 and later
+   advertise `schedules_jobs` because POLL, DISCOVER, MIKROTIK, PING, and
+   service-check assignments are all scheduled locally. The server drops an
+   agent that goes 5 minutes without a heartbeat.
+7. On any disconnect the scheduler is cancelled and its credential-bearing
+   inventory is discarded before reconnect. The new authenticated connection
+   must provide complete lists again; assignments are never persisted locally.
+8. Reconnection uses exponential backoff (1s to 10s, plus up to 25% jitter). A
+   session that lasts 30s resets the backoff.
+
+### Scheduler rollout compatibility
+
+Deploy the server first. Retire its legacy 60-second list re-push only when both
+sides meet these minimum versions:
+
+| Component | Minimum version | Required wire behavior |
+|-----------|-----------------|------------------------|
+| Towerops server | 0.2.0 | Populates each recurring `AgentJob.interval_seconds` and pushes complete, including empty, job and check lists after assignment changes. |
+| Towerops agent | 1.5.0 | Retains recurring lists, schedules jobs and checks locally, and advertises `AgentHeartbeat.schedules_jobs`. |
+
+Server 0.1.x does not populate per-job intervals or push an empty list after the
+last assignment is removed. Although agent 1.5.0 treats a zero job interval as
+the legacy 60-second cadence, deploy it only after the server behavior above is
+available because its heartbeat disables the legacy refresh. Repeated unchanged
+lists are safe: they do not reset timers or trigger an extra run.
 
 Messages are Protocol Buffers ([`proto/agent.proto`](proto/agent.proto))
 carried inside the Phoenix channel envelope.

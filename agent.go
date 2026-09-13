@@ -143,9 +143,10 @@ type session struct {
 
 	// pools and results exist only once the channel join has been accepted;
 	// see runSession.
-	pools   *jobPools
-	results *resultQueue
-	notices <-chan outbound
+	pools     *jobPools
+	scheduler *recurringScheduler
+	results   *resultQueue
+	notices   <-chan outbound
 
 	refCounter atomic.Uint64
 }
@@ -225,6 +226,8 @@ func runSessionWithResults(
 	}
 	s.results = results
 	s.notices = notices
+	s.scheduler = newRecurringScheduler(s.ctx, realScheduleClock{})
+	s.pools.scheduler = s.scheduler
 
 	// Publish update-critical deployment metadata as soon as the join is
 	// accepted. A full queue is non-fatal because the ticker will retry.
@@ -286,10 +289,16 @@ func (s *session) stop() {
 	s.cancel()
 	_ = s.ws.Close()
 
+	if s.scheduler != nil {
+		s.scheduler.cancelAll()
+	}
 	if s.pools != nil {
 		for _, name := range s.pools.stop(poolShutdownTimeout) {
 			slog.Warn("worker pool shutdown timed out, abandoning in-flight jobs", "pool", name)
 		}
+	}
+	if s.scheduler != nil && !s.scheduler.wait(poolShutdownTimeout) {
+		slog.Warn("recurring scheduler shutdown timed out")
 	}
 	close(s.writeCh)
 	<-s.writerDone
@@ -440,10 +449,7 @@ func (s *session) heartbeat(uptime time.Duration) *pb.AgentHeartbeat {
 		Hostname:      s.hostname,
 		IpAddress:     s.ws.LocalIP(),
 		Container:     runningInContainer(),
-		// The agent currently executes each pushed list once and retains no
-		// schedule. Keep this false: the server's 60-second legacy re-push is
-		// the effective recurring interval until the scheduler in #19 exists.
-		SchedulesJobs: false,
+		SchedulesJobs: true,
 	}
 }
 
@@ -631,12 +637,27 @@ func handleMessage(
 			"topic", msg.Topic)
 		return true, errChannelReloaded
 
-	case "jobs", "discovery_job", "backup_job":
+	case "jobs":
 		var jobList pb.AgentJobList
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &jobList) {
 			return false, nil
 		}
-		slog.Info("received jobs", "count", len(jobList.Jobs))
+		recurring, oneShot := splitRecurringJobs(jobList.Jobs)
+		if len(recurring) > 0 || len(jobList.Jobs) == 0 {
+			slog.Info("received recurring jobs", "count", len(recurring))
+			pools.scheduler.replaceJobs(recurring, pools, out)
+		}
+		for _, job := range oneShot {
+			slog.Info("received one-shot job", "job_id", job.JobId, "type", job.JobType)
+			dispatchJob(ctx, job, pools, out)
+		}
+
+	case "discovery_job", "backup_job":
+		var jobList pb.AgentJobList
+		if !decodeBinaryPayload(msg.Event, msg.Payload, &jobList) {
+			return false, nil
+		}
+		slog.Info("received one-shot jobs", "event", msg.Event, "count", len(jobList.Jobs))
 		for _, job := range jobList.Jobs {
 			dispatchJob(ctx, job, pools, out)
 		}
@@ -646,10 +667,8 @@ func handleMessage(
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &checkList) {
 			return false, nil
 		}
-		slog.Info("received checks", "count", len(checkList.Checks))
-		for _, check := range checkList.Checks {
-			executeCheck(ctx, check, pools, out)
-		}
+		slog.Info("received recurring checks", "count", len(checkList.Checks))
+		pools.scheduler.replaceChecks(checkList.Checks, pools, out)
 
 	case "restart":
 		slog.Info("restart requested by server")
@@ -681,6 +700,34 @@ func handleMessage(
 		slog.Debug("ignoring event", "event", msg.Event)
 	}
 	return false, nil
+}
+func splitRecurringJobs(jobs []*pb.AgentJob) (recurring, oneShot []*pb.AgentJob) {
+	recurring = make([]*pb.AgentJob, 0, len(jobs))
+	oneShot = make([]*pb.AgentJob, 0, len(jobs))
+	for _, job := range jobs {
+		if job == nil {
+			slog.Error("job dropped, payload contained a nil job")
+			continue
+		}
+		if recurringJob(job) {
+			recurring = append(recurring, job)
+		} else {
+			oneShot = append(oneShot, job)
+		}
+	}
+	return recurring, oneShot
+}
+
+func recurringJob(job *pb.AgentJob) bool {
+	if strings.HasPrefix(job.JobId, "live_poll:") || strings.HasPrefix(job.JobId, "probe:") {
+		return false
+	}
+	switch job.JobType {
+	case pb.JobType_DISCOVER, pb.JobType_POLL, pb.JobType_MIKROTIK, pb.JobType_PING:
+		return true
+	default:
+		return false
+	}
 }
 
 // decodeBinaryPayload unwraps the base64 protobuf a server push carries in its
@@ -770,11 +817,12 @@ func (q *resultQueue) takeRetry() (outbound, bool) {
 
 // jobPools holds the worker pools for each job type.
 type jobPools struct {
-	snmp     *workerPool
-	mikrotik *workerPool
-	ping     *workerPool
-	checks   *workerPool
-	notices  chan<- outbound
+	snmp      *workerPool
+	mikrotik  *workerPool
+	ping      *workerPool
+	checks    *workerPool
+	notices   chan<- outbound
+	scheduler *recurringScheduler
 }
 
 func (p *jobPools) stop(timeout time.Duration) []string {
@@ -807,36 +855,54 @@ func (p *jobPools) stop(timeout time.Duration) []string {
 	return nil
 }
 
-// dispatchJob routes a job to the appropriate worker pool.
+// dispatchJob routes a one-shot job to the appropriate worker pool.
 func dispatchJob(
 	ctx context.Context,
 	job *pb.AgentJob,
 	pools *jobPools,
 	out *resultQueue,
 ) {
+	_ = submitJob(ctx, job, pools, out, nil)
+}
+
+func submitJob(
+	ctx context.Context,
+	job *pb.AgentJob,
+	pools *jobPools,
+	out *resultQueue,
+	done func(),
+) bool {
 	slog.Info("starting job", "job_id", job.JobId, "type", job.JobType)
+
+	task := func(execute func()) func() {
+		return func() {
+			if done != nil {
+				defer done()
+			}
+			execute()
+		}
+	}
 
 	var ok bool
 	switch job.JobType {
 	case pb.JobType_MIKROTIK:
-		ok = pools.mikrotik.submit(ctx, func() { executeMikrotikJob(ctx, job, out) })
+		ok = pools.mikrotik.submit(ctx, task(func() { executeMikrotikJob(ctx, job, out) }))
 	case pb.JobType_TEST_CREDENTIALS:
-		ok = pools.snmp.submit(ctx, func() { executeCredentialTest(ctx, job, out) })
+		ok = pools.snmp.submit(ctx, task(func() { executeCredentialTest(ctx, job, out) }))
 	case pb.JobType_PING:
-		ok = pools.ping.submit(ctx, func() { executePingJob(ctx, job, out) })
+		ok = pools.ping.submit(ctx, task(func() { executePingJob(ctx, job, out) }))
 	case pb.JobType_LLDP_TOPOLOGY:
-		ok = pools.snmp.submit(ctx, func() { executeLldpTopologyJob(ctx, job, out) })
+		ok = pools.snmp.submit(ctx, task(func() { executeLldpTopologyJob(ctx, job, out) }))
 	case pb.JobType_DISCOVER, pb.JobType_POLL:
-		ok = pools.snmp.submit(ctx, func() { executeSnmpJob(ctx, job, out) })
+		ok = pools.snmp.submit(ctx, task(func() { executeSnmpJob(ctx, job, out) }))
 	default:
-		// A job type this build does not know about would otherwise be run as
-		// an SNMP job, against a device config it may not even carry.
 		slog.Error("job dropped, unknown job type", "job_id", job.JobId, "type", job.JobType)
-		return
+		return false
 	}
 	if !ok {
 		reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
 	}
+	return ok
 }
 
 // nextBackoff doubles the current delay (capped at max) and adds up to 25% jitter.
@@ -914,9 +980,22 @@ func reportPoolRejection(
 	}
 }
 
-// executeCheck dispatches a check to the worker pool.
+// executeCheck dispatches a one-shot check to the worker pool.
 func executeCheck(ctx context.Context, check *pb.Check, pools *jobPools, out *resultQueue) {
+	_ = submitCheck(ctx, check, pools, out, nil)
+}
+
+func submitCheck(
+	ctx context.Context,
+	check *pb.Check,
+	pools *jobPools,
+	out *resultQueue,
+	done func(),
+) bool {
 	ok := pools.checks.submit(ctx, func() {
+		if done != nil {
+			defer done()
+		}
 		result := ExecuteCheck(ctx, check)
 		slog.Info("check complete", "check", result.CheckId, "status", result.Status)
 		sendResult(ctx, out, "check_result", result, check.Id)
@@ -924,4 +1003,5 @@ func executeCheck(ctx context.Context, check *pb.Check, pools *jobPools, out *re
 	if !ok {
 		reportPoolRejection(ctx, pools.notices, "", check.Id, "CHECK")
 	}
+	return ok
 }
