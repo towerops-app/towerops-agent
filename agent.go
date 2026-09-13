@@ -440,6 +440,10 @@ func (s *session) heartbeat(uptime time.Duration) *pb.AgentHeartbeat {
 		Hostname:      s.hostname,
 		IpAddress:     s.ws.LocalIP(),
 		Container:     runningInContainer(),
+		// The agent currently executes each pushed list once and retains no
+		// schedule. Keep this false: the server's 60-second legacy re-push is
+		// the effective recurring interval until the scheduler in #19 exists.
+		SchedulesJobs: false,
 	}
 }
 
