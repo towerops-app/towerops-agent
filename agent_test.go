@@ -481,7 +481,7 @@ func TestHandleMessageRejectsPayloadAboveServerLimit(t *testing.T) {
 	out := testQueue()
 	serverEncodedCeiling := base64.StdEncoding.EncodedLen(10 << 20)
 
-	payload, _ := json.Marshal(map[string]string{"binary": strings.Repeat("A", serverEncodedCeiling+1)})
+	payload, _ := json.Marshal(map[string]string{"binary": strings.Repeat("A", serverEncodedCeiling+4)})
 
 	_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), out)
 
