@@ -218,8 +218,8 @@ func TestHandleMessage(t *testing.T) {
 
 		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: oneShot}, "agent:test", pools, out)
 		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
-		if len(pools.scheduler.jobs) != 0 {
-			t.Fatalf("authoritative one-shot-only inventory retained %d recurring jobs", len(pools.scheduler.jobs))
+		if len(pools.scheduler.jobs) != 1 {
+			t.Fatalf("ad-hoc one-shot jobs frame changed recurring inventory size to %d", len(pools.scheduler.jobs))
 		}
 	})
 
@@ -249,6 +249,23 @@ func TestHandleMessage(t *testing.T) {
 		}
 		if pools.localScheduling {
 			t.Fatal("legacy recurring job inventory did not disable local scheduling")
+		}
+
+		modern := makeJobPayload(&pb.AgentJob{
+			JobId:           "poll:device-1",
+			JobType:         pb.JobType_POLL,
+			SnmpDevice:      &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+			IntervalSeconds: 60,
+		})
+		_, _ = handleMessage(context.Background(), channelMsg{
+			Topic: "agent:test", Event: "jobs", Payload: modern,
+		}, "agent:test", pools, out)
+		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
+		if !pools.localScheduling {
+			t.Fatal("interval-bearing job inventory did not re-enable local scheduling")
+		}
+		if _, ok := pools.scheduler.jobs["poll:device-1"]; !ok {
+			t.Fatal("interval-bearing job was not retained after legacy fallback")
 		}
 	})
 
@@ -465,6 +482,27 @@ func TestHandleMessage(t *testing.T) {
 		}
 		if pools.localScheduling {
 			t.Fatal("legacy check inventory did not disable local scheduling")
+		}
+
+		modernList := &pb.CheckList{Checks: []*pb.Check{{
+			Id: "modern-check", CheckType: "unknown", IntervalSeconds: 60,
+		}}}
+		modernBin, _ := proto.Marshal(modernList)
+		modernPayload, _ := json.Marshal(map[string]string{
+			"binary": base64.StdEncoding.EncodeToString(modernBin),
+		})
+		_, _ = handleMessage(context.Background(), channelMsg{
+			Topic: "agent:test", Event: "check_jobs", Payload: modernPayload,
+		}, "agent:test", pools, out)
+		result = wantResult[*pb.CheckResult](t, out, "check_result", time.Second)
+		if result.CheckId != "modern-check" {
+			t.Fatalf("modern check result ID = %q", result.CheckId)
+		}
+		if !pools.localScheduling {
+			t.Fatal("interval-bearing check inventory did not re-enable local scheduling")
+		}
+		if _, ok := pools.scheduler.checks["modern-check"]; !ok {
+			t.Fatal("interval-bearing check was not retained after legacy fallback")
 		}
 	})
 

@@ -680,12 +680,9 @@ func handleMessage(
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &jobList) {
 			return false, nil
 		}
-		if pools.localScheduling && hasLegacyRecurringJobs(jobList.Jobs) {
+		if hasLegacyRecurringJobs(jobList.Jobs) {
 			slog.Warn("server sent recurring jobs without intervals; falling back to legacy scheduling")
 			pools.localScheduling = false
-		}
-		if !pools.localScheduling {
-			slog.Info("received legacy one-shot jobs", "count", len(jobList.Jobs))
 			pools.scheduler.replaceJobs(nil, pools, out)
 			for _, job := range jobList.Jobs {
 				if job != nil {
@@ -695,12 +692,18 @@ func handleMessage(
 			break
 		}
 
-		// `jobs` is the authoritative recurring inventory. Jobs with no
-		// interval are one-shot for wire compatibility, but still participate
-		// in replacement so a list containing only one-shots clears stale work.
 		recurring, oneShot := splitRecurringJobs(jobList.Jobs)
+		if len(recurring) > 0 && !pools.localScheduling {
+			slog.Info("server sent interval-bearing jobs; enabling local scheduling")
+			pools.localScheduling = true
+		}
 		slog.Info("received recurring jobs", "count", len(recurring))
-		pools.scheduler.replaceJobs(recurring, pools, out)
+		// A jobs frame containing only ad-hoc work is not an authoritative
+		// inventory. Preserve scheduled assignments until an interval-bearing
+		// or explicitly empty inventory arrives.
+		if pools.localScheduling && (len(recurring) > 0 || len(jobList.Jobs) == 0) {
+			pools.scheduler.replaceJobs(recurring, pools, out)
+		}
 		for _, job := range oneShot {
 			slog.Info("received one-shot job", "job_id", job.JobId, "type", job.JobType)
 			dispatchJob(ctx, job, pools, out)
@@ -721,12 +724,9 @@ func handleMessage(
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &checkList) {
 			return false, nil
 		}
-		if pools.localScheduling && hasLegacyRecurringChecks(checkList.Checks) {
+		if hasLegacyRecurringChecks(checkList.Checks) {
 			slog.Warn("server sent recurring checks without intervals; falling back to legacy scheduling")
 			pools.localScheduling = false
-		}
-		if !pools.localScheduling {
-			slog.Info("received legacy one-shot checks", "count", len(checkList.Checks))
 			pools.scheduler.replaceChecks(nil, pools, out)
 			for _, check := range checkList.Checks {
 				if check != nil {
@@ -735,8 +735,14 @@ func handleMessage(
 			}
 			break
 		}
-		slog.Info("received recurring checks", "count", len(checkList.Checks))
-		pools.scheduler.replaceChecks(checkList.Checks, pools, out)
+		if len(checkList.Checks) > 0 && !pools.localScheduling {
+			slog.Info("server sent interval-bearing checks; enabling local scheduling")
+			pools.localScheduling = true
+		}
+		if pools.localScheduling {
+			slog.Info("received recurring checks", "count", len(checkList.Checks))
+			pools.scheduler.replaceChecks(checkList.Checks, pools, out)
+		}
 
 	case "restart":
 		slog.Info("restart requested by server")
