@@ -86,7 +86,7 @@ func rootIsOverlay(mountInfo []byte) bool {
 		}
 		for i, field := range fields {
 			if field == "-" && i+1 < len(fields) {
-				return fields[i+1] == "overlay"
+				return strings.Contains(fields[i+1], "overlay")
 			}
 		}
 	}

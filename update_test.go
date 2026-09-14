@@ -54,6 +54,12 @@ func TestDetectContainer(t *testing.T) {
 			want:        true,
 		},
 		{
+			name:        "overlayfs root mount",
+			markerIndex: -1,
+			mountInfo:   "33 21 0:32 / / rw,relatime - overlayfs overlay rw,lowerdir=/overlay/ro",
+			want:        true,
+		},
+		{
 			name:        "host docker data mount",
 			markerIndex: -1,
 			cgroup:      "0::/init.scope",
