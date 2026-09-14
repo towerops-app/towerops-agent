@@ -123,9 +123,6 @@ func httpTransportForServerName(serverName string) *http.Transport {
 }
 
 func tlsConfigForServerName(base *tls.Config, serverName string) *tls.Config {
-	if base == nil {
-		base = &tls.Config{}
-	}
 	config := base.Clone()
 	config.ServerName = serverName
 	return config
