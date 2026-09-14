@@ -484,6 +484,122 @@ func TestMikrotikConnect(t *testing.T) {
 	_ = client.close()
 }
 
+func TestMikrotikConnectLegacyChallengeResponse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	const challenge = "0102030405060708090a0b0c0d0e0f10"
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		server := &mikrotikClient{conn: conn}
+
+		first, readErr := server.readSentence()
+		if readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		if len(first) == 0 || first[0] != "/login" {
+			serverErr <- fmt.Errorf("first sentence = %v, want /login", first)
+			return
+		}
+		if writeErr := server.writeSentence([]string{"!done", "=ret=" + challenge}); writeErr != nil {
+			serverErr <- writeErr
+			return
+		}
+
+		second, readErr := server.readSentence()
+		if readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		if !slices.Contains(second, "=name=admin") ||
+			!slices.Contains(second, "=response=0023629d4ccf8e764cfa013f317c0ab95f") {
+			serverErr <- fmt.Errorf("challenge response sentence = %v", second)
+			return
+		}
+		if writeErr := server.writeSentence([]string{"!done"}); writeErr != nil {
+			serverErr <- writeErr
+			return
+		}
+		_, _ = server.readSentence()
+		serverErr <- nil
+	}()
+
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	var portNum uint32
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
+	client, err := mikrotikConnect(context.Background(), "127.0.0.1", portNum, "admin", "pass", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = client.close()
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLegacyMikrotikLoginResponseRejectsMalformedChallenge(t *testing.T) {
+	if _, err := legacyMikrotikLoginResponse("pass", "not-hex"); err == nil {
+		t.Fatal("malformed legacy challenge was accepted")
+	}
+	if challenge := mikrotikLoginChallenge(&mikrotikResponse{}); challenge != "" {
+		t.Fatalf("empty login response returned challenge %q", challenge)
+	}
+}
+
+func TestMikrotikConnectLegacyChallengeErrors(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		challenge string
+		wantError string
+	}{
+		{name: "malformed challenge", challenge: "not-hex", wantError: "auth challenge: invalid challenge"},
+		{name: "closed challenge response", challenge: "0102030405060708090a0b0c0d0e0f10", wantError: "auth challenge:"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = ln.Close() }()
+
+			serverDone := make(chan struct{})
+			go func() {
+				defer close(serverDone)
+				conn, acceptErr := ln.Accept()
+				if acceptErr != nil {
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				server := &mikrotikClient{conn: conn}
+				_, _ = server.readSentence()
+				_ = server.writeSentence([]string{"!done", "=ret=" + test.challenge})
+				if test.challenge != "not-hex" {
+					_, _ = server.readSentence()
+				}
+			}()
+
+			_, port, _ := net.SplitHostPort(ln.Addr().String())
+			var portNum uint32
+			_, _ = fmt.Sscanf(port, "%d", &portNum)
+			_, err = mikrotikConnect(context.Background(), "127.0.0.1", portNum, "admin", "pass", false)
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("connect error = %v, want containing %q", err, test.wantError)
+			}
+			<-serverDone
+		})
+	}
+}
+
 func TestMikrotikConnectAuthError(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1031,6 +1147,40 @@ func TestHmExecuteMikrotikJobDeliversSentences(t *testing.T) {
 	}
 	if result.JobId != "m-ok" || result.DeviceId != "dev-1" {
 		t.Fatalf("unexpected identity: %+v", result)
+	}
+}
+
+func TestExecuteMikrotikJobDefaultsAPIPort(t *testing.T) {
+	original := mikrotikDial
+	defer func() { mikrotikDial = original }()
+
+	for _, test := range []struct {
+		name string
+		ssl  bool
+		port uint32
+	}{
+		{name: "plaintext", port: 8728},
+		{name: "TLS", ssl: true, port: 8729},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var gotPort uint32
+			mikrotikDial = func(_ context.Context, _ string, port uint32, _, _ string, _ bool) (*mikrotikClient, error) {
+				gotPort = port
+				return &mikrotikClient{conn: &nopCloser{readWriter: &bytes.Buffer{}}}, nil
+			}
+			out := newResultQueue(1)
+			executeMikrotikJob(context.Background(), &pb.AgentJob{
+				JobId:          "default-port",
+				MikrotikDevice: &pb.MikrotikDevice{Ip: "192.0.2.1", UseSsl: test.ssl},
+			}, out)
+			if gotPort != test.port {
+				t.Fatalf("dial port = %d, want %d", gotPort, test.port)
+			}
+			result := decodeQueuedResult[*pb.MikrotikResult](t, <-out.items)
+			if result.Error != "" {
+				t.Fatalf("unexpected result error: %s", result.Error)
+			}
+		})
 	}
 }
 
