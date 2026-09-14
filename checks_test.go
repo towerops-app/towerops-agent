@@ -663,11 +663,39 @@ func TestHTTPCheck_HostHeaderSetsTLSServerName(t *testing.T) {
 	}
 }
 
+func TestHTTPCheck_HostHeaderSetsTLSServerNameWithoutVerification(t *testing.T) {
+	const expectedHost = "virtual.example.test"
+	serverName := make(chan string, 1)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.TLS = &tls.Config{
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			serverName <- hello.ServerName
+			return nil, nil
+		},
+	}
+	srv.StartTLS()
+	defer srv.Close()
+
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+		Url:       srv.URL,
+		Headers:   map[string]string{"Host": expectedHost},
+		VerifySsl: false,
+	}, 5000)
+	if status != checkOK {
+		t.Fatalf("status = %d, want OK: %s", status, output)
+	}
+	if got := <-serverName; got != expectedHost {
+		t.Fatalf("TLS server name = %q, want %q", got, expectedHost)
+	}
+}
+
 func TestHTTPTransportForServerNameCachesAndEvicts(t *testing.T) {
 	httpTransportCacheMu.Lock()
 	originalCache := httpTransportCache
 	originalOrder := httpTransportCacheOrder
-	httpTransportCache = make(map[string]*http.Transport)
+	httpTransportCache = make(map[httpTransportCacheKey]*http.Transport)
 	httpTransportCacheOrder = nil
 	httpTransportCacheMu.Unlock()
 	t.Cleanup(func() {
@@ -680,20 +708,20 @@ func TestHTTPTransportForServerNameCachesAndEvicts(t *testing.T) {
 		httpTransportCacheMu.Unlock()
 	})
 
-	first := httpTransportForServerName("host-0.example")
+	first := httpTransportForServerName("host-0.example", false)
 	if first.TLSClientConfig.ServerName != "host-0.example" {
 		t.Fatalf("TLS server name = %q", first.TLSClientConfig.ServerName)
 	}
-	if cached := httpTransportForServerName("host-0.example"); cached != first {
+	if cached := httpTransportForServerName("host-0.example", false); cached != first {
 		t.Fatal("transport cache did not reuse the existing transport")
 	}
 	for i := 1; i <= maxHTTPTransportCacheEntries; i++ {
-		_ = httpTransportForServerName(fmt.Sprintf("host-%d.example", i))
+		_ = httpTransportForServerName(fmt.Sprintf("host-%d.example", i), false)
 	}
 	if len(httpTransportCache) != maxHTTPTransportCacheEntries {
 		t.Fatalf("transport cache size = %d, want %d", len(httpTransportCache), maxHTTPTransportCacheEntries)
 	}
-	if _, ok := httpTransportCache["host-0.example"]; ok {
+	if _, ok := httpTransportCache[httpTransportCacheKey{serverName: "host-0.example"}]; ok {
 		t.Fatal("oldest transport was not evicted")
 	}
 }

@@ -23,6 +23,11 @@ import (
 	"github.com/towerops-app/towerops-agent/pb"
 )
 
+type httpTransportCacheKey struct {
+	serverName string
+	insecure   bool
+}
+
 var (
 	defaultHTTPTransport  = newCheckHTTPTransport(false)
 	insecureHTTPTransport = newCheckHTTPTransport(true)
@@ -33,8 +38,8 @@ var (
 	httpRegexCache          = make(map[string]*regexp.Regexp)
 	httpRegexCacheOrder     []string
 	httpTransportCacheMu    sync.Mutex
-	httpTransportCache      = make(map[string]*http.Transport)
-	httpTransportCacheOrder []string
+	httpTransportCache      = make(map[httpTransportCacheKey]*http.Transport)
+	httpTransportCacheOrder []httpTransportCacheKey
 
 	// systemCertPool loads the platform root store. Overridable for tests.
 	systemCertPool = x509.SystemCertPool
@@ -101,15 +106,16 @@ func newCheckHTTPTransport(insecure bool) *http.Transport {
 	return transport
 }
 
-func httpTransportForServerName(serverName string) *http.Transport {
+func httpTransportForServerName(serverName string, insecure bool) *http.Transport {
 	httpTransportCacheMu.Lock()
 	defer httpTransportCacheMu.Unlock()
 
-	if transport, ok := httpTransportCache[serverName]; ok {
+	key := httpTransportCacheKey{serverName: serverName, insecure: insecure}
+	if transport, ok := httpTransportCache[key]; ok {
 		return transport
 	}
 
-	transport := newCheckHTTPTransport(false)
+	transport := newCheckHTTPTransport(insecure)
 	transport.TLSClientConfig = tlsConfigForServerName(transport.TLSClientConfig, serverName)
 	if len(httpTransportCacheOrder) == maxHTTPTransportCacheEntries {
 		evicted := httpTransportCacheOrder[0]
@@ -117,8 +123,8 @@ func httpTransportForServerName(serverName string) *http.Transport {
 		delete(httpTransportCache, evicted)
 		httpTransportCacheOrder = httpTransportCacheOrder[1:]
 	}
-	httpTransportCache[serverName] = transport
-	httpTransportCacheOrder = append(httpTransportCacheOrder, serverName)
+	httpTransportCache[key] = transport
+	httpTransportCacheOrder = append(httpTransportCacheOrder, key)
 	return transport
 }
 
@@ -231,10 +237,10 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	}
 
 	transport := defaultHTTPTransport
-	if !config.VerifySsl {
+	if tlsServerName != "" {
+		transport = httpTransportForServerName(tlsServerName, !config.VerifySsl)
+	} else if !config.VerifySsl {
 		transport = insecureHTTPTransport
-	} else if tlsServerName != "" {
-		transport = httpTransportForServerName(tlsServerName)
 	}
 	client := &http.Client{
 		Transport: transport,
