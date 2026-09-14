@@ -1790,7 +1790,7 @@ type AgentJob struct {
 	MikrotikDevice   *MikrotikDevice        `protobuf:"bytes,6,opt,name=mikrotik_device,json=mikrotikDevice,proto3" json:"mikrotik_device,omitempty"`
 	MikrotikCommands []*MikrotikCommand     `protobuf:"bytes,7,rep,name=mikrotik_commands,json=mikrotikCommands,proto3" json:"mikrotik_commands,omitempty"`
 	IntervalSeconds  uint32                 `protobuf:"varint,8,opt,name=interval_seconds,json=intervalSeconds,proto3" json:"interval_seconds,omitempty"`
-	TimeoutMs        uint32                 `protobuf:"varint,9,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"` // Operation deadline; zero means the agent default
+	PingTimeoutMs    uint32                 `protobuf:"varint,9,opt,name=ping_timeout_ms,json=pingTimeoutMs,proto3" json:"ping_timeout_ms,omitempty"` // Ping timeout; zero means the agent default
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -1881,9 +1881,9 @@ func (x *AgentJob) GetIntervalSeconds() uint32 {
 	return 0
 }
 
-func (x *AgentJob) GetTimeoutMs() uint32 {
+func (x *AgentJob) GetPingTimeoutMs() uint32 {
 	if x != nil {
-		return x.TimeoutMs
+		return x.PingTimeoutMs
 	}
 	return 0
 }
@@ -3268,7 +3268,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x11HeartbeatResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\"<\n" +
 	"\fAgentJobList\x12,\n" +
-	"\x04jobs\x18\x01 \x03(\v2\x18.towerops.agent.AgentJobR\x04jobs\"\xc5\x03\n" +
+	"\x04jobs\x18\x01 \x03(\v2\x18.towerops.agent.AgentJobR\x04jobs\"\xce\x03\n" +
 	"\bAgentJob\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x122\n" +
 	"\bjob_type\x18\x02 \x01(\x0e2\x17.towerops.agent.JobTypeR\ajobType\x12\x1b\n" +
@@ -3278,9 +3278,8 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\aqueries\x18\x05 \x03(\v2\x19.towerops.agent.SnmpQueryR\aqueries\x12G\n" +
 	"\x0fmikrotik_device\x18\x06 \x01(\v2\x1e.towerops.agent.MikrotikDeviceR\x0emikrotikDevice\x12L\n" +
 	"\x11mikrotik_commands\x18\a \x03(\v2\x1f.towerops.agent.MikrotikCommandR\x10mikrotikCommands\x12)\n" +
-	"\x10interval_seconds\x18\b \x01(\rR\x0fintervalSeconds\x12\x1d\n" +
-	"\n" +
-	"timeout_ms\x18\t \x01(\rR\ttimeoutMs\"\xfb\x02\n" +
+	"\x10interval_seconds\x18\b \x01(\rR\x0fintervalSeconds\x12&\n" +
+	"\x0fping_timeout_ms\x18\t \x01(\rR\rpingTimeoutMs\"\xfb\x02\n" +
 	"\n" +
 	"SnmpDevice\x12\x0e\n" +
 	"\x02ip\x18\x01 \x01(\tR\x02ip\x12\x1c\n" +

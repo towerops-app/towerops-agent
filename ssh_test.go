@@ -42,10 +42,10 @@ func TestExecutePingJob(t *testing.T) {
 
 		out := newResultQueue(1)
 		executePingJob(context.Background(), &pb.AgentJob{
-			JobId:      "p1",
-			DeviceId:   "dev-1",
-			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
-			TimeoutMs:  1_234,
+			JobId:         "p1",
+			DeviceId:      "dev-1",
+			SnmpDevice:    &pb.SnmpDevice{Ip: "10.0.0.1"},
+			PingTimeoutMs: 1_234,
 		}, out)
 
 		result := sshTReceiveMonitoringResult(t, out)

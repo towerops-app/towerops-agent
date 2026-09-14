@@ -93,7 +93,7 @@ func executePingJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	}
 
 	timestamp := time.Now().Unix()
-	timeoutMs := int(job.TimeoutMs)
+	timeoutMs := int(job.PingTimeoutMs)
 	if timeoutMs <= 0 {
 		timeoutMs = defaultPingTimeoutMs
 	}
