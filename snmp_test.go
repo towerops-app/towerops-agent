@@ -40,6 +40,20 @@ func TestSnmpValueToString(t *testing.T) {
 			want: "00:1a:2b",
 		},
 		{
+			name: "printable interface physical address",
+			pdu: gosnmp.SnmpPDU{
+				Name:  "." + oidIfPhysAddress + ".7",
+				Type:  gosnmp.OctetString,
+				Value: []byte("Hello!"),
+			},
+			want: "48:65:6c:6c:6f:21",
+		},
+		{
+			name: "delete control byte",
+			pdu:  gosnmp.SnmpPDU{Type: gosnmp.OctetString, Value: []byte{'a', 0x7f}},
+			want: "61:7f",
+		},
+		{
 			name: "oid",
 			pdu:  gosnmp.SnmpPDU{Type: gosnmp.ObjectIdentifier, Value: "1.3.6.1.2.1.1.1.0"},
 			want: "1.3.6.1.2.1.1.1.0",
@@ -1399,7 +1413,7 @@ func TestPropSnwOctetStringRoundtrip(t *testing.T) {
 		printable := utf8.Valid(b)
 		if printable {
 			for _, c := range b {
-				if c < 0x20 && c != '\n' && c != '\r' && c != '\t' {
+				if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') || c == 0x7f {
 					printable = false
 					break
 				}
