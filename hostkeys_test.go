@@ -218,11 +218,44 @@ func TestSSHHostKeyCallbackLegacyAndNamespacedKeys(t *testing.T) {
 	if err := json.Unmarshal(persistedData, &persisted); err != nil {
 		t.Fatal(err)
 	}
+	if got := persisted["ssh:"+legacyAddress]; got != legacyKeys[legacyAddress] {
+		t.Fatalf("legacy key was not migrated to %q: %v", "ssh:"+legacyAddress, persisted)
+	}
+	if _, ok := persisted[legacyAddress]; ok {
+		t.Fatalf("migrated key remained under legacy name %q", legacyAddress)
+	}
 	if _, ok := persisted["ssh:"+newAddress]; !ok {
 		t.Fatalf("first-use key was not stored under %q: %v", "ssh:"+newAddress, persisted)
 	}
 	if _, ok := persisted[newAddress]; ok {
 		t.Fatalf("first-use key was stored under legacy name %q", newAddress)
+	}
+}
+
+func TestHostKeyStoreLegacyMigrationRollsBackOnSaveFailure(t *testing.T) {
+	const (
+		legacyHost  = "192.0.2.5:22"
+		fingerprint = "trusted"
+	)
+	s := &hostKeyStore{
+		path: filepath.Join(t.TempDir(), "known_hosts.json"),
+		keys: map[string]string{legacyHost: fingerprint},
+	}
+	originalMarshal := hostKeyMarshal
+	hostKeyMarshal = func(any, string, string) ([]byte, error) {
+		return nil, errors.New("marshal failed")
+	}
+	t.Cleanup(func() { hostKeyMarshal = originalMarshal })
+
+	err := s.verify("ssh:"+legacyHost, fingerprint)
+	if err == nil || !strings.Contains(err.Error(), "failed to migrate trusted host key") {
+		t.Fatalf("migration error = %v, want persistence failure", err)
+	}
+	if got := s.keys[legacyHost]; got != fingerprint {
+		t.Fatalf("legacy key was not restored after failed migration: %v", s.keys)
+	}
+	if _, ok := s.keys["ssh:"+legacyHost]; ok {
+		t.Fatalf("namespaced key remained after failed migration: %v", s.keys)
 	}
 }
 

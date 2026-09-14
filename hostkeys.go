@@ -118,9 +118,13 @@ func (s *hostKeyStore) verify(host, fingerprint string) error {
 	}
 
 	stored, exists := s.keys[host]
+	legacyHost := ""
 	if !exists {
-		if legacyHost, ok := strings.CutPrefix(host, "ssh:"); ok {
-			stored, exists = s.keys[legacyHost]
+		if candidate, ok := strings.CutPrefix(host, "ssh:"); ok {
+			stored, exists = s.keys[candidate]
+			if exists {
+				legacyHost = candidate
+			}
 		}
 	}
 	if !exists {
@@ -135,6 +139,15 @@ func (s *hostKeyStore) verify(host, fingerprint string) error {
 
 	if stored != fingerprint {
 		return fmt.Errorf("TOFU: host key changed for %s (stored=%s, got=%s) - possible MITM", host, stored, fingerprint)
+	}
+	if legacyHost != "" {
+		delete(s.keys, legacyHost)
+		s.keys[host] = fingerprint
+		if err := s.save(); err != nil {
+			delete(s.keys, host)
+			s.keys[legacyHost] = stored
+			return fmt.Errorf("failed to migrate trusted host key from %s to %s: %w", legacyHost, host, err)
+		}
 	}
 	return nil
 }
