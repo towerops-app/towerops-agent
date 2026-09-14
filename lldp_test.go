@@ -174,7 +174,7 @@ func TestLldpTParseMgmtAddr(t *testing.T) {
 			oid: lldpTMgmtOid(true, "0.5.1", "2", 16,
 				[]int{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}),
 			wantKey: "0.5.1",
-			wantIP:  "2001:db8:0:0:0:0:0:1",
+			wantIP:  "2001:db8::1",
 		},
 		{
 			name: "ipv6 address length mismatch",
@@ -219,9 +219,8 @@ func TestLldpTParseMgmtAddrRejectsExtraOctets(t *testing.T) {
 	}
 }
 
-// TestLldpTParseMgmtAddrIPv6NonNumeric covers the strconv.Atoi failure arm,
-// which needs a hand-built OID with a non-numeric octet.
-func TestLldpTParseMgmtAddrIPv6NonNumeric(t *testing.T) {
+// TestLldpTParseMgmtAddrIPv6InvalidOctet covers malformed IPv6 index octets.
+func TestLldpTParseMgmtAddrIPv6InvalidOctet(t *testing.T) {
 	octets := make([]string, 16)
 	for i := range octets {
 		octets[i] = "0"
@@ -236,6 +235,12 @@ func TestLldpTParseMgmtAddrIPv6NonNumeric(t *testing.T) {
 				t.Fatalf("parseMgmtAddr(%q) = (%q, %q), want (%q, %q)", oid, key, ip, "0.5.1", "")
 			}
 		})
+	}
+	octets[0] = "999"
+	oid := "." + oidRemManAddr + ".0.5.1.2.16." + strings.Join(octets, ".")
+	key, ip := parseMgmtAddr(oid)
+	if key != "0.5.1" || ip != "" {
+		t.Fatalf("parseMgmtAddr(%q) = (%q, %q), want (%q, %q)", oid, key, ip, "0.5.1", "")
 	}
 }
 

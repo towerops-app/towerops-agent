@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net"
 	"slices"
@@ -263,17 +262,15 @@ func parseMgmtAddr(oid string) (key string, ip string) {
 		if addrLen != net.IPv6len {
 			return key, ""
 		}
-		// Convert 16 octets to IPv6 hex format
-		var ipv6Parts []string
-		for i := 0; i < 16; i += 2 {
-			a, errA := strconv.Atoi(parts[5+i])
-			b, errB := strconv.Atoi(parts[5+i+1])
-			if errA != nil || errB != nil {
+		address := make(net.IP, net.IPv6len)
+		for i, part := range parts[5:] {
+			octet, parseErr := strconv.Atoi(part)
+			if parseErr != nil || octet < 0 || octet > 255 {
 				return key, ""
 			}
-			ipv6Parts = append(ipv6Parts, fmt.Sprintf("%x", a*256+b))
+			address[i] = byte(octet)
 		}
-		ip = strings.Join(ipv6Parts, ":")
+		ip = address.String()
 	default:
 		return key, ""
 	}
