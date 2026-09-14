@@ -549,6 +549,27 @@ func TestHTTPCheck_CustomHeaders(t *testing.T) {
 	}
 }
 
+func TestHTTPCheck_HostHeaderOverridesRequestAuthority(t *testing.T) {
+	const expectedHost = "virtual.example.test"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != expectedHost {
+			t.Errorf("request Host = %q, want %q", r.Host, expectedHost)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+		Url:     srv.URL,
+		Headers: map[string]string{"Host": expectedHost},
+	}, 5000)
+	if status != checkOK {
+		t.Fatalf("status = %d, want OK: %s", status, output)
+	}
+}
+
 func TestHTTPCheck_UnreachableServer(t *testing.T) {
 	// Use a non-routable address to guarantee failure
 	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
@@ -690,6 +711,51 @@ func TestHTTPCheck_EmptyBody_NoRegex(t *testing.T) {
 
 	if status != 0 {
 		t.Fatalf("expected status 0, got %d: %s", status, output)
+	}
+}
+
+func TestHTTPCheck_BoundsStreamingBodyDrain(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("response writer does not implement http.Flusher")
+			return
+		}
+		flusher.Flush()
+
+		chunk := bytes.Repeat([]byte("a"), 32<<10)
+		for written := 0; written < maxHTTPDrainBytes+len(chunk); written += len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+		<-release
+	}))
+	defer func() {
+		close(release)
+		srv.Close()
+	}()
+
+	done := make(chan struct{})
+	var status uint32
+	var output string
+	go func() {
+		status, output = executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+			Url: srv.URL,
+		}, 5000)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if status != checkOK {
+			t.Fatalf("status = %d, want OK: %s", status, output)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HTTP check kept draining a response beyond its byte limit")
 	}
 }
 
@@ -1090,6 +1156,25 @@ func TestDNSCheck_CNAMERecord(t *testing.T) {
 	// CNAME lookup may return the hostname itself if no CNAME exists
 	if status != 0 && status != 2 {
 		t.Fatalf("expected status 0 or 2, got %d: %s", status, output)
+	}
+}
+
+func TestDNSCheck_CNAMEWithoutAliasIsCritical(t *testing.T) {
+	original := dnsLookupCNAME
+	t.Cleanup(func() { dnsLookupCNAME = original })
+	dnsLookupCNAME = func(_ *net.Resolver, _ context.Context, host string) (string, error) {
+		return host + ".", nil
+	}
+
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+		Hostname:   "direct.example.test",
+		RecordType: "CNAME",
+	}, 5000)
+	if status != checkCritical {
+		t.Fatalf("status = %d, want CRITICAL: %s", status, output)
+	}
+	if !strings.Contains(output, "No CNAME records found") {
+		t.Fatalf("output = %q, want missing CNAME result", output)
 	}
 }
 
@@ -1784,28 +1869,6 @@ func TestChkTHTTPCheckBodyReadErrorWithRegex(t *testing.T) {
 
 	if status != 2 {
 		t.Fatalf("expected status 2 for truncated body, got %d: %s", status, output)
-	}
-	if !strings.Contains(output, "Failed to read body") {
-		t.Fatalf("expected read-body failure, got %s", output)
-	}
-}
-
-func TestChkTHTTPCheckDrainErrorAfterRegexLimit(t *testing.T) {
-	// io.ReadAll fills the regex limit without error, then the drain io.Copy
-	// hits the truncated body.
-	body := bytes.Repeat([]byte("a"), maxHTTPRegexBody+4096)
-	url := chkTRawHTTPServer(t,
-		fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", maxHTTPRegexBody*4),
-		body)
-
-	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
-		Url:       url,
-		Regex:     "aaa",
-		VerifySsl: true,
-	}, 10000)
-
-	if status != 2 {
-		t.Fatalf("expected status 2 for drain failure, got %d: %s", status, output)
 	}
 	if !strings.Contains(output, "Failed to read body") {
 		t.Fatalf("expected read-body failure, got %s", output)

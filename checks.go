@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -43,7 +44,8 @@ var (
 	}
 
 	// dnsLookupTXT resolves TXT records for DNS checks. Overridable for tests.
-	dnsLookupTXT = (*net.Resolver).LookupTXT
+	dnsLookupTXT   = (*net.Resolver).LookupTXT
+	dnsLookupCNAME = (*net.Resolver).LookupCNAME
 
 	// sslDialTLS establishes the TLS connection used by SSL checks.
 	// Overridable for tests.
@@ -79,6 +81,7 @@ const (
 
 const (
 	maxHTTPRegexBody         = 1 << 20
+	maxHTTPDrainBytes        = 1 << 20
 	maxHTTPRegexCacheEntries = 64
 	maxTCPOutputBytes        = 256
 )
@@ -156,10 +159,10 @@ func checkTimeout(timeoutMs uint32) time.Duration {
 	return time.Duration(timeoutMs) * time.Millisecond
 }
 
-// executeHTTPCheck performs an HTTP/HTTPS check
-func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs uint32) (uint32, string) { // The server always sends verify_ssl explicitly: true unless the operator
-	// opts out. A false zero value only skips verification for callers that
-	// bypass the server's check builder.
+// executeHTTPCheck performs an HTTP/HTTPS check. The server sends verify_ssl
+// explicitly: true unless the operator opts out. A false zero value skips
+// verification only for callers that bypass the server's check builder.
+func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs uint32) (uint32, string) {
 	transport := defaultHTTPTransport
 	if !config.VerifySsl {
 		transport = insecureHTTPTransport
@@ -188,9 +191,12 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 		return checkCritical, fmt.Sprintf("Failed to create request: %v", err)
 	}
 
-	// Add headers
 	for key, value := range config.Headers {
-		req.Header.Set(key, value)
+		if strings.EqualFold(key, "Host") {
+			req.Host = value
+		} else {
+			req.Header.Set(key, value)
+		}
 	}
 
 	resp, err := client.Do(req)
@@ -206,9 +212,9 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	}
 
 	if resp.StatusCode != expectedStatus {
-		// Drain the response before returning so repeated failing checks can
-		// still reuse the shared transport connection.
-		_, _ = io.Copy(io.Discard, resp.Body)
+		// Drain only a bounded prefix. Larger bodies lose connection reuse but
+		// cannot occupy a worker indefinitely.
+		_ = drainHTTPBody(resp.Body)
 		return checkCritical, fmt.Sprintf("HTTP %d, expected %d", resp.StatusCode, expectedStatus)
 	}
 
@@ -216,32 +222,36 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	if config.Regex != "" {
 		re, err := cachedHTTPRegex(config.Regex)
 		if err != nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = drainHTTPBody(resp.Body)
 			return checkUnknown, fmt.Sprintf("Invalid regex: %v", err)
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPRegexBody+1))
 		if err != nil {
 			return checkCritical, fmt.Sprintf("Failed to read body: %v", err)
 		}
-		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-			return checkCritical, fmt.Sprintf("Failed to read body: %v", err)
-		}
 		if len(body) > maxHTTPRegexBody {
 			return checkUnknown, fmt.Sprintf("Response body exceeds regex limit of %d bytes", maxHTTPRegexBody)
 		}
-
 		if !re.Match(body) {
 			return checkCritical, fmt.Sprintf("Content does not match pattern: %s", config.Regex)
 		}
 	} else {
-		// Consume successful response bodies so the shared transport can reuse
-		// the underlying connection for subsequent checks.
-		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		// Consume a bounded prefix so normal small bodies retain connection
+		// reuse without letting an unbounded stream occupy a worker forever.
+		if err := drainHTTPBody(resp.Body); err != nil {
 			return checkCritical, fmt.Sprintf("Failed to read body: %v", err)
 		}
 	}
 
 	return checkOK, fmt.Sprintf("HTTP %d OK", resp.StatusCode)
+}
+
+func drainHTTPBody(body io.Reader) error {
+	_, err := io.CopyN(io.Discard, body, maxHTTPDrainBytes)
+	if err == nil || errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
 }
 
 // cachedHTTPRegex uses a small FIFO cache: regexes are reused across frequent
@@ -400,9 +410,10 @@ func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs u
 		}
 
 	case "CNAME":
-		cname, lookupErr := resolver.LookupCNAME(ctx, config.Hostname)
+		cname, lookupErr := dnsLookupCNAME(resolver, ctx, config.Hostname)
 		err = lookupErr
-		if cname != "" {
+		if cname != "" &&
+			strings.TrimSuffix(cname, ".") != strings.TrimSuffix(config.Hostname, ".") {
 			results = append(results, cname)
 		}
 
