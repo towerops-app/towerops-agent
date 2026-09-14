@@ -209,6 +209,7 @@ message AgentJob {
   MikrotikDevice mikrotik_device = 6;
   repeated MikrotikCommand mikrotik_commands = 7;
   uint32 interval_seconds = 8;
+  uint32 timeout_ms = 9;          // Operation deadline; zero means the agent default
 }
 
 message SnmpDevice {

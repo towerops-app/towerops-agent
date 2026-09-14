@@ -31,10 +31,12 @@ func TestExecutePingJob(t *testing.T) {
 		}
 	})
 
-	t.Run("success", func(t *testing.T) {
+	t.Run("success uses configured timeout", func(t *testing.T) {
 		origPing := doPing
 		defer func() { doPing = origPing }()
+		var gotTimeoutMs int
 		doPing = func(_ context.Context, ip string, timeoutMs int) (float64, error) {
+			gotTimeoutMs = timeoutMs
 			return 3.14, nil
 		}
 
@@ -43,6 +45,7 @@ func TestExecutePingJob(t *testing.T) {
 			JobId:      "p1",
 			DeviceId:   "dev-1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+			TimeoutMs:  1_234,
 		}, out)
 
 		result := sshTReceiveMonitoringResult(t, out)
@@ -55,12 +58,17 @@ func TestExecutePingJob(t *testing.T) {
 		if result.DeviceId != "dev-1" {
 			t.Errorf("device id: got %q, want %q", result.DeviceId, "dev-1")
 		}
+		if gotTimeoutMs != 1_234 {
+			t.Errorf("timeout: got %dms, want 1234ms", gotTimeoutMs)
+		}
 	})
 
-	t.Run("failure", func(t *testing.T) {
+	t.Run("failure uses default timeout for legacy jobs", func(t *testing.T) {
 		origPing := doPing
 		defer func() { doPing = origPing }()
+		var gotTimeoutMs int
 		doPing = func(_ context.Context, ip string, timeoutMs int) (float64, error) {
+			gotTimeoutMs = timeoutMs
 			return 0, fmt.Errorf("request timeout")
 		}
 
@@ -74,6 +82,9 @@ func TestExecutePingJob(t *testing.T) {
 		result := sshTReceiveMonitoringResult(t, out)
 		if result.Status != "failure" {
 			t.Errorf("status: got %q, want %q", result.Status, "failure")
+		}
+		if gotTimeoutMs != defaultPingTimeoutMs {
+			t.Errorf("timeout: got %dms, want default %dms", gotTimeoutMs, defaultPingTimeoutMs)
 		}
 	})
 }
