@@ -863,7 +863,7 @@ func TestDispatchJobReportsUnknownJobType(t *testing.T) {
 
 	select {
 	case notice := <-notices:
-		report := decodeAgentError(t, notice)
+		report := decodeQueuedResult[*pb.AgentError](t, notice)
 		if report.JobId != "unknown-1" || report.DeviceId != "device-1" {
 			t.Fatalf("unsupported job notice = %#v", report)
 		}
