@@ -67,7 +67,7 @@ func detectContainer() bool {
 	}
 
 	mountInfo, err := os.ReadFile(containerMountInfoPath)
-	return err == nil && containsContainerEvidence(mountInfo)
+	return err == nil && rootIsOverlay(mountInfo)
 }
 
 func containsContainerEvidence(data []byte) bool {
@@ -75,8 +75,22 @@ func containsContainerEvidence(data []byte) bool {
 	return strings.Contains(text, "docker") ||
 		strings.Contains(text, "containerd") ||
 		strings.Contains(text, "kubepods") ||
-		strings.Contains(text, "libpod") ||
-		strings.Contains(text, "/overlay")
+		strings.Contains(text, "libpod")
+}
+
+func rootIsOverlay(mountInfo []byte) bool {
+	for line := range strings.SplitSeq(string(mountInfo), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 7 || fields[4] != "/" {
+			continue
+		}
+		for i, field := range fields {
+			if field == "-" && i+1 < len(fields) {
+				return fields[i+1] == "overlay"
+			}
+		}
+	}
+	return false
 }
 
 // The response-header budget is separate from the transfer watchdog so a

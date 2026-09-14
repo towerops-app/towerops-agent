@@ -48,11 +48,16 @@ func TestDetectContainer(t *testing.T) {
 		{name: "podman marker", markerIndex: 1, want: true},
 		{name: "kubernetes cgroup", markerIndex: -1, cgroup: "0::/kubepods.slice/pod123", want: true},
 		{
-			name:        "cgroup v2 container mount",
+			name:        "overlay root mount",
 			markerIndex: -1,
-			cgroup:      "0::/",
-			mountInfo:   "21 1 0:20 /docker/overlay2/rootfs / rw - overlay overlay rw",
+			mountInfo:   "33 21 0:32 / / rw,relatime - overlay overlay rw,lowerdir=/overlay/ro",
 			want:        true,
+		},
+		{
+			name:        "host docker data mount",
+			markerIndex: -1,
+			cgroup:      "0::/init.scope",
+			mountInfo:   "21 1 0:20 /docker/overlay2/rootfs /var/lib/docker rw - ext4 /dev/root rw",
 		},
 		{name: "no container evidence", markerIndex: -1, cgroup: "0::/", mountInfo: "21 1 8:1 / / rw - ext4 /dev/root rw"},
 	}
