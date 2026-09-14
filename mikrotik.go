@@ -5,7 +5,9 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -81,11 +83,22 @@ func mikrotikConnect(ctx context.Context, ip string, port uint32, username, pass
 
 	c := &mikrotikClient{conn: conn}
 
-	// Authenticate
 	resp, err := c.execute("/login", map[string]string{"name": username, "password": password})
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("auth: %w", err)
+	}
+	if challenge := mikrotikLoginChallenge(resp); challenge != "" {
+		response, responseErr := legacyMikrotikLoginResponse(password, challenge)
+		if responseErr != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("auth challenge: %w", responseErr)
+		}
+		resp, err = c.execute("/login", map[string]string{"name": username, "response": response})
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("auth challenge: %w", err)
+		}
 	}
 	if resp.err != "" {
 		_ = conn.Close()
@@ -93,6 +106,28 @@ func mikrotikConnect(ctx context.Context, ip string, port uint32, username, pass
 	}
 
 	return c, nil
+}
+
+func mikrotikLoginChallenge(resp *mikrotikResponse) string {
+	for _, sentence := range resp.sentences {
+		if challenge := sentence.attributes["ret"]; challenge != "" {
+			return challenge
+		}
+	}
+	return ""
+}
+
+func legacyMikrotikLoginResponse(password, challenge string) (string, error) {
+	challengeBytes, err := hex.DecodeString(challenge)
+	if err != nil {
+		return "", fmt.Errorf("invalid challenge: %w", err)
+	}
+	payload := make([]byte, 1, 1+len(password)+len(challengeBytes))
+	payload = append(payload, password...)
+	payload = append(payload, challengeBytes...)
+	// #nosec G501 -- RouterOS before 6.43 requires MD5 for its wire protocol.
+	digest := md5.Sum(payload)
+	return "00" + hex.EncodeToString(digest[:]), nil
 }
 
 // execute sends a command and reads the full response.
@@ -326,9 +361,17 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue)
 		return
 	}
 
-	slog.Debug("executing mikrotik job", "job_id", job.JobId, "device", dev.Ip, "port", dev.Port, "ssl", dev.UseSsl)
+	port := dev.Port
+	if port == 0 {
+		if dev.UseSsl {
+			port = 8729
+		} else {
+			port = 8728
+		}
+	}
+	slog.Debug("executing mikrotik job", "job_id", job.JobId, "device", dev.Ip, "port", port, "ssl", dev.UseSsl)
 
-	client, err := mikrotikDial(ctx, dev.Ip, dev.Port, dev.Username, dev.Password, dev.UseSsl)
+	client, err := mikrotikDial(ctx, dev.Ip, port, dev.Username, dev.Password, dev.UseSsl)
 	if err != nil {
 		sendResult(ctx, out, "mikrotik_result", mikrotikError(
 			job,
