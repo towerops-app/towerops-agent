@@ -477,10 +477,11 @@ func TestHandleMessage(t *testing.T) {
 	})
 }
 
-func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
+func TestHandleMessageRejectsPayloadAboveServerLimit(t *testing.T) {
 	out := testQueue()
+	serverEncodedCeiling := base64.StdEncoding.EncodedLen(10 << 20)
 
-	payload, _ := json.Marshal(map[string]string{"binary": strings.Repeat("A", maxEncodedJobPayloadBytes+1)})
+	payload, _ := json.Marshal(map[string]string{"binary": strings.Repeat("A", serverEncodedCeiling+1)})
 
 	_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), out)
 
@@ -490,7 +491,7 @@ func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
 	}
 }
 
-func TestDecodeBinaryPayloadAcceptsServerSizedPayload(t *testing.T) {
+func TestDecodeBinaryPayloadAcceptsServerLimit(t *testing.T) {
 	origDecode := decodeBase64
 	defer func() { decodeBase64 = origDecode }()
 
@@ -500,14 +501,17 @@ func TestDecodeBinaryPayloadAcceptsServerSizedPayload(t *testing.T) {
 	}
 	decodeBase64 = func(string) ([]byte, error) { return bin, nil }
 
-	previousAgentLimit := strings.Repeat("A", (4<<20)+1)
-	payload, err := json.Marshal(map[string]string{"binary": previousAgentLimit})
+	serverEncodedCeiling := base64.StdEncoding.EncodedLen(10 << 20)
+	if maxEncodedJobPayloadBytes != serverEncodedCeiling {
+		t.Fatalf("agent encoded ceiling = %d, want server ceiling %d", maxEncodedJobPayloadBytes, serverEncodedCeiling)
+	}
+	payload, err := json.Marshal(map[string]string{"binary": strings.Repeat("A", serverEncodedCeiling)})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if !decodeBinaryPayload("jobs", payload, &pb.AgentJobList{}) {
-		t.Fatal("payload within the server's 10 MiB limit was rejected")
+		t.Fatal("payload at the server's 10 MiB decoded limit was rejected")
 	}
 }
 
