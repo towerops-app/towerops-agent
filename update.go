@@ -48,6 +48,7 @@ var maxUpdateSize int64 = 100 << 20 // 100 MB
 
 var containerMarkerFiles = []string{"/.dockerenv", "/run/.containerenv"}
 var containerCgroupPath = "/proc/1/cgroup"
+var containerMountInfoPath = "/proc/self/mountinfo"
 
 // runningInContainer reports whether the agent runs inside a container image,
 // where the binary cannot be replaced in place. Result is computed once.
@@ -61,14 +62,21 @@ func detectContainer() bool {
 	}
 
 	cgroup, err := os.ReadFile(containerCgroupPath)
-	if err != nil {
-		return false
+	if err == nil && containsContainerEvidence(cgroup) {
+		return true
 	}
-	cgroups := string(cgroup)
-	return strings.Contains(cgroups, "docker") ||
-		strings.Contains(cgroups, "containerd") ||
-		strings.Contains(cgroups, "kubepods") ||
-		strings.Contains(cgroups, "libpod")
+
+	mountInfo, err := os.ReadFile(containerMountInfoPath)
+	return err == nil && containsContainerEvidence(mountInfo)
+}
+
+func containsContainerEvidence(data []byte) bool {
+	text := string(data)
+	return strings.Contains(text, "docker") ||
+		strings.Contains(text, "containerd") ||
+		strings.Contains(text, "kubepods") ||
+		strings.Contains(text, "libpod") ||
+		strings.Contains(text, "/overlay")
 }
 
 // The response-header budget is separate from the transfer watchdog so a

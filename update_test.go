@@ -30,21 +30,31 @@ func forceBareBinaryUpdate(t *testing.T) {
 func TestDetectContainer(t *testing.T) {
 	origMarkers := containerMarkerFiles
 	origCgroup := containerCgroupPath
+	origMountInfo := containerMountInfoPath
 	t.Cleanup(func() {
 		containerMarkerFiles = origMarkers
 		containerCgroupPath = origCgroup
+		containerMountInfoPath = origMountInfo
 	})
 
 	tests := []struct {
 		name        string
 		markerIndex int
 		cgroup      string
+		mountInfo   string
 		want        bool
 	}{
 		{name: "docker marker", markerIndex: 0, want: true},
 		{name: "podman marker", markerIndex: 1, want: true},
 		{name: "kubernetes cgroup", markerIndex: -1, cgroup: "0::/kubepods.slice/pod123", want: true},
-		{name: "no container evidence", markerIndex: -1, want: false},
+		{
+			name:        "cgroup v2 container mount",
+			markerIndex: -1,
+			cgroup:      "0::/",
+			mountInfo:   "21 1 0:20 /docker/overlay2/rootfs / rw - overlay overlay rw",
+			want:        true,
+		},
+		{name: "no container evidence", markerIndex: -1, cgroup: "0::/", mountInfo: "21 1 8:1 / / rw - ext4 /dev/root rw"},
 	}
 
 	for _, tt := range tests {
@@ -55,6 +65,7 @@ func TestDetectContainer(t *testing.T) {
 				filepath.Join(dir, ".containerenv"),
 			}
 			containerCgroupPath = filepath.Join(dir, "cgroup")
+			containerMountInfoPath = filepath.Join(dir, "mountinfo")
 
 			if tt.markerIndex >= 0 {
 				if err := os.WriteFile(containerMarkerFiles[tt.markerIndex], nil, 0600); err != nil {
@@ -64,6 +75,11 @@ func TestDetectContainer(t *testing.T) {
 			if tt.cgroup != "" {
 				if err := os.WriteFile(containerCgroupPath, []byte(tt.cgroup), 0600); err != nil {
 					t.Fatalf("write cgroup fixture: %v", err)
+				}
+			}
+			if tt.mountInfo != "" {
+				if err := os.WriteFile(containerMountInfoPath, []byte(tt.mountInfo), 0600); err != nil {
+					t.Fatalf("write mountinfo fixture: %v", err)
 				}
 			}
 
