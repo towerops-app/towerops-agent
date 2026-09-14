@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -37,6 +38,18 @@ var snmpDial = func(ctx context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(
 	return conn, func() { _ = conn.Conn.Close() }, nil
 }
 
+// closeOnCancellation interrupts gosnmp even if a transport path does not
+// observe GoSNMP.Context while blocked in socket I/O.
+func closeOnCancellation(ctx context.Context, closeFn func()) func() {
+	var once sync.Once
+	closeOnce := func() { once.Do(closeFn) }
+	stop := context.AfterFunc(ctx, closeOnce)
+	return func() {
+		stop()
+		closeOnce()
+	}
+}
+
 // executeSnmpJob runs SNMP GET/WALK queries for a job and sends results.
 func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	dev := job.SnmpDevice
@@ -52,7 +65,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 		sendResult(ctx, out, "result", emptySnmpResult(job), job.JobId)
 		return
 	}
-	defer closeFn()
+	defer closeOnCancellation(ctx, closeFn)()
 
 	totalOIDs := 0
 	for _, q := range job.Queries {
@@ -60,6 +73,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	}
 	oidValues := make(map[string]string, totalOIDs)
 
+	var walkErrors []string
 	cancelled := false
 	for _, q := range job.Queries {
 		if ctx.Err() != nil {
@@ -83,6 +97,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 				}
 				if err != nil {
 					slog.Warn("snmp walk failed", "device", dev.Ip, "oid", baseOID, "error", err)
+					walkErrors = append(walkErrors, fmt.Sprintf("%s: %v", canonicalOID(baseOID), err))
 					continue
 				}
 				for _, v := range results {
@@ -109,6 +124,14 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 
 	slog.Info("snmp job complete", "job_id", job.JobId, "oids", len(oidValues))
 	sendResult(ctx, out, "result", result, job.JobId)
+	if len(walkErrors) > 0 {
+		sendResult(ctx, out, "error", &pb.AgentError{
+			DeviceId:  job.DeviceId,
+			JobId:     job.JobId,
+			Message:   "SNMP walk failed: " + strings.Join(walkErrors, "; "),
+			Timestamp: time.Now().Unix(),
+		}, job.JobId)
+	}
 }
 
 func emptySnmpResult(job *pb.AgentJob) *pb.SnmpResult {
@@ -200,7 +223,7 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQue
 		sendResult(ctx, out, "credential_test_result", result, job.JobId)
 		return
 	}
-	defer closeFn()
+	defer closeOnCancellation(ctx, closeFn)()
 
 	packet, err := conn.Get([]string{"1.3.6.1.2.1.1.1.0"})
 	if err != nil {
@@ -215,10 +238,20 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQue
 		return
 	}
 
-	sysDescr := ""
 	if packet.Error != gosnmp.NoError {
-		slog.Debug("snmp credential test error status", "device", dev.Ip, "status", packet.Error, "error_index", packet.ErrorIndex)
-	} else if len(packet.Variables) > 0 && snmpValueUsable(packet.Variables[0]) {
+		result := &pb.CredentialTestResult{
+			TestId:       job.JobId,
+			Success:      false,
+			ErrorMessage: fmt.Sprintf("SNMP test failed: status %v (error index %d)", packet.Error, packet.ErrorIndex),
+			Timestamp:    timestamp,
+		}
+		slog.Info("credential test complete", "test_id", result.TestId, "success", result.Success)
+		sendResult(ctx, out, "credential_test_result", result, job.JobId)
+		return
+	}
+
+	sysDescr := ""
+	if len(packet.Variables) > 0 && snmpValueUsable(packet.Variables[0]) {
 		sysDescr = snmpValueToString(packet.Variables[0])
 	}
 	// A successful GET proves the credentials work even when sysDescr is unavailable.
@@ -247,7 +280,7 @@ func newSnmpConn(ctx context.Context, dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error
 		Port:           uint16(port),
 		Timeout:        10 * time.Second,
 		Retries:        2,
-		MaxRepetitions: 10,
+		MaxRepetitions: 25,
 		Context:        ctx,
 	}
 
@@ -366,10 +399,14 @@ func snmpValueToString(pdu gosnmp.SnmpPDU) string {
 		}
 		return string(b)
 	case gosnmp.ObjectIdentifier:
-		if s, ok := pdu.Value.(string); ok {
-			return s
+		switch value := pdu.Value.(type) {
+		case string:
+			return value
+		case []byte:
+			return formatHex(value)
+		default:
+			return fmt.Sprintf("%v", value)
 		}
-		return fmt.Sprintf("%v", pdu.Value)
 	case gosnmp.IPAddress:
 		if s, ok := pdu.Value.(string); ok {
 			return s
