@@ -680,9 +680,7 @@ func handleMessage(
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &jobList) {
 			return false, nil
 		}
-		if hasLegacyRecurringJobs(jobList.Jobs) {
-			slog.Warn("server sent recurring jobs without intervals; falling back to legacy scheduling")
-			pools.localScheduling = false
+		if !pools.localScheduling {
 			pools.scheduler.replaceJobs(nil, pools, out)
 			for _, job := range jobList.Jobs {
 				if job != nil {
@@ -693,15 +691,11 @@ func handleMessage(
 		}
 
 		recurring, oneShot := splitRecurringJobs(jobList.Jobs)
-		if len(recurring) > 0 && !pools.localScheduling {
-			slog.Info("server sent interval-bearing jobs; enabling local scheduling")
-			pools.localScheduling = true
-		}
 		slog.Info("received recurring jobs", "count", len(recurring))
 		// A jobs frame containing only ad-hoc work is not an authoritative
 		// inventory. Preserve scheduled assignments until an interval-bearing
 		// or explicitly empty inventory arrives.
-		if pools.localScheduling && (len(recurring) > 0 || len(jobList.Jobs) == 0) {
+		if len(recurring) > 0 || len(jobList.Jobs) == 0 {
 			pools.scheduler.replaceJobs(recurring, pools, out)
 		}
 		for _, job := range oneShot {
@@ -724,9 +718,7 @@ func handleMessage(
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &checkList) {
 			return false, nil
 		}
-		if hasLegacyRecurringChecks(checkList.Checks) {
-			slog.Warn("server sent recurring checks without intervals; falling back to legacy scheduling")
-			pools.localScheduling = false
+		if !pools.localScheduling {
 			pools.scheduler.replaceChecks(nil, pools, out)
 			for _, check := range checkList.Checks {
 				if check != nil {
@@ -735,14 +727,8 @@ func handleMessage(
 			}
 			break
 		}
-		if len(checkList.Checks) > 0 && !pools.localScheduling {
-			slog.Info("server sent interval-bearing checks; enabling local scheduling")
-			pools.localScheduling = true
-		}
-		if pools.localScheduling {
-			slog.Info("received recurring checks", "count", len(checkList.Checks))
-			pools.scheduler.replaceChecks(checkList.Checks, pools, out)
-		}
+		slog.Info("received recurring checks", "count", len(checkList.Checks))
+		pools.scheduler.replaceChecks(checkList.Checks, pools, out)
 
 	case "restart":
 		slog.Info("restart requested by server")
@@ -794,29 +780,6 @@ func splitRecurringJobs(jobs []*pb.AgentJob) (recurring, oneShot []*pb.AgentJob)
 
 func recurringJob(job *pb.AgentJob) bool {
 	return job.IntervalSeconds > 0
-}
-
-func hasLegacyRecurringJobs(jobs []*pb.AgentJob) bool {
-	for _, job := range jobs {
-		if job == nil || job.IntervalSeconds > 0 ||
-			strings.HasPrefix(job.JobId, "live_poll:") || strings.HasPrefix(job.JobId, "probe:") {
-			continue
-		}
-		switch job.JobType {
-		case pb.JobType_POLL, pb.JobType_DISCOVER, pb.JobType_PING, pb.JobType_MIKROTIK, pb.JobType_LLDP_TOPOLOGY:
-			return true
-		}
-	}
-	return false
-}
-
-func hasLegacyRecurringChecks(checks []*pb.Check) bool {
-	for _, check := range checks {
-		if check != nil && check.IntervalSeconds == 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // decodeBinaryPayload unwraps the base64 protobuf a server push carries in its

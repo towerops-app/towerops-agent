@@ -223,7 +223,7 @@ func TestHandleMessage(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy scheduling dispatches inventories once without retention", func(t *testing.T) {
+	t.Run("explicit legacy scheduling dispatches inventories once without retention", func(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
 		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
@@ -236,6 +236,7 @@ func TestHandleMessage(t *testing.T) {
 
 		out := testQueue()
 		pools := testPools(t)
+		pools.localScheduling = false
 		payload := makeJobPayload(&pb.AgentJob{
 			JobId:      "poll:device-1",
 			JobType:    pb.JobType_POLL,
@@ -248,7 +249,7 @@ func TestHandleMessage(t *testing.T) {
 			t.Fatalf("legacy scheduling retained %d jobs", len(pools.scheduler.jobs))
 		}
 		if pools.localScheduling {
-			t.Fatal("legacy recurring job inventory did not disable local scheduling")
+			t.Fatal("legacy scheduling mode changed after a job inventory")
 		}
 
 		modern := makeJobPayload(&pb.AgentJob{
@@ -261,11 +262,11 @@ func TestHandleMessage(t *testing.T) {
 			Topic: "agent:test", Event: "jobs", Payload: modern,
 		}, "agent:test", pools, out)
 		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
-		if !pools.localScheduling {
-			t.Fatal("interval-bearing job inventory did not re-enable local scheduling")
+		if pools.localScheduling {
+			t.Fatal("interval-bearing job changed explicit legacy scheduling mode")
 		}
-		if _, ok := pools.scheduler.jobs["poll:device-1"]; !ok {
-			t.Fatal("interval-bearing job was not retained after legacy fallback")
+		if len(pools.scheduler.jobs) != 0 {
+			t.Fatalf("legacy scheduling retained %d interval-bearing jobs", len(pools.scheduler.jobs))
 		}
 	})
 
@@ -460,13 +461,14 @@ func TestHandleMessage(t *testing.T) {
 		_ = wantResult[*pb.CheckResult](t, out, "check_result", time.Second)
 	})
 
-	t.Run("legacy check inventory runs once without retention", func(t *testing.T) {
+	t.Run("explicit legacy check scheduling runs inventories once without retention", func(t *testing.T) {
 		checkList := &pb.CheckList{Checks: []*pb.Check{
 			{Id: "legacy-check", CheckType: "unknown"},
 		}}
 		bin, _ := proto.Marshal(checkList)
 		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString(bin)})
 		pools := testPools(t)
+		pools.localScheduling = false
 		out := testQueue()
 
 		_, _ = handleMessage(context.Background(), channelMsg{
@@ -481,7 +483,7 @@ func TestHandleMessage(t *testing.T) {
 			t.Fatalf("legacy scheduling retained %d checks", len(pools.scheduler.checks))
 		}
 		if pools.localScheduling {
-			t.Fatal("legacy check inventory did not disable local scheduling")
+			t.Fatal("legacy scheduling mode changed after a check inventory")
 		}
 
 		modernList := &pb.CheckList{Checks: []*pb.Check{{
@@ -498,11 +500,11 @@ func TestHandleMessage(t *testing.T) {
 		if result.CheckId != "modern-check" {
 			t.Fatalf("modern check result ID = %q", result.CheckId)
 		}
-		if !pools.localScheduling {
-			t.Fatal("interval-bearing check inventory did not re-enable local scheduling")
+		if pools.localScheduling {
+			t.Fatal("interval-bearing check changed explicit legacy scheduling mode")
 		}
-		if _, ok := pools.scheduler.checks["modern-check"]; !ok {
-			t.Fatal("interval-bearing check was not retained after legacy fallback")
+		if len(pools.scheduler.checks) != 0 {
+			t.Fatalf("legacy scheduling retained %d interval-bearing checks", len(pools.scheduler.checks))
 		}
 	})
 
