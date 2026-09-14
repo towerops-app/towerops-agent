@@ -480,10 +480,7 @@ func TestHandleMessage(t *testing.T) {
 func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
 	out := testQueue()
 
-	// Create a binary payload larger than maxJobPayloadBytes
-	oversized := make([]byte, maxJobPayloadBytes+1)
-	encoded := base64.StdEncoding.EncodeToString(oversized)
-	payload, _ := json.Marshal(map[string]string{"binary": encoded})
+	payload, _ := json.Marshal(map[string]string{"binary": strings.Repeat("A", maxJobPayloadBytes+1)})
 
 	_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), out)
 
@@ -493,6 +490,27 @@ func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
 		t.Error("expected no SNMP result for oversized payload")
 	case <-time.After(100 * time.Millisecond):
 		// Good - nothing dispatched
+	}
+}
+
+func TestDecodeBinaryPayloadAcceptsServerSizedPayload(t *testing.T) {
+	origDecode := decodeBase64
+	defer func() { decodeBase64 = origDecode }()
+
+	bin, err := proto.Marshal(&pb.AgentJobList{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodeBase64 = func(string) ([]byte, error) { return bin, nil }
+
+	previousAgentLimit := strings.Repeat("A", (4<<20)+1)
+	payload, err := json.Marshal(map[string]string{"binary": previousAgentLimit})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !decodeBinaryPayload("jobs", payload, &pb.AgentJobList{}) {
+		t.Fatal("payload within the server's 10 MiB limit was rejected")
 	}
 }
 

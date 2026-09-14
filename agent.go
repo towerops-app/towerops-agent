@@ -47,7 +47,7 @@ var successfulConnectionThreshold = 30 * time.Second
 // to drain before abandoning their in-flight jobs.
 var poolShutdownTimeout = 5 * time.Second
 
-const maxJobPayloadBytes = 4 << 20 // 4 MB - well above any legitimate job list
+const maxJobPayloadBytes = 10 << 20 // Matches the server's 10 MiB application payload limit.
 
 // resultQueueSize bounds the process-wide in-memory result backlog retained
 // across WebSocket reconnects. It exceeds the 420 slots the former per-type
