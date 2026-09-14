@@ -187,6 +187,12 @@ func TestRunMainInvalidFlag(t *testing.T) {
 	}
 }
 
+func TestRunMainHelp(t *testing.T) {
+	if code := runMain(context.Background(), []string{"--help"}); code != 0 {
+		t.Errorf("expected help to exit 0, got %d", code)
+	}
+}
+
 func TestRunMainTokenFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	tokenPath := filepath.Join(tmpDir, "token")
