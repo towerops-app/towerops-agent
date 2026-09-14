@@ -1,9 +1,9 @@
 // Copyright (C) 2026 Graham McIntire
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The canonical wire contract is maintained in the Towerops server at
-// priv/proto/agent.proto. Keep this file byte-for-byte identical to that copy;
-// change the server schema and hand-written codec first, then mirror them here.
+// The canonical wire contract is maintained in the TowerOps server at
+// priv/proto/agent.proto. Everything from `syntax = "proto3";` down must stay
+// byte-for-byte identical to that copy; each repository keeps its own header.
 
 syntax = "proto3";
 
