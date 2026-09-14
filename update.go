@@ -48,6 +48,11 @@ var maxUpdateSize int64 = 100 << 20 // 100 MB
 
 var containerMarkerFiles = []string{"/.dockerenv", "/run/.containerenv"}
 var containerCgroupPath = "/proc/1/cgroup"
+var containerCgroupNamespacePath = "/proc/1/ns/cgroup"
+var containerMountInfoPath = "/proc/self/mountinfo"
+
+// Linux exposes the initial cgroup namespace with this reserved proc inode.
+const initialCgroupNamespace = "cgroup:[4026531835]"
 
 // runningInContainer reports whether the agent runs inside a container image,
 // where the binary cannot be replaced in place. Result is computed once.
@@ -61,14 +66,44 @@ func detectContainer() bool {
 	}
 
 	cgroup, err := os.ReadFile(containerCgroupPath)
-	if err != nil {
+	if err == nil &&
+		(containsContainerEvidence(cgroup) || cgroupRootInPrivateNamespace(cgroup)) {
+		return true
+	}
+
+	mountInfo, err := os.ReadFile(containerMountInfoPath)
+	return err == nil && rootIsOverlay(mountInfo)
+}
+
+func containsContainerEvidence(data []byte) bool {
+	text := string(data)
+	return strings.Contains(text, "docker") ||
+		strings.Contains(text, "containerd") ||
+		strings.Contains(text, "kubepods") ||
+		strings.Contains(text, "libpod")
+}
+
+func cgroupRootInPrivateNamespace(data []byte) bool {
+	if strings.TrimSpace(string(data)) != "0::/" {
 		return false
 	}
-	cgroups := string(cgroup)
-	return strings.Contains(cgroups, "docker") ||
-		strings.Contains(cgroups, "containerd") ||
-		strings.Contains(cgroups, "kubepods") ||
-		strings.Contains(cgroups, "libpod")
+	namespace, err := os.Readlink(containerCgroupNamespacePath)
+	return err == nil && namespace != initialCgroupNamespace
+}
+
+func rootIsOverlay(mountInfo []byte) bool {
+	for line := range strings.SplitSeq(string(mountInfo), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 7 || fields[4] != "/" {
+			continue
+		}
+		for i, field := range fields {
+			if field == "-" && i+1 < len(fields) {
+				return strings.Contains(fields[i+1], "overlay")
+			}
+		}
+	}
+	return false
 }
 
 // The response-header budget is separate from the transfer watchdog so a
