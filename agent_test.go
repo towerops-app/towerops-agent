@@ -89,11 +89,12 @@ func testPools(t *testing.T) *jobPools {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &jobPools{
-		snmp:     newWorkerPool(4),
-		mikrotik: newWorkerPool(4),
-		ping:     newWorkerPool(4),
-		checks:   newWorkerPool(4),
-		notices:  make(chan outbound, overloadNoticeQueueSize),
+		snmp:            newWorkerPool(4),
+		mikrotik:        newWorkerPool(4),
+		ping:            newWorkerPool(4),
+		checks:          newWorkerPool(4),
+		notices:         make(chan outbound, overloadNoticeQueueSize),
+		localScheduling: true,
 	}
 	p.scheduler = newRecurringScheduler(ctx, realScheduleClock{})
 	t.Cleanup(func() {
@@ -163,7 +164,7 @@ func TestHandleMessage(t *testing.T) {
 		// Just verify it doesn't panic
 	})
 
-	t.Run("jobs reconcile recurring work without retaining one-shot polls", func(t *testing.T) {
+	t.Run("jobs replace recurring inventory while dedicated events remain one-shot", func(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
 
@@ -178,9 +179,10 @@ func TestHandleMessage(t *testing.T) {
 		out := testQueue()
 		pools := testPools(t)
 		recurring := makeJobPayload(&pb.AgentJob{
-			JobId:      "poll:device-1",
-			JobType:    pb.JobType_POLL,
-			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+			JobId:           "poll:device-1",
+			JobType:         pb.JobType_POLL,
+			SnmpDevice:      &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+			IntervalSeconds: 60,
 		})
 
 		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: recurring}, "agent:test", pools, out)
@@ -194,15 +196,44 @@ func TestHandleMessage(t *testing.T) {
 			JobType:    pb.JobType_POLL,
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		})
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: oneShot}, "agent:test", pools, out)
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "discovery_job", Payload: oneShot}, "agent:test", pools, out)
 		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
 		if len(pools.scheduler.jobs) != 1 {
-			t.Fatalf("one-shot poll changed recurring inventory size to %d", len(pools.scheduler.jobs))
+			t.Fatalf("dedicated one-shot push changed recurring inventory size to %d", len(pools.scheduler.jobs))
 		}
 
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: makeJobPayload()}, "agent:test", pools, out)
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: oneShot}, "agent:test", pools, out)
+		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
 		if len(pools.scheduler.jobs) != 0 {
-			t.Fatalf("empty recurring list retained %d jobs", len(pools.scheduler.jobs))
+			t.Fatalf("authoritative one-shot-only inventory retained %d recurring jobs", len(pools.scheduler.jobs))
+		}
+	})
+
+	t.Run("legacy scheduling dispatches inventories once without retention", func(t *testing.T) {
+		origDial := snmpDial
+		defer func() { snmpDial = origDial }()
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			return &mockSnmpQuerier{
+				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+					return &gosnmp.SnmpPacket{}, nil
+				},
+			}, func() {}, nil
+		}
+
+		out := testQueue()
+		pools := testPools(t)
+		pools.localScheduling = false
+		payload := makeJobPayload(&pb.AgentJob{
+			JobId:           "poll:device-1",
+			JobType:         pb.JobType_POLL,
+			SnmpDevice:      &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+			IntervalSeconds: 60,
+		})
+
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", pools, out)
+		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
+		if len(pools.scheduler.jobs) != 0 {
+			t.Fatalf("legacy scheduling retained %d jobs", len(pools.scheduler.jobs))
 		}
 	})
 
@@ -1134,7 +1165,7 @@ func TestPoolOverloadReportsEveryJobClassWithoutUsingResultSpool(t *testing.T) {
 	dispatchJob(context.Background(), &pb.AgentJob{
 		JobId: "ping-overload", DeviceId: "device-3", JobType: pb.JobType_PING,
 	}, p, out)
-	executeCheck(context.Background(), &pb.Check{Id: "check-overload"}, p, out)
+	_ = submitCheck(context.Background(), &pb.Check{Id: "check-overload"}, p, out, func() {}, false)
 
 	if len(out.items) != 0 || len(out.slots) != 0 {
 		t.Fatal("pool rejection notices consumed completed-result spool capacity")
@@ -1213,24 +1244,26 @@ func TestResultQueueKeepsRetryAheadOfNewerResults(t *testing.T) {
 	}
 }
 
-func TestSendResultUsesAgentContextForDropSeverity(t *testing.T) {
+func TestSendResultCancellationAndDropRateLimit(t *testing.T) {
 	logs := agtCaptureLogs(t)
+	previousInterval := resultDropLogInterval
+	resultDropLogInterval = time.Hour
+	t.Cleanup(func() { resultDropLogInterval = previousInterval })
+
 	agentCtx, stopAgent := context.WithCancel(context.Background())
 	out := newResultQueueForAgent(agentCtx, 0)
 	sessionCtx, stopSession := context.WithCancel(context.Background())
 	stopSession()
 
-	sendResult(sessionCtx, out, "result", &pb.SnmpResult{JobId: "during-reconnect"}, "during-reconnect")
-	if !logs.has("ERROR result buffer full during reconnect - result dropped") {
-		t.Fatal("result loss during reconnect was not logged at error level")
-	}
-	if logs.has("result dropped, agent stopped") {
-		t.Fatal("session cancellation was misreported as agent shutdown")
+	sendResult(sessionCtx, out, "result", &pb.SnmpResult{JobId: "cancelled"}, "cancelled")
+	if !logs.has("DEBUG result discarded, job cancelled") {
+		t.Fatal("cancelled job result was not discarded")
 	}
 
-	sendResult(context.Background(), out, "result", &pb.SnmpResult{JobId: "while-connected"}, "while-connected")
-	if !logs.has("ERROR result buffer full - agent overloaded") {
-		t.Fatal("connected result loss was not reported as agent overload")
+	sendResult(context.Background(), out, "result", &pb.SnmpResult{JobId: "first-overflow"}, "first-overflow")
+	sendResult(context.Background(), out, "result", &pb.SnmpResult{JobId: "second-overflow"}, "second-overflow")
+	if got := strings.Count(logs.dump(), "ERROR result buffer full - agent overloaded"); got != 1 {
+		t.Fatalf("spool overflow log count = %d, want 1", got)
 	}
 
 	stopAgent()
@@ -1343,18 +1376,16 @@ func TestRunSessionCtxCancel(t *testing.T) {
 	srv.close()
 }
 
-func TestRunSessionDeliversResultBufferedAfterDisconnect(t *testing.T) {
+func TestRunSessionDeliversPreviouslyBufferedResult(t *testing.T) {
 	results := newResultQueue(1)
-	endedCtx, endSession := context.WithCancel(context.Background())
-	endSession()
-	sendResult(endedCtx, results, "error", &pb.AgentError{
+	result, ok := encodeOutbound("error", &pb.AgentError{
 		DeviceId:  "device-1",
 		JobId:     "job-1",
-		Message:   "completed while disconnected",
+		Message:   "completed before disconnect",
 		Timestamp: 1,
 	}, "job-1")
-	if len(results.items) != 1 {
-		t.Fatal("completed result was not buffered after its session ended")
+	if !ok || !results.enqueue(result) {
+		t.Fatal("could not prepare buffered result")
 	}
 
 	ln := agtListen(t)
@@ -1997,7 +2028,7 @@ func TestExecuteCheckPoolFull(t *testing.T) {
 
 	out := testQueue()
 	check := &pb.Check{Id: "c1", CheckType: "tcp", TimeoutMs: 1000}
-	executeCheck(ctx, check, p, out)
+	_ = submitCheck(ctx, check, p, out, func() {}, false)
 	// Should log "check rejected (pool full)" but not panic
 	close(done)
 }
@@ -2051,15 +2082,18 @@ func TestRunSessionRestartInMainLoop(t *testing.T) {
 func TestRunSessionSendsImmediateHeartbeat(t *testing.T) {
 	origHostname := getHostname
 	origContainer := runningInContainer
+	origProcessStart := processStart
 	defer func() {
 		getHostname = origHostname
 		runningInContainer = origContainer
+		processStart = origProcessStart
 	}()
 
 	getHostname = func() (string, error) {
 		return "tower-agent-01", nil
 	}
 	runningInContainer = func() bool { return true }
+	processStart = time.Now().Add(-2 * time.Minute)
 
 	ln := agtListen(t)
 	done := make(chan error, 1)
@@ -2088,6 +2122,38 @@ func TestRunSessionSendsImmediateHeartbeat(t *testing.T) {
 	}
 	if !heartbeat.SchedulesJobs {
 		t.Error("heartbeat schedules_jobs = false with local scheduler enabled")
+	}
+	if heartbeat.UptimeSeconds < 119 {
+		t.Errorf("heartbeat uptime_seconds = %d, want process uptime near 120s", heartbeat.UptimeSeconds)
+	}
+
+	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
+	if err := <-done; !errors.Is(err, errRestartRequested) {
+		t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
+	}
+}
+
+func TestRunSessionLegacySchedulingHeartbeat(t *testing.T) {
+	ln := agtListen(t)
+	done := make(chan error, 1)
+	go func() {
+		results := newResultQueue(1)
+		done <- runSessionWithResultsAndScheduling(
+			context.Background(),
+			agtURL(ln),
+			"token",
+			nil,
+			results,
+			false,
+		)
+	}()
+
+	conn, topic := agtAccept(t, ln)
+	frame := agtWaitEvent(t, agtReadFrames(conn), "heartbeat")
+	var heartbeat pb.AgentHeartbeat
+	agtDecodeBinary(t, frame.Payload, &heartbeat)
+	if heartbeat.SchedulesJobs {
+		t.Fatal("heartbeat schedules_jobs = true in legacy scheduling mode")
 	}
 
 	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
@@ -3355,7 +3421,7 @@ func agtStallSession(t *testing.T, logs *agtLogSink, _ int) *agtStalledSession {
 	t.Helper()
 
 	s := &agtStalledSession{}
-	hit, release := logs.gateOn("sent snmp trap")
+	hit, release := logs.gateOn("spooled snmp trap")
 	s.release = release
 
 	ln := agtListen(t)

@@ -46,9 +46,10 @@ type scheduleSpec struct {
 }
 
 type scheduleEntry struct {
-	cancel  context.CancelFunc
-	stopped chan struct{}
-	spec    scheduleSpec
+	cancel      context.CancelFunc
+	stopped     chan struct{}
+	predecessor <-chan struct{}
+	spec        scheduleSpec
 }
 
 // recurringScheduler owns the credential-bearing assignment inventory for one
@@ -87,13 +88,12 @@ func (s *recurringScheduler) replaceJobs(
 			slog.Error("recurring job dropped, stable job ID is required")
 			continue
 		}
-		job := proto.Clone(job).(*pb.AgentJob)
 		specs = append(specs, scheduleSpec{
 			id:       job.JobId,
 			interval: interval(job.IntervalSeconds),
 			payload:  job,
 			submit: func(ctx context.Context, done func()) bool {
-				return submitJob(ctx, job, pools, out, done)
+				return submitJob(ctx, job, pools, out, done, true)
 			},
 		})
 	}
@@ -111,13 +111,12 @@ func (s *recurringScheduler) replaceChecks(
 			slog.Error("recurring check dropped, stable check ID is required")
 			continue
 		}
-		check := proto.Clone(check).(*pb.Check)
 		specs = append(specs, scheduleSpec{
 			id:       check.Id,
 			interval: interval(check.IntervalSeconds),
 			payload:  check,
 			submit: func(ctx context.Context, done func()) bool {
-				return submitCheck(ctx, check, pools, out, done)
+				return submitCheck(ctx, check, pools, out, done, true)
 			},
 		})
 	}
@@ -159,30 +158,42 @@ func (s *recurringScheduler) replace(group *map[string]*scheduleEntry, specs []s
 		var predecessor <-chan struct{}
 		if current != nil {
 			current.cancel()
-			predecessor = current.stopped
+			if current.predecessor != nil {
+				predecessor = current.predecessor
+			} else {
+				predecessor = current.stopped
+			}
 		}
 
 		ctx, cancel := context.WithCancel(s.ctx)
-		entry := &scheduleEntry{cancel: cancel, stopped: make(chan struct{}), spec: spec}
+		entry := &scheduleEntry{
+			cancel:      cancel,
+			stopped:     make(chan struct{}),
+			predecessor: predecessor,
+			spec:        spec,
+		}
 		(*group)[id] = entry
 		s.wg.Add(1)
-		go s.run(ctx, entry, predecessor)
+		go s.run(ctx, entry)
 	}
 }
 
-func (s *recurringScheduler) run(
-	ctx context.Context,
-	entry *scheduleEntry,
-	predecessor <-chan struct{},
-) {
+func (s *recurringScheduler) run(ctx context.Context, entry *scheduleEntry) {
 	defer s.wg.Done()
 	defer close(entry.stopped)
 
-	if predecessor != nil {
-		<-predecessor
+	if entry.predecessor != nil {
+		select {
+		case <-ctx.Done():
+			return
+		case <-entry.predecessor:
+		}
 		if ctx.Err() != nil {
 			return
 		}
+		s.mu.Lock()
+		entry.predecessor = nil
+		s.mu.Unlock()
 	}
 
 	for {
@@ -193,8 +204,9 @@ func (s *recurringScheduler) run(
 }
 
 // runOnce starts one tick promptly, then holds the next tick until both the
-// configured interval has elapsed and the accepted task has completed. A full
-// worker pool is reported by submit and retried only at the next interval.
+// configured interval has elapsed and the task has completed. Scheduled
+// submission waits for bounded worker-pool capacity, so assignments cannot
+// lose every tick to a reconnect-synchronized queue burst.
 func (s *recurringScheduler) runOnce(ctx context.Context, spec scheduleSpec) bool {
 	done := make(chan struct{})
 	accepted := spec.submit(ctx, func() { close(done) })

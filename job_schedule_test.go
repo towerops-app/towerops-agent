@@ -105,17 +105,15 @@ func testScheduleSpec(id, value string, interval time.Duration, runs chan<- sche
 		},
 	}
 }
-func TestSplitRecurringJobsCoversEveryRecurringType(t *testing.T) {
+func TestSplitRecurringJobsUsesIntervalSignal(t *testing.T) {
 	jobs := []*pb.AgentJob{
-		{JobId: "discover:device-1", JobType: pb.JobType_DISCOVER},
-		{JobId: "poll:device-1", JobType: pb.JobType_POLL},
-		{JobId: "mikrotik:device-1", JobType: pb.JobType_MIKROTIK},
-		{JobId: "ping:device-1", JobType: pb.JobType_PING},
-		{JobId: "live_poll:device-1:topic", JobType: pb.JobType_POLL},
-		{JobId: "probe:device-1", JobType: pb.JobType_PING},
+		{JobId: "discover:device-1", JobType: pb.JobType_DISCOVER, IntervalSeconds: 60},
+		{JobId: "poll:device-1", JobType: pb.JobType_POLL, IntervalSeconds: 60},
+		{JobId: "mikrotik:device-1", JobType: pb.JobType_MIKROTIK, IntervalSeconds: 60},
+		{JobId: "ping:device-1", JobType: pb.JobType_PING, IntervalSeconds: 60},
+		{JobId: "future:device-1", JobType: pb.JobType_NETWORK_SWEEP, IntervalSeconds: 60},
+		{JobId: "poll-with-new-prefix", JobType: pb.JobType_POLL},
 		{JobId: "credential:test", JobType: pb.JobType_TEST_CREDENTIALS},
-		{JobId: "lldp:device-1", JobType: pb.JobType_LLDP_TOPOLOGY},
-		{JobId: "sweep:subnet-1", JobType: pb.JobType_NETWORK_SWEEP},
 		nil,
 	}
 
@@ -125,15 +123,13 @@ func TestSplitRecurringJobsCoversEveryRecurringType(t *testing.T) {
 		"poll:device-1",
 		"mikrotik:device-1",
 		"ping:device-1",
+		"future:device-1",
 	}) {
 		t.Fatalf("recurring job IDs = %v", got)
 	}
 	if got := jobIDs(oneShot); !slices.Equal(got, []string{
-		"live_poll:device-1:topic",
-		"probe:device-1",
+		"poll-with-new-prefix",
 		"credential:test",
-		"lldp:device-1",
-		"sweep:subnet-1",
 	}) {
 		t.Fatalf("one-shot job IDs = %v", got)
 	}
@@ -316,58 +312,51 @@ func TestRecurringSchedulerReconnectStartsEmpty(t *testing.T) {
 	}
 }
 
-func TestRecurringSchedulerReportsPoolBackpressure(t *testing.T) {
+func TestRecurringSchedulerWaitsForPoolCapacity(t *testing.T) {
 	clock := newManualScheduleClock()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	notices := make(chan outbound, 1)
-	pools := &jobPools{
-		snmp:     newWorkerPool(1),
-		mikrotik: newWorkerPool(1),
-		ping:     newWorkerPool(1),
-		checks:   newWorkerPool(1),
-		notices:  notices,
-	}
+	pool := newWorkerPool(1)
 	release := make(chan struct{})
-	fillWorkerPool(t, pools.snmp, release)
+	fillWorkerPool(t, pool, release)
 
+	started := make(chan struct{})
 	scheduler := newRecurringScheduler(ctx, clock)
-	scheduler.replaceJobs([]*pb.AgentJob{{
-		JobId:           "poll:device-1",
-		JobType:         pb.JobType_POLL,
-		DeviceId:        "device-1",
-		IntervalSeconds: 29,
-	}}, pools, testQueue())
+	scheduler.replace(&scheduler.jobs, []scheduleSpec{{
+		id:       "job-1",
+		interval: 29 * time.Second,
+		payload:  &pb.AgentJob{JobId: "job-1"},
+		submit: func(ctx context.Context, done func()) bool {
+			return pool.submitWait(ctx, func() {
+				close(started)
+				done()
+			})
+		},
+	}})
 
 	select {
-	case notice := <-notices:
-		errorMessage := decodeAgentError(t, notice)
-		if errorMessage.JobId != "poll:device-1" {
-			t.Fatalf("overload notice job_id = %q", errorMessage.JobId)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("rejected scheduled tick did not emit overload notice")
+	case <-started:
+		t.Fatal("scheduled task bypassed full queue")
+	case <-time.After(20 * time.Millisecond):
 	}
-	timer := nextManualTimer(t, clock)
-	if timer.interval != 29*time.Second {
-		t.Fatalf("job timer interval = %s, want 29s", timer.interval)
-	}
-	fireManualTimer(t, timer.timer)
 	select {
-	case notice := <-notices:
-		if errorMessage := decodeAgentError(t, notice); errorMessage.JobId != "poll:device-1" {
-			t.Fatalf("retry overload notice job_id = %q", errorMessage.JobId)
-		}
+	case <-clock.requests:
+		t.Fatal("scheduler started its interval before queue admission")
+	default:
+	}
+
+	close(release)
+	select {
+	case <-started:
 	case <-time.After(time.Second):
-		t.Fatal("rejected scheduled tick was not retried on its next interval")
+		t.Fatal("scheduled task did not start after capacity opened")
+	}
+	if timer := nextManualTimer(t, clock); timer.interval != 29*time.Second {
+		t.Fatalf("job timer interval = %s, want 29s", timer.interval)
 	}
 
 	scheduler.cancelAll()
-	close(release)
-	pools.snmp.stop()
-	pools.mikrotik.stop()
-	pools.ping.stop()
-	pools.checks.stop()
+	pool.stop()
 	if !scheduler.wait(time.Second) {
 		t.Fatal("scheduler did not stop")
 	}
@@ -375,32 +364,18 @@ func TestRecurringSchedulerReportsPoolBackpressure(t *testing.T) {
 
 func TestRecurringSchedulerUsesCheckInterval(t *testing.T) {
 	clock := newManualScheduleClock()
-	notices := make(chan outbound, 1)
-	pools := &jobPools{checks: newWorkerPool(1), notices: notices}
-	release := make(chan struct{})
-	fillWorkerPool(t, pools.checks, release)
-
+	pools := &jobPools{checks: newWorkerPool(1), notices: make(chan outbound, 1)}
 	scheduler := newRecurringScheduler(context.Background(), clock)
 	scheduler.replaceChecks([]*pb.Check{{
 		Id:              "check-1",
 		IntervalSeconds: 47,
 	}}, pools, testQueue())
 
-	select {
-	case notice := <-notices:
-		errorMessage := decodeAgentError(t, notice)
-		if errorMessage.JobId != "check-1" {
-			t.Fatalf("overload notice job_id = %q", errorMessage.JobId)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("rejected scheduled check did not emit overload notice")
-	}
 	if timer := nextManualTimer(t, clock); timer.interval != 47*time.Second {
 		t.Fatalf("check timer interval = %s, want 47s", timer.interval)
 	}
 
 	scheduler.cancelAll()
-	close(release)
 	pools.checks.stop()
 	if !scheduler.wait(time.Second) {
 		t.Fatal("scheduler did not stop")
@@ -419,16 +394,4 @@ func fillWorkerPool(t *testing.T, pool *workerPool, release <-chan struct{}) {
 			t.Fatal("worker pool rejected task before queue filled")
 		}
 	}
-}
-
-func decodeAgentError(t *testing.T, notice outbound) *pb.AgentError {
-	t.Helper()
-	if notice.event != "error" {
-		t.Fatalf("notice event = %q, want error", notice.event)
-	}
-	var message pb.AgentError
-	if !decodeBinaryPayload("error", notice.payload, &message) {
-		t.Fatal("decode overload notice")
-	}
-	return &message
 }

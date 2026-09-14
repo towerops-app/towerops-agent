@@ -429,6 +429,12 @@ func TestRunMainTokenFlagWarning(t *testing.T) {
 	}
 }
 
+func TestRunMainHelpExitsSuccessfully(t *testing.T) {
+	if code := runMain(context.Background(), []string{"--help"}); code != 0 {
+		t.Fatalf("help exit = %d, want 0", code)
+	}
+}
+
 func TestRunMainWithRunAgent(t *testing.T) {
 	// Test the full path through runAgent with a real (but immediately cancelled) context
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
