@@ -169,6 +169,11 @@ Towerops, which attaches it to the device whose management IP matches the
 trap's source address. SNMPv3 traps are not supported because the listener has
 no configured USM user or authentication material.
 
+SNMPv3 traps and informs are not supported. The listener has no USM user,
+authentication, or privacy configuration, so it cannot decode SNMPv3 messages.
+Configure devices to send SNMPv1 or SNMPv2c notifications to this listener, or
+use a separate receiver that supports SNMPv3.
+
 SNMPv1 header fields are mapped to a v2c-style trap OID following RFC 3584
 §3.1, so a trap has one identifier regardless of the version that delivered it.
 
