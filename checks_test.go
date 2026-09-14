@@ -376,6 +376,36 @@ func TestHTTPCheck_FollowRedirectsTrue(t *testing.T) {
 	}
 }
 
+func TestHTTPCheck_HostOverrideRefusesCrossHostRedirect(t *testing.T) {
+	targetHit := make(chan struct{}, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetHit <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	redirectURL := strings.Replace(target.URL, "127.0.0.1", "localhost", 1)
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectURL, http.StatusFound)
+	}))
+	defer source.Close()
+
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+		Url:             source.URL,
+		Headers:         map[string]string{"Host": "virtual.example.test"},
+		VerifySsl:       true,
+		FollowRedirects: true,
+	}, 5000)
+	if status != checkCritical || !strings.Contains(output, "refusing cross-host redirect") {
+		t.Fatalf("status = %d, output = %q; want cross-host redirect failure", status, output)
+	}
+	select {
+	case <-targetHit:
+		t.Fatal("cross-host redirect target received a request")
+	default:
+	}
+}
+
 func TestHTTPCheck_FollowRedirectsFalse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/redirect" {
@@ -634,6 +664,21 @@ func TestHTTPTransportForServerNameCachesAndEvicts(t *testing.T) {
 	}
 	if _, ok := httpTransportCache["host-0.example"]; ok {
 		t.Fatal("oldest transport was not evicted")
+	}
+}
+
+func TestTLSConfigForServerNameClonesExistingConfig(t *testing.T) {
+	base := &tls.Config{MinVersion: tls.VersionTLS13}
+	config := tlsConfigForServerName(base, "service.example")
+
+	if config == base {
+		t.Fatal("TLS config was not cloned")
+	}
+	if config.MinVersion != tls.VersionTLS13 {
+		t.Fatalf("minimum TLS version = %d, want TLS 1.3", config.MinVersion)
+	}
+	if config.ServerName != "service.example" {
+		t.Fatalf("TLS server name = %q", config.ServerName)
 	}
 }
 
@@ -1547,6 +1592,7 @@ func TestHTTPCheck_HeadMethod(t *testing.T) {
 		if r.Method != "HEAD" {
 			t.Errorf("expected HEAD, got %s", r.Method)
 		}
+		w.Header().Set("Content-Length", "1234")
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()

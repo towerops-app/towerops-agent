@@ -110,12 +110,7 @@ func httpTransportForServerName(serverName string) *http.Transport {
 	}
 
 	transport := newCheckHTTPTransport(false)
-	if transport.TLSClientConfig == nil {
-		transport.TLSClientConfig = &tls.Config{}
-	} else {
-		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
-	}
-	transport.TLSClientConfig.ServerName = serverName
+	transport.TLSClientConfig = tlsConfigForServerName(transport.TLSClientConfig, serverName)
 	if len(httpTransportCacheOrder) == maxHTTPTransportCacheEntries {
 		evicted := httpTransportCacheOrder[0]
 		httpTransportCache[evicted].CloseIdleConnections()
@@ -125,6 +120,15 @@ func httpTransportForServerName(serverName string) *http.Transport {
 	httpTransportCache[serverName] = transport
 	httpTransportCacheOrder = append(httpTransportCacheOrder, serverName)
 	return transport
+}
+
+func tlsConfigForServerName(base *tls.Config, serverName string) *tls.Config {
+	if base == nil {
+		base = &tls.Config{}
+	}
+	config := base.Clone()
+	config.ServerName = serverName
+	return config
 }
 
 func tlsServerNameForHost(host string) string {
@@ -239,6 +243,10 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 			if !config.FollowRedirects {
 				return http.ErrUseLastResponse
 			}
+			if tlsServerName != "" && len(via) > 0 &&
+				!strings.EqualFold(req.URL.Hostname(), via[len(via)-1].URL.Hostname()) {
+				return fmt.Errorf("refusing cross-host redirect while Host overrides TLS server name")
+			}
 			return nil
 		},
 	}
@@ -248,6 +256,10 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 		return checkCritical, fmt.Sprintf("Request failed: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	contentLength := resp.ContentLength
+	if resp.Request.Method == http.MethodHead {
+		contentLength = -1
+	}
 
 	// Check status code
 	expectedStatus := int(config.ExpectedStatus)
@@ -258,7 +270,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	if resp.StatusCode != expectedStatus {
 		// Drain only a bounded prefix. Larger bodies lose connection reuse but
 		// cannot occupy a worker indefinitely.
-		_ = drainHTTPBody(resp.Body, resp.ContentLength)
+		_ = drainHTTPBody(resp.Body, contentLength)
 		return checkCritical, fmt.Sprintf("HTTP %d, expected %d", resp.StatusCode, expectedStatus)
 	}
 
@@ -266,7 +278,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	if config.Regex != "" {
 		re, err := cachedHTTPRegex(config.Regex)
 		if err != nil {
-			_ = drainHTTPBody(resp.Body, resp.ContentLength)
+			_ = drainHTTPBody(resp.Body, contentLength)
 			return checkUnknown, fmt.Sprintf("Invalid regex: %v", err)
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPRegexBody+1))
@@ -284,7 +296,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 		// reuse without letting an unbounded stream occupy a worker forever.
 		// Errors after the cap are intentionally unobserved: the worker must
 		// return even when a server never terminates its response.
-		if err := drainHTTPBody(resp.Body, resp.ContentLength); err != nil {
+		if err := drainHTTPBody(resp.Body, contentLength); err != nil {
 			return checkCritical, fmt.Sprintf("Failed to read body: %v", err)
 		}
 	}
