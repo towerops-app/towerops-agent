@@ -320,6 +320,9 @@ message MikrotikDevice {
 message MikrotikCommand {
   string command = 1;
   map<string, string> args = 2;
+  // Ordered RouterOS API words. New senders populate both words and args during
+  // rollout; new agents prefer words, while older agents continue using args.
+  repeated string words = 3;
 }
 
 message MikrotikResult {
