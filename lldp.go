@@ -55,7 +55,7 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, out *resultQu
 		}, jobID)
 		return
 	}
-	defer closeConn()
+	defer closeOnCancellation(ctx, closeConn)()
 
 	result := discoverLldpNeighbors(client, deviceID, jobID, !isSnmpV1(snmpDev.Version))
 

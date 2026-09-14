@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -73,7 +74,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	}
 	oidValues := make(map[string]string, totalOIDs)
 
-	var walkErrors []string
+	var queryErrors []string
 	cancelled := false
 	for _, q := range job.Queries {
 		if ctx.Err() != nil {
@@ -83,7 +84,9 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 		switch q.QueryType {
 		case pb.QueryType_GET:
 			for batch := range slices.Chunk(q.Oids, snmpMaxOIDsPerGet) {
-				snmpGetInto(conn, dev, batch, oidValues)
+				if err := snmpGetInto(conn, dev, batch, oidValues); err != nil && ctx.Err() == nil {
+					queryErrors = append(queryErrors, fmt.Sprintf("GET: %v", err))
+				}
 			}
 		case pb.QueryType_WALK:
 			// SNMPv1 doesn't support GETBULK, use GETNEXT-based WalkAll instead
@@ -95,23 +98,26 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 				} else {
 					results, err = conn.BulkWalkAll(baseOID)
 				}
-				if err != nil {
-					slog.Warn("snmp walk failed", "device", dev.Ip, "oid", baseOID, "error", err)
-					walkErrors = append(walkErrors, fmt.Sprintf("%s: %v", canonicalOID(baseOID), err))
-					continue
-				}
 				for _, v := range results {
 					if !snmpValueUsable(v) {
 						continue
 					}
 					oidValues[canonicalOID(v.Name)] = snmpValueToString(v)
 				}
+				if err != nil {
+					if ctx.Err() != nil {
+						cancelled = true
+						break
+					}
+					slog.Warn("snmp walk failed", "device", dev.Ip, "oid", baseOID, "error", err)
+					queryErrors = append(queryErrors, fmt.Sprintf("%s: %v", canonicalOID(baseOID), err))
+				}
 			}
 		}
 	}
 
 	if cancelled {
-		slog.Warn("snmp job cancelled, sending partial result", "job_id", job.JobId, "oids", len(oidValues))
+		slog.Warn("snmp job cancelled, dropping partial result", "job_id", job.JobId, "oids", len(oidValues))
 	}
 
 	result := &pb.SnmpResult{
@@ -124,11 +130,11 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 
 	slog.Info("snmp job complete", "job_id", job.JobId, "oids", len(oidValues))
 	sendResult(ctx, out, "result", result, job.JobId)
-	if len(walkErrors) > 0 {
+	if len(queryErrors) > 0 && ctx.Err() == nil {
 		sendResult(ctx, out, "error", &pb.AgentError{
 			DeviceId:  job.DeviceId,
 			JobId:     job.JobId,
-			Message:   "SNMP walk failed: " + strings.Join(walkErrors, "; "),
+			Message:   "SNMP query failed: " + strings.Join(queryErrors, "; "),
 			Timestamp: time.Now().Unix(),
 		}, job.JobId)
 	}
@@ -153,11 +159,11 @@ func isSnmpV1(version string) bool { return version == "1" || version == "v1" }
 // back as Null - so the batch is halved down to single OIDs to recover the
 // values that do resolve. tooBig is split for the same reason: the device
 // cannot fit the response in one PDU.
-func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[string]string) {
+func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[string]string) error {
 	result, err := conn.Get(oids)
 	if err != nil {
 		slog.Warn("snmp get failed", "device", dev.Ip, "oids", len(oids), "error", err)
-		return
+		return err
 	}
 
 	switch result.Error {
@@ -168,17 +174,21 @@ func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[s
 			}
 			into[canonicalOID(v.Name)] = snmpValueToString(v)
 		}
+		return nil
 	case gosnmp.NoSuchName, gosnmp.TooBig:
 		if len(oids) == 1 {
 			slog.Debug("snmp get oid skipped", "device", dev.Ip, "oid", oids[0], "status", result.Error, "error_index", result.ErrorIndex)
-			return
+			return nil
 		}
 		slog.Warn("snmp get batch split", "device", dev.Ip, "batch_size", len(oids), "status", result.Error, "error_index", result.ErrorIndex)
 		mid := len(oids) / 2
-		snmpGetInto(conn, dev, oids[:mid], into)
-		snmpGetInto(conn, dev, oids[mid:], into)
+		return errors.Join(
+			snmpGetInto(conn, dev, oids[:mid], into),
+			snmpGetInto(conn, dev, oids[mid:], into),
+		)
 	default:
 		slog.Warn("snmp get error status", "device", dev.Ip, "batch_size", len(oids), "status", result.Error, "error_index", result.ErrorIndex)
+		return fmt.Errorf("status %s at index %d", result.Error, result.ErrorIndex)
 	}
 }
 

@@ -601,7 +601,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := newResultQueue(1)
+		ch := newResultQueue(2)
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
@@ -614,6 +614,10 @@ func TestExecuteSnmpJob(t *testing.T) {
 		if len(result.OidValues) != 0 {
 			t.Errorf("got %d oid values, want 0 on error", len(result.OidValues))
 		}
+		notice := decodeQueuedResult[*pb.AgentError](t, (<-ch.items))
+		if !strings.Contains(notice.Message, "GET: timeout") {
+			t.Fatalf("GET error message = %q", notice.Message)
+		}
 	})
 
 	t.Run("WALK error reaches the server with the partial result", func(t *testing.T) {
@@ -622,7 +626,11 @@ func TestExecuteSnmpJob(t *testing.T) {
 
 		mock := &mockSnmpQuerier{
 			walkFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
-				return nil, fmt.Errorf("timeout")
+				return []gosnmp.SnmpPDU{{
+					Name:  rootOid + ".1",
+					Type:  gosnmp.OctetString,
+					Value: []byte("partial"),
+				}}, fmt.Errorf("timeout")
 			},
 		}
 		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
@@ -640,8 +648,8 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}, ch)
 
 		result := decodeQueuedResult[*pb.SnmpResult](t, (<-ch.items))
-		if len(result.OidValues) != 0 {
-			t.Errorf("got %d oid values, want 0 on error", len(result.OidValues))
+		if got := result.OidValues["1.3.6.1.2.1.2.1"]; got != "partial" {
+			t.Errorf("partial walk value = %q, want partial", got)
 		}
 		notice := decodeQueuedResult[*pb.AgentError](t, (<-ch.items))
 		if notice.DeviceId != "device-1" || notice.JobId != "1" {
@@ -989,7 +997,7 @@ func TestSnmpGetIntoUnhandledErrorStatus(t *testing.T) {
 	}
 
 	into := map[string]string{}
-	snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, oids, into)
+	_ = snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, oids, into)
 
 	if len(into) != 0 {
 		t.Errorf("into = %v, want empty on genErr response", into)
@@ -1241,7 +1249,7 @@ func TestExecuteSnmpJobCancellationClosesTransport(t *testing.T) {
 	entered := make(chan struct{})
 	closed := make(chan struct{})
 	mock := &mockSnmpQuerier{
-		getFunc: func(_ []string) (*gosnmp.SnmpPacket, error) {
+		bulkWalkFunc: func(_ string) ([]gosnmp.SnmpPDU, error) {
 			close(entered)
 			<-closed
 			return nil, fmt.Errorf("transport closed")
@@ -1259,8 +1267,8 @@ func TestExecuteSnmpJobCancellationClosesTransport(t *testing.T) {
 			JobId:      "cancelled",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 			Queries: []*pb.SnmpQuery{{
-				QueryType: pb.QueryType_GET,
-				Oids:      []string{".1.3.6.1.2.1.1.1.0"},
+				QueryType: pb.QueryType_WALK,
+				Oids:      []string{".1.3.6.1.2.1"},
 			}},
 		}, newResultQueue(1))
 	}()
