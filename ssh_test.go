@@ -34,15 +34,18 @@ func TestExecutePingJob(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		origPing := doPing
 		defer func() { doPing = origPing }()
+		gotTimeout := 0
 		doPing = func(_ context.Context, ip string, timeoutMs int) (float64, error) {
+			gotTimeout = timeoutMs
 			return 3.14, nil
 		}
 
 		out := newResultQueue(1)
 		executePingJob(context.Background(), &pb.AgentJob{
-			JobId:      "p1",
-			DeviceId:   "dev-1",
-			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+			JobId:           "p1",
+			DeviceId:        "dev-1",
+			SnmpDevice:      &pb.SnmpDevice{Ip: "10.0.0.1"},
+			IntervalSeconds: 2,
 		}, out)
 
 		result := sshTReceiveMonitoringResult(t, out)
@@ -54,6 +57,9 @@ func TestExecutePingJob(t *testing.T) {
 		}
 		if result.DeviceId != "dev-1" {
 			t.Errorf("device id: got %q, want %q", result.DeviceId, "dev-1")
+		}
+		if gotTimeout != 2000 {
+			t.Errorf("timeout: got %dms, want 2000ms recurrence ceiling", gotTimeout)
 		}
 	})
 
