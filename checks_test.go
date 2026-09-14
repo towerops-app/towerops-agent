@@ -570,6 +570,82 @@ func TestHTTPCheck_HostHeaderOverridesRequestAuthority(t *testing.T) {
 	}
 }
 
+func TestHTTPCheck_HostHeaderSetsTLSServerName(t *testing.T) {
+	const expectedHost = "example.com"
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != expectedHost {
+			t.Errorf("request Host = %q, want %q", r.Host, expectedHost)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	roots := x509.NewCertPool()
+	roots.AddCert(srv.Certificate())
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.TLSClientConfig = &tls.Config{RootCAs: roots}
+	originalDefault := http.DefaultTransport
+	http.DefaultTransport = base
+	t.Cleanup(func() { http.DefaultTransport = originalDefault })
+
+	for range 2 {
+		status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+			Url:       srv.URL,
+			Headers:   map[string]string{"Host": expectedHost},
+			VerifySsl: true,
+		}, 5000)
+		if status != checkOK {
+			t.Fatalf("status = %d, want OK with Host-based TLS verification: %s", status, output)
+		}
+	}
+}
+
+func TestHTTPTransportForServerNameCachesAndEvicts(t *testing.T) {
+	httpTransportCacheMu.Lock()
+	originalCache := httpTransportCache
+	originalOrder := httpTransportCacheOrder
+	httpTransportCache = make(map[string]*http.Transport)
+	httpTransportCacheOrder = nil
+	httpTransportCacheMu.Unlock()
+	t.Cleanup(func() {
+		httpTransportCacheMu.Lock()
+		for _, transport := range httpTransportCache {
+			transport.CloseIdleConnections()
+		}
+		httpTransportCache = originalCache
+		httpTransportCacheOrder = originalOrder
+		httpTransportCacheMu.Unlock()
+	})
+
+	first := httpTransportForServerName("host-0.example")
+	if first.TLSClientConfig.ServerName != "host-0.example" {
+		t.Fatalf("TLS server name = %q", first.TLSClientConfig.ServerName)
+	}
+	if cached := httpTransportForServerName("host-0.example"); cached != first {
+		t.Fatal("transport cache did not reuse the existing transport")
+	}
+	for i := 1; i <= maxHTTPTransportCacheEntries; i++ {
+		_ = httpTransportForServerName(fmt.Sprintf("host-%d.example", i))
+	}
+	if len(httpTransportCache) != maxHTTPTransportCacheEntries {
+		t.Fatalf("transport cache size = %d, want %d", len(httpTransportCache), maxHTTPTransportCacheEntries)
+	}
+	if _, ok := httpTransportCache["host-0.example"]; ok {
+		t.Fatal("oldest transport was not evicted")
+	}
+}
+
+func TestTLSServerNameForHost(t *testing.T) {
+	if got := tlsServerNameForHost("example.com:443"); got != "example.com" {
+		t.Fatalf("server name with port = %q", got)
+	}
+	if got := tlsServerNameForHost("[2001:db8::1]:443"); got != "" {
+		t.Fatalf("IP literal produced TLS server name %q", got)
+	}
+}
+
 func TestHTTPCheck_UnreachableServer(t *testing.T) {
 	// Use a non-routable address to guarantee failure
 	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
@@ -1162,12 +1238,12 @@ func TestDNSCheck_CNAMERecord(t *testing.T) {
 func TestDNSCheck_CNAMEWithoutAliasIsCritical(t *testing.T) {
 	original := dnsLookupCNAME
 	t.Cleanup(func() { dnsLookupCNAME = original })
-	dnsLookupCNAME = func(_ *net.Resolver, _ context.Context, host string) (string, error) {
-		return host + ".", nil
+	dnsLookupCNAME = func(_ *net.Resolver, _ context.Context, _ string) (string, error) {
+		return "direct.example.test.", nil
 	}
 
 	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
-		Hostname:   "direct.example.test",
+		Hostname:   "Direct.Example.Test",
 		RecordType: "CNAME",
 	}, 5000)
 	if status != checkCritical {
@@ -1175,6 +1251,23 @@ func TestDNSCheck_CNAMEWithoutAliasIsCritical(t *testing.T) {
 	}
 	if !strings.Contains(output, "No CNAME records found") {
 		t.Fatalf("output = %q, want missing CNAME result", output)
+	}
+}
+
+func TestDNSCheck_CNAMEAliasIgnoresCase(t *testing.T) {
+	original := dnsLookupCNAME
+	t.Cleanup(func() { dnsLookupCNAME = original })
+	dnsLookupCNAME = func(_ *net.Resolver, _ context.Context, _ string) (string, error) {
+		return "Alias.Example.Test.", nil
+	}
+
+	status, output := executeDNSCheck(context.Background(), &pb.DnsCheckConfig{
+		Hostname:   "direct.example.test",
+		RecordType: "CNAME",
+		Expected:   "alias.example.test",
+	}, 5000)
+	if status != checkOK {
+		t.Fatalf("status = %d, want OK: %s", status, output)
 	}
 }
 
@@ -1870,8 +1963,15 @@ func TestChkTHTTPCheckBodyReadErrorWithRegex(t *testing.T) {
 	if status != 2 {
 		t.Fatalf("expected status 2 for truncated body, got %d: %s", status, output)
 	}
+
 	if !strings.Contains(output, "Failed to read body") {
 		t.Fatalf("expected read-body failure, got %s", output)
+	}
+}
+func TestDrainHTTPBodyDetectsTruncatedContentLength(t *testing.T) {
+	err := drainHTTPBody(strings.NewReader("short"), 10)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("drain error = %v, want unexpected EOF", err)
 	}
 }
 
@@ -2056,9 +2156,11 @@ func TestChkTDNSAnswerMatches(t *testing.T) {
 	}{
 		{"cname answer keeps its trailing dot", "CNAME", []string{"example.com."}, "example.com", true},
 		{"expected carries the trailing dot", "CNAME", []string{"example.com"}, "example.com.", true},
+		{"cname comparison ignores case", "CNAME", []string{"EXAMPLE.COM."}, "example.com", true},
 		{"cname mismatch", "CNAME", []string{"other.example.com."}, "example.com", false},
 		{"mx preference and host", "MX", []string{"10 mx.example.com."}, "10 mx.example.com", true},
 		{"mx host alone", "MX", []string{"10 mx.example.com."}, "mx.example.com", true},
+		{"mx host comparison ignores case", "MX", []string{"10 MX.EXAMPLE.COM."}, "mx.example.com", true},
 		{"mx wrong preference", "MX", []string{"10 mx.example.com."}, "20 mx.example.com", false},
 		{"mx picks the matching record", "MX", []string{"10 a.example.com.", "20 b.example.com."}, "b.example.com", true},
 		{"txt is never split on spaces", "TXT", []string{"hello v=spf1"}, "v=spf1", false},

@@ -29,9 +29,12 @@ var (
 	sslRootCAsMu          sync.Mutex
 	sslRootCAsPool        *x509.CertPool
 
-	httpRegexCacheMu    sync.Mutex
-	httpRegexCache      = make(map[string]*regexp.Regexp)
-	httpRegexCacheOrder []string
+	httpRegexCacheMu        sync.Mutex
+	httpRegexCache          = make(map[string]*regexp.Regexp)
+	httpRegexCacheOrder     []string
+	httpTransportCacheMu    sync.Mutex
+	httpTransportCache      = make(map[string]*http.Transport)
+	httpTransportCacheOrder []string
 
 	// systemCertPool loads the platform root store. Overridable for tests.
 	systemCertPool = x509.SystemCertPool
@@ -80,10 +83,11 @@ const (
 )
 
 const (
-	maxHTTPRegexBody         = 1 << 20
-	maxHTTPDrainBytes        = 1 << 20
-	maxHTTPRegexCacheEntries = 64
-	maxTCPOutputBytes        = 256
+	maxHTTPRegexBody             = 1 << 20
+	maxHTTPDrainBytes            = 1 << 20
+	maxHTTPRegexCacheEntries     = 64
+	maxHTTPTransportCacheEntries = 64
+	maxTCPOutputBytes            = 256
 )
 
 func newCheckHTTPTransport(insecure bool) *http.Transport {
@@ -95,6 +99,43 @@ func newCheckHTTPTransport(insecure bool) *http.Transport {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 	return transport
+}
+
+func httpTransportForServerName(serverName string) *http.Transport {
+	httpTransportCacheMu.Lock()
+	defer httpTransportCacheMu.Unlock()
+
+	if transport, ok := httpTransportCache[serverName]; ok {
+		return transport
+	}
+
+	transport := newCheckHTTPTransport(false)
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	} else {
+		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	}
+	transport.TLSClientConfig.ServerName = serverName
+	if len(httpTransportCacheOrder) == maxHTTPTransportCacheEntries {
+		evicted := httpTransportCacheOrder[0]
+		httpTransportCache[evicted].CloseIdleConnections()
+		delete(httpTransportCache, evicted)
+		httpTransportCacheOrder = httpTransportCacheOrder[1:]
+	}
+	httpTransportCache[serverName] = transport
+	httpTransportCacheOrder = append(httpTransportCacheOrder, serverName)
+	return transport
+}
+
+func tlsServerNameForHost(host string) string {
+	if hostname, _, err := net.SplitHostPort(host); err == nil {
+		host = hostname
+	}
+	host = strings.Trim(host, "[]")
+	if net.ParseIP(host) != nil {
+		return ""
+	}
+	return host
 }
 
 // ExecuteCheck runs a service check and returns the result.
@@ -163,23 +204,7 @@ func checkTimeout(timeoutMs uint32) time.Duration {
 // explicitly: true unless the operator opts out. A false zero value skips
 // verification only for callers that bypass the server's check builder.
 func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs uint32) (uint32, string) {
-	transport := defaultHTTPTransport
-	if !config.VerifySsl {
-		transport = insecureHTTPTransport
-	}
-
 	timeout := checkTimeout(timeoutMs)
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if !config.FollowRedirects {
-				return http.ErrUseLastResponse
-			}
-			return nil
-		},
-	}
 
 	method := strings.ToUpper(config.Method)
 	if method == "" {
@@ -191,12 +216,31 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 		return checkCritical, fmt.Sprintf("Failed to create request: %v", err)
 	}
 
+	tlsServerName := ""
 	for key, value := range config.Headers {
 		if strings.EqualFold(key, "Host") {
 			req.Host = value
+			tlsServerName = tlsServerNameForHost(value)
 		} else {
 			req.Header.Set(key, value)
 		}
+	}
+
+	transport := defaultHTTPTransport
+	if !config.VerifySsl {
+		transport = insecureHTTPTransport
+	} else if tlsServerName != "" {
+		transport = httpTransportForServerName(tlsServerName)
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if !config.FollowRedirects {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
 	}
 
 	resp, err := client.Do(req)
@@ -214,7 +258,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	if resp.StatusCode != expectedStatus {
 		// Drain only a bounded prefix. Larger bodies lose connection reuse but
 		// cannot occupy a worker indefinitely.
-		_ = drainHTTPBody(resp.Body)
+		_ = drainHTTPBody(resp.Body, resp.ContentLength)
 		return checkCritical, fmt.Sprintf("HTTP %d, expected %d", resp.StatusCode, expectedStatus)
 	}
 
@@ -222,7 +266,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	if config.Regex != "" {
 		re, err := cachedHTTPRegex(config.Regex)
 		if err != nil {
-			_ = drainHTTPBody(resp.Body)
+			_ = drainHTTPBody(resp.Body, resp.ContentLength)
 			return checkUnknown, fmt.Sprintf("Invalid regex: %v", err)
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPRegexBody+1))
@@ -238,7 +282,9 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	} else {
 		// Consume a bounded prefix so normal small bodies retain connection
 		// reuse without letting an unbounded stream occupy a worker forever.
-		if err := drainHTTPBody(resp.Body); err != nil {
+		// Errors after the cap are intentionally unobserved: the worker must
+		// return even when a server never terminates its response.
+		if err := drainHTTPBody(resp.Body, resp.ContentLength); err != nil {
 			return checkCritical, fmt.Sprintf("Failed to read body: %v", err)
 		}
 	}
@@ -246,9 +292,15 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	return checkOK, fmt.Sprintf("HTTP %d OK", resp.StatusCode)
 }
 
-func drainHTTPBody(body io.Reader) error {
-	_, err := io.CopyN(io.Discard, body, maxHTTPDrainBytes)
-	if err == nil || errors.Is(err, io.EOF) {
+func drainHTTPBody(body io.Reader, contentLength int64) error {
+	n, err := io.CopyN(io.Discard, body, maxHTTPDrainBytes)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, io.EOF) {
+		if contentLength >= 0 && n < contentLength {
+			return io.ErrUnexpectedEOF
+		}
 		return nil
 	}
 	return err
@@ -413,7 +465,7 @@ func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs u
 		cname, lookupErr := dnsLookupCNAME(resolver, ctx, config.Hostname)
 		err = lookupErr
 		if cname != "" &&
-			strings.TrimSuffix(cname, ".") != strings.TrimSuffix(config.Hostname, ".") {
+			!strings.EqualFold(strings.TrimSuffix(cname, "."), strings.TrimSuffix(config.Hostname, ".")) {
 			results = append(results, cname)
 		}
 
@@ -464,11 +516,12 @@ func dnsAnswerMatches(recordType string, results []string, expected string) bool
 
 	want := strings.TrimSuffix(expected, ".")
 	for _, result := range results {
-		if strings.TrimSuffix(result, ".") == want {
+		if strings.EqualFold(strings.TrimSuffix(result, "."), want) {
 			return true
 		}
 		if recordType == "MX" {
-			if _, host, found := strings.Cut(result, " "); found && strings.TrimSuffix(host, ".") == want {
+			if _, host, found := strings.Cut(result, " "); found &&
+				strings.EqualFold(strings.TrimSuffix(host, "."), want) {
 				return true
 			}
 		}
