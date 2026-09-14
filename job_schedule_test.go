@@ -193,6 +193,7 @@ func TestRecurringSchedulerIntervalAndNonOverlap(t *testing.T) {
 	close(first.done)
 
 	second := nextInvocation(t, runs)
+	_ = nextManualTimer(t, clock)
 	close(second.done)
 	scheduler.cancelAll()
 	if !scheduler.wait(time.Second) {
@@ -224,12 +225,12 @@ func TestRecurringSchedulerReplacementAndRemoval(t *testing.T) {
 		testScheduleSpec("job-1", "new", time.Minute, runs),
 	})
 	assertNoInvocation(t, runs)
-	close(oldRun.done)
 	select {
 	case <-intermediate.stopped:
 	case <-time.After(time.Second):
 		t.Fatal("superseded replacement did not stop")
 	}
+	close(oldRun.done)
 
 	newRun := nextInvocation(t, runs)
 	_ = nextManualTimer(t, clock)
