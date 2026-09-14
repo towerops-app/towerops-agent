@@ -116,8 +116,9 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 		}
 	}
 
-	if cancelled {
+	if cancelled || ctx.Err() != nil {
 		slog.Warn("snmp job cancelled, dropping partial result", "job_id", job.JobId, "oids", len(oidValues))
+		return
 	}
 
 	result := &pb.SnmpResult{

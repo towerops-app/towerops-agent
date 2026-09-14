@@ -1261,6 +1261,7 @@ func TestExecuteSnmpJobCancellationClosesTransport(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	out := newResultQueue(1)
 	go func() {
 		defer close(done)
 		executeSnmpJob(ctx, &pb.AgentJob{
@@ -1270,7 +1271,7 @@ func TestExecuteSnmpJobCancellationClosesTransport(t *testing.T) {
 				QueryType: pb.QueryType_WALK,
 				Oids:      []string{".1.3.6.1.2.1"},
 			}},
-		}, newResultQueue(1))
+		}, out)
 	}()
 
 	<-entered
@@ -1279,6 +1280,11 @@ func TestExecuteSnmpJobCancellationClosesTransport(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("SNMP request did not stop after context cancellation")
+	}
+	select {
+	case result := <-out.items:
+		t.Fatalf("cancelled SNMP job queued partial result %q", result.event)
+	default:
 	}
 }
 func TestExecuteCredentialTestRejectsUnsupportedAuthProtocol(t *testing.T) {
