@@ -896,7 +896,7 @@ func submitJob(
 	case pb.JobType_DISCOVER, pb.JobType_POLL:
 		ok = pools.snmp.submit(ctx, task(func() { executeSnmpJob(ctx, job, out) }))
 	default:
-		slog.Error("job dropped, unknown job type", "job_id", job.JobId, "type", job.JobType)
+		reportUnsupportedJob(ctx, pools.notices, job)
 		return false
 	}
 	if !ok {
@@ -952,18 +952,38 @@ func sendResult(ctx context.Context, out *resultQueue, event string, msg proto.M
 	}
 	slog.Error("result buffer full - agent overloaded", "job_id", jobID, "event", event)
 }
+func reportUnsupportedJob(ctx context.Context, notices chan<- outbound, job *pb.AgentJob) {
+	jobType := strconv.FormatInt(int64(job.JobType), 10)
+	slog.Error("job dropped, unknown job type", "job_id", job.JobId, "type", jobType)
+	reportJobRejection(
+		ctx,
+		notices,
+		job.DeviceId,
+		job.JobId,
+		jobType,
+		"unsupported job type "+jobType,
+	)
+}
 
 func reportPoolRejection(
 	ctx context.Context,
 	notices chan<- outbound,
 	deviceID, jobID, jobType string,
 ) {
+	message := "worker pool overloaded; retry " + jobType + " job"
+	slog.Warn("job rejected, pool full", "job_id", jobID, "type", jobType)
+	reportJobRejection(ctx, notices, deviceID, jobID, jobType, message)
+}
+
+func reportJobRejection(
+	ctx context.Context,
+	notices chan<- outbound,
+	deviceID, jobID, jobType, message string,
+) {
 	if ctx.Err() != nil {
 		slog.Debug("job rejected, session ended", "job_id", jobID, "type", jobType)
 		return
 	}
-	message := "worker pool overloaded; retry " + jobType + " job"
-	slog.Warn("job rejected, pool full", "job_id", jobID, "type", jobType)
 	notice, ok := encodeOutbound("error", &pb.AgentError{
 		DeviceId:  deviceID,
 		JobId:     jobID,
@@ -976,7 +996,7 @@ func reportPoolRejection(
 	select {
 	case notices <- notice:
 	default:
-		slog.Warn("overload notice queue full, notification dropped", "job_id", jobID, "type", jobType)
+		slog.Warn("job rejection notice queue full, notification dropped", "job_id", jobID, "type", jobType)
 	}
 }
 

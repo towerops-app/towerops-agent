@@ -658,9 +658,9 @@ func TestDispatchJob(t *testing.T) {
 	})
 }
 
-// A JobType this build does not know about used to fall through to the SNMP
-// pool, where it would run against a device config it may not even carry.
-func TestDispatchJobDropsUnknownJobType(t *testing.T) {
+// A JobType this build does not know about must never reach an executor, and
+// the server needs an error result so it can account for the rejected job.
+func TestDispatchJobReportsUnknownJobType(t *testing.T) {
 	logs := agtCaptureLogs(t)
 	origDial := snmpDial
 	defer func() { snmpDial = origDial }()
@@ -671,16 +671,31 @@ func TestDispatchJobDropsUnknownJobType(t *testing.T) {
 	}
 
 	out := testQueue()
+	pools := testPools(t)
+	notices := make(chan outbound, 1)
+	pools.notices = notices
 	dispatchJob(context.Background(), &pb.AgentJob{
 		JobId:      "unknown-1",
+		DeviceId:   "device-1",
 		JobType:    pb.JobType(99),
 		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
-	}, testPools(t), out)
+	}, pools, out)
+
+	if len(out.items) != 0 {
+		t.Fatal("unknown job type produced a completed result")
+	}
 
 	select {
-	case result := <-out.items:
-		t.Fatalf("unknown job type produced a %q result", result.event)
-	case <-time.After(200 * time.Millisecond):
+	case notice := <-notices:
+		report := decodeAgentError(t, notice)
+		if report.JobId != "unknown-1" || report.DeviceId != "device-1" {
+			t.Fatalf("unsupported job notice = %#v", report)
+		}
+		if report.Message != "unsupported job type 99" {
+			t.Fatalf("unsupported job message = %q", report.Message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unknown job type was not reported to the server")
 	}
 	if got := dials.Load(); got != 0 {
 		t.Fatalf("unknown job type reached the SNMP executor %d times", got)
@@ -1155,8 +1170,8 @@ func TestPoolOverloadReportsEveryJobClassWithoutUsingResultSpool(t *testing.T) {
 
 	logs := agtCaptureLogs(t)
 	reportPoolRejection(context.Background(), make(chan outbound), "", "dropped-notice", "CHECK")
-	if !logs.has("overload notice queue full") {
-		t.Fatal("dropped overload notice was not logged")
+	if !logs.has("job rejection notice queue full") {
+		t.Fatal("dropped job rejection notice was not logged")
 	}
 
 	invalidNotices := make(chan outbound, 1)
