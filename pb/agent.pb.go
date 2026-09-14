@@ -2659,9 +2659,12 @@ func (x *MikrotikDevice) GetSshPort() uint32 {
 }
 
 type MikrotikCommand struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Command       string                 `protobuf:"bytes,1,opt,name=command,proto3" json:"command,omitempty"`
-	Args          map[string]string      `protobuf:"bytes,2,rep,name=args,proto3" json:"args,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Command string                 `protobuf:"bytes,1,opt,name=command,proto3" json:"command,omitempty"`
+	Args    map[string]string      `protobuf:"bytes,2,rep,name=args,proto3" json:"args,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Ordered RouterOS API words after command; do not repeat the command here.
+	// Senders populate both words and args during rollout for older agents.
+	Words         []string `protobuf:"bytes,3,rep,name=words,proto3" json:"words,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2706,6 +2709,13 @@ func (x *MikrotikCommand) GetCommand() string {
 func (x *MikrotikCommand) GetArgs() map[string]string {
 	if x != nil {
 		return x.Args
+	}
+	return nil
+}
+
+func (x *MikrotikCommand) GetWords() []string {
+	if x != nil {
+		return x.Words
 	}
 	return nil
 }
@@ -3334,10 +3344,11 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\busername\x18\x03 \x01(\tR\busername\x12\x1a\n" +
 	"\bpassword\x18\x04 \x01(\tR\bpassword\x12\x17\n" +
 	"\ause_ssl\x18\x05 \x01(\bR\x06useSsl\x12\x19\n" +
-	"\bssh_port\x18\x06 \x01(\rR\asshPort\"\xa3\x01\n" +
+	"\bssh_port\x18\x06 \x01(\rR\asshPort\"\xb9\x01\n" +
 	"\x0fMikrotikCommand\x12\x18\n" +
 	"\acommand\x18\x01 \x01(\tR\acommand\x12=\n" +
-	"\x04args\x18\x02 \x03(\v2).towerops.agent.MikrotikCommand.ArgsEntryR\x04args\x1a7\n" +
+	"\x04args\x18\x02 \x03(\v2).towerops.agent.MikrotikCommand.ArgsEntryR\x04args\x12\x14\n" +
+	"\x05words\x18\x03 \x03(\tR\x05words\x1a7\n" +
 	"\tArgsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb8\x01\n" +

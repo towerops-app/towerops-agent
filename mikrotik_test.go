@@ -1122,10 +1122,14 @@ func TestHmExecuteMikrotikJobDeliversSentences(t *testing.T) {
 
 	out := newResultQueue(1)
 	executeMikrotikJob(context.Background(), &pb.AgentJob{
-		JobId:            "m-ok",
-		DeviceId:         "dev-1",
-		MikrotikDevice:   &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
-		MikrotikCommands: []*pb.MikrotikCommand{{Command: "/interface/print"}},
+		JobId:          "m-ok",
+		DeviceId:       "dev-1",
+		MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
+		MikrotikCommands: []*pb.MikrotikCommand{{
+			Command: "/interface/print",
+			Args:    map[string]string{"name": "legacy"},
+			Words:   []string{"=name=ether1", "?running=true", "?#|", "?disabled=false"},
+		}},
 	}, out)
 
 	o := <-out.items
@@ -1147,6 +1151,15 @@ func TestHmExecuteMikrotikJobDeliversSentences(t *testing.T) {
 	}
 	if result.JobId != "m-ok" || result.DeviceId != "dev-1" {
 		t.Fatalf("unexpected identity: %+v", result)
+	}
+	written := &mikrotikClient{conn: &nopCloser{readWriter: &stream}}
+	words, err := written.readSentence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantWords := []string{"/interface/print", "=name=ether1", "?running=true", "?#|", "?disabled=false"}
+	if !slices.Equal(words, wantWords) {
+		t.Fatalf("command words = %v, want %v", words, wantWords)
 	}
 }
 
