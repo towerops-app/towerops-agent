@@ -247,9 +247,8 @@ func TestHostKeyStoreLegacyMigrationRollsBackOnSaveFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { hostKeyMarshal = originalMarshal })
 
-	err := s.verify("ssh:"+legacyHost, fingerprint)
-	if err == nil || !strings.Contains(err.Error(), "failed to migrate trusted host key") {
-		t.Fatalf("migration error = %v, want persistence failure", err)
+	if err := s.verify("ssh:"+legacyHost, fingerprint); err != nil {
+		t.Fatalf("matching legacy key was rejected after migration save failure: %v", err)
 	}
 	if got := s.keys[legacyHost]; got != fingerprint {
 		t.Fatalf("legacy key was not restored after failed migration: %v", s.keys)

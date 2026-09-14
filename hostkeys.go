@@ -146,7 +146,8 @@ func (s *hostKeyStore) verify(host, fingerprint string) error {
 		if err := s.save(); err != nil {
 			delete(s.keys, host)
 			s.keys[legacyHost] = stored
-			return fmt.Errorf("failed to migrate trusted host key from %s to %s: %w", legacyHost, host, err)
+			slog.Warn("failed to migrate trusted host key; continuing with verified legacy entry",
+				"legacy_host", legacyHost, "host", host, "error", err)
 		}
 	}
 	return nil
