@@ -1,9 +1,9 @@
-// Canonical statement of the agent wire contract. The Go agent mirrors
-// everything below this block, verbatim, at
-// towerops-agent/proto/agent.proto - edit this copy first, then reproduce the
-// change there. The hand-written codec in lib/towerops/proto/ implements what
-// is written here, and test/towerops/proto/network_sweep_test.exs pins the
-// bounds these comments promise to a non-Elixir reader.
+// Copyright (C) 2026 Graham McIntire
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The canonical wire contract is maintained in the Towerops server at
+// priv/proto/agent.proto. Keep this file byte-for-byte identical to that copy;
+// change the server schema and hand-written codec first, then mirror them here.
 
 syntax = "proto3";
 
