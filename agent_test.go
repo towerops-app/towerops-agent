@@ -478,6 +478,13 @@ func TestHandleMessage(t *testing.T) {
 }
 
 func TestHandleMessageRejectsPayloadAboveServerLimit(t *testing.T) {
+	origDecode := decodeBase64
+	defer func() { decodeBase64 = origDecode }()
+	decodeBase64 = func(string) ([]byte, error) {
+		t.Fatal("oversize payload reached the decoder")
+		return nil, nil
+	}
+
 	out := testQueue()
 	serverEncodedCeiling := base64.StdEncoding.EncodedLen(10 << 20)
 
