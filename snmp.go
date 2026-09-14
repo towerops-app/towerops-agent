@@ -346,6 +346,8 @@ func mapPrivProtocol(p string) (gosnmp.SnmpV3PrivProtocol, error) {
 	}
 }
 
+const oidIfPhysAddress = "1.3.6.1.2.1.2.2.1.6"
+
 // snmpValueToString converts a gosnmp PDU value to a string.
 func snmpValueToString(pdu gosnmp.SnmpPDU) string {
 	switch pdu.Type {
@@ -356,11 +358,14 @@ func snmpValueToString(pdu gosnmp.SnmpPDU) string {
 		if !ok {
 			return fmt.Sprintf("%v", pdu.Value)
 		}
+		if strings.HasPrefix(canonicalOID(pdu.Name), oidIfPhysAddress+".") {
+			return formatHex(b)
+		}
 		if !utf8.Valid(b) {
 			return formatHex(b)
 		}
 		for _, c := range b {
-			if c < 0x20 && c != '\n' && c != '\r' && c != '\t' {
+			if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') || c == 0x7f {
 				return formatHex(b)
 			}
 		}
