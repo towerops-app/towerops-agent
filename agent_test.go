@@ -588,22 +588,48 @@ func TestHandleMessage(t *testing.T) {
 	})
 }
 
-func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
-	out := testQueue()
+func TestHandleMessageRejectsPayloadAboveServerLimit(t *testing.T) {
+	origDecode := decodeBase64
+	defer func() { decodeBase64 = origDecode }()
+	decodeBase64 = func(string) ([]byte, error) {
+		t.Fatal("oversize payload reached the decoder")
+		return nil, nil
+	}
 
-	// Create a binary payload larger than maxJobPayloadBytes
-	oversized := make([]byte, maxJobPayloadBytes+1)
-	encoded := base64.StdEncoding.EncodeToString(oversized)
-	payload, _ := json.Marshal(map[string]string{"binary": encoded})
+	out := testQueue()
+	serverEncodedCeiling := base64.StdEncoding.EncodedLen(10 << 20)
+
+	payload, _ := json.Marshal(map[string]string{"binary": strings.Repeat("A", serverEncodedCeiling+4)})
 
 	_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), out)
 
-	// Verify no jobs were dispatched
-	select {
-	case <-out.items:
-		t.Error("expected no SNMP result for oversized payload")
-	case <-time.After(100 * time.Millisecond):
-		// Good - nothing dispatched
+	rejection := wantResult[*pb.AgentError](t, out, "error", 100*time.Millisecond)
+	if !strings.Contains(rejection.Message, "Rejected malformed or oversized jobs payload") {
+		t.Fatalf("rejection message = %q", rejection.Message)
+	}
+}
+
+func TestDecodeBinaryPayloadAcceptsServerLimit(t *testing.T) {
+	origDecode := decodeBase64
+	defer func() { decodeBase64 = origDecode }()
+
+	bin, err := proto.Marshal(&pb.AgentJobList{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodeBase64 = func(string) ([]byte, error) { return bin, nil }
+
+	serverEncodedCeiling := base64.StdEncoding.EncodedLen(10 << 20)
+	if maxEncodedJobPayloadBytes != serverEncodedCeiling {
+		t.Fatalf("agent encoded ceiling = %d, want server ceiling %d", maxEncodedJobPayloadBytes, serverEncodedCeiling)
+	}
+	payload, err := json.Marshal(map[string]string{"binary": strings.Repeat("A", serverEncodedCeiling)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !decodeBinaryPayload("jobs", payload, &pb.AgentJobList{}) {
+		t.Fatal("payload at the server's 10 MiB decoded limit was rejected")
 	}
 }
 
