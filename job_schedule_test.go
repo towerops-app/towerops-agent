@@ -385,16 +385,37 @@ func TestRecurringSchedulerUsesCheckInterval(t *testing.T) {
 	}
 }
 
-func TestRecurringSchedulerStopsAfterRejectedSubmission(t *testing.T) {
+func TestRecurringSchedulerRetriesAfterRejectedSubmission(t *testing.T) {
+	clock := newManualScheduleClock()
+	scheduler := newRecurringScheduler(context.Background(), clock)
+	continued := make(chan bool, 1)
+	go func() {
+		continued <- scheduler.runOnce(context.Background(), scheduleSpec{
+			interval: time.Hour,
+			submit: func(context.Context, func()) bool {
+				return false
+			},
+		})
+	}()
+
+	timer := nextManualTimer(t, clock)
+	fireManualTimer(t, timer.timer)
+	if !<-continued {
+		t.Fatal("scheduler stopped after its worker pool rejected one submission")
+	}
+}
+
+func TestRecurringSchedulerRejectedSubmissionStopsOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 	scheduler := newRecurringScheduler(context.Background(), realScheduleClock{})
-	ran := scheduler.runOnce(context.Background(), scheduleSpec{
+	if scheduler.runOnce(ctx, scheduleSpec{
 		interval: time.Hour,
 		submit: func(context.Context, func()) bool {
 			return false
 		},
-	})
-	if ran {
-		t.Fatal("scheduler continued after its worker pool rejected submission")
+	}) {
+		t.Fatal("scheduler continued after cancellation")
 	}
 }
 

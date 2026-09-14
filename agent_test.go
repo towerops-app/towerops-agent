@@ -236,18 +236,19 @@ func TestHandleMessage(t *testing.T) {
 
 		out := testQueue()
 		pools := testPools(t)
-		pools.localScheduling = false
 		payload := makeJobPayload(&pb.AgentJob{
-			JobId:           "poll:device-1",
-			JobType:         pb.JobType_POLL,
-			SnmpDevice:      &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
-			IntervalSeconds: 60,
+			JobId:      "poll:device-1",
+			JobType:    pb.JobType_POLL,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		})
 
 		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", pools, out)
 		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
 		if len(pools.scheduler.jobs) != 0 {
 			t.Fatalf("legacy scheduling retained %d jobs", len(pools.scheduler.jobs))
+		}
+		if pools.localScheduling {
+			t.Fatal("legacy recurring job inventory did not disable local scheduling")
 		}
 	})
 
@@ -431,7 +432,7 @@ func TestHandleMessage(t *testing.T) {
 
 	t.Run("check_jobs valid", func(t *testing.T) {
 		checkList := &pb.CheckList{Checks: []*pb.Check{
-			{Id: "c1", CheckType: "tcp", TimeoutMs: 1000,
+			{Id: "c1", CheckType: "tcp", IntervalSeconds: 60, TimeoutMs: 1000,
 				Config: &pb.Check_Tcp{Tcp: &pb.TcpCheckConfig{Host: "127.0.0.1", Port: 1}}},
 		}}
 		bin, _ := proto.Marshal(checkList)
@@ -444,12 +445,11 @@ func TestHandleMessage(t *testing.T) {
 
 	t.Run("legacy check inventory runs once without retention", func(t *testing.T) {
 		checkList := &pb.CheckList{Checks: []*pb.Check{
-			{Id: "legacy-check", CheckType: "unknown", IntervalSeconds: 60},
+			{Id: "legacy-check", CheckType: "unknown"},
 		}}
 		bin, _ := proto.Marshal(checkList)
 		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString(bin)})
 		pools := testPools(t)
-		pools.localScheduling = false
 		out := testQueue()
 
 		_, _ = handleMessage(context.Background(), channelMsg{
@@ -462,6 +462,9 @@ func TestHandleMessage(t *testing.T) {
 		}
 		if len(pools.scheduler.checks) != 0 {
 			t.Fatalf("legacy scheduling retained %d checks", len(pools.scheduler.checks))
+		}
+		if pools.localScheduling {
+			t.Fatal("legacy check inventory did not disable local scheduling")
 		}
 	})
 

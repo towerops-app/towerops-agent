@@ -475,6 +475,10 @@ func (s *session) sessionErr() error {
 }
 
 func (s *session) heartbeat() *pb.AgentHeartbeat {
+	localScheduling := s.localScheduling
+	if s.pools != nil {
+		localScheduling = s.pools.localScheduling
+	}
 	return &pb.AgentHeartbeat{
 		Version:       version,
 		UptimeSeconds: uint64(time.Since(processStart).Seconds()),
@@ -482,7 +486,7 @@ func (s *session) heartbeat() *pb.AgentHeartbeat {
 		Hostname:      s.hostname,
 		IpAddress:     s.ws.LocalIP(),
 		Container:     runningInContainer(),
-		SchedulesJobs: s.localScheduling,
+		SchedulesJobs: localScheduling,
 	}
 }
 
@@ -676,6 +680,10 @@ func handleMessage(
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &jobList) {
 			return false, nil
 		}
+		if pools.localScheduling && hasLegacyRecurringJobs(jobList.Jobs) {
+			slog.Warn("server sent recurring jobs without intervals; falling back to legacy scheduling")
+			pools.localScheduling = false
+		}
 		if !pools.localScheduling {
 			slog.Info("received legacy one-shot jobs", "count", len(jobList.Jobs))
 			pools.scheduler.replaceJobs(nil, pools, out)
@@ -713,11 +721,17 @@ func handleMessage(
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &checkList) {
 			return false, nil
 		}
+		if pools.localScheduling && hasLegacyRecurringChecks(checkList.Checks) {
+			slog.Warn("server sent recurring checks without intervals; falling back to legacy scheduling")
+			pools.localScheduling = false
+		}
 		if !pools.localScheduling {
 			slog.Info("received legacy one-shot checks", "count", len(checkList.Checks))
 			pools.scheduler.replaceChecks(nil, pools, out)
 			for _, check := range checkList.Checks {
-				_ = submitCheck(ctx, check, pools, out, func() {}, false)
+				if check != nil {
+					_ = submitCheck(ctx, check, pools, out, func() {}, false)
+				}
 			}
 			break
 		}
@@ -774,6 +788,29 @@ func splitRecurringJobs(jobs []*pb.AgentJob) (recurring, oneShot []*pb.AgentJob)
 
 func recurringJob(job *pb.AgentJob) bool {
 	return job.IntervalSeconds > 0
+}
+
+func hasLegacyRecurringJobs(jobs []*pb.AgentJob) bool {
+	for _, job := range jobs {
+		if job == nil || job.IntervalSeconds > 0 ||
+			strings.HasPrefix(job.JobId, "live_poll:") || strings.HasPrefix(job.JobId, "probe:") {
+			continue
+		}
+		switch job.JobType {
+		case pb.JobType_POLL, pb.JobType_DISCOVER, pb.JobType_PING, pb.JobType_MIKROTIK, pb.JobType_LLDP_TOPOLOGY:
+			return true
+		}
+	}
+	return false
+}
+
+func hasLegacyRecurringChecks(checks []*pb.Check) bool {
+	for _, check := range checks {
+		if check != nil && check.IntervalSeconds == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // decodeBinaryPayload unwraps the base64 protobuf a server push carries in its

@@ -211,7 +211,12 @@ func (s *recurringScheduler) runOnce(ctx context.Context, spec scheduleSpec) boo
 	defer timer.Stop()
 
 	if !accepted {
-		return false
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C():
+			return true
+		}
 	}
 
 	completed := false
