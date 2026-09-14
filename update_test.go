@@ -30,29 +30,48 @@ func forceBareBinaryUpdate(t *testing.T) {
 func TestDetectContainer(t *testing.T) {
 	origMarkers := containerMarkerFiles
 	origCgroup := containerCgroupPath
+	origCgroupNamespace := containerCgroupNamespacePath
 	origMountInfo := containerMountInfoPath
 	t.Cleanup(func() {
 		containerMarkerFiles = origMarkers
 		containerCgroupPath = origCgroup
+		containerCgroupNamespacePath = origCgroupNamespace
 		containerMountInfoPath = origMountInfo
 	})
 
 	tests := []struct {
-		name        string
-		markerIndex int
-		cgroup      string
-		mountInfo   string
-		want        bool
+		name            string
+		markerIndex     int
+		cgroup          string
+		cgroupNamespace string
+		mountInfo       string
+		want            bool
 	}{
 		{name: "docker marker", markerIndex: 0, want: true},
 		{name: "podman marker", markerIndex: 1, want: true},
 		{name: "kubernetes cgroup", markerIndex: -1, cgroup: "0::/kubepods.slice/pod123", want: true},
 		{
-			name:        "cgroup v2 namespace root",
+			name:            "cgroup v2 root in private namespace",
+			markerIndex:     -1,
+			cgroup:          "0::/\n",
+			cgroupNamespace: "cgroup:[4026533000]",
+			mountInfo:       "21 1 8:1 / / rw - ext4 /dev/root rw",
+			want:            true,
+		},
+		{
+			name:            "cgroup v2 root in initial namespace",
+			markerIndex:     -1,
+			cgroup:          "0::/\n",
+			cgroupNamespace: initialCgroupNamespace,
+			mountInfo:       "21 1 8:1 / / rw - ext4 /dev/root rw",
+			want:            false,
+		},
+		{
+			name:        "cgroup v2 root with unreadable namespace",
 			markerIndex: -1,
 			cgroup:      "0::/\n",
 			mountInfo:   "21 1 8:1 / / rw - ext4 /dev/root rw",
-			want:        true,
+			want:        false,
 		},
 		{
 			name:        "overlay root mount",
@@ -83,6 +102,7 @@ func TestDetectContainer(t *testing.T) {
 				filepath.Join(dir, ".containerenv"),
 			}
 			containerCgroupPath = filepath.Join(dir, "cgroup")
+			containerCgroupNamespacePath = filepath.Join(dir, "cgroup-namespace")
 			containerMountInfoPath = filepath.Join(dir, "mountinfo")
 
 			if tt.markerIndex >= 0 {
@@ -93,6 +113,11 @@ func TestDetectContainer(t *testing.T) {
 			if tt.cgroup != "" {
 				if err := os.WriteFile(containerCgroupPath, []byte(tt.cgroup), 0600); err != nil {
 					t.Fatalf("write cgroup fixture: %v", err)
+				}
+			}
+			if tt.cgroupNamespace != "" {
+				if err := os.Symlink(tt.cgroupNamespace, containerCgroupNamespacePath); err != nil {
+					t.Fatalf("create cgroup namespace fixture: %v", err)
 				}
 			}
 			if tt.mountInfo != "" {
