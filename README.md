@@ -85,6 +85,7 @@ Flags override their corresponding environment variables.
 | `TOWEROPS_TRAP_BIND` | `--trap-bind` | Local address for the trap listener. Use `::` to receive traps from IPv6-only devices. | `0.0.0.0` |
 | `TOWEROPS_TRAP_PORT` | `--trap-port` | UDP port for the trap listener | `162` |
 | `TOWEROPS_TRAP_COMMUNITY` | `--trap-community` | Only accept traps carrying this community string. Unset accepts any community. | unset |
+| `TOWEROPS_LEGACY_SCHEDULING` | `--legacy-scheduling` | Disable local recurring scheduling and advertise `schedules_jobs: false`, restoring server-driven refreshes during a rollback. | `false` |
 
 The legacy unprefixed variables `LOG_LEVEL`, `LOG_FORMAT`, `TRAP_ENABLED`,
 `TRAP_PORT` and `TRAP_COMMUNITY` remain accepted when the corresponding
@@ -104,22 +105,25 @@ Towerops server ──WebSocket/TLS──▶ agent ──▶ SNMP / ICMP / SSH /
    the `agent:<id>` channel with its token. A rejected token ends the session.
 2. The server pushes the connection's complete recurring `jobs` and
    `check_jobs` inventories on join, then pushes replacements whenever
-   assignments, credentials, or intervals change. Interactive `live_poll:*`
-   and `probe:*` jobs remain one-shot work.
+   assignments, credentials, or intervals change. Ad-hoc work uses the
+   backwards-compatible `discovery_job` or `backup_job` one-shot lanes.
 3. Newly assigned recurring work runs promptly, then at its configured
-   interval. `AgentJob.interval_seconds = 0` falls back to the legacy 60-second
-   cadence for older payloads. One stable assignment ID never overlaps itself;
-   a changed assignment waits for its predecessor to stop before starting.
+   interval. `AgentJob.interval_seconds = 0` identifies one-shot work. One
+   stable assignment ID never overlaps itself; a changed assignment waits for
+   its active predecessor to stop, and superseded waiters exit immediately.
 4. Jobs execute on bounded worker pools - one per protocol - so a slow or
-   unreachable device cannot stall the rest. Pool rejection remains visible to
-   the server as an `AgentError`; it is not counted as a successful tick.
-5. Results are streamed back as they complete. The server batches ICMP result
+   unreachable device cannot stall the rest. Recurring schedulers wait for
+   bounded queue capacity instead of dropping synchronized ticks. Interactive
+   overload remains visible to the server as an `AgentError`.
+5. Results are streamed back as they complete. A cancelled job produces no
+   measurement. Completed results and traps use a bounded process-wide spool
+   across reconnects; a successful socket write removes an item, so delivery is
+   at-most-once rather than server-acknowledged. The server batches ICMP result
    persistence for up to 100ms; the agent does not batch SNMP results on the wire.
-6. The agent sends a heartbeat every 60s carrying its version, uptime and
-   architecture, plus a channel keepalive every 25s. Version 1.5.0 and later
-   advertise `schedules_jobs` because POLL, DISCOVER, MIKROTIK, PING, and
-   service-check assignments are all scheduled locally. The server drops an
-   agent that goes 5 minutes without a heartbeat.
+6. The agent sends a heartbeat every 60s carrying its version, process uptime
+   and architecture, plus a channel keepalive every 25s. Version 1.5.0 and
+   later advertise `schedules_jobs` unless `--legacy-scheduling` is set. The
+   server drops an agent that goes 5 minutes without a heartbeat.
 7. On any disconnect the scheduler is cancelled and its credential-bearing
    inventory is discarded before reconnect. The new authenticated connection
    must provide complete lists again; assignments are never persisted locally.
@@ -137,10 +141,10 @@ sides meet these minimum versions:
 | Towerops agent | 1.5.0 | Retains recurring lists, schedules jobs and checks locally, and advertises `AgentHeartbeat.schedules_jobs`. |
 
 Server 0.1.x does not populate per-job intervals or push an empty list after the
-last assignment is removed. Although agent 1.5.0 treats a zero job interval as
-the legacy 60-second cadence, deploy it only after the server behavior above is
-available because its heartbeat disables the legacy refresh. Repeated unchanged
-lists are safe: they do not reset timers or trigger an extra run.
+last assignment is removed. Use `--legacy-scheduling` only as a rollback escape
+hatch with such a server: the agent advertises `schedules_jobs: false` and runs
+each refreshed list once instead of retaining it. Repeated unchanged lists in
+local scheduling mode do not reset timers or trigger an extra run.
 
 Messages are Protocol Buffers ([`proto/agent.proto`](proto/agent.proto))
 carried inside the Phoenix channel envelope.
@@ -162,7 +166,8 @@ the agent's address on UDP 162. The listener binds `0.0.0.0` by default; set
 `TOWEROPS_TRAP_BIND=::` to receive traps from IPv6-only devices. The agent parses
 SNMPv1 and SNMPv2c traps and informs, normalises them, and forwards each one to
 Towerops, which attaches it to the device whose management IP matches the
-trap's source address.
+trap's source address. SNMPv3 traps are not supported because the listener has
+no configured USM user or authentication material.
 
 SNMPv1 header fields are mapped to a v2c-style trap OID following RFC 3584
 §3.1, so a trap has one identifier regardless of the version that delivered it.

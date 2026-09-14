@@ -87,13 +87,15 @@ func TestChannelMsgNullRef(t *testing.T) {
 
 func testPools(t *testing.T) *jobPools {
 	t.Helper()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &jobPools{
-		snmp:     newWorkerPool(4),
-		mikrotik: newWorkerPool(4),
-		ping:     newWorkerPool(4),
-		checks:   newWorkerPool(4),
-		notices:  make(chan outbound, overloadNoticeQueueSize),
+		snmp:            newWorkerPool(4),
+		mikrotik:        newWorkerPool(4),
+		ping:            newWorkerPool(4),
+		checks:          newWorkerPool(4),
+		notices:         make(chan outbound, overloadNoticeQueueSize),
+		localScheduling: true,
 	}
 	p.scheduler = newRecurringScheduler(ctx, realScheduleClock{})
 	t.Cleanup(func() {
@@ -108,6 +110,19 @@ func testPools(t *testing.T) *jobPools {
 		}
 	})
 	return p
+}
+func TestSendBinaryRejectsInvalidProtobufString(t *testing.T) {
+	s := &session{
+		ctx:     context.Background(),
+		topic:   "agent:test",
+		writeCh: make(chan writeRequest, 1),
+	}
+	if s.sendBinary("heartbeat", &pb.AgentHeartbeat{Hostname: string([]byte{0xff})}) {
+		t.Fatal("sendBinary accepted an invalid UTF-8 protobuf string")
+	}
+	if len(s.writeCh) != 0 {
+		t.Fatal("sendBinary queued an unencodable protobuf")
+	}
 }
 
 // newResultQueue supplies an active agent context to tests that do not need to
@@ -163,7 +178,7 @@ func TestHandleMessage(t *testing.T) {
 		// Just verify it doesn't panic
 	})
 
-	t.Run("jobs reconcile recurring work without retaining one-shot polls", func(t *testing.T) {
+	t.Run("jobs replace recurring inventory while dedicated events remain one-shot", func(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
 
@@ -178,9 +193,10 @@ func TestHandleMessage(t *testing.T) {
 		out := testQueue()
 		pools := testPools(t)
 		recurring := makeJobPayload(&pb.AgentJob{
-			JobId:      "poll:device-1",
-			JobType:    pb.JobType_POLL,
-			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+			JobId:           "poll:device-1",
+			JobType:         pb.JobType_POLL,
+			SnmpDevice:      &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+			IntervalSeconds: 60,
 		})
 
 		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: recurring}, "agent:test", pools, out)
@@ -194,15 +210,63 @@ func TestHandleMessage(t *testing.T) {
 			JobType:    pb.JobType_POLL,
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
 		})
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "discovery_job", Payload: oneShot}, "agent:test", pools, out)
+		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
+		if len(pools.scheduler.jobs) != 1 {
+			t.Fatalf("dedicated one-shot push changed recurring inventory size to %d", len(pools.scheduler.jobs))
+		}
+
 		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: oneShot}, "agent:test", pools, out)
 		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
 		if len(pools.scheduler.jobs) != 1 {
-			t.Fatalf("one-shot poll changed recurring inventory size to %d", len(pools.scheduler.jobs))
+			t.Fatalf("ad-hoc one-shot jobs frame changed recurring inventory size to %d", len(pools.scheduler.jobs))
+		}
+	})
+
+	t.Run("explicit legacy scheduling dispatches inventories once without retention", func(t *testing.T) {
+		origDial := snmpDial
+		defer func() { snmpDial = origDial }()
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			return &mockSnmpQuerier{
+				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+					return &gosnmp.SnmpPacket{}, nil
+				},
+			}, func() {}, nil
 		}
 
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: makeJobPayload()}, "agent:test", pools, out)
+		out := testQueue()
+		pools := testPools(t)
+		pools.localScheduling = false
+		payload := makeJobPayload(&pb.AgentJob{
+			JobId:      "poll:device-1",
+			JobType:    pb.JobType_POLL,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+		})
+
+		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", pools, out)
+		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
 		if len(pools.scheduler.jobs) != 0 {
-			t.Fatalf("empty recurring list retained %d jobs", len(pools.scheduler.jobs))
+			t.Fatalf("legacy scheduling retained %d jobs", len(pools.scheduler.jobs))
+		}
+		if pools.localScheduling {
+			t.Fatal("legacy scheduling mode changed after a job inventory")
+		}
+
+		modern := makeJobPayload(&pb.AgentJob{
+			JobId:           "poll:device-1",
+			JobType:         pb.JobType_POLL,
+			SnmpDevice:      &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+			IntervalSeconds: 60,
+		})
+		_, _ = handleMessage(context.Background(), channelMsg{
+			Topic: "agent:test", Event: "jobs", Payload: modern,
+		}, "agent:test", pools, out)
+		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
+		if pools.localScheduling {
+			t.Fatal("interval-bearing job changed explicit legacy scheduling mode")
+		}
+		if len(pools.scheduler.jobs) != 0 {
+			t.Fatalf("legacy scheduling retained %d interval-bearing jobs", len(pools.scheduler.jobs))
 		}
 	})
 
@@ -386,7 +450,7 @@ func TestHandleMessage(t *testing.T) {
 
 	t.Run("check_jobs valid", func(t *testing.T) {
 		checkList := &pb.CheckList{Checks: []*pb.Check{
-			{Id: "c1", CheckType: "tcp", TimeoutMs: 1000,
+			{Id: "c1", CheckType: "tcp", IntervalSeconds: 60, TimeoutMs: 1000,
 				Config: &pb.Check_Tcp{Tcp: &pb.TcpCheckConfig{Host: "127.0.0.1", Port: 1}}},
 		}}
 		bin, _ := proto.Marshal(checkList)
@@ -395,6 +459,53 @@ func TestHandleMessage(t *testing.T) {
 		out := testQueue()
 		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: payload}, "agent:test", testPools(t), out)
 		_ = wantResult[*pb.CheckResult](t, out, "check_result", time.Second)
+	})
+
+	t.Run("explicit legacy check scheduling runs inventories once without retention", func(t *testing.T) {
+		checkList := &pb.CheckList{Checks: []*pb.Check{
+			{Id: "legacy-check", CheckType: "unknown"},
+		}}
+		bin, _ := proto.Marshal(checkList)
+		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString(bin)})
+		pools := testPools(t)
+		pools.localScheduling = false
+		out := testQueue()
+
+		_, _ = handleMessage(context.Background(), channelMsg{
+			Topic: "agent:test", Event: "check_jobs", Payload: payload,
+		}, "agent:test", pools, out)
+
+		result := wantResult[*pb.CheckResult](t, out, "check_result", time.Second)
+		if result.CheckId != "legacy-check" {
+			t.Fatalf("legacy check result ID = %q", result.CheckId)
+		}
+		if len(pools.scheduler.checks) != 0 {
+			t.Fatalf("legacy scheduling retained %d checks", len(pools.scheduler.checks))
+		}
+		if pools.localScheduling {
+			t.Fatal("legacy scheduling mode changed after a check inventory")
+		}
+
+		modernList := &pb.CheckList{Checks: []*pb.Check{{
+			Id: "modern-check", CheckType: "unknown", IntervalSeconds: 60,
+		}}}
+		modernBin, _ := proto.Marshal(modernList)
+		modernPayload, _ := json.Marshal(map[string]string{
+			"binary": base64.StdEncoding.EncodeToString(modernBin),
+		})
+		_, _ = handleMessage(context.Background(), channelMsg{
+			Topic: "agent:test", Event: "check_jobs", Payload: modernPayload,
+		}, "agent:test", pools, out)
+		result = wantResult[*pb.CheckResult](t, out, "check_result", time.Second)
+		if result.CheckId != "modern-check" {
+			t.Fatalf("modern check result ID = %q", result.CheckId)
+		}
+		if pools.localScheduling {
+			t.Fatal("interval-bearing check changed explicit legacy scheduling mode")
+		}
+		if len(pools.scheduler.checks) != 0 {
+			t.Fatalf("legacy scheduling retained %d interval-bearing checks", len(pools.scheduler.checks))
+		}
 	})
 
 	t.Run("check_jobs invalid json", func(t *testing.T) {
@@ -658,6 +769,73 @@ func TestDispatchJob(t *testing.T) {
 	})
 }
 
+func TestCancelledQueuedWorkDoesNotExecute(t *testing.T) {
+	t.Run("job", func(t *testing.T) {
+		pools := testPools(t)
+		pools.snmp = newWorkerPool(1)
+		t.Cleanup(func() { pools.snmp.stop() })
+		release := make(chan struct{})
+		started := make(chan struct{})
+		if !pools.snmp.submit(context.Background(), func() {
+			close(started)
+			<-release
+		}) {
+			t.Fatal("pool rejected blocker")
+		}
+		<-started
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		accepted := submitJob(ctx, &pb.AgentJob{
+			JobId:      "cancelled-job",
+			JobType:    pb.JobType_POLL,
+			SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1"},
+		}, pools, testQueue(), func() { close(done) }, false)
+		if !accepted {
+			t.Fatal("pool rejected queued job")
+		}
+		cancel()
+		close(release)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("cancelled queued job did not complete bookkeeping")
+		}
+	})
+
+	t.Run("check", func(t *testing.T) {
+		pools := testPools(t)
+		pools.checks = newWorkerPool(1)
+		t.Cleanup(func() { pools.checks.stop() })
+		release := make(chan struct{})
+		started := make(chan struct{})
+		if !pools.checks.submit(context.Background(), func() {
+			close(started)
+			<-release
+		}) {
+			t.Fatal("pool rejected blocker")
+		}
+		<-started
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		accepted := submitCheck(ctx, &pb.Check{
+			Id:        "cancelled-check",
+			CheckType: "unknown",
+		}, pools, testQueue(), func() { close(done) }, false)
+		if !accepted {
+			t.Fatal("pool rejected queued check")
+		}
+		cancel()
+		close(release)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("cancelled queued check did not complete bookkeeping")
+		}
+	})
+}
+
 // A JobType this build does not know about must never reach an executor, and
 // the server needs an error result so it can account for the rejected job.
 func TestDispatchJobReportsUnknownJobType(t *testing.T) {
@@ -687,7 +865,7 @@ func TestDispatchJobReportsUnknownJobType(t *testing.T) {
 
 	select {
 	case notice := <-notices:
-		report := decodeAgentError(t, notice)
+		report := decodeQueuedResult[*pb.AgentError](t, notice)
 		if report.JobId != "unknown-1" || report.DeviceId != "device-1" {
 			t.Fatalf("unsupported job notice = %#v", report)
 		}
@@ -1134,7 +1312,7 @@ func TestPoolOverloadReportsEveryJobClassWithoutUsingResultSpool(t *testing.T) {
 	dispatchJob(context.Background(), &pb.AgentJob{
 		JobId: "ping-overload", DeviceId: "device-3", JobType: pb.JobType_PING,
 	}, p, out)
-	executeCheck(context.Background(), &pb.Check{Id: "check-overload"}, p, out)
+	_ = submitCheck(context.Background(), &pb.Check{Id: "check-overload"}, p, out, func() {}, false)
 
 	if len(out.items) != 0 || len(out.slots) != 0 {
 		t.Fatal("pool rejection notices consumed completed-result spool capacity")
@@ -1213,28 +1391,30 @@ func TestResultQueueKeepsRetryAheadOfNewerResults(t *testing.T) {
 	}
 }
 
-func TestSendResultUsesAgentContextForDropSeverity(t *testing.T) {
+func TestSendResultCancellationAndDropRateLimit(t *testing.T) {
 	logs := agtCaptureLogs(t)
+	previousInterval := resultDropLogInterval
+	resultDropLogInterval = time.Hour
+	t.Cleanup(func() { resultDropLogInterval = previousInterval })
+
 	agentCtx, stopAgent := context.WithCancel(context.Background())
 	out := newResultQueueForAgent(agentCtx, 0)
 	sessionCtx, stopSession := context.WithCancel(context.Background())
 	stopSession()
 
-	sendResult(sessionCtx, out, "result", &pb.SnmpResult{JobId: "during-reconnect"}, "during-reconnect")
-	if !logs.has("ERROR result buffer full during reconnect - result dropped") {
-		t.Fatal("result loss during reconnect was not logged at error level")
-	}
-	if logs.has("result dropped, agent stopped") {
-		t.Fatal("session cancellation was misreported as agent shutdown")
+	sendResult(sessionCtx, out, "result", &pb.SnmpResult{JobId: "cancelled"}, "cancelled")
+	if !logs.has("DEBUG result discarded, job cancelled") {
+		t.Fatal("cancelled job result was not discarded")
 	}
 
-	sendResult(context.Background(), out, "result", &pb.SnmpResult{JobId: "while-connected"}, "while-connected")
-	if !logs.has("ERROR result buffer full - agent overloaded") {
-		t.Fatal("connected result loss was not reported as agent overload")
+	sendResult(context.Background(), out, "result", &pb.SnmpResult{JobId: "first-overflow"}, "first-overflow")
+	sendResult(context.Background(), out, "result", &pb.SnmpResult{JobId: "second-overflow"}, "second-overflow")
+	if got := strings.Count(logs.dump(), "ERROR result buffer full - agent overloaded"); got != 1 {
+		t.Fatalf("spool overflow log count = %d, want 1", got)
 	}
-
 	stopAgent()
-	sendResult(sessionCtx, out, "result", &pb.SnmpResult{JobId: "during-shutdown"}, "during-shutdown")
+	sendResult(context.Background(), out, "result", &pb.SnmpResult{JobId: "full-during-shutdown"}, "full-during-shutdown")
+	sendResult(sessionCtx, out, "result", &pb.SnmpResult{JobId: "cancelled-during-shutdown"}, "cancelled-during-shutdown")
 	if !logs.has("DEBUG result dropped, agent stopped") {
 		t.Fatal("agent shutdown result drop was not logged at debug level")
 	}
@@ -1343,18 +1523,16 @@ func TestRunSessionCtxCancel(t *testing.T) {
 	srv.close()
 }
 
-func TestRunSessionDeliversResultBufferedAfterDisconnect(t *testing.T) {
+func TestRunSessionDeliversPreviouslyBufferedResult(t *testing.T) {
 	results := newResultQueue(1)
-	endedCtx, endSession := context.WithCancel(context.Background())
-	endSession()
-	sendResult(endedCtx, results, "error", &pb.AgentError{
+	result, ok := encodeOutbound("error", &pb.AgentError{
 		DeviceId:  "device-1",
 		JobId:     "job-1",
-		Message:   "completed while disconnected",
+		Message:   "completed before disconnect",
 		Timestamp: 1,
 	}, "job-1")
-	if len(results.items) != 1 {
-		t.Fatal("completed result was not buffered after its session ended")
+	if !ok || !results.enqueue(result) {
+		t.Fatal("could not prepare buffered result")
 	}
 
 	ln := agtListen(t)
@@ -1997,7 +2175,7 @@ func TestExecuteCheckPoolFull(t *testing.T) {
 
 	out := testQueue()
 	check := &pb.Check{Id: "c1", CheckType: "tcp", TimeoutMs: 1000}
-	executeCheck(ctx, check, p, out)
+	_ = submitCheck(ctx, check, p, out, func() {}, false)
 	// Should log "check rejected (pool full)" but not panic
 	close(done)
 }
@@ -2051,15 +2229,18 @@ func TestRunSessionRestartInMainLoop(t *testing.T) {
 func TestRunSessionSendsImmediateHeartbeat(t *testing.T) {
 	origHostname := getHostname
 	origContainer := runningInContainer
+	origProcessStart := processStart
 	defer func() {
 		getHostname = origHostname
 		runningInContainer = origContainer
+		processStart = origProcessStart
 	}()
 
 	getHostname = func() (string, error) {
 		return "tower-agent-01", nil
 	}
 	runningInContainer = func() bool { return true }
+	processStart = time.Now().Add(-2 * time.Minute)
 
 	ln := agtListen(t)
 	done := make(chan error, 1)
@@ -2088,6 +2269,38 @@ func TestRunSessionSendsImmediateHeartbeat(t *testing.T) {
 	}
 	if !heartbeat.SchedulesJobs {
 		t.Error("heartbeat schedules_jobs = false with local scheduler enabled")
+	}
+	if heartbeat.UptimeSeconds < 119 {
+		t.Errorf("heartbeat uptime_seconds = %d, want process uptime near 120s", heartbeat.UptimeSeconds)
+	}
+
+	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
+	if err := <-done; !errors.Is(err, errRestartRequested) {
+		t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
+	}
+}
+
+func TestRunSessionLegacySchedulingHeartbeat(t *testing.T) {
+	ln := agtListen(t)
+	done := make(chan error, 1)
+	go func() {
+		results := newResultQueue(1)
+		done <- runSessionWithResultsAndScheduling(
+			context.Background(),
+			agtURL(ln),
+			"token",
+			nil,
+			results,
+			false,
+		)
+	}()
+
+	conn, topic := agtAccept(t, ln)
+	frame := agtWaitEvent(t, agtReadFrames(conn), "heartbeat")
+	var heartbeat pb.AgentHeartbeat
+	agtDecodeBinary(t, frame.Payload, &heartbeat)
+	if heartbeat.SchedulesJobs {
+		t.Fatal("heartbeat schedules_jobs = true in legacy scheduling mode")
 	}
 
 	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
@@ -3355,7 +3568,7 @@ func agtStallSession(t *testing.T, logs *agtLogSink, _ int) *agtStalledSession {
 	t.Helper()
 
 	s := &agtStalledSession{}
-	hit, release := logs.gateOn("sent snmp trap")
+	hit, release := logs.gateOn("spooled snmp trap")
 	s.release = release
 
 	ln := agtListen(t)

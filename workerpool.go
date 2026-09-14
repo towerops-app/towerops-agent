@@ -43,16 +43,35 @@ func newWorkerPool(n int) *workerPool {
 	return p
 }
 
-// submit enqueues a task without blocking the session event loop. Callers must
-// handle false as overload (or cancellation).
+// submit enqueues a task without blocking. Interactive callers use it so a
+// saturated protocol cannot stall the session event loop.
 func (p *workerPool) submit(ctx context.Context, fn func()) bool {
-	if ctx.Err() != nil {
-		return false
-	}
+	return p.submitMode(ctx, fn, false)
+}
+
+// submitWait applies backpressure until a queue slot opens or ctx is
+// cancelled. Recurring schedulers have one goroutine per assignment, so
+// waiting here spreads a burst without blocking unrelated work.
+func (p *workerPool) submitWait(ctx context.Context, fn func()) bool {
+	return p.submitMode(ctx, fn, true)
+}
+
+func (p *workerPool) submitMode(ctx context.Context, fn func(), wait bool) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.closed {
 		return false
+	}
+	if !wait && ctx.Err() != nil {
+		return false
+	}
+	if wait {
+		select {
+		case p.tasks <- fn:
+			return true
+		case <-ctx.Done():
+			return false
+		}
 	}
 	select {
 	case p.tasks <- fn:

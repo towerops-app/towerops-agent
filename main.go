@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -48,8 +49,12 @@ func runMain(ctx context.Context, args []string) int {
 	trapPort := fs.Uint("trap-port", envUint(162, "TOWEROPS_TRAP_PORT", "TRAP_PORT"), "UDP port for the SNMP trap listener")
 	trapCommunity := fs.String("trap-community", envFirst("TOWEROPS_TRAP_COMMUNITY", "TRAP_COMMUNITY"), "Only accept traps carrying this community string (default: any)")
 	hostKeysFile := fs.String("host-keys-file", envOrDefault(defaultHostKeysPath, "TOWEROPS_HOST_KEYS_FILE"), "Path to the SSH and TLS trust-on-first-use store")
+	legacyScheduling := fs.Bool("legacy-scheduling", envBool(false, "TOWEROPS_LEGACY_SCHEDULING"), "Disable local recurring scheduling and request legacy server pushes")
 
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 1
 	}
 
@@ -113,7 +118,7 @@ func runMain(ctx context.Context, args []string) int {
 	}
 
 	// Run agent with reconnect loop
-	runAgent(ctx, wsURL, *token, traps)
+	runAgentWithScheduling(ctx, wsURL, *token, traps, !*legacyScheduling)
 
 	slog.Info("towerops agent stopped")
 	return 0
