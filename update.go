@@ -72,7 +72,8 @@ func detectContainer() bool {
 
 func containsContainerEvidence(data []byte) bool {
 	text := string(data)
-	return strings.Contains(text, "docker") ||
+	return strings.TrimSpace(text) == "0::/" ||
+		strings.Contains(text, "docker") ||
 		strings.Contains(text, "containerd") ||
 		strings.Contains(text, "kubepods") ||
 		strings.Contains(text, "libpod")
