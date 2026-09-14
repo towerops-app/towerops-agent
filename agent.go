@@ -717,9 +717,7 @@ func handleMessage(
 			slog.Info("received legacy one-shot checks", "count", len(checkList.Checks))
 			pools.scheduler.replaceChecks(nil, pools, out)
 			for _, check := range checkList.Checks {
-				if check != nil {
-					_ = submitCheck(ctx, check, pools, out, func() {}, false)
-				}
+				_ = submitCheck(ctx, check, pools, out, func() {}, false)
 			}
 			break
 		}
@@ -1030,14 +1028,13 @@ func (q *resultQueue) reportDrop(jobID, event string) {
 	if last != 0 && now-last < int64(resultDropLogInterval) {
 		return
 	}
-	if !q.lastDropLog.CompareAndSwap(last, now) {
-		return
+	if q.lastDropLog.CompareAndSwap(last, now) {
+		slog.Error("result buffer full - agent overloaded",
+			"job_id", jobID,
+			"event", event,
+			"dropped", dropped,
+		)
 	}
-	slog.Error("result buffer full - agent overloaded",
-		"job_id", jobID,
-		"event", event,
-		"dropped", dropped,
-	)
 }
 func reportUnsupportedJob(ctx context.Context, notices chan<- outbound, job *pb.AgentJob) {
 	jobType := strconv.FormatInt(int64(job.JobType), 10)

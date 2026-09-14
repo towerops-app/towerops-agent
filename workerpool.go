@@ -57,12 +57,12 @@ func (p *workerPool) submitWait(ctx context.Context, fn func()) bool {
 }
 
 func (p *workerPool) submitMode(ctx context.Context, fn func(), wait bool) bool {
-	if ctx.Err() != nil {
-		return false
-	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.closed {
+		return false
+	}
+	if !wait && ctx.Err() != nil {
 		return false
 	}
 	if wait {

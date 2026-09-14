@@ -89,6 +89,9 @@ func testScheduleSpec(id, value string, interval time.Duration, runs chan<- sche
 		interval: interval,
 		payload:  &pb.Check{Id: id, CheckType: value},
 		submit: func(ctx context.Context, done func()) bool {
+			if ctx.Err() != nil {
+				return false
+			}
 			completion := make(chan struct{})
 			runs <- scheduleInvocation{ctx: ctx, done: completion}
 			go func() {
@@ -379,6 +382,31 @@ func TestRecurringSchedulerUsesCheckInterval(t *testing.T) {
 	pools.checks.stop()
 	if !scheduler.wait(time.Second) {
 		t.Fatal("scheduler did not stop")
+	}
+}
+
+func TestRecurringSchedulerStopsAfterRejectedSubmission(t *testing.T) {
+	scheduler := newRecurringScheduler(context.Background(), realScheduleClock{})
+	ran := scheduler.runOnce(context.Background(), scheduleSpec{
+		interval: time.Hour,
+		submit: func(context.Context, func()) bool {
+			return false
+		},
+	})
+	if ran {
+		t.Fatal("scheduler continued after its worker pool rejected submission")
+	}
+}
+
+func TestRecurringSchedulerWaitHonorsTimeout(t *testing.T) {
+	scheduler := newRecurringScheduler(context.Background(), realScheduleClock{})
+	scheduler.wg.Add(1)
+	if scheduler.wait(time.Millisecond) {
+		t.Fatal("scheduler wait succeeded while work was still active")
+	}
+	scheduler.wg.Done()
+	if !scheduler.wait(time.Second) {
+		t.Fatal("scheduler wait did not observe completed work")
 	}
 }
 

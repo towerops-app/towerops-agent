@@ -188,9 +188,6 @@ func (s *recurringScheduler) run(ctx context.Context, entry *scheduleEntry) {
 			return
 		case <-entry.predecessor:
 		}
-		if ctx.Err() != nil {
-			return
-		}
 		s.mu.Lock()
 		entry.predecessor = nil
 		s.mu.Unlock()
@@ -214,12 +211,7 @@ func (s *recurringScheduler) runOnce(ctx context.Context, spec scheduleSpec) boo
 	defer timer.Stop()
 
 	if !accepted {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-timer.C():
-			return true
-		}
+		return false
 	}
 
 	completed := false

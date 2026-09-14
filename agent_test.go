@@ -87,6 +87,7 @@ func TestChannelMsgNullRef(t *testing.T) {
 
 func testPools(t *testing.T) *jobPools {
 	t.Helper()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &jobPools{
 		snmp:            newWorkerPool(4),
@@ -109,6 +110,19 @@ func testPools(t *testing.T) *jobPools {
 		}
 	})
 	return p
+}
+func TestSendBinaryRejectsInvalidProtobufString(t *testing.T) {
+	s := &session{
+		ctx:     context.Background(),
+		topic:   "agent:test",
+		writeCh: make(chan writeRequest, 1),
+	}
+	if s.sendBinary("heartbeat", &pb.AgentHeartbeat{Hostname: string([]byte{0xff})}) {
+		t.Fatal("sendBinary accepted an invalid UTF-8 protobuf string")
+	}
+	if len(s.writeCh) != 0 {
+		t.Fatal("sendBinary queued an unencodable protobuf")
+	}
 }
 
 // newResultQueue supplies an active agent context to tests that do not need to
@@ -428,6 +442,29 @@ func TestHandleMessage(t *testing.T) {
 		_ = wantResult[*pb.CheckResult](t, out, "check_result", time.Second)
 	})
 
+	t.Run("legacy check inventory runs once without retention", func(t *testing.T) {
+		checkList := &pb.CheckList{Checks: []*pb.Check{
+			{Id: "legacy-check", CheckType: "unknown", IntervalSeconds: 60},
+		}}
+		bin, _ := proto.Marshal(checkList)
+		payload, _ := json.Marshal(map[string]string{"binary": base64.StdEncoding.EncodeToString(bin)})
+		pools := testPools(t)
+		pools.localScheduling = false
+		out := testQueue()
+
+		_, _ = handleMessage(context.Background(), channelMsg{
+			Topic: "agent:test", Event: "check_jobs", Payload: payload,
+		}, "agent:test", pools, out)
+
+		result := wantResult[*pb.CheckResult](t, out, "check_result", time.Second)
+		if result.CheckId != "legacy-check" {
+			t.Fatalf("legacy check result ID = %q", result.CheckId)
+		}
+		if len(pools.scheduler.checks) != 0 {
+			t.Fatalf("legacy scheduling retained %d checks", len(pools.scheduler.checks))
+		}
+	})
+
 	t.Run("check_jobs invalid json", func(t *testing.T) {
 		out := testQueue()
 		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: json.RawMessage(`not json`)}, "agent:test", testPools(t), out)
@@ -686,6 +723,73 @@ func TestDispatchJob(t *testing.T) {
 		}, testPools(t), out)
 
 		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
+	})
+}
+
+func TestCancelledQueuedWorkDoesNotExecute(t *testing.T) {
+	t.Run("job", func(t *testing.T) {
+		pools := testPools(t)
+		pools.snmp = newWorkerPool(1)
+		t.Cleanup(func() { pools.snmp.stop() })
+		release := make(chan struct{})
+		started := make(chan struct{})
+		if !pools.snmp.submit(context.Background(), func() {
+			close(started)
+			<-release
+		}) {
+			t.Fatal("pool rejected blocker")
+		}
+		<-started
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		accepted := submitJob(ctx, &pb.AgentJob{
+			JobId:      "cancelled-job",
+			JobType:    pb.JobType_POLL,
+			SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1"},
+		}, pools, testQueue(), func() { close(done) }, false)
+		if !accepted {
+			t.Fatal("pool rejected queued job")
+		}
+		cancel()
+		close(release)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("cancelled queued job did not complete bookkeeping")
+		}
+	})
+
+	t.Run("check", func(t *testing.T) {
+		pools := testPools(t)
+		pools.checks = newWorkerPool(1)
+		t.Cleanup(func() { pools.checks.stop() })
+		release := make(chan struct{})
+		started := make(chan struct{})
+		if !pools.checks.submit(context.Background(), func() {
+			close(started)
+			<-release
+		}) {
+			t.Fatal("pool rejected blocker")
+		}
+		<-started
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		accepted := submitCheck(ctx, &pb.Check{
+			Id:        "cancelled-check",
+			CheckType: "unknown",
+		}, pools, testQueue(), func() { close(done) }, false)
+		if !accepted {
+			t.Fatal("pool rejected queued check")
+		}
+		cancel()
+		close(release)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("cancelled queued check did not complete bookkeeping")
+		}
 	})
 }
 
@@ -1265,9 +1369,9 @@ func TestSendResultCancellationAndDropRateLimit(t *testing.T) {
 	if got := strings.Count(logs.dump(), "ERROR result buffer full - agent overloaded"); got != 1 {
 		t.Fatalf("spool overflow log count = %d, want 1", got)
 	}
-
 	stopAgent()
-	sendResult(sessionCtx, out, "result", &pb.SnmpResult{JobId: "during-shutdown"}, "during-shutdown")
+	sendResult(context.Background(), out, "result", &pb.SnmpResult{JobId: "full-during-shutdown"}, "full-during-shutdown")
+	sendResult(sessionCtx, out, "result", &pb.SnmpResult{JobId: "cancelled-during-shutdown"}, "cancelled-during-shutdown")
 	if !logs.has("DEBUG result dropped, agent stopped") {
 		t.Fatal("agent shutdown result drop was not logged at debug level")
 	}
