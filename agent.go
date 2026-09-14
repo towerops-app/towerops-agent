@@ -47,7 +47,9 @@ var successfulConnectionThreshold = 30 * time.Second
 // to drain before abandoning their in-flight jobs.
 var poolShutdownTimeout = 5 * time.Second
 
-const maxJobPayloadBytes = 10 << 20 // Matches the server's 10 MiB application payload limit.
+const maxDecodedJobPayloadBytes = 10 << 20
+
+var maxEncodedJobPayloadBytes = base64.StdEncoding.EncodedLen(maxDecodedJobPayloadBytes)
 
 // resultQueueSize bounds the process-wide in-memory result backlog retained
 // across WebSocket reconnects. It exceeds the 420 slots the former per-type
@@ -640,6 +642,7 @@ func handleMessage(
 	case "jobs":
 		var jobList pb.AgentJobList
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &jobList) {
+			reportPayloadRejection(ctx, out, msg.Event)
 			return false, nil
 		}
 		recurring, oneShot := splitRecurringJobs(jobList.Jobs)
@@ -655,6 +658,7 @@ func handleMessage(
 	case "discovery_job", "backup_job":
 		var jobList pb.AgentJobList
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &jobList) {
+			reportPayloadRejection(ctx, out, msg.Event)
 			return false, nil
 		}
 		slog.Info("received one-shot jobs", "event", msg.Event, "count", len(jobList.Jobs))
@@ -665,6 +669,7 @@ func handleMessage(
 	case "check_jobs":
 		var checkList pb.CheckList
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &checkList) {
+			reportPayloadRejection(ctx, out, msg.Event)
 			return false, nil
 		}
 		slog.Info("received recurring checks", "count", len(checkList.Checks))
@@ -700,6 +705,13 @@ func handleMessage(
 		slog.Debug("ignoring event", "event", msg.Event)
 	}
 	return false, nil
+}
+
+func reportPayloadRejection(ctx context.Context, out *resultQueue, event string) {
+	sendResult(ctx, out, "error", &pb.AgentError{
+		Message:   "Rejected malformed or oversized " + event + " payload",
+		Timestamp: time.Now().Unix(),
+	}, "")
 }
 func splitRecurringJobs(jobs []*pb.AgentJob) (recurring, oneShot []*pb.AgentJob) {
 	recurring = make([]*pb.AgentJob, 0, len(jobs))
@@ -741,8 +753,8 @@ func decodeBinaryPayload(event string, raw json.RawMessage, msg proto.Message) b
 		slog.Error("decode payload", "event", event, "error", err)
 		return false
 	}
-	if len(payload.Binary) > maxJobPayloadBytes {
-		slog.Error("payload too large", "event", event, "size", len(payload.Binary), "max", maxJobPayloadBytes)
+	if len(payload.Binary) > maxEncodedJobPayloadBytes {
+		slog.Error("payload too large", "event", event, "size", len(payload.Binary), "max", maxEncodedJobPayloadBytes)
 		return false
 	}
 	bin, err := decodeBase64(payload.Binary)

@@ -480,16 +480,13 @@ func TestHandleMessage(t *testing.T) {
 func TestHandleMessageRejectsOversizedPayload(t *testing.T) {
 	out := testQueue()
 
-	payload, _ := json.Marshal(map[string]string{"binary": strings.Repeat("A", maxJobPayloadBytes+1)})
+	payload, _ := json.Marshal(map[string]string{"binary": strings.Repeat("A", maxEncodedJobPayloadBytes+1)})
 
 	_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: payload}, "agent:test", testPools(t), out)
 
-	// Verify no jobs were dispatched
-	select {
-	case <-out.items:
-		t.Error("expected no SNMP result for oversized payload")
-	case <-time.After(100 * time.Millisecond):
-		// Good - nothing dispatched
+	rejection := wantResult[*pb.AgentError](t, out, "error", 100*time.Millisecond)
+	if !strings.Contains(rejection.Message, "Rejected malformed or oversized jobs payload") {
+		t.Fatalf("rejection message = %q", rejection.Message)
 	}
 }
 
