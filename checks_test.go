@@ -406,6 +406,36 @@ func TestHTTPCheck_HostOverrideRefusesCrossHostRedirect(t *testing.T) {
 	}
 }
 
+func TestHTTPCheck_HostOverrideFollowsCrossHostRedirectWithoutTLSVerification(t *testing.T) {
+	targetHit := make(chan struct{}, 1)
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetHit <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	redirectURL := strings.Replace(target.URL, "127.0.0.1", "localhost", 1)
+	source := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectURL, http.StatusFound)
+	}))
+	defer source.Close()
+
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+		Url:             source.URL,
+		Headers:         map[string]string{"Host": "virtual.example.test"},
+		VerifySsl:       false,
+		FollowRedirects: true,
+	}, 5000)
+	if status != checkOK {
+		t.Fatalf("status = %d, want OK after cross-host redirect with TLS verification disabled: %s", status, output)
+	}
+	select {
+	case <-targetHit:
+	default:
+		t.Fatal("cross-host redirect target did not receive a request")
+	}
+}
+
 func TestHTTPCheck_FollowRedirectsFalse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/redirect" {
@@ -592,8 +622,9 @@ func TestHTTPCheck_HostHeaderOverridesRequestAuthority(t *testing.T) {
 	defer srv.Close()
 
 	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
-		Url:     srv.URL,
-		Headers: map[string]string{"Host": expectedHost},
+		Url:       srv.URL,
+		Headers:   map[string]string{"Host": expectedHost},
+		VerifySsl: true,
 	}, 5000)
 	if status != checkOK {
 		t.Fatalf("status = %d, want OK: %s", status, output)
@@ -676,6 +707,16 @@ func TestTLSConfigForServerNameClonesExistingConfig(t *testing.T) {
 	}
 	if config.MinVersion != tls.VersionTLS13 {
 		t.Fatalf("minimum TLS version = %d, want TLS 1.3", config.MinVersion)
+	}
+	if config.ServerName != "service.example" {
+		t.Fatalf("TLS server name = %q", config.ServerName)
+	}
+}
+
+func TestTLSConfigForServerNameCreatesConfigForNilBase(t *testing.T) {
+	config := tlsConfigForServerName(nil, "service.example")
+	if config == nil {
+		t.Fatal("TLS config is nil")
 	}
 	if config.ServerName != "service.example" {
 		t.Fatalf("TLS server name = %q", config.ServerName)

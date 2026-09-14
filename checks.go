@@ -123,6 +123,9 @@ func httpTransportForServerName(serverName string) *http.Transport {
 }
 
 func tlsConfigForServerName(base *tls.Config, serverName string) *tls.Config {
+	if base == nil {
+		return &tls.Config{ServerName: serverName}
+	}
 	config := base.Clone()
 	config.ServerName = serverName
 	return config
@@ -240,7 +243,7 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 			if !config.FollowRedirects {
 				return http.ErrUseLastResponse
 			}
-			if tlsServerName != "" && len(via) > 0 &&
+			if config.VerifySsl && tlsServerName != "" && len(via) > 0 &&
 				!strings.EqualFold(req.URL.Hostname(), via[len(via)-1].URL.Hostname()) {
 				return fmt.Errorf("refusing cross-host redirect while Host overrides TLS server name")
 			}
@@ -291,8 +294,6 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	} else {
 		// Consume a bounded prefix so normal small bodies retain connection
 		// reuse without letting an unbounded stream occupy a worker forever.
-		// Errors after the cap are intentionally unobserved: the worker must
-		// return even when a server never terminates its response.
 		if err := drainHTTPBody(resp.Body, contentLength); err != nil {
 			return checkCritical, fmt.Sprintf("Failed to read body: %v", err)
 		}
@@ -301,6 +302,9 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	return checkOK, fmt.Sprintf("HTTP %d OK", resp.StatusCode)
 }
 
+// drainHTTPBody consumes at most maxHTTPDrainBytes. Once that cap is reached,
+// later read errors are intentionally unobserved because detecting them would
+// require unbounded work.
 func drainHTTPBody(body io.Reader, contentLength int64) error {
 	n, err := io.CopyN(io.Discard, body, maxHTTPDrainBytes)
 	if err == nil {
