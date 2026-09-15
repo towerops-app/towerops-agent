@@ -237,6 +237,7 @@ func TestRunMainHelp(t *testing.T) {
 			// page renders flag defaults, so it must never echo them.
 			t.Setenv("TOWEROPS_AGENT_TOKEN", "s3cret-token")
 			t.Setenv("TOWEROPS_TRAP_COMMUNITY", "s3cret-community")
+			t.Setenv("TOWEROPS_API_URL", "wss://agent:s3cret-apiurl@example.com")
 
 			stdoutReader, stdoutWriter, err := os.Pipe()
 			if err != nil {
@@ -287,12 +288,26 @@ func TestRunMainHelp(t *testing.T) {
 			if len(stderr) != 0 {
 				t.Errorf("help wrote to stderr: %q", stderr)
 			}
-			for _, secret := range []string{"s3cret-token", "s3cret-community"} {
+			for _, secret := range []string{"s3cret-token", "s3cret-community", "s3cret-apiurl"} {
 				if strings.Contains(string(stdout), secret) {
 					t.Errorf("help leaked %q to stdout:\n%s", secret, stdout)
 				}
 			}
 		})
+	}
+}
+
+// An explicitly empty flag overrides the environment, per the README's "Flags
+// override their corresponding environment variables": `--token=` must reach
+// the required-args check instead of silently picking up TOWEROPS_AGENT_TOKEN.
+// `--api-url=` and `--trap-community=` share the same flagIsSet gate, so a
+// regression to an emptiness check fails here first.
+func TestRunMainExplicitEmptyFlagOverridesEnvironment(t *testing.T) {
+	t.Setenv("TOWEROPS_API_URL", "wss://example.com")
+	t.Setenv("TOWEROPS_AGENT_TOKEN", "env-token")
+
+	if code := runMain(context.Background(), []string{"--token="}); code != 1 {
+		t.Errorf("exit = %d, want 1: --token= must not fall back to the environment", code)
 	}
 }
 
