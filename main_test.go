@@ -233,6 +233,11 @@ func TestRunMainInvalidFlag(t *testing.T) {
 func TestRunMainHelp(t *testing.T) {
 	for _, arg := range []string{"--help", "-h"} {
 		t.Run(arg, func(t *testing.T) {
+			// Secrets live in the environment on real deployments; the help
+			// page renders flag defaults, so it must never echo them.
+			t.Setenv("TOWEROPS_AGENT_TOKEN", "s3cret-token")
+			t.Setenv("TOWEROPS_TRAP_COMMUNITY", "s3cret-community")
+
 			stdoutReader, stdoutWriter, err := os.Pipe()
 			if err != nil {
 				t.Fatalf("create stdout pipe: %v", err)
@@ -281,6 +286,11 @@ func TestRunMainHelp(t *testing.T) {
 			}
 			if len(stderr) != 0 {
 				t.Errorf("help wrote to stderr: %q", stderr)
+			}
+			for _, secret := range []string{"s3cret-token", "s3cret-community"} {
+				if strings.Contains(string(stdout), secret) {
+					t.Errorf("help leaked %q to stdout:\n%s", secret, stdout)
+				}
 			}
 		})
 	}

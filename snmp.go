@@ -6,10 +6,12 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -37,6 +39,18 @@ var snmpDial = func(ctx context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(
 	return conn, func() { _ = conn.Conn.Close() }, nil
 }
 
+// closeOnCancellation interrupts gosnmp even if a transport path does not
+// observe GoSNMP.Context while blocked in socket I/O.
+func closeOnCancellation(ctx context.Context, closeFn func()) func() {
+	var once sync.Once
+	closeOnce := func() { once.Do(closeFn) }
+	stop := context.AfterFunc(ctx, closeOnce)
+	return func() {
+		stop()
+		closeOnce()
+	}
+}
+
 // executeSnmpJob runs SNMP GET/WALK queries for a job and sends results.
 func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	dev := job.SnmpDevice
@@ -52,7 +66,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 		sendResult(ctx, out, "result", emptySnmpResult(job), job.JobId)
 		return
 	}
-	defer closeFn()
+	defer closeOnCancellation(ctx, closeFn)()
 
 	totalOIDs := 0
 	for _, q := range job.Queries {
@@ -60,6 +74,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	}
 	oidValues := make(map[string]string, totalOIDs)
 
+	var queryErrors []string
 	cancelled := false
 	for _, q := range job.Queries {
 		if ctx.Err() != nil {
@@ -69,7 +84,9 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 		switch q.QueryType {
 		case pb.QueryType_GET:
 			for batch := range slices.Chunk(q.Oids, snmpMaxOIDsPerGet) {
-				snmpGetInto(conn, dev, batch, oidValues)
+				if err := snmpGetInto(conn, dev, batch, oidValues); err != nil && ctx.Err() == nil {
+					queryErrors = append(queryErrors, fmt.Sprintf("GET: %v", err))
+				}
 			}
 		case pb.QueryType_WALK:
 			// SNMPv1 doesn't support GETBULK, use GETNEXT-based WalkAll instead
@@ -81,22 +98,27 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 				} else {
 					results, err = conn.BulkWalkAll(baseOID)
 				}
-				if err != nil {
-					slog.Warn("snmp walk failed", "device", dev.Ip, "oid", baseOID, "error", err)
-					continue
-				}
 				for _, v := range results {
 					if !snmpValueUsable(v) {
 						continue
 					}
 					oidValues[canonicalOID(v.Name)] = snmpValueToString(v)
 				}
+				if err != nil {
+					if ctx.Err() != nil {
+						cancelled = true
+						break
+					}
+					slog.Warn("snmp walk failed", "device", dev.Ip, "oid", baseOID, "error", err)
+					queryErrors = append(queryErrors, fmt.Sprintf("%s: %v", canonicalOID(baseOID), err))
+				}
 			}
 		}
 	}
 
-	if cancelled {
-		slog.Warn("snmp job cancelled, sending partial result", "job_id", job.JobId, "oids", len(oidValues))
+	if cancelled || ctx.Err() != nil {
+		slog.Warn("snmp job cancelled, dropping partial result", "job_id", job.JobId, "oids", len(oidValues))
+		return
 	}
 
 	result := &pb.SnmpResult{
@@ -109,6 +131,14 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 
 	slog.Info("snmp job complete", "job_id", job.JobId, "oids", len(oidValues))
 	sendResult(ctx, out, "result", result, job.JobId)
+	if len(queryErrors) > 0 && ctx.Err() == nil {
+		sendResult(ctx, out, "error", &pb.AgentError{
+			DeviceId:  job.DeviceId,
+			JobId:     job.JobId,
+			Message:   "SNMP query failed: " + strings.Join(queryErrors, "; "),
+			Timestamp: time.Now().Unix(),
+		}, job.JobId)
+	}
 }
 
 func emptySnmpResult(job *pb.AgentJob) *pb.SnmpResult {
@@ -130,11 +160,11 @@ func isSnmpV1(version string) bool { return version == "1" || version == "v1" }
 // back as Null - so the batch is halved down to single OIDs to recover the
 // values that do resolve. tooBig is split for the same reason: the device
 // cannot fit the response in one PDU.
-func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[string]string) {
+func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[string]string) error {
 	result, err := conn.Get(oids)
 	if err != nil {
 		slog.Warn("snmp get failed", "device", dev.Ip, "oids", len(oids), "error", err)
-		return
+		return err
 	}
 
 	switch result.Error {
@@ -145,17 +175,21 @@ func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[s
 			}
 			into[canonicalOID(v.Name)] = snmpValueToString(v)
 		}
+		return nil
 	case gosnmp.NoSuchName, gosnmp.TooBig:
 		if len(oids) == 1 {
 			slog.Debug("snmp get oid skipped", "device", dev.Ip, "oid", oids[0], "status", result.Error, "error_index", result.ErrorIndex)
-			return
+			return nil
 		}
 		slog.Warn("snmp get batch split", "device", dev.Ip, "batch_size", len(oids), "status", result.Error, "error_index", result.ErrorIndex)
 		mid := len(oids) / 2
-		snmpGetInto(conn, dev, oids[:mid], into)
-		snmpGetInto(conn, dev, oids[mid:], into)
+		return errors.Join(
+			snmpGetInto(conn, dev, oids[:mid], into),
+			snmpGetInto(conn, dev, oids[mid:], into),
+		)
 	default:
 		slog.Warn("snmp get error status", "device", dev.Ip, "batch_size", len(oids), "status", result.Error, "error_index", result.ErrorIndex)
+		return fmt.Errorf("status %s at index %d", result.Error, result.ErrorIndex)
 	}
 }
 
@@ -200,7 +234,7 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQue
 		sendResult(ctx, out, "credential_test_result", result, job.JobId)
 		return
 	}
-	defer closeFn()
+	defer closeOnCancellation(ctx, closeFn)()
 
 	packet, err := conn.Get([]string{"1.3.6.1.2.1.1.1.0"})
 	if err != nil {
@@ -215,10 +249,20 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQue
 		return
 	}
 
-	sysDescr := ""
 	if packet.Error != gosnmp.NoError {
-		slog.Debug("snmp credential test error status", "device", dev.Ip, "status", packet.Error, "error_index", packet.ErrorIndex)
-	} else if len(packet.Variables) > 0 && snmpValueUsable(packet.Variables[0]) {
+		result := &pb.CredentialTestResult{
+			TestId:       job.JobId,
+			Success:      false,
+			ErrorMessage: fmt.Sprintf("SNMP test failed: status %v (error index %d)", packet.Error, packet.ErrorIndex),
+			Timestamp:    timestamp,
+		}
+		slog.Info("credential test complete", "test_id", result.TestId, "success", result.Success)
+		sendResult(ctx, out, "credential_test_result", result, job.JobId)
+		return
+	}
+
+	sysDescr := ""
+	if len(packet.Variables) > 0 && snmpValueUsable(packet.Variables[0]) {
 		sysDescr = snmpValueToString(packet.Variables[0])
 	}
 	// A successful GET proves the credentials work even when sysDescr is unavailable.
@@ -247,7 +291,7 @@ func newSnmpConn(ctx context.Context, dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error
 		Port:           uint16(port),
 		Timeout:        10 * time.Second,
 		Retries:        2,
-		MaxRepetitions: 10,
+		MaxRepetitions: 25,
 		Context:        ctx,
 	}
 
@@ -346,6 +390,8 @@ func mapPrivProtocol(p string) (gosnmp.SnmpV3PrivProtocol, error) {
 	}
 }
 
+const oidIfPhysAddress = "1.3.6.1.2.1.2.2.1.6"
+
 // snmpValueToString converts a gosnmp PDU value to a string.
 func snmpValueToString(pdu gosnmp.SnmpPDU) string {
 	switch pdu.Type {
@@ -356,20 +402,27 @@ func snmpValueToString(pdu gosnmp.SnmpPDU) string {
 		if !ok {
 			return fmt.Sprintf("%v", pdu.Value)
 		}
+		if strings.HasPrefix(canonicalOID(pdu.Name), oidIfPhysAddress+".") {
+			return formatHex(b)
+		}
 		if !utf8.Valid(b) {
 			return formatHex(b)
 		}
 		for _, c := range b {
-			if c < 0x20 && c != '\n' && c != '\r' && c != '\t' {
+			if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') || c == 0x7f {
 				return formatHex(b)
 			}
 		}
 		return string(b)
 	case gosnmp.ObjectIdentifier:
-		if s, ok := pdu.Value.(string); ok {
-			return s
+		switch value := pdu.Value.(type) {
+		case string:
+			return value
+		case []byte:
+			return formatHex(value)
+		default:
+			return fmt.Sprintf("%v", value)
 		}
-		return fmt.Sprintf("%v", pdu.Value)
 	case gosnmp.IPAddress:
 		if s, ok := pdu.Value.(string); ok {
 			return s

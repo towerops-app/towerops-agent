@@ -1,11 +1,9 @@
 // Copyright (C) 2026 Graham McIntire
-//
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The Towerops server's copy at priv/proto/agent.proto is canonical for shared
-// fields. AgentJob.interval_seconds (field 8) is the forward-compatible agent
-// scheduler extension that server 0.2.0 must populate before agent 1.5.0 is
-// deployed; see README.md's scheduler rollout compatibility table.
+// The canonical wire contract is maintained in the TowerOps server at
+// priv/proto/agent.proto. Everything from `syntax = "proto3";` down must stay
+// byte-for-byte identical to that copy; each repository keeps its own header.
 
 syntax = "proto3";
 
@@ -211,6 +209,7 @@ message AgentJob {
   MikrotikDevice mikrotik_device = 6;
   repeated MikrotikCommand mikrotik_commands = 7;
   uint32 interval_seconds = 8;
+  uint32 ping_timeout_ms = 9;     // Ping timeout; zero means the agent default
 }
 
 message SnmpDevice {
@@ -322,6 +321,9 @@ message MikrotikDevice {
 message MikrotikCommand {
   string command = 1;
   map<string, string> args = 2;
+  // Ordered RouterOS API words after command; do not repeat the command here.
+  // Senders populate both words and args during rollout for older agents.
+  repeated string words = 3;
 }
 
 message MikrotikResult {

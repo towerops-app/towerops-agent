@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gosnmp/gosnmp"
@@ -40,9 +41,28 @@ func TestSnmpValueToString(t *testing.T) {
 			want: "00:1a:2b",
 		},
 		{
+			name: "printable interface physical address",
+			pdu: gosnmp.SnmpPDU{
+				Name:  "." + oidIfPhysAddress + ".7",
+				Type:  gosnmp.OctetString,
+				Value: []byte("Hello!"),
+			},
+			want: "48:65:6c:6c:6f:21",
+		},
+		{
+			name: "delete control byte",
+			pdu:  gosnmp.SnmpPDU{Type: gosnmp.OctetString, Value: []byte{'a', 0x7f}},
+			want: "61:7f",
+		},
+		{
 			name: "oid",
 			pdu:  gosnmp.SnmpPDU{Type: gosnmp.ObjectIdentifier, Value: "1.3.6.1.2.1.1.1.0"},
 			want: "1.3.6.1.2.1.1.1.0",
+		},
+		{
+			name: "oid bytes",
+			pdu:  gosnmp.SnmpPDU{Type: gosnmp.ObjectIdentifier, Value: []byte{0x2b, 0x06, 0x01}},
+			want: "2b:06:01",
 		},
 		{
 			name: "counter32",
@@ -595,7 +615,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := newResultQueue(1)
+		ch := newResultQueue(2)
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
@@ -608,24 +628,33 @@ func TestExecuteSnmpJob(t *testing.T) {
 		if len(result.OidValues) != 0 {
 			t.Errorf("got %d oid values, want 0 on error", len(result.OidValues))
 		}
+		notice := decodeQueuedResult[*pb.AgentError](t, (<-ch.items))
+		if !strings.Contains(notice.Message, "GET: timeout") {
+			t.Fatalf("GET error message = %q", notice.Message)
+		}
 	})
 
-	t.Run("WALK error continues", func(t *testing.T) {
+	t.Run("WALK error reaches the server with the partial result", func(t *testing.T) {
 		orig := snmpDial
 		defer func() { snmpDial = orig }()
 
 		mock := &mockSnmpQuerier{
 			walkFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
-				return nil, fmt.Errorf("timeout")
+				return []gosnmp.SnmpPDU{{
+					Name:  rootOid + ".1",
+					Type:  gosnmp.OctetString,
+					Value: []byte("partial"),
+				}}, fmt.Errorf("timeout")
 			},
 		}
 		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
-		ch := newResultQueue(1)
+		ch := newResultQueue(2)
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
+			DeviceId:   "device-1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 			Queries: []*pb.SnmpQuery{
 				{QueryType: pb.QueryType_WALK, Oids: []string{".1.3.6.1.2.1.2"}},
@@ -633,8 +662,15 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}, ch)
 
 		result := decodeQueuedResult[*pb.SnmpResult](t, (<-ch.items))
-		if len(result.OidValues) != 0 {
-			t.Errorf("got %d oid values, want 0 on error", len(result.OidValues))
+		if got := result.OidValues["1.3.6.1.2.1.2.1"]; got != "partial" {
+			t.Errorf("partial walk value = %q, want partial", got)
+		}
+		notice := decodeQueuedResult[*pb.AgentError](t, (<-ch.items))
+		if notice.DeviceId != "device-1" || notice.JobId != "1" {
+			t.Fatalf("walk error identity = %+v", notice)
+		}
+		if !strings.Contains(notice.Message, "1.3.6.1.2.1.2: timeout") {
+			t.Fatalf("walk error message = %q", notice.Message)
 		}
 	})
 
@@ -975,7 +1011,7 @@ func TestSnmpGetIntoUnhandledErrorStatus(t *testing.T) {
 	}
 
 	into := map[string]string{}
-	snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, oids, into)
+	_ = snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, oids, into)
 
 	if len(into) != 0 {
 		t.Errorf("into = %v, want empty on genErr response", into)
@@ -1183,7 +1219,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 			t.Fatalf("SystemDescription = %q, want empty", result.SystemDescription)
 		}
 	})
-	t.Run("error status leaves sysDescr empty", func(t *testing.T) {
+	t.Run("error status rejects credentials", func(t *testing.T) {
 		orig := snmpDial
 		defer func() { snmpDial = orig }()
 
@@ -1210,14 +1246,60 @@ func TestExecuteCredentialTest(t *testing.T) {
 		}, out)
 
 		result := decodeQueuedResult[*pb.CredentialTestResult](t, (<-out.items))
-		if !result.Success {
-			t.Error("successful GET should prove the credentials")
+		if result.Success {
+			t.Fatal("credential test succeeded despite SNMP error status")
 		}
-		if result.SystemDescription != "" {
-			t.Fatalf("SystemDescription = %q, want empty", result.SystemDescription)
+		if !strings.Contains(result.ErrorMessage, "NoSuchName") ||
+			!strings.Contains(result.ErrorMessage, "error index 1") {
+			t.Fatalf("ErrorMessage = %q, want status and index", result.ErrorMessage)
 		}
 	})
+}
 
+func TestExecuteSnmpJobCancellationClosesTransport(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	entered := make(chan struct{})
+	closed := make(chan struct{})
+	mock := &mockSnmpQuerier{
+		bulkWalkFunc: func(_ string) ([]gosnmp.SnmpPDU, error) {
+			close(entered)
+			<-closed
+			return nil, fmt.Errorf("transport closed")
+		},
+	}
+	snmpDial = func(_ context.Context, _ *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		return mock, func() { close(closed) }, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	out := newResultQueue(1)
+	go func() {
+		defer close(done)
+		executeSnmpJob(ctx, &pb.AgentJob{
+			JobId:      "cancelled",
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+			Queries: []*pb.SnmpQuery{{
+				QueryType: pb.QueryType_WALK,
+				Oids:      []string{".1.3.6.1.2.1"},
+			}},
+		}, out)
+	}()
+
+	<-entered
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("SNMP request did not stop after context cancellation")
+	}
+	select {
+	case result := <-out.items:
+		t.Fatalf("cancelled SNMP job queued partial result %q", result.event)
+	default:
+	}
 }
 func TestExecuteCredentialTestRejectsUnsupportedAuthProtocol(t *testing.T) {
 	out := newResultQueue(1)
@@ -1399,7 +1481,7 @@ func TestPropSnwOctetStringRoundtrip(t *testing.T) {
 		printable := utf8.Valid(b)
 		if printable {
 			for _, c := range b {
-				if c < 0x20 && c != '\n' && c != '\r' && c != '\t' {
+				if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') || c == 0x7f {
 					printable = false
 					break
 				}

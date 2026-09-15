@@ -75,6 +75,8 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 	return string(output), nil
 }
 
+const defaultPingTimeoutMs = 5000
+
 // executePingJob pings a device and sends a monitoring check result.
 func executePingJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	dev := job.SnmpDevice
@@ -91,7 +93,11 @@ func executePingJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	}
 
 	timestamp := time.Now().Unix()
-	responseTime, err := doPing(ctx, dev.Ip, 5000)
+	timeoutMs := int(job.PingTimeoutMs)
+	if timeoutMs <= 0 {
+		timeoutMs = defaultPingTimeoutMs
+	}
+	responseTime, err := doPing(ctx, dev.Ip, timeoutMs)
 
 	if err != nil {
 		slog.Warn("device down", "device", job.DeviceId, "error", err)

@@ -149,6 +149,43 @@ func TestWorkerPoolSubmitRespectsContext(t *testing.T) {
 	close(blocker)
 }
 
+func TestWorkerPoolSubmitWaitStopsOnCancellation(t *testing.T) {
+	pool := newWorkerPool(1)
+	blocker := make(chan struct{})
+	started := make(chan struct{})
+	if !pool.submit(context.Background(), func() {
+		close(started)
+		<-blocker
+	}) {
+		t.Fatal("pool rejected blocker")
+	}
+	<-started
+	for range cap(pool.tasks) {
+		if !pool.submit(context.Background(), func() { <-blocker }) {
+			t.Fatal("pool rejected queued blocker")
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan bool, 1)
+	go func() {
+		result <- pool.submitWait(ctx, func() { t.Error("cancelled submission executed") })
+	}()
+	cancel()
+
+	select {
+	case accepted := <-result:
+		if accepted {
+			t.Fatal("cancelled waiting submission was accepted")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiting submission did not unblock on cancellation")
+	}
+
+	close(blocker)
+	pool.stop()
+}
+
 func TestWorkerPoolRejectsImmediatelyWhenFull(t *testing.T) {
 	pool := newWorkerPool(1)
 	blocker := make(chan struct{})

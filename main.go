@@ -38,7 +38,7 @@ func stopSignalNotifier(ctx context.Context, stop context.CancelFunc) {
 func runMain(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("towerops-agent", flag.ContinueOnError)
 	apiURL := fs.String("api-url", os.Getenv("TOWEROPS_API_URL"), "API URL (e.g., wss://towerops.net)")
-	token := fs.String("token", os.Getenv("TOWEROPS_AGENT_TOKEN"), "Agent authentication token")
+	token := fs.String("token", "", "Agent authentication token (or set TOWEROPS_AGENT_TOKEN)")
 	tokenFile := fs.String("token-file", "", "Path to file containing agent token (preferred over --token)")
 	logLevel := fs.String("log-level", envOrDefault("info", "TOWEROPS_LOG_LEVEL", "LOG_LEVEL"), "Log level (debug, info, warn, error)")
 	logFormat := fs.String("log-format", envOrDefault("text", "TOWEROPS_LOG_FORMAT", "LOG_FORMAT"), "Log output format (text, json)")
@@ -46,8 +46,9 @@ func runMain(ctx context.Context, args []string) int {
 	trapEnabled := fs.Bool("trap-enabled", envBool(false, "TOWEROPS_TRAP_ENABLED", "TRAP_ENABLED"), "Listen for SNMP traps")
 	trapBind := fs.String("trap-bind", envOrDefault("0.0.0.0", "TOWEROPS_TRAP_BIND"), "Address for the SNMP trap listener")
 	trapPort := fs.Uint("trap-port", envUint(162, "TOWEROPS_TRAP_PORT", "TRAP_PORT"), "UDP port for the SNMP trap listener")
-	trapCommunity := fs.String("trap-community", envFirst("TOWEROPS_TRAP_COMMUNITY", "TRAP_COMMUNITY"), "Only accept traps carrying this community string (default: any)")
+	trapCommunity := fs.String("trap-community", "", "Only accept traps carrying this community string (or set TOWEROPS_TRAP_COMMUNITY; default: any)")
 	hostKeysFile := fs.String("host-keys-file", envOrDefault(defaultHostKeysPath, "TOWEROPS_HOST_KEYS_FILE"), "Path to the SSH and TLS trust-on-first-use store")
+	legacyScheduling := fs.Bool("legacy-scheduling", envBool(false, "TOWEROPS_LEGACY_SCHEDULING"), "Disable local recurring scheduling and request legacy server pushes")
 	showHelp := fs.Bool("help", false, "Show this help message and exit")
 	fs.BoolVar(showHelp, "h", false, "Show this help message and exit (shorthand)")
 
@@ -60,6 +61,17 @@ func runMain(ctx context.Context, args []string) int {
 		fs.SetOutput(os.Stdout)
 		fs.Usage()
 		return 0
+	}
+
+	// Secrets are resolved only after the help short-circuit: flag.PrintDefaults
+	// renders every non-empty default, so an env-sourced token or community
+	// string would otherwise be printed on stdout by `--help`.
+	if *token == "" {
+		envToken := os.Getenv("TOWEROPS_AGENT_TOKEN")
+		token = &envToken
+	}
+	if *trapCommunity == "" {
+		*trapCommunity = envFirst("TOWEROPS_TRAP_COMMUNITY", "TRAP_COMMUNITY")
 	}
 
 	// Read token from file if --token-file is provided
@@ -122,7 +134,7 @@ func runMain(ctx context.Context, args []string) int {
 	}
 
 	// Run agent with reconnect loop
-	runAgent(ctx, wsURL, *token, traps)
+	runAgentWithScheduling(ctx, wsURL, *token, traps, !*legacyScheduling)
 
 	slog.Info("towerops agent stopped")
 	return 0

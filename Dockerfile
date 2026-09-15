@@ -41,4 +41,5 @@ ENV TOWEROPS_HOST_KEYS_FILE=/data/known_hosts.json
 VOLUME /data
 WORKDIR /data
 USER towerops
+STOPSIGNAL SIGTERM
 CMD ["/usr/local/bin/towerops-agent"]

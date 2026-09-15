@@ -141,6 +141,10 @@ func (c *mikrotikClient) execute(command string, args map[string]string) (*mikro
 		}
 	}
 
+	return c.executeWords(words)
+}
+
+func (c *mikrotikClient) executeWords(words []string) (*mikrotikResponse, error) {
 	if err := c.writeSentence(words); err != nil {
 		return nil, err
 	}
@@ -388,9 +392,18 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue)
 	var errorMessage string
 
 	for _, cmd := range job.MikrotikCommands {
-		slog.Debug("executing mikrotik command", "command", cmd.Command, "args", len(cmd.Args))
+		slog.Debug("executing mikrotik command", "command", cmd.Command, "args", len(cmd.Args), "words", len(cmd.Words))
 
-		resp, err := client.execute(cmd.Command, cmd.Args)
+		var resp *mikrotikResponse
+		var err error
+		if len(cmd.Words) > 0 {
+			words := make([]string, 1, len(cmd.Words)+1)
+			words[0] = cmd.Command
+			words = append(words, cmd.Words...)
+			resp, err = client.executeWords(words)
+		} else {
+			resp, err = client.execute(cmd.Command, cmd.Args)
+		}
 		if err != nil {
 			errorMessage = fmt.Sprintf("command '%s' failed: %v", cmd.Command, err)
 			slog.Error("mikrotik command failed", "device", job.DeviceId, "error", errorMessage)
