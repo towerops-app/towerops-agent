@@ -181,15 +181,108 @@ func TestRunMainMissingArgs(t *testing.T) {
 }
 
 func TestRunMainInvalidFlag(t *testing.T) {
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stdout pipe: %v", err)
+	}
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	originalStdout, originalStderr := os.Stdout, os.Stderr
+	t.Cleanup(func() {
+		os.Stdout, os.Stderr = originalStdout, originalStderr
+		_ = stdoutWriter.Close()
+		_ = stderrWriter.Close()
+		_ = stdoutReader.Close()
+		_ = stderrReader.Close()
+	})
+	os.Stdout, os.Stderr = stdoutWriter, stderrWriter
+
 	code := runMain(context.Background(), []string{"--nonexistent-flag"})
+
+	if err := stdoutWriter.Close(); err != nil {
+		t.Fatalf("close stdout writer: %v", err)
+	}
+	if err := stderrWriter.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	os.Stdout, os.Stderr = originalStdout, originalStderr
+
 	if code != 1 {
-		t.Errorf("expected exit 1, got %d", code)
+		t.Errorf("exit = %d, want 1", code)
+	}
+	stdout, err := io.ReadAll(stdoutReader)
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	stderr, err := io.ReadAll(stderrReader)
+	if err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+	// Diagnostics belong on stderr; stdout stays clean so callers capturing it
+	// never mistake an error page for help output.
+	if !strings.Contains(string(stderr), "nonexistent-flag") {
+		t.Errorf("stderr missing flag error:\n%s", stderr)
+	}
+	if len(stdout) != 0 {
+		t.Errorf("flag error wrote to stdout: %q", stdout)
 	}
 }
 
 func TestRunMainHelp(t *testing.T) {
-	if code := runMain(context.Background(), []string{"--help"}); code != 0 {
-		t.Errorf("expected help to exit 0, got %d", code)
+	for _, arg := range []string{"--help", "-h"} {
+		t.Run(arg, func(t *testing.T) {
+			stdoutReader, stdoutWriter, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("create stdout pipe: %v", err)
+			}
+			stderrReader, stderrWriter, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("create stderr pipe: %v", err)
+			}
+			originalStdout, originalStderr := os.Stdout, os.Stderr
+			t.Cleanup(func() {
+				os.Stdout, os.Stderr = originalStdout, originalStderr
+				_ = stdoutWriter.Close()
+				_ = stderrWriter.Close()
+				_ = stdoutReader.Close()
+				_ = stderrReader.Close()
+			})
+			os.Stdout, os.Stderr = stdoutWriter, stderrWriter
+
+			code := runMain(context.Background(), []string{arg})
+
+			if err := stdoutWriter.Close(); err != nil {
+				t.Fatalf("close stdout writer: %v", err)
+			}
+			if err := stderrWriter.Close(); err != nil {
+				t.Fatalf("close stderr writer: %v", err)
+			}
+			os.Stdout, os.Stderr = originalStdout, originalStderr
+
+			if code != 0 {
+				t.Errorf("exit = %d, want 0", code)
+			}
+			stdout, err := io.ReadAll(stdoutReader)
+			if err != nil {
+				t.Fatalf("read stdout: %v", err)
+			}
+			stderr, err := io.ReadAll(stderrReader)
+			if err != nil {
+				t.Fatalf("read stderr: %v", err)
+			}
+			// The help page is the documented stdout contract: piping it into
+			// grep or a file has to yield the flag list, not an empty stream.
+			for _, want := range []string{"Usage of towerops-agent", "-api-url", "-trap-port", "-help"} {
+				if !strings.Contains(string(stdout), want) {
+					t.Errorf("help stdout missing %q:\n%s", want, stdout)
+				}
+			}
+			if len(stderr) != 0 {
+				t.Errorf("help wrote to stderr: %q", stderr)
+			}
+		})
 	}
 }
 

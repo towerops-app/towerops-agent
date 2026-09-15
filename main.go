@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -49,12 +48,18 @@ func runMain(ctx context.Context, args []string) int {
 	trapPort := fs.Uint("trap-port", envUint(162, "TOWEROPS_TRAP_PORT", "TRAP_PORT"), "UDP port for the SNMP trap listener")
 	trapCommunity := fs.String("trap-community", envFirst("TOWEROPS_TRAP_COMMUNITY", "TRAP_COMMUNITY"), "Only accept traps carrying this community string (default: any)")
 	hostKeysFile := fs.String("host-keys-file", envOrDefault(defaultHostKeysPath, "TOWEROPS_HOST_KEYS_FILE"), "Path to the SSH and TLS trust-on-first-use store")
+	showHelp := fs.Bool("help", false, "Show this help message and exit")
+	fs.BoolVar(showHelp, "h", false, "Show this help message and exit (shorthand)")
 
+	// Parse errors stay on fs's default stderr; only the help page is rerouted
+	// to stdout below so `towerops-agent --help | grep ...` sees the content.
 	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
 		return 1
+	}
+	if *showHelp {
+		fs.SetOutput(os.Stdout)
+		fs.Usage()
+		return 0
 	}
 
 	// Read token from file if --token-file is provided
