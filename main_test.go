@@ -181,9 +181,167 @@ func TestRunMainMissingArgs(t *testing.T) {
 }
 
 func TestRunMainInvalidFlag(t *testing.T) {
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stdout pipe: %v", err)
+	}
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	originalStdout, originalStderr := os.Stdout, os.Stderr
+	t.Cleanup(func() {
+		os.Stdout, os.Stderr = originalStdout, originalStderr
+		_ = stdoutWriter.Close()
+		_ = stderrWriter.Close()
+		_ = stdoutReader.Close()
+		_ = stderrReader.Close()
+	})
+	os.Stdout, os.Stderr = stdoutWriter, stderrWriter
+
 	code := runMain(context.Background(), []string{"--nonexistent-flag"})
+
+	if err := stdoutWriter.Close(); err != nil {
+		t.Fatalf("close stdout writer: %v", err)
+	}
+	if err := stderrWriter.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	os.Stdout, os.Stderr = originalStdout, originalStderr
+
 	if code != 1 {
-		t.Errorf("expected exit 1, got %d", code)
+		t.Errorf("exit = %d, want 1", code)
+	}
+	stdout, err := io.ReadAll(stdoutReader)
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	stderr, err := io.ReadAll(stderrReader)
+	if err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+	// Diagnostics belong on stderr; stdout stays clean so callers capturing it
+	// never mistake an error page for help output.
+	if !strings.Contains(string(stderr), "nonexistent-flag") {
+		t.Errorf("stderr missing flag error:\n%s", stderr)
+	}
+	if len(stdout) != 0 {
+		t.Errorf("flag error wrote to stdout: %q", stdout)
+	}
+}
+
+func TestRunMainHelp(t *testing.T) {
+	for _, arg := range []string{"--help", "-h"} {
+		t.Run(arg, func(t *testing.T) {
+			// Secrets live in the environment on real deployments; the help
+			// page renders flag defaults, so it must never echo them.
+			t.Setenv("TOWEROPS_AGENT_TOKEN", "s3cret-token")
+			t.Setenv("TOWEROPS_TRAP_COMMUNITY", "s3cret-community")
+			t.Setenv("TOWEROPS_API_URL", "wss://agent:s3cret-apiurl@example.com")
+
+			stdoutReader, stdoutWriter, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("create stdout pipe: %v", err)
+			}
+			stderrReader, stderrWriter, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("create stderr pipe: %v", err)
+			}
+			originalStdout, originalStderr := os.Stdout, os.Stderr
+			t.Cleanup(func() {
+				os.Stdout, os.Stderr = originalStdout, originalStderr
+				_ = stdoutWriter.Close()
+				_ = stderrWriter.Close()
+				_ = stdoutReader.Close()
+				_ = stderrReader.Close()
+			})
+			os.Stdout, os.Stderr = stdoutWriter, stderrWriter
+
+			code := runMain(context.Background(), []string{arg})
+
+			if err := stdoutWriter.Close(); err != nil {
+				t.Fatalf("close stdout writer: %v", err)
+			}
+			if err := stderrWriter.Close(); err != nil {
+				t.Fatalf("close stderr writer: %v", err)
+			}
+			os.Stdout, os.Stderr = originalStdout, originalStderr
+
+			if code != 0 {
+				t.Errorf("exit = %d, want 0", code)
+			}
+			stdout, err := io.ReadAll(stdoutReader)
+			if err != nil {
+				t.Fatalf("read stdout: %v", err)
+			}
+			stderr, err := io.ReadAll(stderrReader)
+			if err != nil {
+				t.Fatalf("read stderr: %v", err)
+			}
+			// The help page is the documented stdout contract: piping it into
+			// grep or a file has to yield the flag list, not an empty stream.
+			for _, want := range []string{"Usage of towerops-agent", "-api-url", "-trap-port", "-help"} {
+				if !strings.Contains(string(stdout), want) {
+					t.Errorf("help stdout missing %q:\n%s", want, stdout)
+				}
+			}
+			if len(stderr) != 0 {
+				t.Errorf("help wrote to stderr: %q", stderr)
+			}
+			for _, secret := range []string{"s3cret-token", "s3cret-community", "s3cret-apiurl"} {
+				if strings.Contains(string(stdout), secret) {
+					t.Errorf("help leaked %q to stdout:\n%s", secret, stdout)
+				}
+			}
+		})
+	}
+}
+
+// An explicitly empty flag overrides the environment, per the README's "Flags
+// override their corresponding environment variables": `--token=` must reach
+// the required-args check instead of silently picking up TOWEROPS_AGENT_TOKEN.
+// `--api-url=` and `--trap-community=` share the same flagIsSet gate.
+func TestRunMainExplicitEmptyFlagOverridesEnvironment(t *testing.T) {
+	t.Setenv("TOWEROPS_API_URL", "wss://example.com")
+	t.Setenv("TOWEROPS_AGENT_TOKEN", "env-token")
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	originalStderr := os.Stderr
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		os.Stderr = originalStderr
+		slog.SetDefault(originalLogger)
+		_ = writer.Close()
+		_ = reader.Close()
+	})
+	os.Stderr = writer
+
+	// A cancelled context and a temp trust store keep an unguarded fallback
+	// from reconnecting forever or writing known_hosts.json into the package
+	// directory: it would return 0 here instead of hanging the test binary.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	code := runMain(ctx, []string{"--token=", cliTHostKeysFlag(t)})
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	os.Stderr = originalStderr
+	stderr, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+
+	if code != 1 {
+		t.Errorf("exit = %d, want 1: --token= must not fall back to the environment", code)
+	}
+	// Naming the guarded step is what makes a regression diagnosable: without
+	// it, an env-filled token simply starts a normal run.
+	if !strings.Contains(string(stderr), "--api-url and --token are required") {
+		t.Errorf("stderr missing required-args error:\n%s", stderr)
 	}
 }
 
@@ -426,12 +584,6 @@ func TestRunMainTokenFlagWarning(t *testing.T) {
 	})
 	if code != 0 {
 		t.Errorf("expected exit 0, got %d", code)
-	}
-}
-
-func TestRunMainHelpExitsSuccessfully(t *testing.T) {
-	if code := runMain(context.Background(), []string{"--help"}); code != 0 {
-		t.Fatalf("help exit = %d, want 0", code)
 	}
 }
 
