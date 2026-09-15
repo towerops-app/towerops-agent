@@ -300,14 +300,48 @@ func TestRunMainHelp(t *testing.T) {
 // An explicitly empty flag overrides the environment, per the README's "Flags
 // override their corresponding environment variables": `--token=` must reach
 // the required-args check instead of silently picking up TOWEROPS_AGENT_TOKEN.
-// `--api-url=` and `--trap-community=` share the same flagIsSet gate, so a
-// regression to an emptiness check fails here first.
+// `--api-url=` and `--trap-community=` share the same flagIsSet gate.
 func TestRunMainExplicitEmptyFlagOverridesEnvironment(t *testing.T) {
 	t.Setenv("TOWEROPS_API_URL", "wss://example.com")
 	t.Setenv("TOWEROPS_AGENT_TOKEN", "env-token")
 
-	if code := runMain(context.Background(), []string{"--token="}); code != 1 {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	originalStderr := os.Stderr
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		os.Stderr = originalStderr
+		slog.SetDefault(originalLogger)
+		_ = writer.Close()
+		_ = reader.Close()
+	})
+	os.Stderr = writer
+
+	// A cancelled context and a temp trust store keep an unguarded fallback
+	// from reconnecting forever or writing known_hosts.json into the package
+	// directory: it would return 0 here instead of hanging the test binary.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	code := runMain(ctx, []string{"--token=", cliTHostKeysFlag(t)})
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	os.Stderr = originalStderr
+	stderr, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+
+	if code != 1 {
 		t.Errorf("exit = %d, want 1: --token= must not fall back to the environment", code)
+	}
+	// Naming the guarded step is what makes a regression diagnosable: without
+	// it, an env-filled token simply starts a normal run.
+	if !strings.Contains(string(stderr), "--api-url and --token are required") {
+		t.Errorf("stderr missing required-args error:\n%s", stderr)
 	}
 }
 
