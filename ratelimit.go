@@ -8,6 +8,8 @@ import (
 	"math/rand/v2"
 	"sync"
 	"time"
+
+	"github.com/gosnmp/gosnmp"
 )
 
 // defaultSNMPPDURate is the process-wide ceiling on SNMP request packets per
@@ -97,6 +99,12 @@ func (b *tokenBucket) wait(ctx context.Context) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+// snmpSentHook returns the gosnmp OnSent callback that paces outbound packets
+// through the process-wide token bucket.
+func snmpSentHook(ctx context.Context) func(*gosnmp.GoSNMP) {
+	return func(*gosnmp.GoSNMP) { snmpPDUs.wait(ctx) }
 }
 
 // snmpPDUs is the process-wide token bucket for outbound SNMP request packets.

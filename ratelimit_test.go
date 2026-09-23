@@ -144,3 +144,11 @@ func TestSetSNMPPDURate(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestSNMPSentHook(t *testing.T) {
+	t.Cleanup(func() { setSNMPPDURate(defaultSNMPPDURate) })
+	setSNMPPDURate(0) // disabled: the hook must not block
+	hook := snmpSentHook(context.Background())
+	hook(nil)
+	hook(nil)
+}

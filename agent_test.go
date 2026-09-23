@@ -4107,3 +4107,32 @@ func TestResultQueueDiscoveryLane(t *testing.T) {
 		t.Fatalf("queued results = %d, want 8 after overflow", got)
 	}
 }
+
+func TestJobTargetKey(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		job  *pb.AgentJob
+		want string
+	}{
+		{"snmp ip", &pb.AgentJob{JobId: "j1", SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"}}, "10.0.0.1"},
+		{"mikrotik ip", &pb.AgentJob{JobId: "j2", MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.2"}}, "10.0.0.2"},
+		{"snmp ip wins over mikrotik", &pb.AgentJob{
+			JobId:          "j3",
+			SnmpDevice:     &pb.SnmpDevice{Ip: "10.0.0.3"},
+			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.4"},
+		}, "10.0.0.3"},
+		{"device id fallback", &pb.AgentJob{JobId: "j4", DeviceId: "dev-9"}, "device:dev-9"},
+		{"job id fallback", &pb.AgentJob{JobId: "j5"}, "job:j5"},
+		{"empty snmp ip falls through", &pb.AgentJob{
+			JobId:      "j6",
+			DeviceId:   "dev-6",
+			SnmpDevice: &pb.SnmpDevice{},
+		}, "device:dev-6"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := jobTargetKey(tc.job); got != tc.want {
+				t.Fatalf("jobTargetKey = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
