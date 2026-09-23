@@ -294,6 +294,9 @@ func newSnmpConn(ctx context.Context, dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error
 		MaxRepetitions: 25,
 		Context:        ctx,
 	}
+	// gosnmp invokes OnSent after every transmitted packet, including
+	// retries, so the process-wide token bucket paces real wire traffic.
+	conn.OnSent = func(*gosnmp.GoSNMP) { snmpPDUs.wait(ctx) }
 
 	// Transport
 	if dev.Transport == "tcp" {

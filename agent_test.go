@@ -95,6 +95,7 @@ func testPools(t *testing.T) *jobPools {
 		ping:            newWorkerPool(4),
 		checks:          newWorkerPool(4),
 		notices:         make(chan outbound, overloadNoticeQueueSize),
+		targets:         &targetGates{},
 		localScheduling: true,
 	}
 	p.scheduler = newRecurringScheduler(ctx, realScheduleClock{})
@@ -144,7 +145,7 @@ func wantResult[T proto.Message](t *testing.T, out *resultQueue, event string, t
 	var zero T
 	select {
 	case result := <-out.items:
-		out.ack()
+		out.ack(result)
 		if result.event != event {
 			t.Fatalf("result event = %q, want %q", result.event, event)
 		}
@@ -1406,12 +1407,12 @@ func TestResultQueueKeepsRetryAheadOfNewerResults(t *testing.T) {
 	if !ok || string(retried.payload) != string(first.payload) {
 		t.Fatalf("retried result = %+v, want first result", retried)
 	}
-	queue.ack()
+	queue.ack(retried)
 
 	if got := <-queue.items; got.event != newer.event {
 		t.Fatalf("queued result = %q, want %q after retry", got.event, newer.event)
 	}
-	queue.ack()
+	queue.ack(newer)
 	if _, ok := queue.takeRetry(); ok {
 		t.Fatal("retry lane retained an acknowledged result")
 	}
@@ -3930,4 +3931,179 @@ func TestPropAgtDecodeBinaryPayload(t *testing.T) {
 			t.Fatalf("decodeBinaryPayload accepted %q as base64", junk)
 		}
 	})
+}
+
+// Jobs for the same device target must never run concurrently, even when they
+// land in different worker pools; jobs for different targets stay parallel.
+func TestJobsForSameTargetSerialize(t *testing.T) {
+	origJitter := dispatchJitterMax
+	dispatchJitterMax = 0
+	t.Cleanup(func() { dispatchJitterMax = origJitter })
+
+	t.Run("same pool", func(t *testing.T) {
+		origPing := doPing
+		defer func() { doPing = origPing }()
+
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		defer releaseOnce.Do(func() { close(release) })
+		firstStarted := make(chan struct{})
+		secondStarted := make(chan struct{})
+		var calls atomic.Int32
+		doPing = func(_ context.Context, ip string, _ int) (float64, error) {
+			if calls.Add(1) == 1 {
+				close(firstStarted)
+				<-release
+			} else {
+				close(secondStarted)
+			}
+			return 1, nil
+		}
+
+		pools := testPools(t)
+		out := testQueue()
+		job := func(id string) *pb.AgentJob {
+			return &pb.AgentJob{
+				JobId:      id,
+				JobType:    pb.JobType_PING,
+				SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+			}
+		}
+		dispatchJob(context.Background(), job("p1"), pools, out)
+		<-firstStarted
+		dispatchJob(context.Background(), job("p2"), pools, out)
+
+		select {
+		case <-secondStarted:
+			t.Fatal("second job for the same target ran concurrently with the first")
+		case <-time.After(100 * time.Millisecond):
+		}
+		releaseOnce.Do(func() { close(release) })
+
+		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
+		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
+	})
+
+	t.Run("across pools", func(t *testing.T) {
+		origPing := doPing
+		origDial := snmpDial
+		defer func() { doPing = origPing; snmpDial = origDial }()
+
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		defer releaseOnce.Do(func() { close(release) })
+		pingStarted := make(chan struct{})
+		snmpStarted := make(chan struct{})
+		doPing = func(_ context.Context, ip string, _ int) (float64, error) {
+			close(pingStarted)
+			<-release
+			return 1, nil
+		}
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			close(snmpStarted)
+			return &mockSnmpQuerier{
+				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+					return &gosnmp.SnmpPacket{}, nil
+				},
+			}, func() {}, nil
+		}
+
+		pools := testPools(t)
+		out := testQueue()
+		dispatchJob(context.Background(), &pb.AgentJob{
+			JobId:      "ping-1",
+			JobType:    pb.JobType_PING,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+		}, pools, out)
+		<-pingStarted
+		dispatchJob(context.Background(), &pb.AgentJob{
+			JobId:      "disc-1",
+			JobType:    pb.JobType_DISCOVER,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+		}, pools, out)
+
+		select {
+		case <-snmpStarted:
+			t.Fatal("SNMP job ran concurrently with a ping for the same target")
+		case <-time.After(100 * time.Millisecond):
+		}
+		releaseOnce.Do(func() { close(release) })
+
+		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
+		_ = wantResult[*pb.SnmpResult](t, out, "result", time.Second)
+	})
+
+	t.Run("different targets stay parallel", func(t *testing.T) {
+		origPing := doPing
+		defer func() { doPing = origPing }()
+
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		defer releaseOnce.Do(func() { close(release) })
+		started := make(chan string, 2)
+		doPing = func(_ context.Context, ip string, _ int) (float64, error) {
+			started <- ip
+			<-release
+			return 1, nil
+		}
+
+		pools := testPools(t)
+		out := testQueue()
+		for i, ip := range []string{"10.0.0.1", "10.0.0.2"} {
+			dispatchJob(context.Background(), &pb.AgentJob{
+				JobId:      fmt.Sprintf("p%d", i),
+				JobType:    pb.JobType_PING,
+				SnmpDevice: &pb.SnmpDevice{Ip: ip},
+			}, pools, out)
+		}
+
+		for range 2 {
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("jobs for different targets did not run in parallel")
+			}
+		}
+		releaseOnce.Do(func() { close(release) })
+		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
+		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
+	})
+}
+
+// The reserved discovery lane must hold discovery results even when the
+// general lane is saturated by pings and checks.
+func TestResultQueueDiscoveryLane(t *testing.T) {
+	out := newResultQueue(8) // 6 general slots, 2 reserved for discovery
+
+	pingResult := &pb.MonitoringCheck{DeviceId: "d", Status: "success"}
+	discResult := &pb.SnmpResult{JobType: pb.JobType_DISCOVER}
+
+	// Saturate the general lane with non-discovery results.
+	for range 6 {
+		sendResult(context.Background(), out, "monitoring_check", pingResult, "ping")
+	}
+	// The general lane is full: another ping result must drop.
+	sendResult(context.Background(), out, "monitoring_check", pingResult, "overflow")
+	if got := len(out.items); got != 6 {
+		t.Fatalf("queued results = %d, want 6", got)
+	}
+
+	// Discovery results still fit in their reserved lane.
+	sendResult(context.Background(), out, "result", discResult, "d1")
+	sendResult(context.Background(), out, "result", discResult, "d2")
+	if got := len(out.items); got != 8 {
+		t.Fatalf("queued results = %d, want 8", got)
+	}
+	// Both lanes full: a third discovery result drops.
+	sendResult(context.Background(), out, "result", discResult, "d3")
+	if got := len(out.items); got != 8 {
+		t.Fatalf("queued results = %d, want 8 after drop", got)
+	}
+
+	// Freeing a general slot lets a discovery result overflow into it.
+	out.ack(<-out.items)
+	sendResult(context.Background(), out, "result", discResult, "d3")
+	if got := len(out.items); got != 8 {
+		t.Fatalf("queued results = %d, want 8 after overflow", got)
+	}
 }

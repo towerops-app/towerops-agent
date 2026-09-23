@@ -49,6 +49,7 @@ func runMain(ctx context.Context, args []string) int {
 	trapCommunity := fs.String("trap-community", "", "Only accept traps carrying this community string (or set TOWEROPS_TRAP_COMMUNITY; default: any)")
 	hostKeysFile := fs.String("host-keys-file", envOrDefault(defaultHostKeysPath, "TOWEROPS_HOST_KEYS_FILE"), "Path to the SSH and TLS trust-on-first-use store")
 	legacyScheduling := fs.Bool("legacy-scheduling", envBool(false, "TOWEROPS_LEGACY_SCHEDULING"), "Disable local recurring scheduling and request legacy server pushes")
+	snmpRate := fs.Uint("snmp-rate", envUint(defaultSNMPPDURate, "TOWEROPS_SNMP_RATE"), "Maximum SNMP request packets per second process-wide (0 disables)")
 	showHelp := fs.Bool("help", false, "Show this help message and exit")
 	fs.BoolVar(showHelp, "h", false, "Show this help message and exit (shorthand)")
 
@@ -137,6 +138,9 @@ func runMain(ctx context.Context, args []string) int {
 		defer listener.Close()
 		traps = listener.Traps()
 	}
+	// Apply the configured process-wide SNMP packet ceiling before any
+	// session can dial a device.
+	setSNMPPDURate(*snmpRate)
 
 	// Run agent with reconnect loop
 	runAgentWithScheduling(ctx, wsURL, *token, traps, !*legacyScheduling)
