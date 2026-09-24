@@ -547,7 +547,7 @@ func probeCandidate(ctx context.Context, dev *pb.SnmpDevice, timeout time.Durati
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	conn, closeFn, err := snmpDial(attemptCtx, dev)
+	conn, closeFn, err := snmpDial(attemptCtx, &pb.AgentJob{SnmpDevice: dev})
 	if err != nil {
 		return nil, fmt.Errorf("connection failed: %w", err)
 	}

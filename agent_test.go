@@ -756,7 +756,7 @@ func TestDispatchJob(t *testing.T) {
 	t.Run("CREDENTIAL_PROBE", func(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return nil, nil, fmt.Errorf("refused")
 		}
 

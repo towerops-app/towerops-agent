@@ -1445,9 +1445,9 @@ func TestExecuteCredentialProbe(t *testing.T) {
 		defer func() { snmpDial = orig }()
 
 		var dialed []string
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
-			dialed = append(dialed, dev.Community)
-			if dev.Community == "bad" {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
+			dialed = append(dialed, job.SnmpDevice.Community)
+			if job.SnmpDevice.Community == "bad" {
 				return nil, nil, fmt.Errorf("connection refused")
 			}
 			return &mockSnmpQuerier{
@@ -1496,8 +1496,8 @@ func TestExecuteCredentialProbe(t *testing.T) {
 		orig := snmpDial
 		defer func() { snmpDial = orig }()
 
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
-			if dev.Community == "status-error" {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
+			if job.SnmpDevice.Community == "status-error" {
 				return &mockSnmpQuerier{
 					getFunc: func(_ []string) (*gosnmp.SnmpPacket, error) {
 						return &gosnmp.SnmpPacket{Error: gosnmp.NoSuchName, ErrorIndex: 2}, nil
@@ -1537,7 +1537,7 @@ func TestExecuteCredentialProbe(t *testing.T) {
 		defer func() { snmpDial = orig }()
 
 		calls := 0
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			calls++
 			if calls == 1 {
 				return nil, nil, fmt.Errorf("flaky")
@@ -1573,7 +1573,7 @@ func TestExecuteCredentialProbe(t *testing.T) {
 		defer func() { snmpDial = orig }()
 
 		dialed := make(chan struct{}, 1)
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			dialed <- struct{}{}
 			return nil, nil, fmt.Errorf("refused")
 		}
@@ -1636,7 +1636,7 @@ func TestExecuteCredentialProbe(t *testing.T) {
 		defer func() { snmpDial = orig }()
 
 		calls := 0
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			calls++
 			return nil, nil, fmt.Errorf("refused")
 		}
@@ -1663,8 +1663,8 @@ func TestExecuteCredentialProbe(t *testing.T) {
 		defer func() { snmpDial = orig }()
 
 		var dialed []string
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
-			dialed = append(dialed, dev.Community)
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
+			dialed = append(dialed, job.SnmpDevice.Community)
 			return &mockSnmpQuerier{
 				getFunc: func(_ []string) (*gosnmp.SnmpPacket, error) {
 					return probeSystemPacket(), nil
@@ -1698,7 +1698,7 @@ func TestExecuteCredentialProbe(t *testing.T) {
 		defer func() { snmpDial = orig }()
 
 		ctx, cancel := context.WithCancel(context.Background())
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			cancel()
 			return nil, nil, fmt.Errorf("refused")
 		}
