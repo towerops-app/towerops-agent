@@ -42,43 +42,52 @@ func TestTokenBucketReserve(t *testing.T) {
 	}
 }
 
-func TestTokenBucketSettle(t *testing.T) {
+func TestTokenBucketWait(t *testing.T) {
 	b := newTokenBucket(1000, nil) // 1ms per token, burst of 100
 
-	// With a non-negative balance settle never blocks.
+	// Inside the burst wait never blocks.
 	for range 100 {
-		if !b.settle(context.Background()) {
-			t.Fatal("settle failed inside the burst")
+		if !b.wait(context.Background()) {
+			t.Fatal("wait failed inside the burst")
 		}
-		b.charge()
 	}
 
-	// Charges past the burst create debt; settle sleeps it off.
-	b.charge()
+	// Past the burst each token costs 1ms.
 	start := time.Now()
-	if !b.settle(context.Background()) {
-		t.Fatal("settle failed with outstanding debt")
+	if !b.wait(context.Background()) {
+		t.Fatal("wait failed past the burst")
 	}
 	if elapsed := time.Since(start); elapsed < 500*time.Microsecond {
-		t.Fatalf("settle returned after %v, want ~1ms of debt repayment", elapsed)
+		t.Fatalf("wait returned after %v, want ~1ms", elapsed)
+	}
+
+	// Debt accumulated by charge is paid off by the next wait.
+	b.charge()
+	start = time.Now()
+	if !b.wait(context.Background()) {
+		t.Fatal("wait failed with outstanding debt")
+	}
+	if elapsed := time.Since(start); elapsed < 500*time.Microsecond {
+		t.Fatalf("wait returned after %v, want ~1ms of debt repayment", elapsed)
 	}
 }
 
-func TestTokenBucketSettleHonoursCancellation(t *testing.T) {
-	b := newTokenBucket(1, nil) // 1 token/s: debt takes ~1s to repay
-	b.charge()
-	b.charge()
+func TestTokenBucketWaitHonoursCancellation(t *testing.T) {
+	b := newTokenBucket(1, nil) // 1 token/s: the second wait is ~1s out
+	if !b.wait(context.Background()) {
+		t.Fatal("first wait failed inside the burst")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan bool, 1)
-	go func() { done <- b.settle(ctx) }()
+	go func() { done <- b.wait(ctx) }()
 	cancel()
 	select {
 	case ok := <-done:
 		if ok {
-			t.Fatal("settle succeeded after cancellation")
+			t.Fatal("wait succeeded after cancellation")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("cancelled settle did not return")
+		t.Fatal("cancelled wait did not return")
 	}
 }
 
@@ -89,8 +98,8 @@ func TestTokenBucketDisabled(t *testing.T) {
 			t.Fatalf("disabled bucket waited %v, want 0", d)
 		}
 	}
-	if !b.settle(context.Background()) {
-		t.Fatal("disabled bucket settle blocked")
+	if !b.wait(context.Background()) {
+		t.Fatal("disabled bucket wait blocked")
 	}
 }
 
@@ -235,23 +244,41 @@ func TestRateLimitedQuerier(t *testing.T) {
 	}
 }
 
-// A cancelled context must surface through settle so a queued request does
+// A cancelled context must surface through wait so a queued request does
 // not run against a dead job.
 func TestRateLimitedQuerierCancelledContext(t *testing.T) {
 	t.Cleanup(func() { setSNMPPDURate(defaultSNMPPDURate) })
-	setSNMPPDURate(1) // 1 token/s: the second settle has ~1s of debt
+	setSNMPPDURate(1) // 1 token/s: the second wait has ~1s of debt
 	snmpPDUs.charge()
 	snmpPDUs.charge()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	delegated := false
 	mock := &mockSnmpQuerier{
 		getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
-			return nil, errors.New("delegated despite cancellation")
+			delegated = true
+			return &gosnmp.SnmpPacket{}, nil
 		},
 	}
 	q := &rateLimitedQuerier{ctx: ctx, q: mock}
-	// settle returns false on cancellation; the wrapper still delegates and
-	// the underlying call carries the cancelled context.
-	_, _ = q.Get([]string{"1.3.6.1"})
+	_, err := q.Get([]string{"1.3.6.1"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Get error = %v, want context.Canceled", err)
+	}
+	if _, err := q.WalkAll("1.3.6.1"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("WalkAll error = %v, want context.Canceled", err)
+	}
+	if _, err := q.BulkWalkAll("1.3.6.1"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("BulkWalkAll error = %v, want context.Canceled", err)
+	}
+	if err := q.Walk("1.3.6.1", func(p gosnmp.SnmpPDU) error { return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Walk error = %v, want context.Canceled", err)
+	}
+	if err := q.BulkWalk("1.3.6.1", func(p gosnmp.SnmpPDU) error { return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("BulkWalk error = %v, want context.Canceled", err)
+	}
+	if delegated {
+		t.Fatal("querier delegated to the device despite cancellation")
+	}
 }
