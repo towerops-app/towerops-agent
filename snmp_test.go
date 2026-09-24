@@ -571,6 +571,36 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 	})
 
+	t.Run("discovery phase echoed", func(t *testing.T) {
+		orig := snmpDial
+		defer func() { snmpDial = orig }()
+
+		mock := &mockSnmpQuerier{
+			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+				return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{}}, nil
+			},
+		}
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			return mock, func() {}, nil
+		}
+
+		ch := newResultQueue(1)
+		executeSnmpJob(context.Background(), &pb.AgentJob{
+			JobId:          "1",
+			JobType:        pb.JobType_DISCOVER,
+			DiscoveryPhase: pb.DiscoveryPhase_DISCOVERY_PHASE_IDENTIFY,
+			SnmpDevice:     &pb.SnmpDevice{Ip: "10.0.0.1"},
+			Queries: []*pb.SnmpQuery{
+				{QueryType: pb.QueryType_GET, Oids: []string{"1.3.6.1.2.1.1.1.0"}},
+			},
+		}, ch)
+
+		result := decodeQueuedResult[*pb.SnmpResult](t, (<-ch.items))
+		if result.DiscoveryPhase != pb.DiscoveryPhase_DISCOVERY_PHASE_IDENTIFY {
+			t.Errorf("discovery phase = %v, want IDENTIFY", result.DiscoveryPhase)
+		}
+	})
+
 	t.Run("WALK success", func(t *testing.T) {
 		orig := snmpDial
 		defer func() { snmpDial = orig }()

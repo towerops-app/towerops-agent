@@ -122,11 +122,12 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	}
 
 	result := &pb.SnmpResult{
-		DeviceId:  job.DeviceId,
-		JobType:   job.JobType,
-		JobId:     job.JobId,
-		OidValues: oidValues,
-		Timestamp: time.Now().Unix(),
+		DeviceId:       job.DeviceId,
+		JobType:        job.JobType,
+		JobId:          job.JobId,
+		OidValues:      oidValues,
+		Timestamp:      time.Now().Unix(),
+		DiscoveryPhase: job.DiscoveryPhase,
 	}
 
 	slog.Info("snmp job complete", "job_id", job.JobId, "oids", len(oidValues))
@@ -143,11 +144,12 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 
 func emptySnmpResult(job *pb.AgentJob) *pb.SnmpResult {
 	return &pb.SnmpResult{
-		DeviceId:  job.DeviceId,
-		JobType:   job.JobType,
-		JobId:     job.JobId,
-		OidValues: make(map[string]string),
-		Timestamp: time.Now().Unix(),
+		DeviceId:       job.DeviceId,
+		JobType:        job.JobType,
+		JobId:          job.JobId,
+		OidValues:      make(map[string]string),
+		Timestamp:      time.Now().Unix(),
+		DiscoveryPhase: job.DiscoveryPhase,
 	}
 }
 
