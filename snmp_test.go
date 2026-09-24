@@ -1162,7 +1162,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 				return &gosnmp.SnmpPacket{
 					Variables: []gosnmp.SnmpPDU{
 						{Name: ".1.3.6.1.2.1.1.1.0", Type: gosnmp.OctetString, Value: []byte("RouterOS 7.1")},
-						{Name: ".1.3.6.1.2.1.1.2.0", Type: gosnmp.ObjectIdentifier, Value: "1.3.6.1.4.1.14988.1"},
+						{Name: ".1.3.6.1.2.1.1.2.0", Type: gosnmp.ObjectIdentifier, Value: ".1.3.6.1.4.1.14988.1"},
 						{Name: ".1.3.6.1.2.1.1.5.0", Type: gosnmp.OctetString, Value: []byte("core-router")},
 					},
 				}, nil
@@ -1374,7 +1374,7 @@ func probeSystemPacket() *gosnmp.SnmpPacket {
 	return &gosnmp.SnmpPacket{
 		Variables: []gosnmp.SnmpPDU{
 			{Name: ".1.3.6.1.2.1.1.1.0", Type: gosnmp.OctetString, Value: []byte("Cisco IOS 17.3")},
-			{Name: ".1.3.6.1.2.1.1.2.0", Type: gosnmp.ObjectIdentifier, Value: "1.3.6.1.4.1.9.1.1234"},
+			{Name: ".1.3.6.1.2.1.1.2.0", Type: gosnmp.ObjectIdentifier, Value: ".1.3.6.1.4.1.9.1.1234"},
 			{Name: ".1.3.6.1.2.1.1.5.0", Type: gosnmp.OctetString, Value: []byte("edge-sw-01")},
 			// An unusable varbind must not land in the reported values.
 			{Name: ".1.3.6.1.2.1.1.6.0", Type: gosnmp.NoSuchInstance, Value: nil},
@@ -1565,6 +1565,10 @@ func TestExecuteCredentialProbe(t *testing.T) {
 		}()
 
 		<-dialed
+		// Let the probe reach sleepContext before cancelling: cancelling
+		// while the dial error is still unwinding trips the ctx.Err() check
+		// instead of the delay return this test targets.
+		time.Sleep(50 * time.Millisecond)
 		cancel()
 		select {
 		case <-done:

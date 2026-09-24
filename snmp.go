@@ -331,12 +331,9 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQue
 
 	// Best effort: sysObjectID/sysName enrich the result for device
 	// identification but their absence never fails the credential proof.
-	if identity, err := conn.Get([]string{oidSysObjectID, oidSysName}); err == nil &&
-		identity.Error == gosnmp.NoError {
-		for oid, value := range systemValues(identity) {
-			values[oid] = value
-		}
-	}
+	// snmpGetInto halves a noSuchName batch to single OIDs, so a device
+	// missing sysName still yields its sysObjectID.
+	_ = snmpGetInto(conn, dev, []string{oidSysObjectID, oidSysName}, values)
 	// A successful GET proves the credentials work even when the system
 	// values are unavailable.
 	result := &pb.CredentialTestResult{
@@ -380,13 +377,10 @@ func probeCandidate(ctx context.Context, dev *pb.SnmpDevice, timeout time.Durati
 
 	values := systemValues(packet)
 
-	// Best effort: identity OIDs enrich the result but never fail the proof.
-	if identity, err := conn.Get([]string{oidSysObjectID, oidSysName}); err == nil &&
-		identity.Error == gosnmp.NoError {
-		for oid, value := range systemValues(identity) {
-			values[oid] = value
-		}
-	}
+	// Best effort: identity OIDs enrich the result but never fail the
+	// proof. snmpGetInto halves a noSuchName batch to single OIDs, so a
+	// device missing sysName still yields its sysObjectID.
+	_ = snmpGetInto(conn, dev, []string{oidSysObjectID, oidSysName}, values)
 
 	return values, nil
 }
