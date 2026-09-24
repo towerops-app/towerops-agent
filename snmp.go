@@ -161,7 +161,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 					}
 					values[canonicalOID(v.Name)] = snmpValueToString(v)
 				}
-				buckets = append(buckets, snmpResultBucket{label: root, values: values})
+				buckets = append(buckets, snmpResultBucket{label: root, values: values, completed: err == nil})
 				if err != nil {
 					if ctx.Err() != nil {
 						cancelled = true
@@ -227,10 +227,13 @@ const defaultMaxResultBytes = 8 << 20
 const maxResultPayloadHeadroom = 4096
 
 // snmpResultBucket groups the OID values collected under one walk root. The
-// empty label is the shared GET bucket.
+// empty label is the shared GET bucket. completed marks roots whose walk
+// finished — a failed walk still ships its best-effort bucket but must not
+// claim the root.
 type snmpResultBucket struct {
-	label  string
-	values map[string]string
+	label     string
+	values    map[string]string
+	completed bool
 }
 
 // getBucketTruncatedLabel names the shared GET bucket in truncated_roots:
@@ -262,13 +265,12 @@ func buildSnmpResultFrames(
 
 	newFrame := func() *pb.SnmpResult {
 		return &pb.SnmpResult{
-			DeviceId:       job.DeviceId,
-			JobType:        job.JobType,
-			JobId:          job.JobId,
-			OidValues:      make(map[string]string),
-			Timestamp:      time.Now().Unix(),
-			Partial:        partial,
-			CompletedRoots: completedRoots,
+			DeviceId:  job.DeviceId,
+			JobType:   job.JobType,
+			JobId:     job.JobId,
+			OidValues: make(map[string]string),
+			Timestamp: time.Now().Unix(),
+			Partial:   partial,
 		}
 	}
 
@@ -276,10 +278,16 @@ func buildSnmpResultFrames(
 	var truncated []string
 	frame := newFrame()
 	frameSize := int64(0)
+	// frameRoots names the completed walk roots packed into the current
+	// frame — the server unions them across arrived frames, so a lost frame
+	// cannot claim a root whose bucket never arrived.
+	var frameRoots []string
 	flush := func() {
+		frame.CompletedRoots = frameRoots
 		frames = append(frames, frame)
 		frame = newFrame()
 		frameSize = 0
+		frameRoots = nil
 	}
 
 	for _, bucket := range buckets {
@@ -295,6 +303,9 @@ func buildSnmpResultFrames(
 			}
 			for k, v := range bucket.values {
 				frame.OidValues[k] = v
+			}
+			if bucket.completed && bucket.label != "" {
+				frameRoots = append(frameRoots, bucket.label)
 			}
 			frameSize += bucketSize
 			continue
@@ -324,6 +335,9 @@ func buildSnmpResultFrames(
 		if dropped > 0 {
 			slog.Warn("snmp result truncated to fit max_result_bytes",
 				"job_id", job.JobId, "root", label, "dropped", dropped)
+		}
+		if bucket.completed && bucket.label != "" {
+			frameRoots = append(frameRoots, bucket.label)
 		}
 		flush()
 	}
