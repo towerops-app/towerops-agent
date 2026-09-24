@@ -185,8 +185,10 @@ enum JobType {
   MIKROTIK = 2;
   TEST_CREDENTIALS = 3;
   PING = 4;
-  LLDP_TOPOLOGY = 5;  // Discover all LLDP neighbors for topology mapping
-  NETWORK_SWEEP = 6;  // Discover reachable hosts and their SNMP identities
+  // 5 was LLDP_TOPOLOGY and 6 was NETWORK_SWEEP; both were removed because no
+  // side ever built or executed those jobs. The numbers stay reserved so a
+  // future job type cannot collide with agents that still know the old enum.
+  reserved 5, 6;
   CREDENTIAL_PROBE = 7;  // Try an ordered list of SNMP credentials against one target
 }
 
@@ -222,7 +224,7 @@ message AgentJob {
   uint32 ping_timeout_ms = 9;     // Ping timeout; zero means the agent default
   uint32 snmp_timeout_ms = 10;    // Per-request SNMP timeout; zero means the agent default
   uint32 snmp_retries = 11;       // SNMP request retries; zero means the agent default
-  uint32 deadline_ms = 12;        // Whole-job deadline; zero means no job deadline. SNMP jobs only; LLDP topology ignores it
+  uint32 deadline_ms = 12;        // Whole-job deadline; zero means no job deadline. SNMP jobs only
   // Bound on the base64-encoded result payload the agent sends back, in
   // bytes; zero means the agent default (8 MiB). Results larger than this are
   // split across SnmpResult frames sharing job_id.
@@ -284,38 +286,6 @@ message SnmpResult {
   DiscoveryPhase discovery_phase = 11;
 }
 
-// Network sweep results use the same correlated batch envelope as
-// MikrotikResult: device/job identifiers, repeated rows, error, and timestamp.
-//
-// The server validates every row before accepting any of them: one
-// over-length field aborts the whole message with an error naming the field,
-// and no rows are stored. There is no partial batch and the error does not
-// identify which host was at fault, so **the agent must truncate to the
-// bounds below rather than send an over-length value** - a single 3 KB Cisco
-// IOS sysDescr would otherwise discard the other 2,047 rows.
-//
-// At most 2,048 rows per message. That bound and the two string bounds
-// together size a maximal message at 8,437,820 base64 bytes, inside the
-// channel's 10 MiB limit; a wider sweep must be split across messages sharing
-// one job_id.
-message NetworkSweepResult {
-  string device_id = 1;
-  string job_id = 2;
-  repeated SweepResult results = 3;  // Maximum 2,048 rows
-  string error = 4;
-  int64 timestamp = 5;
-}
-
-message SweepResult {
-  string ip = 1;             // Maximum 255 bytes
-  string mac = 2;            // Maximum 255 bytes
-  string sys_name = 3;       // Maximum 255 bytes (SNMPv2-TC DisplayString); truncate
-  string sys_object_id = 4;  // Maximum 255 bytes
-  string sys_descr = 5;      // Maximum 2,048 bytes; truncate at the agent
-  bool responded_to = 6;
-  bool community_ok = 7;
-}
-
 message AgentHeartbeat {
   string version = 1;
   string hostname = 2;
@@ -331,6 +301,13 @@ message AgentHeartbeat {
   // True when the agent retains recurring jobs and checks and schedules them
   // locally. Servers may stop resending unchanged credential-bearing lists.
   bool schedules_jobs = 9;
+  // True when the agent populated local_ips and interface_subnets from its own
+  // interface table. proto3 cannot tell an absent repeated field from an empty
+  // one, so without this flag the server cannot distinguish "agent predates
+  // vantage point reporting" from "agent has no addresses to report" - and
+  // guessing wrong either strands stale addresses or wipes good ones on every
+  // heartbeat from an old agent.
+  bool reports_vantage_point = 10;
 }
 
 message AgentError {
@@ -408,27 +385,7 @@ message MikrotikSentence {
   map<string, string> attributes = 1;
 }
 
-// LLDP Topology Discovery Results
 
-message LldpTopologyResult {
-  string device_id = 1;
-  string job_id = 2;
-  string local_system_name = 3;
-  repeated LldpNeighbor neighbors = 4;
-  int64 timestamp = 5;
-}
-
-message LldpNeighbor {
-  string neighbor_name = 1;
-  string local_port = 2;
-  string remote_port = 3;
-  string remote_port_id = 4;
-  repeated string management_addresses = 5;
-  // Chassis ID of the neighbour, hex-formatted for MAC-address subtypes. The
-  // agent keys the remote table on this rather than on the system name, which
-  // many devices never advertise.
-  string remote_chassis_id = 6;
-}
 
 // SNMP traps received by an agent's trap listener.
 //

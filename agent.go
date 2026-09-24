@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net"
 	"os"
 	"runtime"
 	"slices"
@@ -574,15 +575,56 @@ func (s *session) heartbeat() *pb.AgentHeartbeat {
 	if s.pools != nil {
 		localScheduling = s.pools.localScheduling
 	}
+	localIPs, subnets := localVantagePoint()
 	return &pb.AgentHeartbeat{
-		Version:       version,
-		UptimeSeconds: uint64(time.Since(processStart).Seconds()),
-		Arch:          runtime.GOARCH,
-		Hostname:      s.hostname,
-		IpAddress:     s.ws.LocalIP(),
-		Container:     runningInContainer(),
-		SchedulesJobs: localScheduling,
+		Version:             version,
+		UptimeSeconds:       uint64(time.Since(processStart).Seconds()),
+		Arch:                runtime.GOARCH,
+		Hostname:            s.hostname,
+		IpAddress:           s.ws.LocalIP(),
+		Container:           runningInContainer(),
+		SchedulesJobs:       localScheduling,
+		LocalIps:            localIPs,
+		InterfaceSubnets:    subnets,
+		ReportsVantagePoint: true,
 	}
+}
+
+// localVantagePoint enumerates the host's non-loopback interface addresses so
+// the server knows which subnets this agent is on-link for. Loopback,
+// link-local and multicast addresses are excluded: they cannot carry a sweep.
+// The lists are sorted so identical reports compare equal server-side.
+func localVantagePoint() (localIPs, subnets []string) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		slog.Warn("interface enumeration failed", "error", err)
+		return nil, nil
+	}
+	seenSubnet := map[string]bool{}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP.IsLoopback() || ipNet.IP.IsLinkLocalUnicast() || ipNet.IP.IsLinkLocalMulticast() {
+				continue
+			}
+			localIPs = append(localIPs, ipNet.IP.String())
+			network := (&net.IPNet{IP: ipNet.IP.Mask(ipNet.Mask), Mask: ipNet.Mask}).String()
+			if !seenSubnet[network] {
+				seenSubnet[network] = true
+				subnets = append(subnets, network)
+			}
+		}
+	}
+	slices.Sort(localIPs)
+	slices.Sort(subnets)
+	return localIPs, subnets
 }
 
 // loop is the session event loop. ctx is the agent-wide context; the session's
@@ -1100,9 +1142,6 @@ func submitJob(
 	case pb.JobType_PING:
 		pool = pools.ping
 		execute = func() { executePingJob(ctx, job, out) }
-	case pb.JobType_LLDP_TOPOLOGY:
-		pool = pools.snmp
-		execute = func() { executeLldpTopologyJob(ctx, job, out) }
 	case pb.JobType_DISCOVER, pb.JobType_POLL:
 		pool = pools.snmp
 		execute = func() { executeSnmpJob(ctx, job, out) }
@@ -1193,9 +1232,7 @@ func encodeOutbound(event string, msg proto.Message, jobID string) (outbound, bo
 func isDiscoveryResult(msg proto.Message) bool {
 	switch m := msg.(type) {
 	case *pb.SnmpResult:
-		return m.JobType == pb.JobType_DISCOVER || m.JobType == pb.JobType_NETWORK_SWEEP
-	case *pb.LldpTopologyResult, *pb.NetworkSweepResult, *pb.SweepResult:
-		return true
+		return m.JobType == pb.JobType_DISCOVER
 	default:
 		return false
 	}

@@ -3063,66 +3063,6 @@ func TestAgtRunSessionTrapMarshalFailure(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// LLDP topology results
-// ---------------------------------------------------------------------------
-
-func TestAgtRunSessionLldpTopologyResult(t *testing.T) {
-	agtSilenceHeartbeats(t)
-
-	origDial := snmpDial
-	defer func() { snmpDial = origDial }()
-	snmpDial = func(context.Context, *pb.AgentJob) (snmpQuerier, func(), error) {
-		return nil, nil, fmt.Errorf("refused")
-	}
-
-	ln := agtListen(t)
-	done := make(chan error, 1)
-	go func() { done <- runSession(context.Background(), agtURL(ln), "token", nil) }()
-
-	conn, topic := agtAccept(t, ln)
-	msgs := agtReadFrames(conn)
-
-	agtSendEvent(t, conn, topic, "jobs", makeJobPayload(&pb.AgentJob{
-		JobId:      "lldp-1",
-		DeviceId:   "dev-lldp",
-		JobType:    pb.JobType_LLDP_TOPOLOGY,
-		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
-	}))
-
-	frame := agtWaitEvent(t, msgs, "lldp_topology_result")
-	var got pb.LldpTopologyResult
-	agtDecodeBinary(t, frame.Payload, &got)
-	if got.DeviceId != "dev-lldp" || got.JobId != "lldp-1" {
-		t.Fatalf("lldp result = %+v, want device dev-lldp job lldp-1", &got)
-	}
-
-	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))
-	if err := <-done; !errors.Is(err, errRestartRequested) {
-		t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
-	}
-}
-
-func TestAgtDispatchJobLldpTopology(t *testing.T) {
-	origDial := snmpDial
-	defer func() { snmpDial = origDial }()
-	snmpDial = func(context.Context, *pb.AgentJob) (snmpQuerier, func(), error) {
-		return nil, nil, fmt.Errorf("refused")
-	}
-
-	out := testQueue()
-	dispatchJob(context.Background(), &pb.AgentJob{
-		JobId:      "lldp-2",
-		DeviceId:   "dev-2",
-		JobType:    pb.JobType_LLDP_TOPOLOGY,
-		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.2"},
-	}, testPools(t), out)
-
-	if result := wantResult[*pb.LldpTopologyResult](t, out, "lldp_topology_result", 5*time.Second); result.JobId != "lldp-2" || result.DeviceId != "dev-2" {
-		t.Fatalf("result = %+v, want job lldp-2 device dev-2", result)
-	}
-}
-
 func TestSessionLoopRetriesResultWhenWriterQueueStalls(t *testing.T) {
 	origTimeout := writeQueueTimeout
 	t.Cleanup(func() { writeQueueTimeout = origTimeout })
