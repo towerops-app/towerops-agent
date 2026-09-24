@@ -387,7 +387,7 @@ func TestSnmpDialDefault(t *testing.T) {
 	realDial := snmpDial
 
 	t.Run("newSnmpConn error propagates", func(t *testing.T) {
-		q, closeFn, err := realDial(context.Background(), &pb.SnmpDevice{Ip: "127.0.0.1", Port: 65536})
+		q, closeFn, err := realDial(context.Background(), &pb.AgentJob{SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1", Port: 65536}})
 		if err == nil || !strings.Contains(err.Error(), "invalid SNMP port") {
 			t.Fatalf("snmpDial error = %v, want invalid SNMP port", err)
 		}
@@ -404,7 +404,7 @@ func TestSnmpDialDefault(t *testing.T) {
 		port := snwTFreeUDPPort(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		q, closeFn, err := realDial(ctx, &pb.SnmpDevice{Ip: "127.0.0.1", Port: port, Version: "2c", Community: "public"})
+		q, closeFn, err := realDial(ctx, &pb.AgentJob{SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1", Port: port, Version: "2c", Community: "public"}})
 		if err != nil {
 			t.Fatalf("snmpDial: %v", err)
 		}
@@ -511,7 +511,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 	t.Run("dial error", func(t *testing.T) {
 		orig := snmpDial
 		defer func() { snmpDial = orig }()
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return nil, nil, fmt.Errorf("connection refused")
 		}
 
@@ -540,7 +540,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			},
 		}
 		var gotCtx context.Context
-		snmpDial = func(ctx context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(ctx context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			gotCtx = ctx
 			return mock, func() { mock.closeCalled = true }, nil
 		}
@@ -584,7 +584,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 				return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{}}, nil
 			},
 		}
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
@@ -617,7 +617,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 				}, nil
 			},
 		}
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
@@ -645,7 +645,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 				return nil, fmt.Errorf("timeout")
 			},
 		}
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
@@ -681,7 +681,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 				}}, fmt.Errorf("timeout")
 			},
 		}
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
@@ -721,7 +721,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 				}, nil
 			},
 		}
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
@@ -753,7 +753,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 				}, nil
 			},
 		}
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
@@ -779,7 +779,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 				}, nil
 			},
 		}
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
@@ -815,7 +815,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 				}, nil
 			},
 		}
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
@@ -849,7 +849,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 				return &gosnmp.SnmpPacket{}, nil
 			},
 		}
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
@@ -877,7 +877,7 @@ func TestExecuteSnmpJobBatchesGets(t *testing.T) {
 			return &gosnmp.SnmpPacket{Variables: vars}, nil
 		},
 	}
-	snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+	snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 		return mock, func() {}, nil
 	}
 
@@ -990,7 +990,7 @@ func TestExecuteSnmpJobSplitsErrorStatusBatches(t *testing.T) {
 			orig := snmpDial
 			defer func() { snmpDial = orig }()
 			mock := &mockSnmpQuerier{getFunc: tt.get}
-			snmpDial = func(_ context.Context, _ *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
 				return mock, func() {}, nil
 			}
 
@@ -1062,7 +1062,7 @@ func TestExecuteSnmpJobCtxCancelled(t *testing.T) {
 	orig := snmpDial
 	defer func() { snmpDial = orig }()
 
-	snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+	snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 		return &mockSnmpQuerier{
 			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 				return &gosnmp.SnmpPacket{}, nil
@@ -1109,7 +1109,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 	t.Run("dial error", func(t *testing.T) {
 		orig := snmpDial
 		defer func() { snmpDial = orig }()
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return nil, nil, fmt.Errorf("connection refused")
 		}
 
@@ -1137,7 +1137,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 				return nil, fmt.Errorf("timeout")
 			},
 		}
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
@@ -1169,7 +1169,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 			},
 		}
 		var gotCtx context.Context
-		snmpDial = func(ctx context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(ctx context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			gotCtx = ctx
 			return mock, func() {}, nil
 		}
@@ -1209,7 +1209,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 				return &gosnmp.SnmpPacket{Variables: nil}, nil
 			},
 		}
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
@@ -1243,7 +1243,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 				}, nil
 			},
 		}
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
@@ -1277,7 +1277,7 @@ func TestExecuteCredentialTest(t *testing.T) {
 				}, nil
 			},
 		}
-		snmpDial = func(_ context.Context, _ *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
 			return mock, func() {}, nil
 		}
 
@@ -1311,7 +1311,7 @@ func TestExecuteSnmpJobCancellationClosesTransport(t *testing.T) {
 			return nil, fmt.Errorf("transport closed")
 		},
 	}
-	snmpDial = func(_ context.Context, _ *pb.SnmpDevice) (snmpQuerier, func(), error) {
+	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
 		return mock, func() { close(closed) }, nil
 	}
 
@@ -1337,10 +1337,12 @@ func TestExecuteSnmpJobCancellationClosesTransport(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("SNMP request did not stop after context cancellation")
 	}
-	select {
-	case result := <-out.items:
-		t.Fatalf("cancelled SNMP job queued partial result %q", result.event)
-	default:
+	result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	if !result.Partial {
+		t.Fatal("cancelled SNMP job did not mark its result partial")
+	}
+	if len(result.CompletedRoots) != 0 {
+		t.Fatalf("completed_roots = %v, want none for a walk that never finished", result.CompletedRoots)
 	}
 }
 func TestExecuteCredentialTestRejectsUnsupportedAuthProtocol(t *testing.T) {
@@ -1759,7 +1761,7 @@ func TestExecuteSnmpJobWalkSkipsSentinelPDUs(t *testing.T) {
 			}, nil
 		},
 	}
-	snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+	snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 		return mock, func() { mock.closeCalled = true }, nil
 	}
 
@@ -1951,4 +1953,209 @@ func TestPropSnwIntegerRoundtrip(t *testing.T) {
 			t.Fatalf("int round-trip: got %d, want %d", backN, n)
 		}
 	})
+}
+
+// TestExecuteSnmpJobDeadline runs a job against a UDP socket that never
+// answers and asserts the job's deadline_ms — not the SNMP request timeout —
+// is what ends the walk.
+func TestExecuteSnmpJobDeadline(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket: %v", err)
+	}
+	defer func() { _ = pc.Close() }()
+	port := uint32(pc.LocalAddr().(*net.UDPAddr).Port)
+
+	out := newResultQueue(8)
+	start := time.Now()
+	executeSnmpJob(context.Background(), &pb.AgentJob{
+		JobId:      "deadline",
+		DeviceId:   "dev-1",
+		DeadlineMs: 300,
+		SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1", Port: port, Version: "2c", Community: "public"},
+		Queries: []*pb.SnmpQuery{
+			{QueryType: pb.QueryType_WALK, Oids: []string{".1.3.6.1.2.1.2.2.1"}},
+			{QueryType: pb.QueryType_WALK, Oids: []string{".1.3.6.1.2.1.4.22"}},
+		},
+	}, out)
+	elapsed := time.Since(start)
+
+	if elapsed > 5*time.Second {
+		t.Fatalf("job ran %v, want it bounded by the 300ms deadline", elapsed)
+	}
+	result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	if !result.Partial {
+		t.Fatal("deadline-expired job did not mark its result partial")
+	}
+	if len(result.CompletedRoots) != 0 {
+		t.Fatalf("completed_roots = %v, want none when the device never answers", result.CompletedRoots)
+	}
+}
+
+// TestExecuteSnmpJobPartialOnCancel cancels mid-walk and asserts the result
+// ships with partial: true naming only the roots that finished.
+func TestExecuteSnmpJobPartialOnCancel(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mock := &mockSnmpQuerier{
+		bulkWalkFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
+			if strings.HasSuffix(rootOid, ".2.2.1") {
+				return []gosnmp.SnmpPDU{{
+					Name:  rootOid + ".1.1",
+					Type:  gosnmp.OctetString,
+					Value: []byte("eth0"),
+				}}, nil
+			}
+			// The second root hangs until the job context ends, like a
+			// device that stops answering mid-walk.
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
+		return mock, func() {}, nil
+	}
+
+	out := newResultQueue(8)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		executeSnmpJob(ctx, &pb.AgentJob{
+			JobId:      "partial",
+			DeviceId:   "dev-1",
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+			Queries: []*pb.SnmpQuery{{
+				QueryType: pb.QueryType_WALK,
+				Oids:      []string{".1.3.6.1.2.1.2.2.1", ".1.3.6.1.2.1.4.22"},
+			}},
+		}, out)
+	}()
+
+	// Let the first root complete, then cancel while the second is in flight.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not stop after cancellation")
+	}
+
+	result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	if !result.Partial {
+		t.Fatal("cancelled job did not mark its result partial")
+	}
+	if len(result.CompletedRoots) != 1 || result.CompletedRoots[0] != "1.3.6.1.2.1.2.2.1" {
+		t.Fatalf("completed_roots = %v, want [1.3.6.1.2.1.2.2.1]", result.CompletedRoots)
+	}
+	if got := result.OidValues["1.3.6.1.2.1.2.2.1.1.1"]; got != "eth0" {
+		t.Fatalf("completed root value = %q, want eth0", got)
+	}
+}
+
+// TestSnmpResultSplitFrames packs a result that exceeds max_result_bytes and
+// asserts it splits along walk-root boundaries into sequenced frames.
+func TestSnmpResultSplitFrames(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	// Two roots, each carrying ~6KB of values; an 8KB decoded bound forces
+	// two frames.
+	bigValue := strings.Repeat("x", 6000)
+	mock := &mockSnmpQuerier{
+		bulkWalkFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
+			return []gosnmp.SnmpPDU{{
+				Name:  rootOid + ".1",
+				Type:  gosnmp.OctetString,
+				Value: []byte(bigValue),
+			}}, nil
+		},
+	}
+	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
+		return mock, func() {}, nil
+	}
+
+	out := newResultQueue(8)
+	executeSnmpJob(context.Background(), &pb.AgentJob{
+		JobId:          "split",
+		DeviceId:       "dev-1",
+		MaxResultBytes: 16 * 1024,
+		SnmpDevice:     &pb.SnmpDevice{Ip: "10.0.0.1"},
+		Queries: []*pb.SnmpQuery{{
+			QueryType: pb.QueryType_WALK,
+			Oids:      []string{".1.3.6.1.2.1.2.2.1", ".1.3.6.1.2.1.4.22"},
+		}},
+	}, out)
+
+	if len(out.items) != 2 {
+		t.Fatalf("queued %d results, want 2 split frames", len(out.items))
+	}
+	first := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	second := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+
+	if first.Sequence != 1 || second.Sequence != 2 {
+		t.Fatalf("sequences = %d, %d; want 1, 2", first.Sequence, second.Sequence)
+	}
+	if first.Final {
+		t.Fatal("first frame marked final")
+	}
+	if !second.Final {
+		t.Fatal("last frame not marked final")
+	}
+	if first.JobId != "split" || second.JobId != "split" {
+		t.Fatalf("frames lost job_id: %q, %q", first.JobId, second.JobId)
+	}
+	if len(first.OidValues)+len(second.OidValues) != 2 {
+		t.Fatalf("frames carry %d values total, want 2", len(first.OidValues)+len(second.OidValues))
+	}
+}
+
+// TestSnmpResultTruncatesOversizedRoot packs a single root larger than the
+// whole bound and asserts it is truncated and flagged rather than dropped.
+func TestSnmpResultTruncatesOversizedRoot(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	mock := &mockSnmpQuerier{
+		bulkWalkFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
+			var pdus []gosnmp.SnmpPDU
+			for i := 0; i < 20; i++ {
+				pdus = append(pdus, gosnmp.SnmpPDU{
+					Name:  fmt.Sprintf("%s.%d", rootOid, i),
+					Type:  gosnmp.OctetString,
+					Value: []byte(strings.Repeat("y", 1000)),
+				})
+			}
+			return pdus, nil
+		},
+	}
+	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
+		return mock, func() {}, nil
+	}
+
+	out := newResultQueue(8)
+	executeSnmpJob(context.Background(), &pb.AgentJob{
+		JobId:          "truncate",
+		DeviceId:       "dev-1",
+		MaxResultBytes: 16 * 1024,
+		SnmpDevice:     &pb.SnmpDevice{Ip: "10.0.0.1"},
+		Queries: []*pb.SnmpQuery{{
+			QueryType: pb.QueryType_WALK,
+			Oids:      []string{".1.3.6.1.2.1.2.2.1"},
+		}},
+	}, out)
+
+	result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	if len(result.OidValues) == 0 || len(result.OidValues) >= 20 {
+		t.Fatalf("truncated frame carries %d values, want a nonzero subset of 20", len(result.OidValues))
+	}
+	if len(result.TruncatedRoots) != 1 || result.TruncatedRoots[0] != "1.3.6.1.2.1.2.2.1" {
+		t.Fatalf("truncated_roots = %v, want [1.3.6.1.2.1.2.2.1]", result.TruncatedRoots)
+	}
+	if !result.Final {
+		t.Fatal("single truncated frame not marked final")
+	}
 }

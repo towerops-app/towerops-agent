@@ -76,6 +76,19 @@ type writeRequest struct {
 	ack  chan error
 }
 
+// pendingResult is a spooled result awaiting the server's phx_reply. The
+// server only replies to rejected messages (oversized payloads), so entries
+// are pruned by age rather than removed on success.
+type pendingResult struct {
+	result outbound
+	sentAt time.Time
+}
+
+// pendingReplyTTL expires phx_reply tracking for results the server never
+// answered. Successful handle_in calls produce no reply, so entries would
+// otherwise accumulate for the life of the session.
+var pendingReplyTTL = 30 * time.Second
+
 // runAgent connects to the server and runs the event loop with reconnect.
 // traps may be nil when the trap listener is disabled.
 func runAgent(ctx context.Context, wsURL, token string, traps <-chan *pb.SnmpTrap) {
@@ -171,6 +184,11 @@ type session struct {
 	notices   <-chan outbound
 
 	refCounter atomic.Uint64
+
+	// pending tracks result refs awaiting a server phx_reply so a rejected
+	// delivery (e.g. an oversized payload) can be retried instead of being
+	// acked on websocket write alone. Only the session loop touches it.
+	pending map[string]pendingResult
 }
 
 // runSession runs one WebSocket session with local recurring scheduling.
@@ -404,15 +422,23 @@ func (s *session) sendBinary(event string, msg proto.Message) bool {
 // sendResultMsg writes a buffered result and waits until the WebSocket writer
 // confirms the frame was handed to the connection. A failed session leaves
 // the result unacknowledged so the next connection can retry it.
+//
+// The message carries a ref so the server's phx_reply can be correlated back
+// to this result: a rejected delivery (oversized payload, decode failure) is
+// retried once by handleResultReply instead of being silently dropped.
 func (s *session) sendResultMsg(result outbound) error {
+	ref := s.nextRef()
 	msg := channelMsg{
 		Topic:   s.topic,
 		Event:   result.event,
 		Payload: result.payload,
+		Ref:     &ref,
 	}
 	data, _ := json.Marshal(msg)
+	s.trackPending(ref, result)
 	ack := make(chan error, 1)
 	if !enqueueWrite(s.ctx, s.writeCh, writeRequest{data: data, ack: ack}, result.event) {
+		delete(s.pending, ref)
 		if s.ctx.Err() != nil {
 			return s.sessionErr()
 		}
@@ -458,6 +484,72 @@ func (s *session) deliverResult(result outbound) error {
 	s.results.ack(result)
 	slog.Debug("sent result", "event", result.event)
 	return nil
+}
+
+// trackPending records a result under its message ref and expires entries the
+// server never answered. Successful handle_in calls produce no phx_reply, so
+// age — not success — is what bounds the map.
+func (s *session) trackPending(ref string, result outbound) {
+	if s.pending == nil {
+		s.pending = make(map[string]pendingResult)
+	}
+	s.prunePending()
+	s.pending[ref] = pendingResult{result: result, sentAt: time.Now()}
+}
+
+func (s *session) prunePending() {
+	cutoff := time.Now().Add(-pendingReplyTTL)
+	for ref, p := range s.pending {
+		if p.sentAt.Before(cutoff) {
+			delete(s.pending, ref)
+		}
+	}
+}
+
+// handleResultReply consumes a phx_reply addressed to this channel. A reply
+// with an error status means the server rejected the result: it is retried
+// once, then dropped loudly — the previous behaviour logged the rejection at
+// debug while the spool slot had already been acked, so oversized results
+// vanished with a false success.
+func (s *session) handleResultReply(msg channelMsg) {
+	if msg.Ref == nil {
+		return
+	}
+	p, ok := s.pending[*msg.Ref]
+	if !ok {
+		return
+	}
+	delete(s.pending, *msg.Ref)
+
+	var reply struct {
+		Status   string `json:"status"`
+		Response struct {
+			Reason string `json:"reason"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(msg.Payload, &reply); err != nil {
+		slog.Warn("unparseable channel reply", "ref", *msg.Ref, "error", err)
+		return
+	}
+	if reply.Status == "ok" {
+		return
+	}
+
+	reason := reply.Response.Reason
+	if reason == "" {
+		reason = reply.Status
+	}
+	if p.result.attempts == 0 {
+		slog.Warn("server rejected result, retrying once",
+			"event", p.result.event, "reason", reason)
+		p.result.attempts++
+		if !s.results.enqueue(p.result) {
+			slog.Error("result retry dropped, spool full", "event", p.result.event)
+		}
+		return
+	}
+	slog.Error("server rejected result twice, dropping",
+		"event", p.result.event, "reason", reason)
 }
 
 // sessionErr reports why the session context was cancelled. Both I/O
@@ -534,6 +626,10 @@ func (s *session) loop(ctx context.Context) error {
 			var msg channelMsg
 			if err := json.Unmarshal(data, &msg); err != nil {
 				slog.Debug("invalid message", "error", err)
+				continue
+			}
+			if msg.Event == "phx_reply" && (msg.Topic == s.topic || msg.Topic == "phoenix") {
+				s.handleResultReply(msg)
 				continue
 			}
 			shouldEnd, endErr := handleMessage(s.ctx, msg, s.topic, s.pools, s.results)
@@ -836,6 +932,9 @@ type outbound struct {
 	payload   json.RawMessage
 	discovery bool
 	discSlot  bool
+	// attempts counts server-rejected deliveries; handleResultReply retries
+	// the first rejection and drops the second.
+	attempts int
 }
 
 // resultQueue is a bounded process-wide spool. A slot remains reserved while

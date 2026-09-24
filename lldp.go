@@ -44,7 +44,7 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, out *resultQu
 	}
 
 	snmpDev := job.SnmpDevice
-	client, closeConn, err := snmpDial(ctx, snmpDev)
+	client, closeConn, err := snmpDial(ctx, job)
 	if err != nil {
 		slog.Error("failed to connect SNMP for LLDP", "job_id", jobID, "device_id", deviceID, "error", err)
 		sendResult(ctx, out, "lldp_topology_result", &pb.LldpTopologyResult{

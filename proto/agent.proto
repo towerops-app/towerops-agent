@@ -220,6 +220,13 @@ message AgentJob {
   repeated MikrotikCommand mikrotik_commands = 7;
   uint32 interval_seconds = 8;
   uint32 ping_timeout_ms = 9;     // Ping timeout; zero means the agent default
+  uint32 snmp_timeout_ms = 10;    // Per-request SNMP timeout; zero means the agent default
+  uint32 snmp_retries = 11;       // SNMP request retries; zero means the agent default
+  uint32 deadline_ms = 12;        // Whole-job deadline; zero means no job deadline
+  // Bound on the base64-encoded result payload the agent sends back, in
+  // bytes; zero means the agent default (8 MiB). Results larger than this are
+  // split across SnmpResult frames sharing job_id.
+  uint32 max_result_bytes = 13;
   DiscoveryPhase discovery_phase = 14;  // Discovery round; echoed back on SnmpResult
   CredentialProbe credential_probe = 15;  // Present on CREDENTIAL_PROBE jobs
 }
@@ -253,6 +260,21 @@ message SnmpResult {
   map<string, string> oid_values = 3;
   int64 timestamp = 4;
   string job_id = 5;
+  // True when the job ended early (deadline or cancellation) and oid_values
+  // covers only the roots in completed_roots. The server reconciles only the
+  // completed stages and leaves stored rows for the rest authoritative.
+  bool partial = 6;
+  // Walk roots the agent finished walking. A root absent from this list was
+  // never walked or ended early; its rows in oid_values are best-effort and
+  // must not drive reconciliation.
+  repeated string completed_roots = 7;
+  // 1-based frame number when a result is split across several SnmpResult
+  // messages sharing job_id; 0 when the result is a single frame.
+  uint32 sequence = 8;
+  // True on the last frame of a split result (and on unsplit results).
+  bool final = 9;
+  // Walk roots whose oid_values were truncated to fit max_result_bytes.
+  repeated string truncated_roots = 10;
   // Echo of AgentJob.discovery_phase for DISCOVER results; UNSPECIFIED for
   // other job types and for agents built before the field existed.
   DiscoveryPhase discovery_phase = 11;
