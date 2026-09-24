@@ -736,7 +736,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 	})
 
-	t.Run("NoSuchObject skipped", func(t *testing.T) {
+	t.Run("NoSuchObject recorded empty", func(t *testing.T) {
 		orig := snmpDial
 		defer func() { snmpDial = orig }()
 
@@ -763,8 +763,11 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}, ch)
 
 		result := decodeQueuedResult[*pb.SnmpResult](t, (<-ch.items))
-		if len(result.OidValues) != 0 {
-			t.Errorf("NoSuchObject should be skipped, got %d oid values", len(result.OidValues))
+		// The device answered: the OID is absent. An empty value marks it
+		// "collected, empty" so the server can prune it — a missing key
+		// would read as "never collected" and keep the stored row.
+		if v, ok := result.OidValues["1.3.6.1.2.1.1.1.0"]; !ok || v != "" {
+			t.Errorf("NoSuchObject should record an empty value, got %v", result.OidValues)
 		}
 	})
 
@@ -988,6 +991,10 @@ func TestExecuteSnmpJobSplitsErrorStatusBatches(t *testing.T) {
 			},
 			want: map[string]string{
 				"1.3.6.1.2.1.1.1.0": "resolved",
+				// The device answered noSuchName for this OID: recorded
+				// empty so the server reads "collected, absent" rather
+				// than "never collected".
+				"1.3.6.1.2.1.1.2.0": "",
 				"1.3.6.1.2.1.1.3.0": "resolved",
 				"1.3.6.1.2.1.1.4.0": "resolved",
 			},
@@ -1073,7 +1080,7 @@ func TestSnmpGetIntoUnhandledErrorStatus(t *testing.T) {
 	}
 
 	into := map[string]string{}
-	_ = snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, oids, into)
+	_, _ = snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, oids, into)
 
 	if len(into) != 0 {
 		t.Errorf("into = %v, want empty on genErr response", into)
@@ -2138,6 +2145,14 @@ func TestSnmpResultSplitFrames(t *testing.T) {
 	}
 	if len(first.OidValues)+len(second.OidValues) != 2 {
 		t.Fatalf("frames carry %d values total, want 2", len(first.OidValues)+len(second.OidValues))
+	}
+	// Each frame names only the completed roots it actually carries, so a
+	// lost frame cannot claim a root whose bucket never arrived.
+	if len(first.CompletedRoots) != 1 || first.CompletedRoots[0] != "1.3.6.1.2.1.2.2.1" {
+		t.Fatalf("frame 1 completed_roots = %v, want [1.3.6.1.2.1.2.2.1]", first.CompletedRoots)
+	}
+	if len(second.CompletedRoots) != 1 || second.CompletedRoots[0] != "1.3.6.1.2.1.4.22" {
+		t.Fatalf("frame 2 completed_roots = %v, want [1.3.6.1.2.1.4.22]", second.CompletedRoots)
 	}
 }
 

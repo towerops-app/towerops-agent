@@ -510,10 +510,12 @@ func (s *session) prunePending() {
 }
 
 // handleResultReply consumes a phx_reply addressed to this channel. A reply
-// with an error status means the server rejected the result: it is retried
-// once, then dropped loudly — the previous behaviour logged the rejection at
-// debug while the spool slot had already been acked, so oversized results
-// vanished with a false success.
+// with an error status means the server rejected the result. Deterministic
+// rejections (oversized payload) are dropped immediately — re-sending the
+// identical marshalled bytes can only be rejected again — while transient
+// rejections are retried once, then dropped loudly. The previous behaviour
+// logged the rejection at debug while the spool slot had already been
+// acked, so oversized results vanished with a false success.
 func (s *session) handleResultReply(msg channelMsg) {
 	if msg.Ref == nil {
 		return
@@ -541,6 +543,11 @@ func (s *session) handleResultReply(msg channelMsg) {
 	reason := reply.Response.Reason
 	if reason == "" {
 		reason = reply.Status
+	}
+	if strings.HasPrefix(reason, "Message too large") {
+		slog.Error("server rejected oversized result, dropping",
+			"event", p.result.event, "reason", reason)
+		return
 	}
 	if p.result.attempts == 0 {
 		slog.Warn("server rejected result, retrying once",
