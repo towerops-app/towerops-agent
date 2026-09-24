@@ -4211,6 +4211,19 @@ func TestJobTargetKey(t *testing.T) {
 			JobType:  pb.JobType_PING,
 			DeviceId: "dev-8",
 		}, "ping:device:dev-8"},
+		{"credential probe keys on candidate ip", &pb.AgentJob{
+			JobId:   "j9",
+			JobType: pb.JobType_CREDENTIAL_PROBE,
+			CredentialProbe: &pb.CredentialProbe{
+				Candidates: []*pb.SnmpDevice{{Ip: "10.0.0.5"}, {Ip: "10.0.0.5"}},
+			},
+		}, "10.0.0.5"},
+		{"credential probe without candidates falls through", &pb.AgentJob{
+			JobId:           "j10",
+			JobType:         pb.JobType_CREDENTIAL_PROBE,
+			DeviceId:        "dev-10",
+			CredentialProbe: &pb.CredentialProbe{},
+		}, "device:dev-10"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := jobTargetKey(tc.job); got != tc.want {

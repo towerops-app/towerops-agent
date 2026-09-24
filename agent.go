@@ -1044,6 +1044,13 @@ func jobTargetKey(job *pb.AgentJob) string {
 	if job.MikrotikDevice != nil && job.MikrotikDevice.Ip != "" {
 		return prefix + job.MikrotikDevice.Ip
 	}
+	// Probe jobs carry the target in their candidates (snmp_device is nil):
+	// key on the shared address so a probe cannot run concurrently with a
+	// poll or discovery on the same device.
+	if job.CredentialProbe != nil && len(job.CredentialProbe.Candidates) > 0 &&
+		job.CredentialProbe.Candidates[0].Ip != "" {
+		return prefix + job.CredentialProbe.Candidates[0].Ip
+	}
 	if job.DeviceId != "" {
 		return prefix + "device:" + job.DeviceId
 	}
