@@ -2139,6 +2139,14 @@ func TestSnmpResultSplitFrames(t *testing.T) {
 	if len(first.OidValues)+len(second.OidValues) != 2 {
 		t.Fatalf("frames carry %d values total, want 2", len(first.OidValues)+len(second.OidValues))
 	}
+	// Each frame names only the completed roots it actually carries, so a
+	// lost frame cannot claim a root whose bucket never arrived.
+	if len(first.CompletedRoots) != 1 || first.CompletedRoots[0] != "1.3.6.1.2.1.2.2.1" {
+		t.Fatalf("frame 1 completed_roots = %v, want [1.3.6.1.2.1.2.2.1]", first.CompletedRoots)
+	}
+	if len(second.CompletedRoots) != 1 || second.CompletedRoots[0] != "1.3.6.1.2.1.4.22" {
+		t.Fatalf("frame 2 completed_roots = %v, want [1.3.6.1.2.1.4.22]", second.CompletedRoots)
+	}
 }
 
 // TestSnmpResultTruncatesOversizedRoot packs a single root larger than the
