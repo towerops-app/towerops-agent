@@ -81,6 +81,39 @@ func (p *workerPool) submitMode(ctx context.Context, fn func(), wait bool) bool 
 	}
 }
 
+// targetGates serializes job execution per device target across every worker
+// pool. Each key maps to a one-slot semaphore: a job for a target that is
+// already being worked waits instead of running concurrently with it.
+type targetGates struct {
+	mu    sync.Mutex
+	gates map[string]chan struct{}
+}
+
+// acquire returns the release function for the target's semaphore, or nil when
+// ctx is cancelled while waiting. A nil key never blocks.
+func (g *targetGates) acquire(ctx context.Context, key string) func() {
+	if g == nil || key == "" {
+		return func() {}
+	}
+	g.mu.Lock()
+	if g.gates == nil {
+		g.gates = make(map[string]chan struct{})
+	}
+	sem, ok := g.gates[key]
+	if !ok {
+		sem = make(chan struct{}, 1)
+		g.gates[key] = sem
+	}
+	g.mu.Unlock()
+
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }
+	case <-ctx.Done():
+		return nil
+	}
+}
+
 // stop closes the task channel and waits for all workers to finish.
 func (p *workerPool) stop() {
 	p.once.Do(func() {

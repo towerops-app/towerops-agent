@@ -253,6 +253,7 @@ func runSessionWithResultsAndScheduling(
 		ping:            newWorkerPool(50),
 		checks:          newWorkerPool(50),
 		notices:         notices,
+		targets:         &targetGates{},
 		localScheduling: localScheduling,
 	}
 	s.results = results
@@ -454,7 +455,7 @@ func (s *session) deliverResult(result outbound) error {
 		s.results.retry(result)
 		return err
 	}
-	s.results.ack()
+	s.results.ack(result)
 	slog.Debug("sent result", "event", result.event)
 	return nil
 }
@@ -827,34 +828,54 @@ func decodeBinaryPayload(event string, raw json.RawMessage, msg proto.Message) b
 
 // outbound is one pre-encoded protobuf result addressed to a Phoenix channel
 // event. Keeping the payload process-wide allows a later WebSocket session to
-// retry it without retaining mutable executor state.
+// retry it without retaining mutable executor state. discovery marks results
+// eligible for the reserved spool lane; discSlot records which lane's slot the
+// result holds so ack can release it.
 type outbound struct {
-	event   string
-	payload json.RawMessage
+	event     string
+	payload   json.RawMessage
+	discovery bool
+	discSlot  bool
 }
 
 // resultQueue is a bounded process-wide spool. A slot remains reserved while
 // the session writer has a result in flight. Failed writes use a dedicated
 // one-item retry lane so they remain ahead of newer queued measurements.
+//
+// A quarter of the slots are reserved for discovery results so a flood of
+// pings and checks cannot evict them; discovery results overflow into the
+// general lane when their reserve is exhausted, never the reverse.
 type resultQueue struct {
 	items       chan outbound
 	retries     chan outbound
 	slots       chan struct{}
+	discSlots   chan struct{}
 	agentCtx    context.Context
 	dropped     atomic.Uint64
 	lastDropLog atomic.Int64
 }
 
 func newResultQueueForAgent(agentCtx context.Context, size int) *resultQueue {
+	discovery := size / 4
 	return &resultQueue{
-		items:    make(chan outbound, size),
-		retries:  make(chan outbound, 1),
-		slots:    make(chan struct{}, size),
-		agentCtx: agentCtx,
+		items:     make(chan outbound, size),
+		retries:   make(chan outbound, 1),
+		slots:     make(chan struct{}, size-discovery),
+		discSlots: make(chan struct{}, discovery),
+		agentCtx:  agentCtx,
 	}
 }
 
 func (q *resultQueue) enqueue(result outbound) bool {
+	if result.discovery {
+		select {
+		case q.discSlots <- struct{}{}:
+			result.discSlot = true
+			q.items <- result
+			return true
+		default:
+		}
+	}
 	select {
 	case q.slots <- struct{}{}:
 		q.items <- result
@@ -864,7 +885,11 @@ func (q *resultQueue) enqueue(result outbound) bool {
 	}
 }
 
-func (q *resultQueue) ack() {
+func (q *resultQueue) ack(result outbound) {
+	if result.discSlot {
+		<-q.discSlots
+		return
+	}
 	<-q.slots
 }
 
@@ -884,7 +909,8 @@ func (q *resultQueue) takeRetry() (outbound, bool) {
 	}
 }
 
-// jobPools holds the worker pools for each job type.
+// jobPools holds the worker pools for each job type and the per-target
+// semaphores that serialize jobs for the same device across all of them.
 type jobPools struct {
 	snmp            *workerPool
 	mikrotik        *workerPool
@@ -892,6 +918,7 @@ type jobPools struct {
 	checks          *workerPool
 	notices         chan<- outbound
 	scheduler       *recurringScheduler
+	targets         *targetGates
 	localScheduling bool
 }
 
@@ -978,11 +1005,46 @@ func submitJob(
 		return false
 	}
 
-	ok := pool.submitMode(ctx, task(execute), wait)
+	// Jitter spreads the start times of jobs pushed in one batch; the target
+	// gate then serializes jobs for the same device across every pool.
+	target := jobTargetKey(job)
+	gated := func() {
+		jitterDispatch(ctx, dispatchJitter())
+		release := pools.targets.acquire(ctx, target)
+		if release == nil {
+			return
+		}
+		defer release()
+		execute()
+	}
+
+	ok := pool.submitMode(ctx, task(gated), wait)
 	if !ok {
 		reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
 	}
 	return ok
+}
+
+// jobTargetKey identifies the device a job runs against so jobs for the same
+// target serialize. The device IP is preferred; jobs without one fall back to
+// the server-assigned device ID, then the job ID. PING jobs get their own
+// namespace: a stalled SNMP walk must not delay the outage signal a ping
+// delivers.
+func jobTargetKey(job *pb.AgentJob) string {
+	prefix := ""
+	if job.JobType == pb.JobType_PING {
+		prefix = "ping:"
+	}
+	if job.SnmpDevice != nil && job.SnmpDevice.Ip != "" {
+		return prefix + job.SnmpDevice.Ip
+	}
+	if job.MikrotikDevice != nil && job.MikrotikDevice.Ip != "" {
+		return prefix + job.MikrotikDevice.Ip
+	}
+	if job.DeviceId != "" {
+		return prefix + "device:" + job.DeviceId
+	}
+	return prefix + "job:" + job.JobId
 }
 
 // nextBackoff doubles the current delay (capped at max) and adds up to 25% jitter.
@@ -1010,7 +1072,20 @@ func encodeOutbound(event string, msg proto.Message, jobID string) (outbound, bo
 	}
 	encoded := base64.StdEncoding.EncodeToString(bin)
 	payload, _ := json.Marshal(map[string]string{"binary": encoded})
-	return outbound{event: event, payload: payload}, true
+	return outbound{event: event, payload: payload, discovery: isDiscoveryResult(msg)}, true
+}
+
+// isDiscoveryResult reports whether a result message carries discovery data
+// and therefore qualifies for the reserved spool lane.
+func isDiscoveryResult(msg proto.Message) bool {
+	switch m := msg.(type) {
+	case *pb.SnmpResult:
+		return m.JobType == pb.JobType_DISCOVER || m.JobType == pb.JobType_NETWORK_SWEEP
+	case *pb.LldpTopologyResult, *pb.NetworkSweepResult, *pb.SweepResult:
+		return true
+	default:
+		return false
+	}
 }
 
 // sendResult queues a completed measurement for at-most-once WebSocket

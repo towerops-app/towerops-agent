@@ -207,3 +207,59 @@ func TestWorkerPoolRejectsImmediatelyWhenFull(t *testing.T) {
 	close(blocker)
 	pool.stop()
 }
+
+func TestTargetGates(t *testing.T) {
+	t.Run("same target serializes", func(t *testing.T) {
+		gates := &targetGates{}
+		release := gates.acquire(context.Background(), "10.0.0.1")
+
+		acquired := make(chan func(), 1)
+		go func() { acquired <- gates.acquire(context.Background(), "10.0.0.1") }()
+		select {
+		case <-acquired:
+			t.Fatal("second acquire for the same target did not wait")
+		case <-time.After(50 * time.Millisecond):
+		}
+		release()
+		select {
+		case r := <-acquired:
+			r()
+		case <-time.After(time.Second):
+			t.Fatal("acquire did not proceed after release")
+		}
+	})
+
+	t.Run("different targets do not block", func(t *testing.T) {
+		gates := &targetGates{}
+		release := gates.acquire(context.Background(), "10.0.0.1")
+		defer release()
+		done := make(chan func(), 1)
+		go func() { done <- gates.acquire(context.Background(), "10.0.0.2") }()
+		select {
+		case r := <-done:
+			r()
+		case <-time.After(time.Second):
+			t.Fatal("acquire for a different target blocked")
+		}
+	})
+
+	t.Run("cancelled acquire returns nil", func(t *testing.T) {
+		gates := &targetGates{}
+		release := gates.acquire(context.Background(), "10.0.0.1")
+		defer release()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if r := gates.acquire(ctx, "10.0.0.1"); r != nil {
+			t.Fatal("cancelled acquire returned a release function")
+		}
+	})
+
+	t.Run("empty key never blocks", func(t *testing.T) {
+		gates := &targetGates{}
+		r := gates.acquire(context.Background(), "")
+		if r == nil {
+			t.Fatal("empty key acquire returned nil")
+		}
+		r()
+	})
+}
