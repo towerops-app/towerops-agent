@@ -26,3 +26,18 @@ ignore:
     package:
       name: golang.org/x/crypto
       type: go-module
+
+  # CVE-2026-89092: stack overflow in glibc's nscd daemon when a malicious
+  # DNS server returns an oversized response. Chainguard's advisory marks
+  # the Wolfi glibc-2.44 package "Pending upstream fix" — there is no fixed
+  # version to upgrade to, and `apk upgrade` in the Dockerfile picks it up
+  # automatically once one lands.
+  #
+  # The vulnerable code path is unreachable in this image: nscd is not
+  # installed or run, and the agent binary is built CGO_ENABLED=0, so name
+  # resolution goes through Go's own resolver and never touches glibc's NSS.
+  # Delete this entry when a fixed glibc ships in wolfi-base.
+  - vulnerability: CVE-2026-89092
+    package:
+      name: glibc-2.44
+      type: apk
