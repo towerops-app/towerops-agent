@@ -736,7 +736,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 	})
 
-	t.Run("NoSuchObject skipped", func(t *testing.T) {
+	t.Run("NoSuchObject recorded empty", func(t *testing.T) {
 		orig := snmpDial
 		defer func() { snmpDial = orig }()
 
@@ -763,8 +763,11 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}, ch)
 
 		result := decodeQueuedResult[*pb.SnmpResult](t, (<-ch.items))
-		if len(result.OidValues) != 0 {
-			t.Errorf("NoSuchObject should be skipped, got %d oid values", len(result.OidValues))
+		// The device answered: the OID is absent. An empty value marks it
+		// "collected, empty" so the server can prune it — a missing key
+		// would read as "never collected" and keep the stored row.
+		if v, ok := result.OidValues["1.3.6.1.2.1.1.1.0"]; !ok || v != "" {
+			t.Errorf("NoSuchObject should record an empty value, got %v", result.OidValues)
 		}
 	})
 
@@ -988,6 +991,10 @@ func TestExecuteSnmpJobSplitsErrorStatusBatches(t *testing.T) {
 			},
 			want: map[string]string{
 				"1.3.6.1.2.1.1.1.0": "resolved",
+				// The device answered noSuchName for this OID: recorded
+				// empty so the server reads "collected, absent" rather
+				// than "never collected".
+				"1.3.6.1.2.1.1.2.0": "",
 				"1.3.6.1.2.1.1.3.0": "resolved",
 				"1.3.6.1.2.1.1.4.0": "resolved",
 			},
