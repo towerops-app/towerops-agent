@@ -114,7 +114,7 @@ func TestSplitRecurringJobsUsesIntervalSignal(t *testing.T) {
 		{JobId: "poll:device-1", JobType: pb.JobType_POLL, IntervalSeconds: 60},
 		{JobId: "mikrotik:device-1", JobType: pb.JobType_MIKROTIK, IntervalSeconds: 60},
 		{JobId: "ping:device-1", JobType: pb.JobType_PING, IntervalSeconds: 60},
-		{JobId: "future:device-1", JobType: pb.JobType_NETWORK_SWEEP, IntervalSeconds: 60},
+		{JobId: "future:device-1", JobType: pb.JobType_CREDENTIAL_PROBE, IntervalSeconds: 60},
 		{JobId: "poll-with-new-prefix", JobType: pb.JobType_POLL},
 		{JobId: "credential:test", JobType: pb.JobType_TEST_CREDENTIALS},
 		nil,
