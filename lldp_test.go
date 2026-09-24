@@ -707,7 +707,7 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 	t.Run("dial error", func(t *testing.T) {
 		orig := snmpDial
 		defer func() { snmpDial = orig }()
-		snmpDial = func(context.Context, *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(context.Context, *pb.AgentJob) (snmpQuerier, func(), error) {
 			return nil, nil, errors.New("dial refused")
 		}
 
@@ -748,10 +748,10 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 			}),
 		}
 		var gotCtx context.Context
-		var gotDev *pb.SnmpDevice
-		snmpDial = func(ctx context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		var gotJob *pb.AgentJob
+		snmpDial = func(ctx context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			gotCtx = ctx
-			gotDev = dev
+			gotJob = job
 			return m, func() { closed = true }, nil
 		}
 
@@ -765,8 +765,8 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 			SnmpDevice: dev,
 		}, out)
 
-		if gotDev != dev {
-			t.Fatalf("snmpDial got device %+v, want %+v", gotDev, dev)
+		if gotJob == nil || gotJob.SnmpDevice != dev {
+			t.Fatalf("snmpDial got job %+v, want device %+v", gotJob, dev)
 		}
 		if gotCtx != ctx {
 			t.Fatal("snmpDial did not receive the job context")
@@ -831,7 +831,7 @@ func TestLldpTExecuteLldpTopologyJobWalkStrategy(t *testing.T) {
 					oidRemChassisId: {lldpTPdu("."+oidRemChassisId+".0.5.1", "chassis-a")},
 				}),
 			}
-			snmpDial = func(context.Context, *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			snmpDial = func(context.Context, *pb.AgentJob) (snmpQuerier, func(), error) {
 				return m, func() {}, nil
 			}
 

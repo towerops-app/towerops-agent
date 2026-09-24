@@ -1846,11 +1846,18 @@ type AgentJob struct {
 	MikrotikDevice   *MikrotikDevice        `protobuf:"bytes,6,opt,name=mikrotik_device,json=mikrotikDevice,proto3" json:"mikrotik_device,omitempty"`
 	MikrotikCommands []*MikrotikCommand     `protobuf:"bytes,7,rep,name=mikrotik_commands,json=mikrotikCommands,proto3" json:"mikrotik_commands,omitempty"`
 	IntervalSeconds  uint32                 `protobuf:"varint,8,opt,name=interval_seconds,json=intervalSeconds,proto3" json:"interval_seconds,omitempty"`
-	PingTimeoutMs    uint32                 `protobuf:"varint,9,opt,name=ping_timeout_ms,json=pingTimeoutMs,proto3" json:"ping_timeout_ms,omitempty"`                                      // Ping timeout; zero means the agent default
-	DiscoveryPhase   DiscoveryPhase         `protobuf:"varint,14,opt,name=discovery_phase,json=discoveryPhase,proto3,enum=towerops.agent.DiscoveryPhase" json:"discovery_phase,omitempty"` // Discovery round; echoed back on SnmpResult
-	CredentialProbe  *CredentialProbe       `protobuf:"bytes,15,opt,name=credential_probe,json=credentialProbe,proto3" json:"credential_probe,omitempty"`                                  // Present on CREDENTIAL_PROBE jobs
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	PingTimeoutMs    uint32                 `protobuf:"varint,9,opt,name=ping_timeout_ms,json=pingTimeoutMs,proto3" json:"ping_timeout_ms,omitempty"`  // Ping timeout; zero means the agent default
+	SnmpTimeoutMs    uint32                 `protobuf:"varint,10,opt,name=snmp_timeout_ms,json=snmpTimeoutMs,proto3" json:"snmp_timeout_ms,omitempty"` // Per-request SNMP timeout; zero means the agent default
+	SnmpRetries      uint32                 `protobuf:"varint,11,opt,name=snmp_retries,json=snmpRetries,proto3" json:"snmp_retries,omitempty"`         // SNMP request retries; zero means the agent default
+	DeadlineMs       uint32                 `protobuf:"varint,12,opt,name=deadline_ms,json=deadlineMs,proto3" json:"deadline_ms,omitempty"`            // Whole-job deadline; zero means no job deadline
+	// Bound on the base64-encoded result payload the agent sends back, in
+	// bytes; zero means the agent default (8 MiB). Results larger than this are
+	// split across SnmpResult frames sharing job_id.
+	MaxResultBytes  uint32           `protobuf:"varint,13,opt,name=max_result_bytes,json=maxResultBytes,proto3" json:"max_result_bytes,omitempty"`
+	DiscoveryPhase  DiscoveryPhase   `protobuf:"varint,14,opt,name=discovery_phase,json=discoveryPhase,proto3,enum=towerops.agent.DiscoveryPhase" json:"discovery_phase,omitempty"` // Discovery round; echoed back on SnmpResult
+	CredentialProbe *CredentialProbe `protobuf:"bytes,15,opt,name=credential_probe,json=credentialProbe,proto3" json:"credential_probe,omitempty"`                                  // Present on CREDENTIAL_PROBE jobs
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *AgentJob) Reset() {
@@ -1942,6 +1949,34 @@ func (x *AgentJob) GetIntervalSeconds() uint32 {
 func (x *AgentJob) GetPingTimeoutMs() uint32 {
 	if x != nil {
 		return x.PingTimeoutMs
+	}
+	return 0
+}
+
+func (x *AgentJob) GetSnmpTimeoutMs() uint32 {
+	if x != nil {
+		return x.SnmpTimeoutMs
+	}
+	return 0
+}
+
+func (x *AgentJob) GetSnmpRetries() uint32 {
+	if x != nil {
+		return x.SnmpRetries
+	}
+	return 0
+}
+
+func (x *AgentJob) GetDeadlineMs() uint32 {
+	if x != nil {
+		return x.DeadlineMs
+	}
+	return 0
+}
+
+func (x *AgentJob) GetMaxResultBytes() uint32 {
+	if x != nil {
+		return x.MaxResultBytes
 	}
 	return 0
 }
@@ -2146,6 +2181,21 @@ type SnmpResult struct {
 	OidValues map[string]string `protobuf:"bytes,3,rep,name=oid_values,json=oidValues,proto3" json:"oid_values,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	Timestamp int64             `protobuf:"varint,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 	JobId     string            `protobuf:"bytes,5,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	// True when the job ended early (deadline or cancellation) and oid_values
+	// covers only the roots in completed_roots. The server reconciles only the
+	// completed stages and leaves stored rows for the rest authoritative.
+	Partial bool `protobuf:"varint,6,opt,name=partial,proto3" json:"partial,omitempty"`
+	// Walk roots the agent finished walking. A root absent from this list was
+	// never walked or ended early; its rows in oid_values are best-effort and
+	// must not drive reconciliation.
+	CompletedRoots []string `protobuf:"bytes,7,rep,name=completed_roots,json=completedRoots,proto3" json:"completed_roots,omitempty"`
+	// 1-based frame number when a result is split across several SnmpResult
+	// messages sharing job_id; 0 when the result is a single frame.
+	Sequence uint32 `protobuf:"varint,8,opt,name=sequence,proto3" json:"sequence,omitempty"`
+	// True on the last frame of a split result (and on unsplit results).
+	Final bool `protobuf:"varint,9,opt,name=final,proto3" json:"final,omitempty"`
+	// Walk roots whose oid_values were truncated to fit max_result_bytes.
+	TruncatedRoots []string `protobuf:"bytes,10,rep,name=truncated_roots,json=truncatedRoots,proto3" json:"truncated_roots,omitempty"`
 	// Echo of AgentJob.discovery_phase for DISCOVER results; UNSPECIFIED for
 	// other job types and for agents built before the field existed.
 	DiscoveryPhase DiscoveryPhase `protobuf:"varint,11,opt,name=discovery_phase,json=discoveryPhase,proto3,enum=towerops.agent.DiscoveryPhase" json:"discovery_phase,omitempty"`
@@ -2216,6 +2266,41 @@ func (x *SnmpResult) GetJobId() string {
 		return x.JobId
 	}
 	return ""
+}
+
+func (x *SnmpResult) GetPartial() bool {
+	if x != nil {
+		return x.Partial
+	}
+	return false
+}
+
+func (x *SnmpResult) GetCompletedRoots() []string {
+	if x != nil {
+		return x.CompletedRoots
+	}
+	return nil
+}
+
+func (x *SnmpResult) GetSequence() uint32 {
+	if x != nil {
+		return x.Sequence
+	}
+	return 0
+}
+
+func (x *SnmpResult) GetFinal() bool {
+	if x != nil {
+		return x.Final
+	}
+	return false
+}
+
+func (x *SnmpResult) GetTruncatedRoots() []string {
+	if x != nil {
+		return x.TruncatedRoots
+	}
+	return nil
 }
 
 func (x *SnmpResult) GetDiscoveryPhase() DiscoveryPhase {
@@ -3550,7 +3635,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x11HeartbeatResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\"<\n" +
 	"\fAgentJobList\x12,\n" +
-	"\x04jobs\x18\x01 \x03(\v2\x18.towerops.agent.AgentJobR\x04jobs\"\xe3\x04\n" +
+	"\x04jobs\x18\x01 \x03(\v2\x18.towerops.agent.AgentJobR\x04jobs\"\xf9\x05\n" +
 	"\bAgentJob\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x122\n" +
 	"\bjob_type\x18\x02 \x01(\x0e2\x17.towerops.agent.JobTypeR\ajobType\x12\x1b\n" +
@@ -3561,7 +3646,13 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x0fmikrotik_device\x18\x06 \x01(\v2\x1e.towerops.agent.MikrotikDeviceR\x0emikrotikDevice\x12L\n" +
 	"\x11mikrotik_commands\x18\a \x03(\v2\x1f.towerops.agent.MikrotikCommandR\x10mikrotikCommands\x12)\n" +
 	"\x10interval_seconds\x18\b \x01(\rR\x0fintervalSeconds\x12&\n" +
-	"\x0fping_timeout_ms\x18\t \x01(\rR\rpingTimeoutMs\x12G\n" +
+	"\x0fping_timeout_ms\x18\t \x01(\rR\rpingTimeoutMs\x12&\n" +
+	"\x0fsnmp_timeout_ms\x18\n" +
+	" \x01(\rR\rsnmpTimeoutMs\x12!\n" +
+	"\fsnmp_retries\x18\v \x01(\rR\vsnmpRetries\x12\x1f\n" +
+	"\vdeadline_ms\x18\f \x01(\rR\n" +
+	"deadlineMs\x12(\n" +
+	"\x10max_result_bytes\x18\r \x01(\rR\x0emaxResultBytes\x12G\n" +
 	"\x0fdiscovery_phase\x18\x0e \x01(\x0e2\x1e.towerops.agent.DiscoveryPhaseR\x0ediscoveryPhase\x12J\n" +
 	"\x10credential_probe\x18\x0f \x01(\v2\x1f.towerops.agent.CredentialProbeR\x0fcredentialProbe\"\xfb\x02\n" +
 	"\n" +
@@ -3582,7 +3673,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\tSnmpQuery\x128\n" +
 	"\n" +
 	"query_type\x18\x01 \x01(\x0e2\x19.towerops.agent.QueryTypeR\tqueryType\x12\x12\n" +
-	"\x04oids\x18\x02 \x03(\tR\x04oids\"\xe3\x02\n" +
+	"\x04oids\x18\x02 \x03(\tR\x04oids\"\x81\x04\n" +
 	"\n" +
 	"SnmpResult\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x122\n" +
@@ -3590,7 +3681,13 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\n" +
 	"oid_values\x18\x03 \x03(\v2).towerops.agent.SnmpResult.OidValuesEntryR\toidValues\x12\x1c\n" +
 	"\ttimestamp\x18\x04 \x01(\x03R\ttimestamp\x12\x15\n" +
-	"\x06job_id\x18\x05 \x01(\tR\x05jobId\x12G\n" +
+	"\x06job_id\x18\x05 \x01(\tR\x05jobId\x12\x18\n" +
+	"\apartial\x18\x06 \x01(\bR\apartial\x12'\n" +
+	"\x0fcompleted_roots\x18\a \x03(\tR\x0ecompletedRoots\x12\x1a\n" +
+	"\bsequence\x18\b \x01(\rR\bsequence\x12\x14\n" +
+	"\x05final\x18\t \x01(\bR\x05final\x12'\n" +
+	"\x0ftruncated_roots\x18\n" +
+	" \x03(\tR\x0etruncatedRoots\x12G\n" +
 	"\x0fdiscovery_phase\x18\v \x01(\x0e2\x1e.towerops.agent.DiscoveryPhaseR\x0ediscoveryPhase\x1a<\n" +
 	"\x0eOidValuesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +

@@ -264,6 +264,18 @@ addresses are still recorded against the organization.
   unauthenticated: restrict UDP 162 to your device network and set
   `TOWEROPS_TRAP_COMMUNITY` to filter on the community string.
 - SNMP community strings and SSH credentials are never logged.
+- **MikroTik TLS and SSH trust on first use.** RouterOS API-TLS and SSH
+  backup connections authenticate the device by pinning its certificate or
+  host-key fingerprint on first contact (`known_hosts.json`, see
+  `TOWEROPS_HOST_KEYS_FILE`). RouterOS serves a self-signed certificate, so
+  the TLS handshake itself is not CA-verified: the first connection trusts
+  whatever the device presents, and every later connection to the same
+  address is rejected if the fingerprint changes. This protects against
+  interception after first contact but not against an attacker present on
+  the very first connection — perform the first poll or backup on a trusted
+  network, or pre-seed `known_hosts.json` with the device's fingerprint. A
+  rejected connection logs `TOFU`; remove the stored entry (or delete the
+  file) to re-pin a legitimately reinstalled device.
 - Reporting a vulnerability: [SECURITY.md](SECURITY.md).
 
 ## License

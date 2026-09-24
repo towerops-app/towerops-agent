@@ -54,11 +54,19 @@ type snmpQuerier interface {
 	BulkWalk(rootOid string, walkFn gosnmp.WalkFunc) error
 }
 
-// snmpDial connects to an SNMP device and returns a querier + close function.
-var snmpDial = func(ctx context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
-	conn, err := newSnmpConn(ctx, dev)
+// snmpDial connects to the job's SNMP device and returns a querier + close
+// function. The job's snmp_timeout_ms/snmp_retries override the connection
+// defaults; zero keeps them.
+var snmpDial = func(ctx context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
+	conn, err := newSnmpConn(ctx, job.SnmpDevice)
 	if err != nil {
 		return nil, nil, err
+	}
+	if job.SnmpTimeoutMs > 0 {
+		conn.Timeout = time.Duration(job.SnmpTimeoutMs) * time.Millisecond
+	}
+	if job.SnmpRetries > 0 {
+		conn.Retries = int(job.SnmpRetries)
 	}
 	return &rateLimitedQuerier{ctx: ctx, q: conn}, func() { _ = conn.Conn.Close() }, nil
 }
@@ -76,28 +84,43 @@ func closeOnCancellation(ctx context.Context, closeFn func()) func() {
 }
 
 // executeSnmpJob runs SNMP GET/WALK queries for a job and sends results.
+//
+// The job's deadline_ms bounds the whole run: when it expires (or the session
+// context is cancelled) the walk stops and whatever was collected ships as a
+// partial result naming the roots that completed, so the server reconciles
+// only those stages instead of losing minutes of work. Results are sent on
+// the agent context — not the job context — so a cancelled job's partial
+// result still reaches the spool and survives a reconnect.
 func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	dev := job.SnmpDevice
 	if dev == nil {
 		slog.Error("job missing snmp device", "job_id", job.JobId)
-		sendResult(ctx, out, "result", emptySnmpResult(job), job.JobId)
+		sendResult(out.agentCtx, out, "result", emptySnmpResult(job), job.JobId)
 		return
 	}
 
-	conn, closeFn, err := snmpDial(ctx, dev)
+	if job.DeadlineMs > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(job.DeadlineMs)*time.Millisecond)
+		defer cancel()
+	}
+
+	conn, closeFn, err := snmpDial(ctx, job)
 	if err != nil {
 		slog.Error("snmp connect", "job_id", job.JobId, "device", dev.Ip, "error", err)
-		sendResult(ctx, out, "result", emptySnmpResult(job), job.JobId)
+		sendResult(out.agentCtx, out, "result", emptySnmpResult(job), job.JobId)
 		return
 	}
 	defer closeOnCancellation(ctx, closeFn)()
 
-	totalOIDs := 0
-	for _, q := range job.Queries {
-		totalOIDs += len(q.Oids)
-	}
-	oidValues := make(map[string]string, totalOIDs)
+	// Values accumulate per walk root so an oversized result can be split
+	// along root boundaries and a cancelled job can name the roots that
+	// finished. GET batches share one bucket: their OIDs are scalar reads,
+	// not subtree walks, so they are not listed in completed_roots.
+	getValues := make(map[string]string)
+	buckets := []snmpResultBucket{{label: "", values: getValues}}
 
+	var completedRoots []string
 	var queryErrors []string
 	cancelled := false
 	for _, q := range job.Queries {
@@ -108,7 +131,11 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 		switch q.QueryType {
 		case pb.QueryType_GET:
 			for batch := range slices.Chunk(q.Oids, snmpMaxOIDsPerGet) {
-				if err := snmpGetInto(conn, dev, batch, oidValues); err != nil && ctx.Err() == nil {
+				if ctx.Err() != nil {
+					cancelled = true
+					break
+				}
+				if err := snmpGetInto(conn, dev, batch, getValues); err != nil && ctx.Err() == nil {
 					queryErrors = append(queryErrors, fmt.Sprintf("GET: %v", err))
 				}
 			}
@@ -116,6 +143,12 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 			// SNMPv1 doesn't support GETBULK, use GETNEXT-based WalkAll instead
 			useV1Walk := isSnmpV1(dev.Version)
 			for _, baseOID := range q.Oids {
+				if ctx.Err() != nil {
+					cancelled = true
+					break
+				}
+				root := canonicalOID(baseOID)
+				values := make(map[string]string)
 				var results []gosnmp.SnmpPDU
 				if useV1Walk {
 					results, err = conn.WalkAll(baseOID)
@@ -126,38 +159,43 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 					if !snmpValueUsable(v) {
 						continue
 					}
-					oidValues[canonicalOID(v.Name)] = snmpValueToString(v)
+					values[canonicalOID(v.Name)] = snmpValueToString(v)
 				}
+				buckets = append(buckets, snmpResultBucket{label: root, values: values})
 				if err != nil {
 					if ctx.Err() != nil {
 						cancelled = true
 						break
 					}
 					slog.Warn("snmp walk failed", "device", dev.Ip, "oid", baseOID, "error", err)
-					queryErrors = append(queryErrors, fmt.Sprintf("%s: %v", canonicalOID(baseOID), err))
+					queryErrors = append(queryErrors, fmt.Sprintf("%s: %v", root, err))
+					continue
 				}
+				completedRoots = append(completedRoots, root)
 			}
+		}
+		if cancelled {
+			break
 		}
 	}
 
-	if cancelled || ctx.Err() != nil {
-		slog.Warn("snmp job cancelled, dropping partial result", "job_id", job.JobId, "oids", len(oidValues))
-		return
+	partial := cancelled || ctx.Err() != nil
+	if partial {
+		slog.Warn("snmp job ended early, shipping partial result",
+			"job_id", job.JobId,
+			"completed_roots", len(completedRoots),
+			"error", ctx.Err())
+	} else {
+		slog.Info("snmp job complete", "job_id", job.JobId, "roots", len(completedRoots))
 	}
 
-	result := &pb.SnmpResult{
-		DeviceId:       job.DeviceId,
-		JobType:        job.JobType,
-		JobId:          job.JobId,
-		OidValues:      oidValues,
-		Timestamp:      time.Now().Unix(),
-		DiscoveryPhase: job.DiscoveryPhase,
+	frames := buildSnmpResultFrames(job, buckets, completedRoots, partial)
+	for _, frame := range frames {
+		frame.DiscoveryPhase = job.DiscoveryPhase
+		sendResult(out.agentCtx, out, "result", frame, job.JobId)
 	}
-
-	slog.Info("snmp job complete", "job_id", job.JobId, "oids", len(oidValues))
-	sendResult(ctx, out, "result", result, job.JobId)
 	if len(queryErrors) > 0 && ctx.Err() == nil {
-		sendResult(ctx, out, "error", &pb.AgentError{
+		sendResult(out.agentCtx, out, "error", &pb.AgentError{
 			DeviceId:  job.DeviceId,
 			JobId:     job.JobId,
 			Message:   "SNMP query failed: " + strings.Join(queryErrors, "; "),
@@ -173,8 +211,156 @@ func emptySnmpResult(job *pb.AgentJob) *pb.SnmpResult {
 		JobId:          job.JobId,
 		OidValues:      make(map[string]string),
 		Timestamp:      time.Now().Unix(),
+		Final:          true,
 		DiscoveryPhase: job.DiscoveryPhase,
 	}
+}
+
+// defaultMaxResultBytes bounds the base64 result payload when the job does
+// not carry max_result_bytes. The server rejects binary payloads over 10 MiB,
+// so the default stays under it.
+const defaultMaxResultBytes = 8 << 20
+
+// maxResultPayloadHeadroom covers the channelMsg JSON envelope around the
+// base64 payload and the frame metadata fields (completed_roots, sequence,
+// flags) that oidEntrySize does not account for.
+const maxResultPayloadHeadroom = 4096
+
+// snmpResultBucket groups the OID values collected under one walk root. The
+// empty label is the shared GET bucket.
+type snmpResultBucket struct {
+	label  string
+	values map[string]string
+}
+
+// getBucketTruncatedLabel names the shared GET bucket in truncated_roots:
+// GET OIDs are scalar reads with no walk root, so a sentinel marks the drop.
+const getBucketTruncatedLabel = "<get-batch>"
+
+// buildSnmpResultFrames packs the collected buckets into SnmpResult frames
+// whose base64 payload stays under the job's max_result_bytes. A result that
+// fits ships as one frame with sequence 0; a larger one splits along bucket
+// boundaries into frames numbered from 1, the last marked final. A single
+// bucket that cannot fit one frame is truncated to what fits and named in
+// truncated_roots.
+func buildSnmpResultFrames(
+	job *pb.AgentJob,
+	buckets []snmpResultBucket,
+	completedRoots []string,
+	partial bool,
+) []*pb.SnmpResult {
+	maxPayload := int64(job.MaxResultBytes)
+	if maxPayload <= 0 {
+		maxPayload = defaultMaxResultBytes
+	}
+	// The bound applies to the base64 payload; keep the decoded protobuf
+	// under three quarters of it, minus the envelope/metadata headroom.
+	maxDecoded := maxPayload*3/4 - maxResultPayloadHeadroom
+	if maxDecoded < 1024 {
+		maxDecoded = 1024
+	}
+
+	newFrame := func() *pb.SnmpResult {
+		return &pb.SnmpResult{
+			DeviceId:       job.DeviceId,
+			JobType:        job.JobType,
+			JobId:          job.JobId,
+			OidValues:      make(map[string]string),
+			Timestamp:      time.Now().Unix(),
+			Partial:        partial,
+			CompletedRoots: completedRoots,
+		}
+	}
+
+	var frames []*pb.SnmpResult
+	var truncated []string
+	frame := newFrame()
+	frameSize := int64(0)
+	flush := func() {
+		frames = append(frames, frame)
+		frame = newFrame()
+		frameSize = 0
+	}
+
+	for _, bucket := range buckets {
+		bucketSize := int64(0)
+		for k, v := range bucket.values {
+			bucketSize += oidEntrySize(k, v)
+		}
+		if bucketSize <= maxDecoded {
+			// Whole bucket fits a frame; start a new one when it does not
+			// fit alongside what is already packed.
+			if frameSize+bucketSize > maxDecoded && frameSize > 0 {
+				flush()
+			}
+			for k, v := range bucket.values {
+				frame.OidValues[k] = v
+			}
+			frameSize += bucketSize
+			continue
+		}
+		// The bucket alone exceeds a frame: pack only the entries that fit
+		// into a dedicated frame and flag the root as truncated. The shared GET
+		// bucket has no walk root to name, so it reports a sentinel — silently
+		// dropping its overflow would ship a result that looks complete.
+		label := bucket.label
+		if label == "" {
+			label = getBucketTruncatedLabel
+		}
+		truncated = append(truncated, label)
+		if frameSize > 0 {
+			flush()
+		}
+		dropped := 0
+		for k, v := range bucket.values {
+			entry := oidEntrySize(k, v)
+			if frameSize+entry > maxDecoded {
+				dropped++
+				continue
+			}
+			frame.OidValues[k] = v
+			frameSize += entry
+		}
+		if dropped > 0 {
+			slog.Warn("snmp result truncated to fit max_result_bytes",
+				"job_id", job.JobId, "root", label, "dropped", dropped)
+		}
+		flush()
+	}
+	if frameSize > 0 || len(frames) == 0 {
+		flush()
+	}
+
+	if len(frames) == 1 {
+		// Unsplit results keep sequence 0 so the server treats them exactly
+		// like a legacy single-frame result.
+		frames[0].Final = true
+	} else {
+		for i, f := range frames {
+			f.Sequence = uint32(i + 1)
+			f.Final = i == len(frames)-1
+		}
+	}
+	for _, f := range frames {
+		f.TruncatedRoots = truncated
+	}
+	return frames
+}
+
+// oidEntrySize returns the encoded size of one oid_values map entry: a
+// length-delimited field 3 record wrapping the key/value entry message.
+func oidEntrySize(key, value string) int64 {
+	entry := int64(1 + varintLen(len(key)) + len(key) + 1 + varintLen(len(value)) + len(value))
+	return int64(1+varintLen(int(entry))) + entry
+}
+
+func varintLen(v int) int {
+	n := 1
+	for v >= 0x80 {
+		v >>= 7
+		n++
+	}
+	return n
 }
 
 // isSnmpV1 reports whether a device speaks SNMPv1, which has no GETBULK.
@@ -283,7 +469,7 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQue
 		return
 	}
 
-	conn, closeFn, err := snmpDial(ctx, dev)
+	conn, closeFn, err := snmpDial(ctx, job)
 	timestamp := time.Now().Unix()
 
 	if err != nil {
@@ -361,7 +547,7 @@ func probeCandidate(ctx context.Context, dev *pb.SnmpDevice, timeout time.Durati
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	conn, closeFn, err := snmpDial(attemptCtx, dev)
+	conn, closeFn, err := snmpDial(attemptCtx, &pb.AgentJob{SnmpDevice: dev})
 	if err != nil {
 		return nil, fmt.Errorf("connection failed: %w", err)
 	}

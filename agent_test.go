@@ -183,7 +183,7 @@ func TestHandleMessage(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
 
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return &mockSnmpQuerier{
 				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 					return &gosnmp.SnmpPacket{}, nil
@@ -227,7 +227,7 @@ func TestHandleMessage(t *testing.T) {
 	t.Run("explicit legacy scheduling dispatches inventories once without retention", func(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return &mockSnmpQuerier{
 				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 					return &gosnmp.SnmpPacket{}, nil
@@ -533,7 +533,7 @@ func TestHandleMessage(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
 
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return &mockSnmpQuerier{
 				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 					return &gosnmp.SnmpPacket{}, nil
@@ -736,7 +736,7 @@ func TestDispatchJob(t *testing.T) {
 	t.Run("TEST_CREDENTIALS", func(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return nil, nil, fmt.Errorf("refused")
 		}
 
@@ -756,7 +756,7 @@ func TestDispatchJob(t *testing.T) {
 	t.Run("CREDENTIAL_PROBE", func(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return nil, nil, fmt.Errorf("refused")
 		}
 
@@ -798,7 +798,7 @@ func TestDispatchJob(t *testing.T) {
 	t.Run("default SNMP", func(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return &mockSnmpQuerier{
 				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 					return &gosnmp.SnmpPacket{}, nil
@@ -892,7 +892,7 @@ func TestDispatchJobReportsUnknownJobType(t *testing.T) {
 	origDial := snmpDial
 	defer func() { snmpDial = origDial }()
 	var dials atomic.Int32
-	snmpDial = func(context.Context, *pb.SnmpDevice) (snmpQuerier, func(), error) {
+	snmpDial = func(context.Context, *pb.AgentJob) (snmpQuerier, func(), error) {
 		dials.Add(1)
 		return nil, nil, errors.New("should not be dialled")
 	}
@@ -2042,7 +2042,7 @@ func TestRunSessionProcessesJobResults(t *testing.T) {
 		doPing = origPing
 	}()
 
-	snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+	snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 		return &mockSnmpQuerier{
 			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 				return &gosnmp.SnmpPacket{}, nil
@@ -2149,7 +2149,7 @@ func TestRunSessionForwardsManySnmpResults(t *testing.T) {
 	origSnmpDial := snmpDial
 	defer func() { snmpDial = origSnmpDial }()
 
-	snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+	snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 		return &mockSnmpQuerier{
 			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 				return &gosnmp.SnmpPacket{}, nil
@@ -3072,7 +3072,7 @@ func TestAgtRunSessionLldpTopologyResult(t *testing.T) {
 
 	origDial := snmpDial
 	defer func() { snmpDial = origDial }()
-	snmpDial = func(context.Context, *pb.SnmpDevice) (snmpQuerier, func(), error) {
+	snmpDial = func(context.Context, *pb.AgentJob) (snmpQuerier, func(), error) {
 		return nil, nil, fmt.Errorf("refused")
 	}
 
@@ -3106,7 +3106,7 @@ func TestAgtRunSessionLldpTopologyResult(t *testing.T) {
 func TestAgtDispatchJobLldpTopology(t *testing.T) {
 	origDial := snmpDial
 	defer func() { snmpDial = origDial }()
-	snmpDial = func(context.Context, *pb.SnmpDevice) (snmpQuerier, func(), error) {
+	snmpDial = func(context.Context, *pb.AgentJob) (snmpQuerier, func(), error) {
 		return nil, nil, fmt.Errorf("refused")
 	}
 
@@ -4021,7 +4021,7 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 			<-release
 			return nil, fmt.Errorf("not reachable")
 		}
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			close(snmpStarted)
 			return &mockSnmpQuerier{
 				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
@@ -4065,7 +4065,7 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 		defer releaseOnce.Do(func() { close(release) })
 		snmpStarted := make(chan struct{})
 		pingDone := make(chan struct{})
-		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			close(snmpStarted)
 			<-release
 			return &mockSnmpQuerier{
@@ -4181,6 +4181,45 @@ func TestResultQueueDiscoveryLane(t *testing.T) {
 	}
 }
 
+// A discovery result requeued after a server rejection still carries
+// discSlot from its first delivery. When the reserved lane is full the
+// requeue takes a general slot, and ack must release that general token —
+// not consume a discovery token owned by another in-flight result.
+func TestResultQueueRequeuedDiscoveryReleasesGeneralLane(t *testing.T) {
+	out := newResultQueue(8) // 6 general slots, 2 reserved for discovery
+	discResult := &pb.SnmpResult{JobType: pb.JobType_DISCOVER}
+
+	// Saturate the reserved lane.
+	sendResult(context.Background(), out, "result", discResult, "d1")
+	sendResult(context.Background(), out, "result", discResult, "d2")
+
+	// Deliver d1: its discovery token is acked, and a newer discovery
+	// result immediately claims the freed slot. When the server then
+	// rejects d1 and handleResultReply requeues it, the reserved lane is
+	// full again, so the requeue must take a general slot.
+	d1 := <-out.items
+	out.ack(d1)
+	sendResult(context.Background(), out, "result", discResult, "d3")
+	d1.attempts++
+	if !out.enqueue(d1) {
+		t.Fatal("requeue of rejected discovery result dropped, want general-lane fallback")
+	}
+
+	// Drain to the requeued item and ack it: it must release the general
+	// token it actually holds.
+	<-out.items // d2
+	<-out.items // d3
+	requeued := <-out.items
+	out.ack(requeued)
+
+	if got := len(out.slots); got != 0 {
+		t.Fatalf("general lane holds %d tokens after ack, want 0 (leaked token)", got)
+	}
+	if got := len(out.discSlots); got != 2 {
+		t.Fatalf("discovery lane holds %d tokens after ack, want 2 (d2/d3 still in flight)", got)
+	}
+}
+
 func TestJobTargetKey(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -4267,4 +4306,247 @@ func TestJobCancelledWhileGated(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("cancelled gated job did not complete bookkeeping")
 	}
+}
+
+// TestHandleResultReplyRetriesRejectedResult covers the phx_reply error path:
+// a server rejection requeues the result once, and a second rejection drops it
+// instead of retrying forever.
+func TestHandleResultReplyRetriesRejectedResult(t *testing.T) {
+	results := newResultQueue(4)
+	s := &session{
+		ctx:     context.Background(),
+		topic:   "agent:test",
+		results: results,
+	}
+	s.refCounter.Store(1)
+
+	result := outbound{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)}
+	ref := "42"
+	s.trackPending(ref, result)
+
+	reply := channelMsg{
+		Topic:   "agent:test",
+		Event:   "phx_reply",
+		Ref:     &ref,
+		Payload: json.RawMessage(`{"status":"error","response":{"reason":"Message too large"}}`),
+	}
+	s.handleResultReply(reply)
+
+	if len(s.pending) != 0 {
+		t.Fatal("rejected result still tracked as pending")
+	}
+	if _, ok := results.takeRetry(); ok {
+		t.Fatal("rejected result went to the session retry lane, want a fresh spool slot")
+	}
+	select {
+	case queued := <-results.items:
+		if queued.attempts != 1 {
+			t.Fatalf("requeued result attempts = %d, want 1", queued.attempts)
+		}
+		results.ack(queued)
+	default:
+		t.Fatal("rejected result was not requeued")
+	}
+
+	// A second rejection of the same result drops it.
+	s.trackPending("43", outbound{event: "result", payload: result.payload, attempts: 1})
+	ref2 := "43"
+	s.handleResultReply(channelMsg{
+		Topic:   "agent:test",
+		Event:   "phx_reply",
+		Ref:     &ref2,
+		Payload: json.RawMessage(`{"status":"error","response":{"reason":"Message too large"}}`),
+	})
+	select {
+	case <-results.items:
+		t.Fatal("twice-rejected result was requeued again")
+	default:
+	}
+}
+
+// TestHandleResultReplyIgnoresUnrelatedReplies covers ok replies and refs the
+// session never sent (e.g. the channel heartbeat).
+func TestHandleResultReplyIgnoresUnrelatedReplies(t *testing.T) {
+	results := newResultQueue(4)
+	s := &session{
+		ctx:     context.Background(),
+		topic:   "agent:test",
+		results: results,
+	}
+	s.refCounter.Store(1)
+
+	result := outbound{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)}
+	s.trackPending("7", result)
+
+	// An ok reply clears the pending entry without requeueing.
+	ref := "7"
+	s.handleResultReply(channelMsg{
+		Topic:   "agent:test",
+		Event:   "phx_reply",
+		Ref:     &ref,
+		Payload: json.RawMessage(`{"status":"ok","response":{}}`),
+	})
+	if len(s.pending) != 0 {
+		t.Fatal("ok reply left a pending entry")
+	}
+	select {
+	case <-results.items:
+		t.Fatal("ok reply requeued the result")
+	default:
+	}
+
+	// Unknown refs (heartbeat replies) are ignored.
+	unknown := "99"
+	s.handleResultReply(channelMsg{
+		Topic:   "agent:test",
+		Event:   "phx_reply",
+		Ref:     &unknown,
+		Payload: json.RawMessage(`{"status":"error","response":{"reason":"crashed"}}`),
+	})
+	select {
+	case <-results.items:
+		t.Fatal("reply for an unknown ref requeued a result")
+	default:
+	}
+}
+
+// TestPrunePendingDropsStaleEntries covers the TTL sweep: a pending result
+// older than pendingReplyTTL is dropped when the next result is tracked.
+func TestPrunePendingDropsStaleEntries(t *testing.T) {
+	s := &session{pending: map[string]pendingResult{}}
+	s.pending["stale"] = pendingResult{
+		result: outbound{event: "result"},
+		sentAt: time.Now().Add(-2 * pendingReplyTTL),
+	}
+	s.trackPending("fresh", outbound{event: "result"})
+
+	if _, ok := s.pending["stale"]; ok {
+		t.Fatal("stale pending entry survived the prune")
+	}
+	if _, ok := s.pending["fresh"]; !ok {
+		t.Fatal("fresh pending entry was pruned")
+	}
+}
+
+// TestHandleResultReplyEdgeCases covers the early returns: a reply with no
+// ref, an unparseable payload, and an error reply with no reason field.
+func TestHandleResultReplyEdgeCases(t *testing.T) {
+	results := newResultQueue(4)
+	s := &session{
+		ctx:     context.Background(),
+		topic:   "agent:test",
+		results: results,
+	}
+
+	// No ref: nothing to correlate, ignored.
+	s.handleResultReply(channelMsg{Topic: "agent:test", Event: "phx_reply"})
+
+	// Unparseable payload: the pending entry is cleared, nothing requeued.
+	s.trackPending("9", outbound{event: "result", payload: json.RawMessage(`{}`)})
+	ref := "9"
+	s.handleResultReply(channelMsg{
+		Topic:   "agent:test",
+		Event:   "phx_reply",
+		Ref:     &ref,
+		Payload: json.RawMessage(`not json`),
+	})
+	if len(s.pending) != 0 {
+		t.Fatal("unparseable reply left a pending entry")
+	}
+	select {
+	case <-results.items:
+		t.Fatal("unparseable reply requeued a result")
+	default:
+	}
+
+	// Error status with an empty reason: retried once, reason falls back to
+	// the status string.
+	s.trackPending("10", outbound{event: "result", payload: json.RawMessage(`{}`)})
+	ref2 := "10"
+	s.handleResultReply(channelMsg{
+		Topic:   "agent:test",
+		Event:   "phx_reply",
+		Ref:     &ref2,
+		Payload: json.RawMessage(`{"status":"error","response":{}}`),
+	})
+	select {
+	case queued := <-results.items:
+		if queued.attempts != 1 {
+			t.Fatalf("requeued result attempts = %d, want 1", queued.attempts)
+		}
+		results.ack(queued)
+	default:
+		t.Fatal("reason-less error reply was not retried")
+	}
+}
+
+// TestHandleResultReplyDropsRetryWhenSpoolFull covers the loud drop when the
+// retry cannot re-enter a full result queue.
+func TestHandleResultReplyDropsRetryWhenSpoolFull(t *testing.T) {
+	results := newResultQueue(1)
+	if !results.enqueue(outbound{event: "filler", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("failed to fill the result queue")
+	}
+	s := &session{
+		ctx:     context.Background(),
+		topic:   "agent:test",
+		results: results,
+	}
+
+	s.trackPending("11", outbound{event: "result", payload: json.RawMessage(`{}`)})
+	ref := "11"
+	s.handleResultReply(channelMsg{
+		Topic:   "agent:test",
+		Event:   "phx_reply",
+		Ref:     &ref,
+		Payload: json.RawMessage(`{"status":"error","response":{"reason":"too large"}}`),
+	})
+	if len(s.pending) != 0 {
+		t.Fatal("dropped retry left a pending entry")
+	}
+	if len(results.items) != 1 {
+		t.Fatalf("result queue holds %d items, want just the filler", len(results.items))
+	}
+}
+
+// TestSessionLoopDispatchesResultReply covers the phx_reply branch of the
+// session loop: a rejection reply requeues the result for redelivery.
+func TestSessionLoopDispatchesResultReply(t *testing.T) {
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	results := newResultQueue(4)
+	msgCh := make(chan []byte, 1)
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     cancel,
+		topic:      "agent:test",
+		msgCh:      msgCh,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		results:    results,
+	}
+
+	s.trackPending("5", outbound{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)})
+	reply, _ := json.Marshal(map[string]any{
+		"topic":   "agent:test",
+		"event":   "phx_reply",
+		"ref":     "5",
+		"payload": map[string]any{"status": "error", "response": map[string]string{"reason": "too large"}},
+	})
+	msgCh <- reply
+
+	done := make(chan error, 1)
+	go func() { done <- s.loop(context.Background()) }()
+
+	select {
+	case queued := <-results.items:
+		if queued.attempts != 1 {
+			t.Fatalf("requeued result attempts = %d, want 1", queued.attempts)
+		}
+		results.ack(queued)
+	case <-time.After(2 * time.Second):
+		t.Fatal("session loop did not requeue the rejected result")
+	}
+	cancel()
+	<-done
 }
