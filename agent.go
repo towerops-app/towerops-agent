@@ -27,6 +27,8 @@ import (
 var doSelfUpdate = selfUpdateContext
 var getHostname = os.Hostname
 var decodeBase64 = base64.StdEncoding.DecodeString
+var netInterfaces = net.Interfaces
+var interfaceAddrs = (*net.Interface).Addrs
 
 var errRestartRequested = errors.New("restart requested")
 var errChannelReloaded = errors.New("channel reloaded")
@@ -595,7 +597,7 @@ func (s *session) heartbeat() *pb.AgentHeartbeat {
 // link-local and multicast addresses are excluded: they cannot carry a sweep.
 // The lists are sorted so identical reports compare equal server-side.
 func localVantagePoint() (localIPs, subnets []string) {
-	ifaces, err := net.Interfaces()
+	ifaces, err := netInterfaces()
 	if err != nil {
 		slog.Warn("interface enumeration failed", "error", err)
 		return nil, nil
@@ -605,7 +607,7 @@ func localVantagePoint() (localIPs, subnets []string) {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		addrs, err := iface.Addrs()
+		addrs, err := interfaceAddrs(&iface)
 		if err != nil {
 			continue
 		}

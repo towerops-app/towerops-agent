@@ -4490,3 +4490,77 @@ func TestSessionLoopDispatchesResultReply(t *testing.T) {
 	cancel()
 	<-done
 }
+
+func TestLocalVantagePoint(t *testing.T) {
+	upIface := net.Interface{Name: "eth0", Flags: net.FlagUp}
+	downIface := net.Interface{Name: "eth1", Flags: 0}
+	loopIface := net.Interface{Name: "lo", Flags: net.FlagUp | net.FlagLoopback}
+
+	t.Run("filters and dedupes interface addresses", func(t *testing.T) {
+		origIfaces, origAddrs := netInterfaces, interfaceAddrs
+		defer func() { netInterfaces, interfaceAddrs = origIfaces, origAddrs }()
+
+		netInterfaces = func() ([]net.Interface, error) {
+			return []net.Interface{upIface, downIface, loopIface}, nil
+		}
+		interfaceAddrs = func(iface *net.Interface) ([]net.Addr, error) {
+			switch iface.Name {
+			case "eth0":
+				return []net.Addr{
+					// Two addresses on one subnet: the subnet must appear once.
+					&net.IPNet{IP: net.ParseIP("192.0.2.10"), Mask: net.CIDRMask(24, 32)},
+					&net.IPNet{IP: net.ParseIP("192.0.2.11"), Mask: net.CIDRMask(24, 32)},
+					&net.IPNet{IP: net.ParseIP("2001:db8::5"), Mask: net.CIDRMask(64, 128)},
+					// Link-local and loopback addresses cannot carry a sweep.
+					&net.IPNet{IP: net.ParseIP("fe80::1"), Mask: net.CIDRMask(64, 128)},
+					&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(8, 32)},
+					// A non-IPNet address is skipped.
+					&net.IPAddr{IP: net.ParseIP("203.0.113.9")},
+				}, nil
+			default:
+				return nil, nil
+			}
+		}
+
+		localIPs, subnets := localVantagePoint()
+		wantIPs := []string{"192.0.2.10", "192.0.2.11", "2001:db8::5"}
+		wantSubnets := []string{"192.0.2.0/24", "2001:db8::/64"}
+		if !reflect.DeepEqual(localIPs, wantIPs) {
+			t.Fatalf("localIPs = %v, want %v", localIPs, wantIPs)
+		}
+		if !reflect.DeepEqual(subnets, wantSubnets) {
+			t.Fatalf("subnets = %v, want %v", subnets, wantSubnets)
+		}
+	})
+
+	t.Run("interface enumeration failure returns nil", func(t *testing.T) {
+		origIfaces := netInterfaces
+		defer func() { netInterfaces = origIfaces }()
+
+		netInterfaces = func() ([]net.Interface, error) {
+			return nil, errors.New("no interfaces")
+		}
+
+		localIPs, subnets := localVantagePoint()
+		if localIPs != nil || subnets != nil {
+			t.Fatalf("localVantagePoint = (%v, %v), want (nil, nil)", localIPs, subnets)
+		}
+	})
+
+	t.Run("address enumeration failure skips the interface", func(t *testing.T) {
+		origIfaces, origAddrs := netInterfaces, interfaceAddrs
+		defer func() { netInterfaces, interfaceAddrs = origIfaces, origAddrs }()
+
+		netInterfaces = func() ([]net.Interface, error) {
+			return []net.Interface{upIface}, nil
+		}
+		interfaceAddrs = func(*net.Interface) ([]net.Addr, error) {
+			return nil, errors.New("addr lookup failed")
+		}
+
+		localIPs, subnets := localVantagePoint()
+		if len(localIPs) != 0 || len(subnets) != 0 {
+			t.Fatalf("localVantagePoint = (%v, %v), want empty", localIPs, subnets)
+		}
+	})
+}
