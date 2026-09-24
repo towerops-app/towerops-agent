@@ -4370,3 +4370,144 @@ func TestHandleResultReplyIgnoresUnrelatedReplies(t *testing.T) {
 	default:
 	}
 }
+
+// TestPrunePendingDropsStaleEntries covers the TTL sweep: a pending result
+// older than pendingReplyTTL is dropped when the next result is tracked.
+func TestPrunePendingDropsStaleEntries(t *testing.T) {
+	s := &session{pending: map[string]pendingResult{}}
+	s.pending["stale"] = pendingResult{
+		result: outbound{event: "result"},
+		sentAt: time.Now().Add(-2 * pendingReplyTTL),
+	}
+	s.trackPending("fresh", outbound{event: "result"})
+
+	if _, ok := s.pending["stale"]; ok {
+		t.Fatal("stale pending entry survived the prune")
+	}
+	if _, ok := s.pending["fresh"]; !ok {
+		t.Fatal("fresh pending entry was pruned")
+	}
+}
+
+// TestHandleResultReplyEdgeCases covers the early returns: a reply with no
+// ref, an unparseable payload, and an error reply with no reason field.
+func TestHandleResultReplyEdgeCases(t *testing.T) {
+	results := newResultQueue(4)
+	s := &session{
+		ctx:     context.Background(),
+		topic:   "agent:test",
+		results: results,
+	}
+
+	// No ref: nothing to correlate, ignored.
+	s.handleResultReply(channelMsg{Topic: "agent:test", Event: "phx_reply"})
+
+	// Unparseable payload: the pending entry is cleared, nothing requeued.
+	s.trackPending("9", outbound{event: "result", payload: json.RawMessage(`{}`)})
+	ref := "9"
+	s.handleResultReply(channelMsg{
+		Topic:   "agent:test",
+		Event:   "phx_reply",
+		Ref:     &ref,
+		Payload: json.RawMessage(`not json`),
+	})
+	if len(s.pending) != 0 {
+		t.Fatal("unparseable reply left a pending entry")
+	}
+	select {
+	case <-results.items:
+		t.Fatal("unparseable reply requeued a result")
+	default:
+	}
+
+	// Error status with an empty reason: retried once, reason falls back to
+	// the status string.
+	s.trackPending("10", outbound{event: "result", payload: json.RawMessage(`{}`)})
+	ref2 := "10"
+	s.handleResultReply(channelMsg{
+		Topic:   "agent:test",
+		Event:   "phx_reply",
+		Ref:     &ref2,
+		Payload: json.RawMessage(`{"status":"error","response":{}}`),
+	})
+	select {
+	case queued := <-results.items:
+		if queued.attempts != 1 {
+			t.Fatalf("requeued result attempts = %d, want 1", queued.attempts)
+		}
+		results.ack()
+	default:
+		t.Fatal("reason-less error reply was not retried")
+	}
+}
+
+// TestHandleResultReplyDropsRetryWhenSpoolFull covers the loud drop when the
+// retry cannot re-enter a full result queue.
+func TestHandleResultReplyDropsRetryWhenSpoolFull(t *testing.T) {
+	results := newResultQueue(1)
+	if !results.enqueue(outbound{event: "filler", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("failed to fill the result queue")
+	}
+	s := &session{
+		ctx:     context.Background(),
+		topic:   "agent:test",
+		results: results,
+	}
+
+	s.trackPending("11", outbound{event: "result", payload: json.RawMessage(`{}`)})
+	ref := "11"
+	s.handleResultReply(channelMsg{
+		Topic:   "agent:test",
+		Event:   "phx_reply",
+		Ref:     &ref,
+		Payload: json.RawMessage(`{"status":"error","response":{"reason":"too large"}}`),
+	})
+	if len(s.pending) != 0 {
+		t.Fatal("dropped retry left a pending entry")
+	}
+	if len(results.items) != 1 {
+		t.Fatalf("result queue holds %d items, want just the filler", len(results.items))
+	}
+}
+
+// TestSessionLoopDispatchesResultReply covers the phx_reply branch of the
+// session loop: a rejection reply requeues the result for redelivery.
+func TestSessionLoopDispatchesResultReply(t *testing.T) {
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	results := newResultQueue(4)
+	msgCh := make(chan []byte, 1)
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     cancel,
+		topic:      "agent:test",
+		msgCh:      msgCh,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		results:    results,
+	}
+
+	s.trackPending("5", outbound{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)})
+	reply, _ := json.Marshal(map[string]any{
+		"topic":   "agent:test",
+		"event":   "phx_reply",
+		"ref":     "5",
+		"payload": map[string]any{"status": "error", "response": map[string]string{"reason": "too large"}},
+	})
+	msgCh <- reply
+
+	done := make(chan error, 1)
+	go func() { done <- s.loop(context.Background()) }()
+
+	select {
+	case queued := <-results.items:
+		if queued.attempts != 1 {
+			t.Fatalf("requeued result attempts = %d, want 1", queued.attempts)
+		}
+		results.ack()
+	case <-time.After(2 * time.Second):
+		t.Fatal("session loop did not requeue the rejected result")
+	}
+	cancel()
+	<-done
+}

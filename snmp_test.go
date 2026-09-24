@@ -434,6 +434,30 @@ func TestSnmpDialDefault(t *testing.T) {
 			t.Error("write succeeded after closeFn, want closed-socket error")
 		}
 	})
+
+	t.Run("job overrides timeout and retries", func(t *testing.T) {
+		port := snwTFreeUDPPort(t)
+		q, closeFn, err := realDial(context.Background(), &pb.AgentJob{
+			SnmpTimeoutMs: 7_500,
+			SnmpRetries:   4,
+			SnmpDevice:    &pb.SnmpDevice{Ip: "127.0.0.1", Port: port, Version: "2c", Community: "public"},
+		})
+		if err != nil {
+			t.Fatalf("snmpDial: %v", err)
+		}
+		defer closeFn()
+
+		conn, ok := q.(*gosnmp.GoSNMP)
+		if !ok {
+			t.Fatalf("snmpDial querier is %T, want *gosnmp.GoSNMP", q)
+		}
+		if conn.Timeout != 7500*time.Millisecond {
+			t.Errorf("conn.Timeout = %v, want 7.5s from snmp_timeout_ms", conn.Timeout)
+		}
+		if conn.Retries != 4 {
+			t.Errorf("conn.Retries = %d, want 4 from snmp_retries", conn.Retries)
+		}
+	})
 }
 
 // mockSnmpQuerier implements snmpQuerier for testing.
@@ -2157,5 +2181,234 @@ func TestSnmpResultTruncatesOversizedRoot(t *testing.T) {
 	}
 	if !result.Final {
 		t.Fatal("single truncated frame not marked final")
+	}
+}
+
+// TestExecuteSnmpJobCancelInsideGetBatch cancels the job context while a GET
+// batch is in flight and asserts the next batch check stops the job with a
+// partial result.
+func TestExecuteSnmpJobCancelInsideGetBatch(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mock := &mockSnmpQuerier{
+		getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+			cancel()
+			return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{{
+				Name:  oids[0],
+				Type:  gosnmp.OctetString,
+				Value: []byte("v"),
+			}}}, nil
+		},
+	}
+	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
+		return mock, func() {}, nil
+	}
+
+	// More than one batch (snmpMaxOIDsPerGet) so the loop re-checks ctx.
+	oids := make([]string, 0, snmpMaxOIDsPerGet+1)
+	for i := 0; i < snmpMaxOIDsPerGet+1; i++ {
+		oids = append(oids, fmt.Sprintf("1.3.6.1.2.1.1.%d.0", i+1))
+	}
+
+	out := newResultQueue(8)
+	executeSnmpJob(ctx, &pb.AgentJob{
+		JobId:      "get-cancel",
+		DeviceId:   "dev-1",
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+		Queries:    []*pb.SnmpQuery{{QueryType: pb.QueryType_GET, Oids: oids}},
+	}, out)
+
+	result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	if !result.Partial {
+		t.Fatal("job cancelled inside a GET batch did not mark its result partial")
+	}
+}
+
+// TestExecuteSnmpJobCancelInsideWalkLoop cancels during the first walk root
+// and asserts the second root is never walked.
+func TestExecuteSnmpJobCancelInsideWalkLoop(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	walkCalls := 0
+	mock := &mockSnmpQuerier{
+		bulkWalkFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
+			walkCalls++
+			cancel()
+			return []gosnmp.SnmpPDU{{
+				Name:  rootOid + ".1",
+				Type:  gosnmp.OctetString,
+				Value: []byte("v"),
+			}}, nil
+		},
+	}
+	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
+		return mock, func() {}, nil
+	}
+
+	out := newResultQueue(8)
+	executeSnmpJob(ctx, &pb.AgentJob{
+		JobId:      "walk-cancel",
+		DeviceId:   "dev-1",
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+		Queries: []*pb.SnmpQuery{{
+			QueryType: pb.QueryType_WALK,
+			Oids:      []string{".1.3.6.1.2.1.2.2.1", ".1.3.6.1.2.1.4.22"},
+		}},
+	}, out)
+
+	result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	if !result.Partial {
+		t.Fatal("job cancelled inside the walk loop did not mark its result partial")
+	}
+	if walkCalls != 1 {
+		t.Fatalf("walked %d roots after cancellation, want 1", walkCalls)
+	}
+}
+
+// TestSnmpResultTruncatesGetBatch packs a GET-only result larger than the
+// bound and asserts the shared GET bucket is flagged by sentinel instead of
+// silently dropping values.
+func TestSnmpResultTruncatesGetBatch(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	mock := &mockSnmpQuerier{
+		getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+			var pdus []gosnmp.SnmpPDU
+			for _, oid := range oids {
+				pdus = append(pdus, gosnmp.SnmpPDU{
+					Name:  oid,
+					Type:  gosnmp.OctetString,
+					Value: []byte(strings.Repeat("g", 2000)),
+				})
+			}
+			return &gosnmp.SnmpPacket{Variables: pdus}, nil
+		},
+	}
+	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
+		return mock, func() {}, nil
+	}
+
+	var oids []string
+	for i := 0; i < 10; i++ {
+		oids = append(oids, fmt.Sprintf("1.3.6.1.4.1.9999.%d", i))
+	}
+
+	out := newResultQueue(8)
+	executeSnmpJob(context.Background(), &pb.AgentJob{
+		JobId:          "get-truncate",
+		DeviceId:       "dev-1",
+		MaxResultBytes: 8 * 1024,
+		SnmpDevice:     &pb.SnmpDevice{Ip: "10.0.0.1"},
+		Queries:        []*pb.SnmpQuery{{QueryType: pb.QueryType_GET, Oids: oids}},
+	}, out)
+
+	result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	if len(result.TruncatedRoots) != 1 || result.TruncatedRoots[0] != getBucketTruncatedLabel {
+		t.Fatalf("truncated_roots = %v, want [%s]", result.TruncatedRoots, getBucketTruncatedLabel)
+	}
+	if len(result.OidValues) == 0 || len(result.OidValues) >= 10 {
+		t.Fatalf("truncated GET frame carries %d values, want a nonzero subset of 10", len(result.OidValues))
+	}
+}
+
+// TestSnmpResultTinyBound exercises the decoded-size floor: a max_result_bytes
+// so small the computed bound goes negative still produces a frame.
+func TestSnmpResultTinyBound(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	mock := &mockSnmpQuerier{
+		bulkWalkFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
+			return []gosnmp.SnmpPDU{{
+				Name:  rootOid + ".1",
+				Type:  gosnmp.OctetString,
+				Value: []byte("v"),
+			}}, nil
+		},
+	}
+	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
+		return mock, func() {}, nil
+	}
+
+	out := newResultQueue(8)
+	executeSnmpJob(context.Background(), &pb.AgentJob{
+		JobId:          "tiny-bound",
+		DeviceId:       "dev-1",
+		MaxResultBytes: 1,
+		SnmpDevice:     &pb.SnmpDevice{Ip: "10.0.0.1"},
+		Queries: []*pb.SnmpQuery{{
+			QueryType: pb.QueryType_WALK,
+			Oids:      []string{".1.3.6.1.2.1.2.2.1"},
+		}},
+	}, out)
+
+	result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	if !result.Final {
+		t.Fatal("single frame under a tiny bound not marked final")
+	}
+}
+
+// TestSnmpResultTruncatedRootAfterPackedFrame covers the flush before an
+// oversized bucket: a small completed root packs a frame, then a root larger
+// than the bound forces that frame out before the truncated one.
+func TestSnmpResultTruncatedRootAfterPackedFrame(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	mock := &mockSnmpQuerier{
+		bulkWalkFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
+			if strings.HasSuffix(rootOid, ".2.2.1") {
+				return []gosnmp.SnmpPDU{{
+					Name:  rootOid + ".1",
+					Type:  gosnmp.OctetString,
+					Value: []byte("small"),
+				}}, nil
+			}
+			var pdus []gosnmp.SnmpPDU
+			for i := 0; i < 20; i++ {
+				pdus = append(pdus, gosnmp.SnmpPDU{
+					Name:  fmt.Sprintf("%s.%d", rootOid, i),
+					Type:  gosnmp.OctetString,
+					Value: []byte(strings.Repeat("z", 1000)),
+				})
+			}
+			return pdus, nil
+		},
+	}
+	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
+		return mock, func() {}, nil
+	}
+
+	out := newResultQueue(8)
+	executeSnmpJob(context.Background(), &pb.AgentJob{
+		JobId:          "packed-then-truncated",
+		DeviceId:       "dev-1",
+		MaxResultBytes: 16 * 1024,
+		SnmpDevice:     &pb.SnmpDevice{Ip: "10.0.0.1"},
+		Queries: []*pb.SnmpQuery{{
+			QueryType: pb.QueryType_WALK,
+			Oids:      []string{".1.3.6.1.2.1.2.2.1", ".1.3.6.1.2.1.4.22"},
+		}},
+	}, out)
+
+	if len(out.items) != 2 {
+		t.Fatalf("queued %d results, want a packed frame plus the truncated one", len(out.items))
+	}
+	first := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	second := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	if len(first.OidValues) != 1 {
+		t.Fatalf("first frame carries %d values, want the small root's 1", len(first.OidValues))
+	}
+	if len(second.TruncatedRoots) != 1 || second.TruncatedRoots[0] != "1.3.6.1.2.1.4.22" {
+		t.Fatalf("truncated_roots = %v, want [1.3.6.1.2.1.4.22]", second.TruncatedRoots)
 	}
 }

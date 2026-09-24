@@ -233,6 +233,10 @@ type snmpResultBucket struct {
 	values map[string]string
 }
 
+// getBucketTruncatedLabel names the shared GET bucket in truncated_roots:
+// GET OIDs are scalar reads with no walk root, so a sentinel marks the drop.
+const getBucketTruncatedLabel = "<get-batch>"
+
 // buildSnmpResultFrames packs the collected buckets into SnmpResult frames
 // whose base64 payload stays under the job's max_result_bytes. A result that
 // fits ships as one frame with sequence 0; a larger one splits along bucket
@@ -296,20 +300,30 @@ func buildSnmpResultFrames(
 			continue
 		}
 		// The bucket alone exceeds a frame: pack only the entries that fit
-		// into a dedicated frame and flag the root as truncated.
-		if bucket.label != "" {
-			truncated = append(truncated, bucket.label)
+		// into a dedicated frame and flag the root as truncated. The shared GET
+		// bucket has no walk root to name, so it reports a sentinel — silently
+		// dropping its overflow would ship a result that looks complete.
+		label := bucket.label
+		if label == "" {
+			label = getBucketTruncatedLabel
 		}
+		truncated = append(truncated, label)
 		if frameSize > 0 {
 			flush()
 		}
+		dropped := 0
 		for k, v := range bucket.values {
 			entry := oidEntrySize(k, v)
 			if frameSize+entry > maxDecoded {
+				dropped++
 				continue
 			}
 			frame.OidValues[k] = v
 			frameSize += entry
+		}
+		if dropped > 0 {
+			slog.Warn("snmp result truncated to fit max_result_bytes",
+				"job_id", job.JobId, "root", label, "dropped", dropped)
 		}
 		flush()
 	}
