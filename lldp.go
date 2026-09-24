@@ -33,11 +33,9 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, out *resultQu
 	jobID := job.JobId
 	timestamp := time.Now().Unix()
 
-	// Results go out on the agent context, not the job context: a job that
-	// hits its deadline still ships the neighbors it found.
 	if job.SnmpDevice == nil {
 		slog.Error("missing SNMP config for LLDP job", "job_id", jobID, "device_id", deviceID)
-		sendResult(out.agentCtx, out, "lldp_topology_result", &pb.LldpTopologyResult{
+		sendResult(ctx, out, "lldp_topology_result", &pb.LldpTopologyResult{
 			DeviceId:  deviceID,
 			JobId:     jobID,
 			Timestamp: timestamp,
@@ -45,17 +43,11 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, out *resultQu
 		return
 	}
 
-	if job.DeadlineMs > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(job.DeadlineMs)*time.Millisecond)
-		defer cancel()
-	}
-
 	snmpDev := job.SnmpDevice
 	client, closeConn, err := snmpDial(ctx, job)
 	if err != nil {
 		slog.Error("failed to connect SNMP for LLDP", "job_id", jobID, "device_id", deviceID, "error", err)
-		sendResult(out.agentCtx, out, "lldp_topology_result", &pb.LldpTopologyResult{
+		sendResult(ctx, out, "lldp_topology_result", &pb.LldpTopologyResult{
 			DeviceId:  deviceID,
 			JobId:     jobID,
 			Timestamp: timestamp,
@@ -66,8 +58,6 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, out *resultQu
 
 	result := discoverLldpNeighbors(client, deviceID, jobID, !isSnmpV1(snmpDev.Version))
 
-	// Sent on the job context, not the agent context: an expired deadline
-	// drops the result so partial tables never read as a complete topology.
 	sendResult(ctx, out, "lldp_topology_result", result, jobID)
 	slog.Info("LLDP topology discovered", "job_id", jobID, "device_id", deviceID, "neighbors", len(result.Neighbors))
 }

@@ -222,7 +222,7 @@ message AgentJob {
   uint32 ping_timeout_ms = 9;     // Ping timeout; zero means the agent default
   uint32 snmp_timeout_ms = 10;    // Per-request SNMP timeout; zero means the agent default
   uint32 snmp_retries = 11;       // SNMP request retries; zero means the agent default
-  uint32 deadline_ms = 12;        // Whole-job deadline; zero means no job deadline
+  uint32 deadline_ms = 12;        // Whole-job deadline; zero means no job deadline. SNMP jobs only; LLDP topology ignores it
   // Bound on the base64-encoded result payload the agent sends back, in
   // bytes; zero means the agent default (8 MiB). Results larger than this are
   // split across SnmpResult frames sharing job_id.

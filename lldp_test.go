@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/gosnmp/gosnmp"
 	"github.com/towerops-app/towerops-agent/pb"
@@ -798,76 +797,6 @@ func TestLldpTExecuteLldpTopologyJob(t *testing.T) {
 		}
 		if !slices.Equal(n.ManagementAddresses, []string{"10.1.2.3"}) {
 			t.Fatalf("ManagementAddresses = %v, want [10.1.2.3]", n.ManagementAddresses)
-		}
-	})
-
-	t.Run("deadline wraps the job context", func(t *testing.T) {
-		orig := snmpDial
-		defer func() { snmpDial = orig }()
-
-		m := &mockSnmpQuerier{
-			getFunc:      lldpTSysNameOK("core-sw"),
-			walkStepFunc: lldpTWalk(map[string][]gosnmp.SnmpPDU{}),
-		}
-		var gotCtx context.Context
-		snmpDial = func(ctx context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
-			gotCtx = ctx
-			return m, func() {}, nil
-		}
-
-		out := newResultQueue(1)
-		executeLldpTopologyJob(context.Background(), &pb.AgentJob{
-			DeviceId:   "dev-4",
-			JobId:      "job-4",
-			DeadlineMs: 30_000,
-			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: "2c"},
-		}, out)
-
-		deadline, ok := gotCtx.Deadline()
-		if !ok {
-			t.Fatal("snmpDial context has no deadline, want one from deadline_ms")
-		}
-		if until := time.Until(deadline); until <= 0 || until > 30*time.Second {
-			t.Fatalf("context deadline is %v out, want ~30s", until)
-		}
-
-		o := <-out.items
-		if o.event != "lldp_topology_result" {
-			t.Fatalf("event = %q, want lldp_topology_result", o.event)
-		}
-	})
-
-	t.Run("expired deadline drops the result", func(t *testing.T) {
-		orig := snmpDial
-		defer func() { snmpDial = orig }()
-
-		// The device never answers: the sysName get blocks until the job
-		// context ends, like a walk cut by the deadline.
-		m := &mockSnmpQuerier{
-			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
-				return nil, context.DeadlineExceeded
-			},
-			walkStepFunc: lldpTWalk(map[string][]gosnmp.SnmpPDU{}),
-		}
-		snmpDial = func(ctx context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
-			<-ctx.Done()
-			return m, func() {}, nil
-		}
-
-		out := newResultQueue(1)
-		executeLldpTopologyJob(context.Background(), &pb.AgentJob{
-			DeviceId:   "dev-5",
-			JobId:      "job-5",
-			DeadlineMs: 50,
-			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: "2c"},
-		}, out)
-
-		// The result goes out on the expired job context, so nothing may be
-		// queued: partial tables must not read as a complete topology.
-		select {
-		case o := <-out.items:
-			t.Fatalf("deadline-expired job queued a %q result, want it dropped", o.event)
-		case <-time.After(200 * time.Millisecond):
 		}
 	})
 }
