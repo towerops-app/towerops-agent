@@ -397,6 +397,10 @@ func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[s
 	case gosnmp.NoError:
 		for _, v := range result.Variables {
 			if !snmpValueUsable(v) {
+				// The device answered: the OID is absent or empty. Record an
+				// empty value so the server can tell "collected, empty" from
+				// "never collected" — a missing key reads as incomplete.
+				into[canonicalOID(v.Name)] = ""
 				continue
 			}
 			into[canonicalOID(v.Name)] = snmpValueToString(v)
@@ -404,6 +408,10 @@ func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[s
 		return nil
 	case gosnmp.NoSuchName, gosnmp.TooBig:
 		if len(oids) == 1 {
+			if result.Error == gosnmp.NoSuchName {
+				// v1: the device answered — the OID is absent. Record empty.
+				into[canonicalOID(oids[0])] = ""
+			}
 			slog.Debug("snmp get oid skipped", "device", dev.Ip, "oid", oids[0], "status", result.Error, "error_index", result.ErrorIndex)
 			return nil
 		}
