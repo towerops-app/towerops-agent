@@ -447,9 +447,13 @@ func TestSnmpDialDefault(t *testing.T) {
 		}
 		defer closeFn()
 
-		conn, ok := q.(*gosnmp.GoSNMP)
+		rl, ok := q.(*rateLimitedQuerier)
 		if !ok {
-			t.Fatalf("snmpDial querier is %T, want *gosnmp.GoSNMP", q)
+			t.Fatalf("snmpDial querier is %T, want *rateLimitedQuerier", q)
+		}
+		conn, ok := rl.q.(*gosnmp.GoSNMP)
+		if !ok {
+			t.Fatalf("rateLimitedQuerier wraps %T, want *gosnmp.GoSNMP", rl.q)
 		}
 		if conn.Timeout != 7500*time.Millisecond {
 			t.Errorf("conn.Timeout = %v, want 7.5s from snmp_timeout_ms", conn.Timeout)

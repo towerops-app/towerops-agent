@@ -4435,7 +4435,7 @@ func TestHandleResultReplyEdgeCases(t *testing.T) {
 		if queued.attempts != 1 {
 			t.Fatalf("requeued result attempts = %d, want 1", queued.attempts)
 		}
-		results.ack()
+		results.ack(queued)
 	default:
 		t.Fatal("reason-less error reply was not retried")
 	}
@@ -4504,7 +4504,7 @@ func TestSessionLoopDispatchesResultReply(t *testing.T) {
 		if queued.attempts != 1 {
 			t.Fatalf("requeued result attempts = %d, want 1", queued.attempts)
 		}
-		results.ack()
+		results.ack(queued)
 	case <-time.After(2 * time.Second):
 		t.Fatal("session loop did not requeue the rejected result")
 	}
