@@ -274,6 +274,10 @@ message SnmpResult {
   // True on the last frame of a split result (and on unsplit results).
   bool final = 9;
   // Walk roots whose oid_values were truncated to fit max_result_bytes.
+  // Roots whose oid_values were truncated to fit max_result_bytes. Entries
+  // are walk roots; the literal "<get-batch>" (not an OID) marks a truncated
+  // GET batch instead. Consumers iterating this list as OID roots must skip
+  // non-OID entries.
   repeated string truncated_roots = 10;
   // Echo of AgentJob.discovery_phase for DISCOVER results; UNSPECIFIED for
   // other job types and for agents built before the field existed.
