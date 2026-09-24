@@ -753,6 +753,28 @@ func TestDispatchJob(t *testing.T) {
 		}
 	})
 
+	t.Run("CREDENTIAL_PROBE", func(t *testing.T) {
+		origDial := snmpDial
+		defer func() { snmpDial = origDial }()
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			return nil, nil, fmt.Errorf("refused")
+		}
+
+		out := testQueue()
+
+		dispatchJob(context.Background(), &pb.AgentJob{
+			JobId:   "cp1",
+			JobType: pb.JobType_CREDENTIAL_PROBE,
+			CredentialProbe: &pb.CredentialProbe{
+				Candidates: []*pb.SnmpDevice{{Ip: "10.0.0.1"}},
+			},
+		}, testPools(t), out)
+
+		if result := wantResult[*pb.CredentialProbeResult](t, out, "credential_probe_result", 500*time.Millisecond); result.MatchedIndex != -1 {
+			t.Errorf("expected no match, got index %d", result.MatchedIndex)
+		}
+	})
+
 	t.Run("PING", func(t *testing.T) {
 		origPing := doPing
 		defer func() { doPing = origPing }()

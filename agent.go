@@ -991,6 +991,9 @@ func submitJob(
 	case pb.JobType_TEST_CREDENTIALS:
 		pool = pools.snmp
 		execute = func() { executeCredentialTest(ctx, job, out) }
+	case pb.JobType_CREDENTIAL_PROBE:
+		pool = pools.snmp
+		execute = func() { executeCredentialProbe(ctx, job, out) }
 	case pb.JobType_PING:
 		pool = pools.ping
 		execute = func() { executePingJob(ctx, job, out) }

@@ -1162,6 +1162,8 @@ func TestExecuteCredentialTest(t *testing.T) {
 				return &gosnmp.SnmpPacket{
 					Variables: []gosnmp.SnmpPDU{
 						{Name: ".1.3.6.1.2.1.1.1.0", Type: gosnmp.OctetString, Value: []byte("RouterOS 7.1")},
+						{Name: ".1.3.6.1.2.1.1.2.0", Type: gosnmp.ObjectIdentifier, Value: "1.3.6.1.4.1.14988.1"},
+						{Name: ".1.3.6.1.2.1.1.5.0", Type: gosnmp.OctetString, Value: []byte("core-router")},
 					},
 				}, nil
 			},
@@ -1189,6 +1191,12 @@ func TestExecuteCredentialTest(t *testing.T) {
 		}
 		if result.SystemDescription != "RouterOS 7.1" {
 			t.Errorf("sysDescr: got %q, want %q", result.SystemDescription, "RouterOS 7.1")
+		}
+		if result.SysObjectId != "1.3.6.1.4.1.14988.1" {
+			t.Errorf("sysObjectID: got %q, want %q", result.SysObjectId, "1.3.6.1.4.1.14988.1")
+		}
+		if result.SysName != "core-router" {
+			t.Errorf("sysName: got %q, want %q", result.SysName, "core-router")
 		}
 	})
 
@@ -1359,6 +1367,346 @@ func TestExecuteCredentialTestRejectsUnsupportedAuthProtocol(t *testing.T) {
 	}
 	if !strings.Contains(result.ErrorMessage, `unsupported SNMPv3 auth protocol "SHA256"`) {
 		t.Fatalf("ErrorMessage = %q, want unsupported protocol", result.ErrorMessage)
+	}
+}
+
+func probeSystemPacket() *gosnmp.SnmpPacket {
+	return &gosnmp.SnmpPacket{
+		Variables: []gosnmp.SnmpPDU{
+			{Name: ".1.3.6.1.2.1.1.1.0", Type: gosnmp.OctetString, Value: []byte("Cisco IOS 17.3")},
+			{Name: ".1.3.6.1.2.1.1.2.0", Type: gosnmp.ObjectIdentifier, Value: "1.3.6.1.4.1.9.1.1234"},
+			{Name: ".1.3.6.1.2.1.1.5.0", Type: gosnmp.OctetString, Value: []byte("edge-sw-01")},
+			// An unusable varbind must not land in the reported values.
+			{Name: ".1.3.6.1.2.1.1.6.0", Type: gosnmp.NoSuchInstance, Value: nil},
+		},
+	}
+}
+
+func TestExecuteCredentialProbe(t *testing.T) {
+	t.Run("nil probe", func(t *testing.T) {
+		out := newResultQueue(1)
+		executeCredentialProbe(context.Background(), &pb.AgentJob{JobId: "p-nil"}, out)
+
+		result := decodeQueuedResult[*pb.CredentialProbeResult](t, (<-out.items))
+		if result.MatchedIndex != -1 {
+			t.Errorf("MatchedIndex = %d, want -1", result.MatchedIndex)
+		}
+		if result.ErrorMessage == "" {
+			t.Error("expected error message for missing probe")
+		}
+	})
+
+	t.Run("empty candidates", func(t *testing.T) {
+		out := newResultQueue(1)
+		executeCredentialProbe(context.Background(), &pb.AgentJob{
+			JobId:           "p-empty",
+			CredentialProbe: &pb.CredentialProbe{},
+		}, out)
+
+		result := decodeQueuedResult[*pb.CredentialProbeResult](t, (<-out.items))
+		if result.MatchedIndex != -1 || result.ErrorMessage == "" {
+			t.Errorf("expected unmatched result with error, got index=%d err=%q",
+				result.MatchedIndex, result.ErrorMessage)
+		}
+	})
+
+	t.Run("second candidate answers", func(t *testing.T) {
+		orig := snmpDial
+		defer func() { snmpDial = orig }()
+
+		var dialed []string
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			dialed = append(dialed, dev.Community)
+			if dev.Community == "bad" {
+				return nil, nil, fmt.Errorf("connection refused")
+			}
+			return &mockSnmpQuerier{
+				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+					return probeSystemPacket(), nil
+				},
+			}, func() {}, nil
+		}
+
+		out := newResultQueue(1)
+		executeCredentialProbe(context.Background(), &pb.AgentJob{
+			JobId: "p-match",
+			CredentialProbe: &pb.CredentialProbe{
+				Candidates: []*pb.SnmpDevice{
+					{Ip: "10.0.0.9", Community: "bad", Version: "2c"},
+					{Ip: "10.0.0.9", Community: "good", Version: "2c"},
+					{Ip: "10.0.0.9", Community: "never-tried", Version: "2c"},
+				},
+				StopOnFirstSuccess: true,
+				AttemptTimeoutMs:   5000,
+			},
+		}, out)
+
+		result := decodeQueuedResult[*pb.CredentialProbeResult](t, (<-out.items))
+		if result.MatchedIndex != 1 {
+			t.Fatalf("MatchedIndex = %d, want 1", result.MatchedIndex)
+		}
+		if result.SysObjectId != "1.3.6.1.4.1.9.1.1234" {
+			t.Errorf("SysObjectId = %q", result.SysObjectId)
+		}
+		if result.SysDescr != "Cisco IOS 17.3" {
+			t.Errorf("SysDescr = %q", result.SysDescr)
+		}
+		if result.SysName != "edge-sw-01" {
+			t.Errorf("SysName = %q", result.SysName)
+		}
+		if result.ErrorMessage != "" {
+			t.Errorf("ErrorMessage = %q, want empty on match", result.ErrorMessage)
+		}
+		if len(dialed) != 2 {
+			t.Errorf("dialed %d candidates, want 2 (stop on first success)", len(dialed))
+		}
+	})
+
+	t.Run("no candidate answers", func(t *testing.T) {
+		orig := snmpDial
+		defer func() { snmpDial = orig }()
+
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			if dev.Community == "status-error" {
+				return &mockSnmpQuerier{
+					getFunc: func(_ []string) (*gosnmp.SnmpPacket, error) {
+						return &gosnmp.SnmpPacket{Error: gosnmp.NoSuchName, ErrorIndex: 2}, nil
+					},
+				}, func() {}, nil
+			}
+			return &mockSnmpQuerier{
+				getFunc: func(_ []string) (*gosnmp.SnmpPacket, error) {
+					return nil, fmt.Errorf("timeout")
+				},
+			}, func() {}, nil
+		}
+
+		out := newResultQueue(1)
+		executeCredentialProbe(context.Background(), &pb.AgentJob{
+			JobId: "p-none",
+			CredentialProbe: &pb.CredentialProbe{
+				Candidates: []*pb.SnmpDevice{
+					{Ip: "10.0.0.9", Community: "get-error", Version: "2c"},
+					{Ip: "10.0.0.9", Community: "status-error", Version: "2c"},
+				},
+				StopOnFirstSuccess: true,
+			},
+		}, out)
+
+		result := decodeQueuedResult[*pb.CredentialProbeResult](t, (<-out.items))
+		if result.MatchedIndex != -1 {
+			t.Fatalf("MatchedIndex = %d, want -1", result.MatchedIndex)
+		}
+		if !strings.Contains(result.ErrorMessage, "NoSuchName") {
+			t.Errorf("ErrorMessage = %q, want last attempt's status error", result.ErrorMessage)
+		}
+	})
+
+	t.Run("retries then succeeds", func(t *testing.T) {
+		orig := snmpDial
+		defer func() { snmpDial = orig }()
+
+		calls := 0
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			calls++
+			if calls == 1 {
+				return nil, nil, fmt.Errorf("flaky")
+			}
+			return &mockSnmpQuerier{
+				getFunc: func(_ []string) (*gosnmp.SnmpPacket, error) {
+					return probeSystemPacket(), nil
+				},
+			}, func() {}, nil
+		}
+
+		out := newResultQueue(1)
+		executeCredentialProbe(context.Background(), &pb.AgentJob{
+			JobId: "p-retry",
+			CredentialProbe: &pb.CredentialProbe{
+				Candidates:         []*pb.SnmpDevice{{Ip: "10.0.0.9", Community: "good", Version: "2c"}},
+				StopOnFirstSuccess: true,
+				AttemptRetries:     1,
+			},
+		}, out)
+
+		result := decodeQueuedResult[*pb.CredentialProbeResult](t, (<-out.items))
+		if result.MatchedIndex != 0 {
+			t.Fatalf("MatchedIndex = %d, want 0 after retry", result.MatchedIndex)
+		}
+		if calls != 2 {
+			t.Errorf("dial calls = %d, want 2", calls)
+		}
+	})
+
+	t.Run("cancelled during inter-attempt delay", func(t *testing.T) {
+		orig := snmpDial
+		defer func() { snmpDial = orig }()
+
+		dialed := make(chan struct{}, 1)
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			dialed <- struct{}{}
+			return nil, nil, fmt.Errorf("refused")
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		out := newResultQueue(1)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			executeCredentialProbe(ctx, &pb.AgentJob{
+				JobId: "p-cancel",
+				CredentialProbe: &pb.CredentialProbe{
+					Candidates:          []*pb.SnmpDevice{{Ip: "10.0.0.9", Community: "x", Version: "2c"}},
+					AttemptRetries:      5,
+					InterAttemptDelayMs: 60_000,
+					StopOnFirstSuccess:  true,
+				},
+			}, out)
+		}()
+
+		<-dialed
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("probe did not stop after cancellation during delay")
+		}
+		select {
+		case o := <-out.items:
+			t.Fatalf("cancelled probe queued result %q", o.event)
+		default:
+		}
+	})
+
+	t.Run("pre-cancelled context sends nothing", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		out := newResultQueue(1)
+		executeCredentialProbe(ctx, &pb.AgentJob{
+			JobId: "p-dead",
+			CredentialProbe: &pb.CredentialProbe{
+				Candidates: []*pb.SnmpDevice{{Ip: "10.0.0.9", Community: "x", Version: "2c"}},
+			},
+		}, out)
+
+		select {
+		case o := <-out.items:
+			t.Fatalf("pre-cancelled probe queued result %q", o.event)
+		default:
+		}
+	})
+
+	t.Run("retries capped", func(t *testing.T) {
+		orig := snmpDial
+		defer func() { snmpDial = orig }()
+
+		calls := 0
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			calls++
+			return nil, nil, fmt.Errorf("refused")
+		}
+
+		out := newResultQueue(1)
+		executeCredentialProbe(context.Background(), &pb.AgentJob{
+			JobId: "p-cap",
+			CredentialProbe: &pb.CredentialProbe{
+				Candidates:     []*pb.SnmpDevice{{Ip: "10.0.0.9", Community: "x", Version: "2c"}},
+				AttemptRetries: 1000,
+			},
+		}, out)
+
+		result := decodeQueuedResult[*pb.CredentialProbeResult](t, (<-out.items))
+		if result.MatchedIndex != -1 {
+			t.Fatalf("MatchedIndex = %d, want -1", result.MatchedIndex)
+		}
+		if calls != 1+maxProbeAttemptRetries {
+			t.Errorf("dial calls = %d, want %d (capped retries)", calls, 1+maxProbeAttemptRetries)
+		}
+	})
+	t.Run("keeps probing after success when not stopping", func(t *testing.T) {
+		orig := snmpDial
+		defer func() { snmpDial = orig }()
+
+		var dialed []string
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			dialed = append(dialed, dev.Community)
+			return &mockSnmpQuerier{
+				getFunc: func(_ []string) (*gosnmp.SnmpPacket, error) {
+					return probeSystemPacket(), nil
+				},
+			}, func() {}, nil
+		}
+
+		out := newResultQueue(1)
+		executeCredentialProbe(context.Background(), &pb.AgentJob{
+			JobId: "p-all",
+			CredentialProbe: &pb.CredentialProbe{
+				Candidates: []*pb.SnmpDevice{
+					{Ip: "10.0.0.9", Community: "first", Version: "2c"},
+					{Ip: "10.0.0.9", Community: "second", Version: "2c"},
+				},
+				StopOnFirstSuccess: false,
+			},
+		}, out)
+
+		result := decodeQueuedResult[*pb.CredentialProbeResult](t, (<-out.items))
+		if result.MatchedIndex != 0 {
+			t.Errorf("MatchedIndex = %d, want first match 0", result.MatchedIndex)
+		}
+		if len(dialed) != 2 {
+			t.Errorf("dialed %d candidates, want all 2 probed", len(dialed))
+		}
+	})
+
+	t.Run("cancelled after failed attempt sends nothing", func(t *testing.T) {
+		orig := snmpDial
+		defer func() { snmpDial = orig }()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			cancel()
+			return nil, nil, fmt.Errorf("refused")
+		}
+
+		out := newResultQueue(1)
+		executeCredentialProbe(ctx, &pb.AgentJob{
+			JobId: "p-cancel-err",
+			CredentialProbe: &pb.CredentialProbe{
+				Candidates: []*pb.SnmpDevice{{Ip: "10.0.0.9", Community: "x", Version: "2c"}},
+			},
+		}, out)
+
+		select {
+		case o := <-out.items:
+			t.Fatalf("cancelled probe queued result %q", o.event)
+		default:
+		}
+	})
+}
+
+func TestSleepContext(t *testing.T) {
+	if !sleepContext(context.Background(), time.Millisecond) {
+		t.Error("sleepContext returned false for a completed sleep")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if sleepContext(ctx, time.Hour) {
+		t.Error("sleepContext returned true for a cancelled context")
+	}
+}
+
+func TestTruncateBytes(t *testing.T) {
+	if got := truncateBytes("short", 10); got != "short" {
+		t.Errorf("truncateBytes shortened a short string to %q", got)
+	}
+	if got := truncateBytes("abcdef", 3); got != "abc" {
+		t.Errorf("truncateBytes = %q, want %q", got, "abc")
+	}
+	// A mid-rune cut must back off to the rune boundary.
+	if got := truncateBytes("abé", 3); got != "ab" {
+		t.Errorf("truncateBytes split a rune: %q", got)
 	}
 }
 

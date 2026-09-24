@@ -21,6 +21,30 @@ import (
 
 const snmpMaxOIDsPerGet = 60
 
+// System-group OIDs a credential probe reads to prove a candidate and feed
+// device identification.
+const (
+	oidSysDescr    = "1.3.6.1.2.1.1.1.0"
+	oidSysObjectID = "1.3.6.1.2.1.1.2.0"
+	oidSysName     = "1.3.6.1.2.1.1.5.0"
+)
+
+// Wire bounds for the system strings a probe reports. The server rejects
+// over-length values and drops the result, so the agent truncates here.
+const (
+	probeMaxOIDBytes   = 255
+	probeMaxNameBytes  = 255
+	probeMaxDescrBytes = 2048
+)
+
+// Probe pacing defaults and floors. The inter-attempt floor keeps a probe
+// from hammering a device when the server asks for no delay.
+const (
+	defaultProbeAttemptTimeout = 10 * time.Second
+	minProbeAttemptDelay       = 250 * time.Millisecond
+	maxProbeAttemptRetries     = 10
+)
+
 // snmpQuerier abstracts SNMP operations for testability.
 type snmpQuerier interface {
 	Get(oids []string) (*gosnmp.SnmpPacket, error)
@@ -206,7 +230,44 @@ func canonicalOID(oid string) string {
 	return strings.TrimPrefix(oid, ".")
 }
 
-// executeCredentialTest tests SNMP credentials by reading sysDescr.0.
+// systemValues maps a GET response's varbinds by canonical OID, skipping
+// unusable values (Null, NoSuchObject, NoSuchInstance, EndOfMibView).
+func systemValues(packet *gosnmp.SnmpPacket) map[string]string {
+	values := make(map[string]string, len(packet.Variables))
+	for _, pdu := range packet.Variables {
+		if snmpValueUsable(pdu) {
+			values[canonicalOID(pdu.Name)] = snmpValueToString(pdu)
+		}
+	}
+	return values
+}
+
+// truncateBytes shortens s to at most n bytes without splitting a UTF-8
+// sequence: the wire contract bounds these fields in bytes, and a mid-rune
+// cut would fail the server's UTF-8 validation anyway.
+func truncateBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for !utf8.ValidString(s[:n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// sleepContext waits for d or returns early when ctx is cancelled.
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// executeCredentialTest tests SNMP credentials by reading the system group.
 func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	dev := job.SnmpDevice
 	if dev == nil {
@@ -238,7 +299,7 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQue
 	}
 	defer closeOnCancellation(ctx, closeFn)()
 
-	packet, err := conn.Get([]string{"1.3.6.1.2.1.1.1.0"})
+	packet, err := conn.Get([]string{oidSysDescr, oidSysObjectID, oidSysName})
 	if err != nil {
 		result := &pb.CredentialTestResult{
 			TestId:       job.JobId,
@@ -263,20 +324,122 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQue
 		return
 	}
 
-	sysDescr := ""
-	if len(packet.Variables) > 0 && snmpValueUsable(packet.Variables[0]) {
-		sysDescr = snmpValueToString(packet.Variables[0])
-	}
-	// A successful GET proves the credentials work even when sysDescr is unavailable.
-
+	values := systemValues(packet)
+	// A successful GET proves the credentials work even when the system
+	// values are unavailable.
 	result := &pb.CredentialTestResult{
 		TestId:            job.JobId,
 		Success:           true,
-		SystemDescription: sysDescr,
+		SystemDescription: truncateBytes(values[oidSysDescr], probeMaxDescrBytes),
+		SysObjectId:       truncateBytes(values[oidSysObjectID], probeMaxOIDBytes),
+		SysName:           truncateBytes(values[oidSysName], probeMaxNameBytes),
 		Timestamp:         timestamp,
 	}
 	slog.Info("credential test complete", "test_id", result.TestId, "success", result.Success)
 	sendResult(ctx, out, "credential_test_result", result, job.JobId)
+}
+
+// probeCandidate performs one probe attempt: dial the candidate and GET the
+// system group within the attempt timeout. The timeout bounds the whole
+// exchange, including gosnmp's own retries.
+func probeCandidate(ctx context.Context, dev *pb.SnmpDevice, timeout time.Duration) (map[string]string, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	conn, closeFn, err := snmpDial(attemptCtx, dev)
+	if err != nil {
+		return nil, fmt.Errorf("connection failed: %w", err)
+	}
+	defer closeOnCancellation(attemptCtx, closeFn)()
+
+	packet, err := conn.Get([]string{oidSysDescr, oidSysObjectID, oidSysName})
+	if err != nil {
+		return nil, fmt.Errorf("SNMP probe failed: %w", err)
+	}
+	if packet.Error != gosnmp.NoError {
+		return nil, fmt.Errorf("SNMP probe failed: status %v (error index %d)", packet.Error, packet.ErrorIndex)
+	}
+	return systemValues(packet), nil
+}
+
+// executeCredentialProbe tries each candidate credential in order against
+// the target and reports which index answered, along with the probed
+// device's system values so the server can classify it and pin the working
+// credential set.
+func executeCredentialProbe(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
+	probe := job.CredentialProbe
+	started := time.Now()
+	result := &pb.CredentialProbeResult{ProbeId: job.JobId, MatchedIndex: -1}
+
+	send := func() {
+		result.DurationMs = uint32(time.Since(started).Milliseconds())
+		result.Timestamp = time.Now().Unix()
+		slog.Info("credential probe complete",
+			"probe_id", result.ProbeId,
+			"matched_index", result.MatchedIndex,
+			"duration_ms", result.DurationMs)
+		sendResult(ctx, out, "credential_probe_result", result, job.JobId)
+	}
+
+	if probe == nil || len(probe.Candidates) == 0 {
+		result.ErrorMessage = "missing probe configuration"
+		send()
+		return
+	}
+
+	timeout := defaultProbeAttemptTimeout
+	if probe.AttemptTimeoutMs > 0 {
+		timeout = time.Duration(probe.AttemptTimeoutMs) * time.Millisecond
+	}
+	delay := max(time.Duration(probe.InterAttemptDelayMs)*time.Millisecond, minProbeAttemptDelay)
+	attempts := 1 + int(min(probe.AttemptRetries, maxProbeAttemptRetries))
+
+	first := true
+	matched := false
+	for i, candidate := range probe.Candidates {
+		for attempt := 0; attempt < attempts; attempt++ {
+			if ctx.Err() != nil {
+				return
+			}
+			if !first && !sleepContext(ctx, delay) {
+				return
+			}
+			first = false
+
+			values, err := probeCandidate(ctx, candidate, timeout)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				result.ErrorMessage = err.Error()
+				continue
+			}
+			// The first match wins: candidates are priority-ordered, so the
+			// earliest success is the credential the server should pin even
+			// when the probe keeps validating the rest of the list.
+			if !matched {
+				result.MatchedIndex = int32(i)
+				result.SysObjectId = truncateBytes(values[oidSysObjectID], probeMaxOIDBytes)
+				result.SysDescr = truncateBytes(values[oidSysDescr], probeMaxDescrBytes)
+				result.SysName = truncateBytes(values[oidSysName], probeMaxNameBytes)
+				result.ErrorMessage = ""
+				matched = true
+			}
+
+			if probe.StopOnFirstSuccess {
+				send()
+				return
+			}
+			break
+		}
+	}
+
+	if !matched {
+		slog.Info("credential probe found no working credential",
+			"probe_id", result.ProbeId,
+			"candidates", len(probe.Candidates))
+	}
+	send()
 }
 
 // newSnmpConn creates a gosnmp.GoSNMP connection from protobuf device config.
