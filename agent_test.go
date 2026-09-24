@@ -3063,7 +3063,6 @@ func TestAgtRunSessionTrapMarshalFailure(t *testing.T) {
 	}
 }
 
-
 func TestSessionLoopRetriesResultWhenWriterQueueStalls(t *testing.T) {
 	origTimeout := writeQueueTimeout
 	t.Cleanup(func() { writeQueueTimeout = origTimeout })
@@ -4269,7 +4268,7 @@ func TestHandleResultReplyRetriesRejectedResult(t *testing.T) {
 		Topic:   "agent:test",
 		Event:   "phx_reply",
 		Ref:     &ref,
-		Payload: json.RawMessage(`{"status":"error","response":{"reason":"Message too large"}}`),
+		Payload: json.RawMessage(`{"status":"error","response":{"reason":"timeout"}}`),
 	}
 	s.handleResultReply(reply)
 
@@ -4296,7 +4295,7 @@ func TestHandleResultReplyRetriesRejectedResult(t *testing.T) {
 		Topic:   "agent:test",
 		Event:   "phx_reply",
 		Ref:     &ref2,
-		Payload: json.RawMessage(`{"status":"error","response":{"reason":"Message too large"}}`),
+		Payload: json.RawMessage(`{"status":"error","response":{"reason":"timeout"}}`),
 	})
 	select {
 	case <-results.items:
@@ -4490,6 +4489,31 @@ func TestSessionLoopDispatchesResultReply(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// A "Message too large" rejection is deterministic — re-sending the same
+// marshalled bytes can only be rejected again — so the result is dropped
+// instead of requeued.
+func TestHandleResultReplyDropsOversizedResult(t *testing.T) {
+	results := newResultQueue(4)
+	s := &session{results: results}
+
+	s.trackPending("5", outbound{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)})
+	payload, _ := json.Marshal(map[string]any{
+		"status":   "error",
+		"response": map[string]string{"reason": "Message too large (max 10485760 bytes)"},
+	})
+	ref := "5"
+	s.handleResultReply(channelMsg{Ref: &ref, Payload: payload})
+
+	select {
+	case queued := <-results.items:
+		t.Fatalf("oversized result was requeued: %+v", queued)
+	default:
+	}
+	if _, ok := s.pending["5"]; ok {
+		t.Fatal("pending entry for ref 5 was not cleared")
+	}
 }
 
 func TestLocalVantagePoint(t *testing.T) {

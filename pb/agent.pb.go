@@ -2179,16 +2179,17 @@ type SnmpResult struct {
 	// covers only the roots in completed_roots. The server reconciles only the
 	// completed stages and leaves stored rows for the rest authoritative.
 	Partial bool `protobuf:"varint,6,opt,name=partial,proto3" json:"partial,omitempty"`
-	// Walk roots the agent finished walking. A root absent from this list was
-	// never walked or ended early; its rows in oid_values are best-effort and
-	// must not drive reconciliation.
+	// Walk roots whose buckets are carried by this frame and whose walks
+	// finished. On a split result each frame names only its own roots — the
+	// consumer unions completed_roots across frames sharing job_id. A root
+	// absent from the union was never walked or ended early; its rows in
+	// oid_values are best-effort and must not drive reconciliation.
 	CompletedRoots []string `protobuf:"bytes,7,rep,name=completed_roots,json=completedRoots,proto3" json:"completed_roots,omitempty"`
 	// 1-based frame number when a result is split across several SnmpResult
 	// messages sharing job_id; 0 when the result is a single frame.
 	Sequence uint32 `protobuf:"varint,8,opt,name=sequence,proto3" json:"sequence,omitempty"`
 	// True on the last frame of a split result (and on unsplit results).
 	Final bool `protobuf:"varint,9,opt,name=final,proto3" json:"final,omitempty"`
-	// Walk roots whose oid_values were truncated to fit max_result_bytes.
 	// Roots whose oid_values were truncated to fit max_result_bytes. Entries
 	// are walk roots; the literal "<get-batch>" (not an OID) marks a truncated
 	// GET batch instead. Consumers iterating this list as OID roots must skip

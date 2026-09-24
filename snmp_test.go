@@ -1080,7 +1080,7 @@ func TestSnmpGetIntoUnhandledErrorStatus(t *testing.T) {
 	}
 
 	into := map[string]string{}
-	_ = snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, oids, into)
+	_, _ = snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, oids, into)
 
 	if len(into) != 0 {
 		t.Errorf("into = %v, want empty on genErr response", into)

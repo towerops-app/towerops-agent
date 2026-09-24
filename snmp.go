@@ -122,6 +122,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 
 	var completedRoots []string
 	var queryErrors []string
+	absentOIDs := 0
 	cancelled := false
 	for _, q := range job.Queries {
 		if ctx.Err() != nil {
@@ -135,7 +136,9 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 					cancelled = true
 					break
 				}
-				if err := snmpGetInto(conn, dev, batch, getValues); err != nil && ctx.Err() == nil {
+				absent, err := snmpGetInto(conn, dev, batch, getValues)
+				absentOIDs += absent
+				if err != nil && ctx.Err() == nil {
 					queryErrors = append(queryErrors, fmt.Sprintf("GET: %v", err))
 				}
 			}
@@ -188,8 +191,16 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	} else {
 		slog.Info("snmp job complete", "job_id", job.JobId, "roots", len(completedRoots))
 	}
+	if absentOIDs > 0 {
+		// Absent answers are recorded as empty values the server may prune,
+		// but the wire cannot tell "object absent" from "OID outside the
+		// credential's view" — surface the count so a scoped credential is
+		// visible instead of silently pruning rows.
+		slog.Warn("snmp job recorded absent OIDs as empty",
+			"job_id", job.JobId, "device", dev.Ip, "absent_oids", absentOIDs)
+	}
 
-	frames := buildSnmpResultFrames(job, buckets, completedRoots, partial)
+	frames := buildSnmpResultFrames(job, buckets, partial)
 	for _, frame := range frames {
 		frame.DiscoveryPhase = job.DiscoveryPhase
 		sendResult(out.agentCtx, out, "result", frame, job.JobId)
@@ -249,7 +260,6 @@ const getBucketTruncatedLabel = "<get-batch>"
 func buildSnmpResultFrames(
 	job *pb.AgentJob,
 	buckets []snmpResultBucket,
-	completedRoots []string,
 	partial bool,
 ) []*pb.SnmpResult {
 	maxPayload := int64(job.MaxResultBytes)
@@ -380,17 +390,25 @@ func varintLen(v int) int {
 // isSnmpV1 reports whether a device speaks SNMPv1, which has no GETBULK.
 func isSnmpV1(version string) bool { return version == "1" || version == "v1" }
 
-// snmpGetInto records one GET batch. gosnmp reports an SNMP error-status
-// response through result.Error with err == nil, and SNMPv1 answers a batch
-// containing any unknown OID with noSuchName plus every request varbind echoed
-// back as Null - so the batch is halved down to single OIDs to recover the
-// values that do resolve. tooBig is split for the same reason: the device
-// cannot fit the response in one PDU.
-func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[string]string) error {
+// snmpGetInto records one GET batch and returns the number of OIDs the
+// device answered as absent (Null/NoSuchObject/NoSuchInstance, or a v1
+// noSuchName singleton). gosnmp reports an SNMP error-status response
+// through result.Error with err == nil, and SNMPv1 answers a batch
+// containing any unknown OID with noSuchName plus every request varbind
+// echoed back as Null - so the batch is halved down to single OIDs to
+// recover the values that do resolve. tooBig is split for the same reason:
+// the device cannot fit the response in one PDU.
+//
+// Absent answers are recorded as empty values so the server can tell
+// "collected, empty" from "never collected". The wire cannot distinguish
+// "object absent" from "OID outside the credential's view" — both read as
+// noSuchObject/noSuchInstance (v1: noSuchName) — so the caller must surface
+// the absent count: a scoped credential otherwise prunes rows silently.
+func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[string]string) (absent int, err error) {
 	result, err := conn.Get(oids)
 	if err != nil {
 		slog.Warn("snmp get failed", "device", dev.Ip, "oids", len(oids), "error", err)
-		return err
+		return 0, err
 	}
 
 	switch result.Error {
@@ -401,29 +419,30 @@ func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[s
 				// empty value so the server can tell "collected, empty" from
 				// "never collected" — a missing key reads as incomplete.
 				into[canonicalOID(v.Name)] = ""
+				absent++
 				continue
 			}
 			into[canonicalOID(v.Name)] = snmpValueToString(v)
 		}
-		return nil
+		return absent, nil
 	case gosnmp.NoSuchName, gosnmp.TooBig:
 		if len(oids) == 1 {
 			if result.Error == gosnmp.NoSuchName {
 				// v1: the device answered — the OID is absent. Record empty.
 				into[canonicalOID(oids[0])] = ""
+				absent = 1
 			}
 			slog.Debug("snmp get oid skipped", "device", dev.Ip, "oid", oids[0], "status", result.Error, "error_index", result.ErrorIndex)
-			return nil
+			return absent, nil
 		}
 		slog.Warn("snmp get batch split", "device", dev.Ip, "batch_size", len(oids), "status", result.Error, "error_index", result.ErrorIndex)
 		mid := len(oids) / 2
-		return errors.Join(
-			snmpGetInto(conn, dev, oids[:mid], into),
-			snmpGetInto(conn, dev, oids[mid:], into),
-		)
+		loAbsent, loErr := snmpGetInto(conn, dev, oids[:mid], into)
+		hiAbsent, hiErr := snmpGetInto(conn, dev, oids[mid:], into)
+		return loAbsent + hiAbsent, errors.Join(loErr, hiErr)
 	default:
 		slog.Warn("snmp get error status", "device", dev.Ip, "batch_size", len(oids), "status", result.Error, "error_index", result.ErrorIndex)
-		return fmt.Errorf("status %s at index %d", result.Error, result.ErrorIndex)
+		return 0, fmt.Errorf("status %s at index %d", result.Error, result.ErrorIndex)
 	}
 }
 
@@ -541,7 +560,7 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQue
 	// identification but their absence never fails the credential proof.
 	// snmpGetInto halves a noSuchName batch to single OIDs, so a device
 	// missing sysName still yields its sysObjectID.
-	_ = snmpGetInto(conn, dev, []string{oidSysObjectID, oidSysName}, values)
+	_, _ = snmpGetInto(conn, dev, []string{oidSysObjectID, oidSysName}, values)
 	// A successful GET proves the credentials work even when the system
 	// values are unavailable.
 	result := &pb.CredentialTestResult{
@@ -588,7 +607,7 @@ func probeCandidate(ctx context.Context, dev *pb.SnmpDevice, timeout time.Durati
 	// Best effort: identity OIDs enrich the result but never fail the
 	// proof. snmpGetInto halves a noSuchName batch to single OIDs, so a
 	// device missing sysName still yields its sysObjectID.
-	_ = snmpGetInto(conn, dev, []string{oidSysObjectID, oidSysName}, values)
+	_, _ = snmpGetInto(conn, dev, []string{oidSysObjectID, oidSysName}, values)
 
 	return values, nil
 }
