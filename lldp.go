@@ -66,7 +66,9 @@ func executeLldpTopologyJob(ctx context.Context, job *pb.AgentJob, out *resultQu
 
 	result := discoverLldpNeighbors(client, deviceID, jobID, !isSnmpV1(snmpDev.Version))
 
-	sendResult(out.agentCtx, out, "lldp_topology_result", result, jobID)
+	// Sent on the job context, not the agent context: an expired deadline
+	// drops the result so partial tables never read as a complete topology.
+	sendResult(ctx, out, "lldp_topology_result", result, jobID)
 	slog.Info("LLDP topology discovered", "job_id", jobID, "device_id", deviceID, "neighbors", len(result.Neighbors))
 }
 

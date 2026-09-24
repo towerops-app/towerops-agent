@@ -2194,8 +2194,10 @@ func TestExecuteSnmpJobCancelInsideGetBatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	getCalls := 0
 	mock := &mockSnmpQuerier{
 		getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+			getCalls++
 			cancel()
 			return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{{
 				Name:  oids[0],
@@ -2225,6 +2227,9 @@ func TestExecuteSnmpJobCancelInsideGetBatch(t *testing.T) {
 	result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
 	if !result.Partial {
 		t.Fatal("job cancelled inside a GET batch did not mark its result partial")
+	}
+	if getCalls != 1 {
+		t.Fatalf("GET ran %d batches after cancellation, want 1", getCalls)
 	}
 }
 
@@ -2352,6 +2357,14 @@ func TestSnmpResultTinyBound(t *testing.T) {
 	}, out)
 
 	result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	// The 1024-byte decoded floor keeps the single small value: the frame
+	// ships complete rather than truncating to nothing.
+	if len(result.OidValues) != 1 {
+		t.Fatalf("frame carries %d values, want the floor to fit 1", len(result.OidValues))
+	}
+	if len(result.TruncatedRoots) != 0 {
+		t.Fatalf("truncated_roots = %v, want none under the floor", result.TruncatedRoots)
+	}
 	if !result.Final {
 		t.Fatal("single frame under a tiny bound not marked final")
 	}
