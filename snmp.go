@@ -299,7 +299,10 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQue
 	}
 	defer closeOnCancellation(ctx, closeFn)()
 
-	packet, err := conn.Get([]string{oidSysDescr, oidSysObjectID, oidSysName})
+	// Prove the credential with sysDescr.0 alone: under SNMPv1 one missing
+	// object fails the whole PDU with noSuchName, so bundling the identity
+	// OIDs here would report a working credential as failed.
+	packet, err := conn.Get([]string{oidSysDescr})
 	if err != nil {
 		result := &pb.CredentialTestResult{
 			TestId:       job.JobId,
@@ -325,13 +328,22 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQue
 	}
 
 	values := systemValues(packet)
+
+	// Best effort: sysObjectID/sysName enrich the result for device
+	// identification but their absence never fails the credential proof.
+	if identity, err := conn.Get([]string{oidSysObjectID, oidSysName}); err == nil &&
+		identity.Error == gosnmp.NoError {
+		for oid, value := range systemValues(identity) {
+			values[oid] = value
+		}
+	}
 	// A successful GET proves the credentials work even when the system
 	// values are unavailable.
 	result := &pb.CredentialTestResult{
 		TestId:            job.JobId,
 		Success:           true,
 		SystemDescription: truncateBytes(values[oidSysDescr], probeMaxDescrBytes),
-		SysObjectId:       truncateBytes(values[oidSysObjectID], probeMaxOIDBytes),
+		SysObjectId:       truncateBytes(canonicalOID(values[oidSysObjectID]), probeMaxOIDBytes),
 		SysName:           truncateBytes(values[oidSysName], probeMaxNameBytes),
 		Timestamp:         timestamp,
 	}
@@ -339,9 +351,15 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQue
 	sendResult(ctx, out, "credential_test_result", result, job.JobId)
 }
 
-// probeCandidate performs one probe attempt: dial the candidate and GET the
-// system group within the attempt timeout. The timeout bounds the whole
-// exchange, including gosnmp's own retries.
+// probeCandidate performs one probe attempt: dial the candidate and prove
+// the credential with a sysDescr.0 GET within the attempt timeout. The
+// timeout bounds the whole exchange, including gosnmp's own retries.
+//
+// The proof GET asks for sysDescr.0 alone: under SNMPv1 a single missing
+// object fails the whole PDU with noSuchName, so bundling the identity
+// OIDs into the proof would report a working credential as failed. The
+// sysObjectID/sysName GET is a second, best-effort exchange — its failure
+// yields empty identity values, not a rejected credential.
 func probeCandidate(ctx context.Context, dev *pb.SnmpDevice, timeout time.Duration) (map[string]string, error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -352,14 +370,25 @@ func probeCandidate(ctx context.Context, dev *pb.SnmpDevice, timeout time.Durati
 	}
 	defer closeOnCancellation(attemptCtx, closeFn)()
 
-	packet, err := conn.Get([]string{oidSysDescr, oidSysObjectID, oidSysName})
+	packet, err := conn.Get([]string{oidSysDescr})
 	if err != nil {
 		return nil, fmt.Errorf("SNMP probe failed: %w", err)
 	}
 	if packet.Error != gosnmp.NoError {
 		return nil, fmt.Errorf("SNMP probe failed: status %v (error index %d)", packet.Error, packet.ErrorIndex)
 	}
-	return systemValues(packet), nil
+
+	values := systemValues(packet)
+
+	// Best effort: identity OIDs enrich the result but never fail the proof.
+	if identity, err := conn.Get([]string{oidSysObjectID, oidSysName}); err == nil &&
+		identity.Error == gosnmp.NoError {
+		for oid, value := range systemValues(identity) {
+			values[oid] = value
+		}
+	}
+
+	return values, nil
 }
 
 // executeCredentialProbe tries each candidate credential in order against
@@ -411,7 +440,9 @@ func executeCredentialProbe(ctx context.Context, job *pb.AgentJob, out *resultQu
 				if ctx.Err() != nil {
 					return
 				}
-				result.ErrorMessage = err.Error()
+				if !matched {
+					result.ErrorMessage = err.Error()
+				}
 				continue
 			}
 			// The first match wins: candidates are priority-ordered, so the
@@ -419,7 +450,7 @@ func executeCredentialProbe(ctx context.Context, job *pb.AgentJob, out *resultQu
 			// when the probe keeps validating the rest of the list.
 			if !matched {
 				result.MatchedIndex = int32(i)
-				result.SysObjectId = truncateBytes(values[oidSysObjectID], probeMaxOIDBytes)
+				result.SysObjectId = truncateBytes(canonicalOID(values[oidSysObjectID]), probeMaxOIDBytes)
 				result.SysDescr = truncateBytes(values[oidSysDescr], probeMaxDescrBytes)
 				result.SysName = truncateBytes(values[oidSysName], probeMaxNameBytes)
 				result.ErrorMessage = ""
