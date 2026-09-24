@@ -62,6 +62,17 @@ func (b *tokenBucket) setRate(rate float64) {
 	}
 }
 
+// refillLocked accrues tokens for elapsed time. Caller holds b.mu.
+func (b *tokenBucket) refillLocked(now time.Time) {
+	if elapsed := now.Sub(b.last); elapsed > 0 {
+		b.tokens += elapsed.Seconds() * b.rate
+		if b.tokens > b.burst {
+			b.tokens = b.burst
+		}
+		b.last = now
+	}
+}
+
 // reserve consumes one token and reports how long the caller must wait before
 // spending it. A zero return means the token was available immediately.
 func (b *tokenBucket) reserve() time.Duration {
@@ -70,14 +81,7 @@ func (b *tokenBucket) reserve() time.Duration {
 	if b.rate <= 0 {
 		return 0
 	}
-	now := b.now()
-	if elapsed := now.Sub(b.last); elapsed > 0 {
-		b.tokens += elapsed.Seconds() * b.rate
-		if b.tokens > b.burst {
-			b.tokens = b.burst
-		}
-		b.last = now
-	}
+	b.refillLocked(b.now())
 	b.tokens--
 	if b.tokens >= 0 {
 		return 0
@@ -85,9 +89,29 @@ func (b *tokenBucket) reserve() time.Duration {
 	return time.Duration(-b.tokens / b.rate * float64(time.Second))
 }
 
-// wait blocks until one token is available or ctx is cancelled.
-func (b *tokenBucket) wait(ctx context.Context) bool {
-	delay := b.reserve()
+// charge consumes one token without waiting, letting the balance go negative.
+// It is used where sleeping is unsafe (inside gosnmp's request deadline); the
+// debt is paid off by settle before the next request.
+func (b *tokenBucket) charge() {
+	_ = b.reserve()
+}
+
+// settle blocks until the bucket's balance is non-negative — that is, until
+// debt accumulated by charge has been refilled — or ctx is cancelled. It does
+// not consume a token itself; the next charge pays for the next request.
+func (b *tokenBucket) settle(ctx context.Context) bool {
+	b.mu.Lock()
+	if b.rate <= 0 {
+		b.mu.Unlock()
+		return true
+	}
+	b.refillLocked(b.now())
+	var delay time.Duration
+	if b.tokens < 0 {
+		delay = time.Duration(-b.tokens / b.rate * float64(time.Second))
+	}
+	b.mu.Unlock()
+
 	if delay <= 0 {
 		return true
 	}
@@ -101,10 +125,46 @@ func (b *tokenBucket) wait(ctx context.Context) bool {
 	}
 }
 
-// snmpSentHook returns the gosnmp OnSent callback that paces outbound packets
-// through the process-wide token bucket.
-func snmpSentHook(ctx context.Context) func(*gosnmp.GoSNMP) {
-	return func(*gosnmp.GoSNMP) { snmpPDUs.wait(ctx) }
+// snmpSentHook returns the gosnmp OnSent callback that charges every
+// transmitted packet — including retries — against the bucket. It never
+// sleeps: blocking inside OnSent would consume gosnmp's per-request deadline,
+// so the debt is settled before the next request instead (see
+// rateLimitedQuerier).
+func snmpSentHook(b *tokenBucket) func(*gosnmp.GoSNMP) {
+	return func(*gosnmp.GoSNMP) { b.charge() }
+}
+
+// rateLimitedQuerier settles the process-wide token bucket before each SNMP
+// request, outside gosnmp's request deadline. Combined with the OnSent charge
+// this paces real wire traffic at the configured rate.
+type rateLimitedQuerier struct {
+	ctx context.Context
+	q   snmpQuerier
+}
+
+func (r *rateLimitedQuerier) Get(oids []string) (*gosnmp.SnmpPacket, error) {
+	snmpPDUs.settle(r.ctx)
+	return r.q.Get(oids)
+}
+
+func (r *rateLimitedQuerier) WalkAll(rootOid string) ([]gosnmp.SnmpPDU, error) {
+	snmpPDUs.settle(r.ctx)
+	return r.q.WalkAll(rootOid)
+}
+
+func (r *rateLimitedQuerier) BulkWalkAll(rootOid string) ([]gosnmp.SnmpPDU, error) {
+	snmpPDUs.settle(r.ctx)
+	return r.q.BulkWalkAll(rootOid)
+}
+
+func (r *rateLimitedQuerier) Walk(rootOid string, walkFn gosnmp.WalkFunc) error {
+	snmpPDUs.settle(r.ctx)
+	return r.q.Walk(rootOid, walkFn)
+}
+
+func (r *rateLimitedQuerier) BulkWalk(rootOid string, walkFn gosnmp.WalkFunc) error {
+	snmpPDUs.settle(r.ctx)
+	return r.q.BulkWalk(rootOid, walkFn)
 }
 
 // snmpPDUs is the process-wide token bucket for outbound SNMP request packets.
@@ -126,10 +186,9 @@ func dispatchJitter() time.Duration {
 	return time.Duration(rand.Int64N(int64(dispatchJitterMax)))
 }
 
-// jitterDispatch sleeps a random sub-max duration to spread the start times of
-// jobs pushed in one batch. It returns early when ctx is cancelled.
-func jitterDispatch(ctx context.Context) {
-	delay := dispatchJitter()
+// jitterDispatch sleeps delay to spread the start times of jobs pushed in one
+// batch. It returns early when ctx is cancelled.
+func jitterDispatch(ctx context.Context, delay time.Duration) {
 	if delay <= 0 {
 		return
 	}

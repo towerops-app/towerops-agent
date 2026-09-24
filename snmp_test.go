@@ -414,9 +414,13 @@ func TestSnmpDialDefault(t *testing.T) {
 		if closeFn == nil {
 			t.Fatal("snmpDial close func = nil, want non-nil")
 		}
-		conn, ok := q.(*gosnmp.GoSNMP)
+		wrapped, ok := q.(*rateLimitedQuerier)
 		if !ok {
-			t.Fatalf("snmpDial querier is %T, want *gosnmp.GoSNMP", q)
+			t.Fatalf("snmpDial querier is %T, want *rateLimitedQuerier", q)
+		}
+		conn, ok := wrapped.q.(*gosnmp.GoSNMP)
+		if !ok {
+			t.Fatalf("wrapped querier is %T, want *gosnmp.GoSNMP", wrapped.q)
 		}
 		if conn.Port != uint16(port) {
 			t.Errorf("conn.Port = %d, want %d", conn.Port, port)

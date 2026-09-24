@@ -5,9 +5,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gosnmp/gosnmp"
 )
 
 func TestTokenBucketReserve(t *testing.T) {
@@ -39,38 +42,43 @@ func TestTokenBucketReserve(t *testing.T) {
 	}
 }
 
-func TestTokenBucketWait(t *testing.T) {
+func TestTokenBucketSettle(t *testing.T) {
 	b := newTokenBucket(1000, nil) // 1ms per token, burst of 100
+
+	// With a non-negative balance settle never blocks.
 	for range 100 {
-		if !b.wait(context.Background()) {
-			t.Fatal("wait failed inside the burst")
+		if !b.settle(context.Background()) {
+			t.Fatal("settle failed inside the burst")
 		}
+		b.charge()
 	}
+
+	// Charges past the burst create debt; settle sleeps it off.
+	b.charge()
 	start := time.Now()
-	if !b.wait(context.Background()) {
-		t.Fatal("wait failed past the burst")
+	if !b.settle(context.Background()) {
+		t.Fatal("settle failed with outstanding debt")
 	}
 	if elapsed := time.Since(start); elapsed < 500*time.Microsecond {
-		t.Fatalf("wait returned after %v, want ~1ms", elapsed)
+		t.Fatalf("settle returned after %v, want ~1ms of debt repayment", elapsed)
 	}
 }
 
-func TestTokenBucketWaitHonoursCancellation(t *testing.T) {
-	b := newTokenBucket(1, nil) // 1 token/s: the second wait is ~1s out
-	if !b.wait(context.Background()) {
-		t.Fatal("first wait failed inside the burst")
-	}
+func TestTokenBucketSettleHonoursCancellation(t *testing.T) {
+	b := newTokenBucket(1, nil) // 1 token/s: debt takes ~1s to repay
+	b.charge()
+	b.charge()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan bool, 1)
-	go func() { done <- b.wait(ctx) }()
+	go func() { done <- b.settle(ctx) }()
 	cancel()
 	select {
 	case ok := <-done:
 		if ok {
-			t.Fatal("wait succeeded after cancellation")
+			t.Fatal("settle succeeded after cancellation")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("cancelled wait did not return")
+		t.Fatal("cancelled settle did not return")
 	}
 }
 
@@ -81,6 +89,9 @@ func TestTokenBucketDisabled(t *testing.T) {
 			t.Fatalf("disabled bucket waited %v, want 0", d)
 		}
 	}
+	if !b.settle(context.Background()) {
+		t.Fatal("disabled bucket settle blocked")
+	}
 }
 
 func TestDispatchJitterBounds(t *testing.T) {
@@ -88,36 +99,44 @@ func TestDispatchJitterBounds(t *testing.T) {
 	dispatchJitterMax = 50 * time.Millisecond
 	t.Cleanup(func() { dispatchJitterMax = orig })
 
+	sawNonzero := false
 	for range 200 {
 		d := dispatchJitter()
 		if d < 0 || d >= 50*time.Millisecond {
 			t.Fatalf("dispatchJitter = %v, want [0, 50ms)", d)
 		}
+		if d > 0 {
+			sawNonzero = true
+		}
+	}
+	if !sawNonzero {
+		t.Fatal("dispatchJitter always returned 0; jitter is not applied")
 	}
 }
 
-func TestJitterDispatchSleepsWithinBound(t *testing.T) {
-	orig := dispatchJitterMax
-	dispatchJitterMax = 20 * time.Millisecond
-	t.Cleanup(func() { dispatchJitterMax = orig })
-
+func TestJitterDispatchSleeps(t *testing.T) {
+	// A no-op implementation would return in nanoseconds; sleeping 20ms must
+	// take at least most of the requested delay.
 	start := time.Now()
-	jitterDispatch(context.Background())
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("jitterDispatch blocked %v, want < 20ms", elapsed)
+	jitterDispatch(context.Background(), 20*time.Millisecond)
+	if elapsed := time.Since(start); elapsed < 15*time.Millisecond {
+		t.Fatalf("jitterDispatch returned after %v, want ~20ms sleep", elapsed)
+	}
+
+	// A non-positive delay must not sleep at all.
+	start = time.Now()
+	jitterDispatch(context.Background(), 0)
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("jitterDispatch(0) blocked %v, want immediate return", elapsed)
 	}
 }
 
 func TestJitterDispatchCancelled(t *testing.T) {
-	orig := dispatchJitterMax
-	dispatchJitterMax = time.Hour
-	t.Cleanup(func() { dispatchJitterMax = orig })
-
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	done := make(chan struct{})
 	go func() {
-		jitterDispatch(ctx)
+		jitterDispatch(ctx, time.Hour)
 		close(done)
 	}()
 	select {
@@ -146,9 +165,93 @@ func TestSetSNMPPDURate(t *testing.T) {
 }
 
 func TestSNMPSentHook(t *testing.T) {
+	current := time.Now()
+	b := newTokenBucket(100, func() time.Time { return current })
+
+	// Drain the burst, then prove each hook call charges one token: the next
+	// reserve must report debt.
+	for range 10 {
+		b.charge()
+	}
+	if d := b.reserve(); d != 10*time.Millisecond {
+		t.Fatalf("reserve after burst waited %v, want 10ms", d)
+	}
+	hook := snmpSentHook(b)
+	hook(nil)
+	if d := b.reserve(); d != 30*time.Millisecond {
+		t.Fatalf("reserve after OnSent charge waited %v, want 30ms", d)
+	}
+}
+
+// The querier wrapper must settle the bucket before delegating, so pacing
+// happens outside gosnmp's request deadline.
+func TestRateLimitedQuerier(t *testing.T) {
 	t.Cleanup(func() { setSNMPPDURate(defaultSNMPPDURate) })
-	setSNMPPDURate(0) // disabled: the hook must not block
-	hook := snmpSentHook(context.Background())
-	hook(nil)
-	hook(nil)
+	setSNMPPDURate(0)
+
+	mock := &mockSnmpQuerier{
+		getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+			return &gosnmp.SnmpPacket{}, nil
+		},
+		walkFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
+			return []gosnmp.SnmpPDU{{Name: rootOid + ".1"}}, nil
+		},
+		walkStepFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
+			return []gosnmp.SnmpPDU{{Name: rootOid + ".1"}}, nil
+		},
+	}
+	q := &rateLimitedQuerier{ctx: context.Background(), q: mock}
+
+	if _, err := q.Get([]string{"1.3.6.1"}); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if _, err := q.WalkAll("1.3.6.1"); err != nil {
+		t.Fatalf("WalkAll: %v", err)
+	}
+	if !mock.walkAllCalled {
+		t.Fatal("WalkAll did not delegate")
+	}
+	if _, err := q.BulkWalkAll("1.3.6.1"); err != nil {
+		t.Fatalf("BulkWalkAll: %v", err)
+	}
+	if !mock.bulkWalkCalled {
+		t.Fatal("BulkWalkAll did not delegate")
+	}
+	var walked []gosnmp.SnmpPDU
+	if err := q.Walk("1.3.6.1", func(p gosnmp.SnmpPDU) error {
+		walked = append(walked, p)
+		return nil
+	}); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if len(walked) != 1 {
+		t.Fatalf("Walk delivered %d PDUs, want 1", len(walked))
+	}
+	if err := q.BulkWalk("1.3.6.1", func(p gosnmp.SnmpPDU) error { return nil }); err != nil {
+		t.Fatalf("BulkWalk: %v", err)
+	}
+	if len(mock.bulkWalkRoots) != 1 {
+		t.Fatal("BulkWalk did not delegate")
+	}
+}
+
+// A cancelled context must surface through settle so a queued request does
+// not run against a dead job.
+func TestRateLimitedQuerierCancelledContext(t *testing.T) {
+	t.Cleanup(func() { setSNMPPDURate(defaultSNMPPDURate) })
+	setSNMPPDURate(1) // 1 token/s: the second settle has ~1s of debt
+	snmpPDUs.charge()
+	snmpPDUs.charge()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	mock := &mockSnmpQuerier{
+		getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+			return nil, errors.New("delegated despite cancellation")
+		},
+	}
+	q := &rateLimitedQuerier{ctx: ctx, q: mock}
+	// settle returns false on cancellation; the wrapper still delegates and
+	// the underlying call carries the cancelled context.
+	_, _ = q.Get([]string{"1.3.6.1"})
 }

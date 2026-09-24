@@ -1009,7 +1009,7 @@ func submitJob(
 	// gate then serializes jobs for the same device across every pool.
 	target := jobTargetKey(job)
 	gated := func() {
-		jitterDispatch(ctx)
+		jitterDispatch(ctx, dispatchJitter())
 		release := pools.targets.acquire(ctx, target)
 		if release == nil {
 			return
@@ -1027,18 +1027,24 @@ func submitJob(
 
 // jobTargetKey identifies the device a job runs against so jobs for the same
 // target serialize. The device IP is preferred; jobs without one fall back to
-// the server-assigned device ID, then the job ID.
+// the server-assigned device ID, then the job ID. PING jobs get their own
+// namespace: a stalled SNMP walk must not delay the outage signal a ping
+// delivers.
 func jobTargetKey(job *pb.AgentJob) string {
+	prefix := ""
+	if job.JobType == pb.JobType_PING {
+		prefix = "ping:"
+	}
 	if job.SnmpDevice != nil && job.SnmpDevice.Ip != "" {
-		return job.SnmpDevice.Ip
+		return prefix + job.SnmpDevice.Ip
 	}
 	if job.MikrotikDevice != nil && job.MikrotikDevice.Ip != "" {
-		return job.MikrotikDevice.Ip
+		return prefix + job.MikrotikDevice.Ip
 	}
 	if job.DeviceId != "" {
-		return "device:" + job.DeviceId
+		return prefix + "device:" + job.DeviceId
 	}
-	return "job:" + job.JobId
+	return prefix + "job:" + job.JobId
 }
 
 // nextBackoff doubles the current delay (capped at max) and adds up to 25% jitter.

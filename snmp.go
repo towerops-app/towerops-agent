@@ -36,7 +36,7 @@ var snmpDial = func(ctx context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(
 	if err != nil {
 		return nil, nil, err
 	}
-	return conn, func() { _ = conn.Conn.Close() }, nil
+	return &rateLimitedQuerier{ctx: ctx, q: conn}, func() { _ = conn.Conn.Close() }, nil
 }
 
 // closeOnCancellation interrupts gosnmp even if a transport path does not
@@ -296,7 +296,7 @@ func newSnmpConn(ctx context.Context, dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error
 	}
 	// gosnmp invokes OnSent after every transmitted packet, including
 	// retries, so the process-wide token bucket paces real wire traffic.
-	conn.OnSent = snmpSentHook(ctx)
+	conn.OnSent = snmpSentHook(snmpPDUs)
 
 	// Transport
 	if dev.Transport == "tcp" {
