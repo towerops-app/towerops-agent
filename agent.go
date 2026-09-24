@@ -977,6 +977,10 @@ func (q *resultQueue) enqueue(result outbound) bool {
 	}
 	select {
 	case q.slots <- struct{}{}:
+		// A requeued discovery result can land here when its reserved lane
+		// is full; the flag must record the lane actually taken or ack
+		// releases the wrong token.
+		result.discSlot = false
 		q.items <- result
 		return true
 	default:

@@ -4181,6 +4181,45 @@ func TestResultQueueDiscoveryLane(t *testing.T) {
 	}
 }
 
+// A discovery result requeued after a server rejection still carries
+// discSlot from its first delivery. When the reserved lane is full the
+// requeue takes a general slot, and ack must release that general token —
+// not consume a discovery token owned by another in-flight result.
+func TestResultQueueRequeuedDiscoveryReleasesGeneralLane(t *testing.T) {
+	out := newResultQueue(8) // 6 general slots, 2 reserved for discovery
+	discResult := &pb.SnmpResult{JobType: pb.JobType_DISCOVER}
+
+	// Saturate the reserved lane.
+	sendResult(context.Background(), out, "result", discResult, "d1")
+	sendResult(context.Background(), out, "result", discResult, "d2")
+
+	// Deliver d1: its discovery token is acked, and a newer discovery
+	// result immediately claims the freed slot. When the server then
+	// rejects d1 and handleResultReply requeues it, the reserved lane is
+	// full again, so the requeue must take a general slot.
+	d1 := <-out.items
+	out.ack(d1)
+	sendResult(context.Background(), out, "result", discResult, "d3")
+	d1.attempts++
+	if !out.enqueue(d1) {
+		t.Fatal("requeue of rejected discovery result dropped, want general-lane fallback")
+	}
+
+	// Drain to the requeued item and ack it: it must release the general
+	// token it actually holds.
+	<-out.items // d2
+	<-out.items // d3
+	requeued := <-out.items
+	out.ack(requeued)
+
+	if got := len(out.slots); got != 0 {
+		t.Fatalf("general lane holds %d tokens after ack, want 0 (leaked token)", got)
+	}
+	if got := len(out.discSlots); got != 2 {
+		t.Fatalf("discovery lane holds %d tokens after ack, want 2 (d2/d3 still in flight)", got)
+	}
+}
+
 func TestJobTargetKey(t *testing.T) {
 	for _, tc := range []struct {
 		name string
