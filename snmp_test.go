@@ -1080,7 +1080,10 @@ func TestSnmpGetIntoUnhandledErrorStatus(t *testing.T) {
 	}
 
 	into := map[string]string{}
-	_, _ = snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, oids, into)
+	absent, _ := snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, oids, into)
+	if absent != 0 {
+		t.Errorf("absent = %d, want 0 on genErr response", absent)
+	}
 
 	if len(into) != 0 {
 		t.Errorf("into = %v, want empty on genErr response", into)
@@ -1091,6 +1094,68 @@ func TestSnmpGetIntoUnhandledErrorStatus(t *testing.T) {
 	if got := strings.Join(batches[0], ","); got != strings.Join(oids, ",") {
 		t.Errorf("batch = %q, want %q", got, strings.Join(oids, ","))
 	}
+}
+
+// TestSnmpGetIntoAbsentCount pins the absent-OID count the caller logs: a
+// varbind the device answered as unusable counts once, a v1 noSuchName
+// singleton counts once, and a split batch sums both halves.
+func TestSnmpGetIntoAbsentCount(t *testing.T) {
+	dev := &pb.SnmpDevice{Ip: "10.0.0.1"}
+
+	t.Run("NoError counts unusable varbinds", func(t *testing.T) {
+		mock := &mockSnmpQuerier{
+			getFunc: func(batch []string) (*gosnmp.SnmpPacket, error) {
+				return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{
+					{Name: batch[0], Type: gosnmp.NoSuchObject},
+					{Name: batch[1], Type: gosnmp.OctetString, Value: []byte("v")},
+					{Name: batch[2], Type: gosnmp.NoSuchInstance},
+				}}, nil
+			},
+		}
+		into := map[string]string{}
+		absent, err := snmpGetInto(mock, dev, []string{".1", ".2", ".3"}, into)
+		if err != nil {
+			t.Fatalf("snmpGetInto error = %v", err)
+		}
+		if absent != 2 {
+			t.Fatalf("absent = %d, want 2", absent)
+		}
+	})
+
+	t.Run("v1 noSuchName singleton counts once", func(t *testing.T) {
+		mock := &mockSnmpQuerier{
+			getFunc: func(batch []string) (*gosnmp.SnmpPacket, error) {
+				return &gosnmp.SnmpPacket{Error: gosnmp.NoSuchName, ErrorIndex: 1}, nil
+			},
+		}
+		into := map[string]string{}
+		absent, err := snmpGetInto(mock, dev, []string{".1"}, into)
+		if err != nil {
+			t.Fatalf("snmpGetInto error = %v", err)
+		}
+		if absent != 1 {
+			t.Fatalf("absent = %d, want 1", absent)
+		}
+	})
+
+	t.Run("split batch sums both halves", func(t *testing.T) {
+		mock := &mockSnmpQuerier{
+			getFunc: func(batch []string) (*gosnmp.SnmpPacket, error) {
+				if len(batch) > 1 {
+					return &gosnmp.SnmpPacket{Error: gosnmp.NoSuchName, ErrorIndex: 1}, nil
+				}
+				return &gosnmp.SnmpPacket{Error: gosnmp.NoSuchName, ErrorIndex: 1}, nil
+			},
+		}
+		into := map[string]string{}
+		absent, err := snmpGetInto(mock, dev, []string{".1", ".2", ".3", ".4"}, into)
+		if err != nil {
+			t.Fatalf("snmpGetInto error = %v", err)
+		}
+		if absent != 4 {
+			t.Fatalf("absent = %d, want 4 (one per singleton after splits)", absent)
+		}
+	})
 }
 
 func TestExecuteSnmpJobCtxCancelled(t *testing.T) {
