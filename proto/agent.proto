@@ -3,8 +3,6 @@
 //
 // The canonical wire contract is maintained in the TowerOps server at
 // priv/proto/agent.proto. Everything from `syntax = "proto3";` down must stay
-// byte-for-byte identical to that copy; each repository keeps its own header.
-
 syntax = "proto3";
 
 package towerops.agent;
@@ -189,6 +187,7 @@ enum JobType {
   PING = 4;
   LLDP_TOPOLOGY = 5;  // Discover all LLDP neighbors for topology mapping
   NETWORK_SWEEP = 6;  // Discover reachable hosts and their SNMP identities
+  CREDENTIAL_PROBE = 7;  // Try an ordered list of SNMP credentials against one target
 }
 
 enum QueryType {
@@ -222,6 +221,7 @@ message AgentJob {
   uint32 interval_seconds = 8;
   uint32 ping_timeout_ms = 9;     // Ping timeout; zero means the agent default
   DiscoveryPhase discovery_phase = 14;  // Discovery round; echoed back on SnmpResult
+  CredentialProbe credential_probe = 15;  // Present on CREDENTIAL_PROBE jobs
 }
 
 message SnmpDevice {
@@ -320,6 +320,35 @@ message CredentialTestResult {
   string error_message = 3;  // Empty if success
   string system_description = 4;  // sysDescr.0 value if success
   int64 timestamp = 5;
+  string sys_object_id = 6;  // sysObjectID.0 value if success; maximum 255 bytes
+  string sys_name = 7;       // sysName.0 value if success; maximum 255 bytes
+}
+
+// A credential probe tries each candidate in order against one target and
+// reports which one answered, so the server can pin the working credential
+// set on the device and classify the probed host from its system values.
+// Each candidate carries the target IP; the server builds all candidates for
+// one probe against the same address.
+//
+// The agent truncates the three system strings to the bounds below before
+// sending - the server rejects over-length values and drops the result.
+message CredentialProbe {
+  repeated SnmpDevice candidates = 1;  // Ordered; the agent tries them in sequence
+  bool stop_on_first_success = 2;      // Stop after the first candidate that answers
+  uint32 attempt_timeout_ms = 3;       // Per-attempt timeout; zero means the agent default
+  uint32 attempt_retries = 4;          // Extra attempts per candidate; zero means one attempt
+  uint32 inter_attempt_delay_ms = 5;   // Delay between attempts; the agent enforces a 250 ms floor
+}
+
+message CredentialProbeResult {
+  string probe_id = 1;        // The job_id of the CREDENTIAL_PROBE job
+  int32 matched_index = 2;    // Index into candidates that answered; -1 when none did
+  string sys_object_id = 3;   // sysObjectID.0 from the matched candidate; maximum 255 bytes
+  string sys_descr = 4;       // sysDescr.0 from the matched candidate; maximum 2,048 bytes
+  string sys_name = 5;        // sysName.0 from the matched candidate; maximum 255 bytes
+  string error_message = 6;   // Last attempt's error when matched_index is -1
+  int64 timestamp = 7;
+  uint32 duration_ms = 8;     // Agent-measured wall time for the whole probe
 }
 
 // MikroTik RouterOS API messages

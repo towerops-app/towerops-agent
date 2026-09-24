@@ -753,6 +753,28 @@ func TestDispatchJob(t *testing.T) {
 		}
 	})
 
+	t.Run("CREDENTIAL_PROBE", func(t *testing.T) {
+		origDial := snmpDial
+		defer func() { snmpDial = origDial }()
+		snmpDial = func(_ context.Context, dev *pb.SnmpDevice) (snmpQuerier, func(), error) {
+			return nil, nil, fmt.Errorf("refused")
+		}
+
+		out := testQueue()
+
+		dispatchJob(context.Background(), &pb.AgentJob{
+			JobId:   "cp1",
+			JobType: pb.JobType_CREDENTIAL_PROBE,
+			CredentialProbe: &pb.CredentialProbe{
+				Candidates: []*pb.SnmpDevice{{Ip: "10.0.0.1"}},
+			},
+		}, testPools(t), out)
+
+		if result := wantResult[*pb.CredentialProbeResult](t, out, "credential_probe_result", 500*time.Millisecond); result.MatchedIndex != -1 {
+			t.Errorf("expected no match, got index %d", result.MatchedIndex)
+		}
+	})
+
 	t.Run("PING", func(t *testing.T) {
 		origPing := doPing
 		defer func() { doPing = origPing }()
@@ -4189,6 +4211,19 @@ func TestJobTargetKey(t *testing.T) {
 			JobType:  pb.JobType_PING,
 			DeviceId: "dev-8",
 		}, "ping:device:dev-8"},
+		{"credential probe keys on candidate ip", &pb.AgentJob{
+			JobId:   "j9",
+			JobType: pb.JobType_CREDENTIAL_PROBE,
+			CredentialProbe: &pb.CredentialProbe{
+				Candidates: []*pb.SnmpDevice{{Ip: "10.0.0.5"}, {Ip: "10.0.0.5"}},
+			},
+		}, "10.0.0.5"},
+		{"credential probe without candidates falls through", &pb.AgentJob{
+			JobId:           "j10",
+			JobType:         pb.JobType_CREDENTIAL_PROBE,
+			DeviceId:        "dev-10",
+			CredentialProbe: &pb.CredentialProbe{},
+		}, "device:dev-10"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := jobTargetKey(tc.job); got != tc.want {
