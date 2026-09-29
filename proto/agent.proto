@@ -3,6 +3,8 @@
 //
 // The canonical wire contract is maintained in the TowerOps server at
 // priv/proto/agent.proto. Everything from `syntax = "proto3";` down must stay
+// byte-for-byte identical to that copy; change the server schema and
+// hand-written codec first, then mirror them here.
 syntax = "proto3";
 
 package towerops.agent;
@@ -190,7 +192,63 @@ enum JobType {
   // future job type cannot collide with agents that still know the old enum.
   reserved 5, 6;
   CREDENTIAL_PROBE = 7;  // Try an ordered list of SNMP credentials against one target
+  CONFIG_BACKUP = 8;     // Vendor-neutral device config backup over SSH
 }
+
+// BACKUP exports the device configuration; PROBE connects and authenticates
+// and reports the login's capabilities (version, identity, group policies)
+// without exporting anything.
+enum ConfigBackupMode {
+  CONFIG_BACKUP_MODE_BACKUP = 0;
+  CONFIG_BACKUP_MODE_PROBE = 1;
+}
+
+message ConfigBackupJob {
+  string vendor = 1;                      // "mikrotik"
+  ConfigBackupMode mode = 2;
+  string host = 3;
+  uint32 ssh_port = 4;
+  string username = 5;
+  string password = 6;
+  bool include_secrets = 7;
+  string expected_host_key_fingerprint = 8;  // SHA256:... ; empty = first use
+  uint32 timeout_ms = 9;                  // 0 = agent default (120000)
+  uint64 max_config_bytes = 10;           // 0 = agent default (16 MiB)
+}
+
+enum ConfigBackupErrorCode {
+  CONFIG_BACKUP_OK = 0;
+  AUTH_FAILED = 1;
+  UNREACHABLE = 2;
+  CONNECTION_REFUSED = 3;
+  TIMEOUT = 4;
+  HOST_KEY_MISMATCH = 5;
+  PERMISSION_DENIED = 6;
+  EXPORT_FAILED = 7;
+  EXPORT_INCOMPLETE = 8;
+  EXPORT_EMPTY = 9;
+  TOO_LARGE = 10;
+  AGENT_BUSY = 11;
+  UNSUPPORTED_VENDOR = 12;
+  INTERNAL = 13;
+}
+
+message ConfigBackupResult {
+  string device_id = 1;
+  string job_id = 2;
+  ConfigBackupErrorCode error_code = 3;
+  string error_detail = 4;      // sanitized, <= 300 chars, never router output beyond that
+  bytes config_gzip = 5;        // empty for PROBE or on error
+  uint64 config_bytes = 6;      // uncompressed size
+  string host_key_fingerprint = 7;  // always, when a handshake happened
+  string os_version = 8;
+  string model = 9;
+  string identity = 10;
+  repeated string user_policies = 11;  // PROBE: the login's group policies
+  bool includes_secrets = 12;
+  uint32 duration_ms = 13;
+  int64 timestamp = 14;
+ }
 
 enum QueryType {
   GET = 0;
@@ -231,6 +289,7 @@ message AgentJob {
   uint32 max_result_bytes = 13;
   DiscoveryPhase discovery_phase = 14;  // Discovery round; echoed back on SnmpResult
   CredentialProbe credential_probe = 15;  // Present on CREDENTIAL_PROBE jobs
+  ConfigBackupJob config_backup = 16;   // Present on CONFIG_BACKUP jobs
 }
 
 message SnmpDevice {
@@ -309,6 +368,10 @@ message AgentHeartbeat {
   // guessing wrong either strands stale addresses or wipes good ones on every
   // heartbeat from an old agent.
   bool reports_vantage_point = 10;
+  // True when the agent implements JobType CONFIG_BACKUP and sends results on
+  // "config_backup_result". Servers fall back to the legacy MikroTik backup
+  // job for agents without it.
+  bool supports_config_backup = 11;
 }
 
 message AgentError {
