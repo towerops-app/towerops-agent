@@ -10,6 +10,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -356,5 +357,476 @@ func TestConfigBackupContextCancel(t *testing.T) {
 	case queued := <-out.items:
 		t.Fatalf("unexpected result after cancel: %+v", queued)
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestConfigBackupMissingPayload(t *testing.T) {
+	job := cbJob("192.0.2.1", 22)
+	job.ConfigBackup = nil
+	out := testQueue()
+
+	executeConfigBackupJob(context.Background(), job, out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_INTERNAL {
+		t.Fatalf("code = %v, want INTERNAL", result.ErrorCode)
+	}
+}
+
+func TestConfigBackupUnsupportedVendor(t *testing.T) {
+	resetHostKeyStore(t)
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbRouterHandler(cbTestExport))
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	job := cbJob(host, port)
+	job.ConfigBackup.Vendor = " Juniper " // case/space-insensitive lookup must still miss
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), job, out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_UNSUPPORTED_VENDOR {
+		t.Fatalf("code = %v, want UNSUPPORTED_VENDOR", result.ErrorCode)
+	}
+	if result.HostKeyFingerprint == "" {
+		t.Error("observed host key fingerprint not reported")
+	}
+}
+
+func TestConfigBackupDialCancelled(t *testing.T) {
+	origDial := sshDial
+	defer func() { sshDial = origDial }()
+	sshDial = func(ctx context.Context, _, _ string, _ *ssh.ClientConfig) (*ssh.Client, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	job := cbJob("192.0.2.1", 22)
+	out := testQueue()
+	executeConfigBackupJob(ctx, job, out)
+
+	select {
+	case queued := <-out.items:
+		t.Fatalf("unexpected result after cancel: %+v", queued)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+func TestConfigBackupDispatchExecutesJob(t *testing.T) {
+	// A rejected connection exercises the pooled execute closure end-to-end.
+	origJitter := dispatchJitterMax
+	dispatchJitterMax = 0
+	t.Cleanup(func() { dispatchJitterMax = origJitter })
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	host, port := cbAddrPort(t, addr)
+
+	pools := &jobPools{
+		backup:  newWorkerPool(1),
+		targets: &targetGates{},
+		notices: make(chan outbound, 8),
+	}
+	defer func() { pools.backup.stop() }()
+	out := testQueue()
+
+	job := cbJob(host, port)
+	if !submitJob(context.Background(), job, pools, out, func() {}, false) {
+		t.Fatal("submitJob rejected a fresh pool")
+	}
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_CONNECTION_REFUSED {
+		t.Fatalf("code = %v (%q), want CONNECTION_REFUSED", result.ErrorCode, result.ErrorDetail)
+	}
+}
+
+func TestConfigBackupDialDefaultPort(t *testing.T) {
+	origDial := sshDial
+	defer func() { sshDial = origDial }()
+	var capturedAddr string
+	sshDial = func(_ context.Context, _, addr string, _ *ssh.ClientConfig) (*ssh.Client, error) {
+		capturedAddr = addr
+		return nil, errors.New("mock dial")
+	}
+
+	job := cbJob("192.0.2.1", 0)
+	_, _, err := configBackupDial(context.Background(), job)
+	if err == nil {
+		t.Fatal("expected dial error")
+	}
+	if capturedAddr != "192.0.2.1:22" {
+		t.Fatalf("addr = %q, want port defaulted to 22", capturedAddr)
+	}
+}
+
+func TestConfigBackupHostKeyHexFingerprint(t *testing.T) {
+	resetHostKeyStore(t)
+	serverSigner := cbNewSigner(t)
+	hexFP := fmt.Sprintf("%x", sha256.Sum256(serverSigner.PublicKey().Marshal()))
+
+	cases := []struct {
+		name     string
+		expected string
+		wantCode pb.ConfigBackupErrorCode
+	}{
+		{"hex-match", hexFP, pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK},
+		{"hex-mismatch", fmt.Sprintf("%x", sha256.Sum256(cbNewSigner(t).PublicKey().Marshal())),
+			pb.ConfigBackupErrorCode_HOST_KEY_MISMATCH},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, c := startTestSSHServerWithSigner(t, serverSigner, cbRouterHandler(cbTestExport))
+			defer c()
+			h, p := cbAddrPort(t, a)
+
+			job := cbJob(h, p)
+			job.ConfigBackup.ExpectedHostKeyFingerprint = tc.expected
+			out := testQueue()
+			executeConfigBackupJob(context.Background(), job, out)
+
+			result := cbReceiveConfigBackupResult(t, out)
+			if result.ErrorCode != tc.wantCode {
+				t.Fatalf("code = %v (%q), want %v", result.ErrorCode, result.ErrorDetail, tc.wantCode)
+			}
+		})
+	}
+}
+
+type cbTimeoutErr struct{}
+
+func (cbTimeoutErr) Error() string   { return "cb timeout" }
+func (cbTimeoutErr) Timeout() bool   { return true }
+func (cbTimeoutErr) Temporary() bool { return true }
+
+func TestIsUnreachableNetTimeout(t *testing.T) {
+	var netErr net.Error = cbTimeoutErr{}
+	if !isUnreachable(netErr) {
+		t.Error("net.Error timeout should classify as unreachable")
+	}
+}
+
+func TestFirstLineEdges(t *testing.T) {
+	if got := firstLine("first\nsecond", maxConfigBackupDetailLen); got != "first" {
+		t.Errorf("firstLine multi-line = %q", got)
+	}
+	long := strings.Repeat("x", maxConfigBackupDetailLen+50)
+	if got := firstLine(long, maxConfigBackupDetailLen); len(got) != maxConfigBackupDetailLen {
+		t.Errorf("firstLine truncation len = %d", len(got))
+	}
+}
+
+func TestSessionErrCode(t *testing.T) {
+	deadline, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if got := sessionErrCode(deadline); got != pb.ConfigBackupErrorCode_TIMEOUT {
+		t.Errorf("deadline ctx = %v, want TIMEOUT", got)
+	}
+	if got := sessionErrCode(context.Background()); got != pb.ConfigBackupErrorCode_EXPORT_FAILED {
+		t.Errorf("live ctx = %v, want EXPORT_FAILED", got)
+	}
+}
+
+func TestRunConfigBackupSessionClosedClient(t *testing.T) {
+	resetHostKeyStore(t)
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbRouterHandler(cbTestExport))
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	job := cbJob(host, port)
+	client, _, err := configBackupDial(context.Background(), job)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = client.Close()
+
+	v := mikrotikBackupVendor{}
+	if _, err := v.readVersion(client); err == nil {
+		t.Error("readVersion on closed client should fail")
+	}
+	if _, err := v.readIdentity(client); err == nil {
+		t.Error("readIdentity on closed client should fail")
+	}
+}
+
+// cbFailOnHandler serves RouterOS replies but fails the command containing
+// failOn with a non-zero exit status and no output.
+func cbFailOnHandler(failOn string) func(ch ssh.Channel, command string) {
+	return func(ch ssh.Channel, command string) {
+		if strings.Contains(command, failOn) {
+			_ = ch.CloseWrite()
+			_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{1}))
+			_ = ch.Close()
+			return
+		}
+		cbRouterHandler(cbTestExport)(ch, command)
+	}
+}
+
+func TestConfigBackupProbeSessionFailures(t *testing.T) {
+	cases := []struct {
+		name   string
+		failOn string
+	}{
+		{"version", "system resource get version"},
+		{"identity", "system identity get name"},
+		{"policy", "user group get"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetHostKeyStore(t)
+			addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbFailOnHandler(tc.failOn))
+			defer cleanup()
+			host, port := cbAddrPort(t, addr)
+
+			job := cbJob(host, port)
+			job.ConfigBackup.Mode = pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE
+			out := testQueue()
+			executeConfigBackupJob(context.Background(), job, out)
+
+			result := cbReceiveConfigBackupResult(t, out)
+			if result.ErrorCode != pb.ConfigBackupErrorCode_EXPORT_FAILED {
+				t.Fatalf("code = %v (%q), want EXPORT_FAILED", result.ErrorCode, result.ErrorDetail)
+			}
+		})
+	}
+}
+
+func TestConfigBackupBackupVersionFails(t *testing.T) {
+	resetHostKeyStore(t)
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbFailOnHandler("system resource get version"))
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	job := cbJob(host, port)
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), job, out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_EXPORT_FAILED {
+		t.Fatalf("code = %v (%q), want EXPORT_FAILED", result.ErrorCode, result.ErrorDetail)
+	}
+}
+
+func TestConfigBackupUnparseableVersion(t *testing.T) {
+	resetHostKeyStore(t)
+	handler := func(ch ssh.Channel, command string) {
+		if strings.Contains(command, "system resource get version") {
+			_, _ = ch.Write([]byte("unknown\n"))
+			_ = ch.CloseWrite()
+			_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+			_ = ch.Close()
+			return
+		}
+		cbRouterHandler(cbTestExport)(ch, command)
+	}
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	job := cbJob(host, port)
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), job, out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+		t.Fatalf("code = %v (%q)", result.ErrorCode, result.ErrorDetail)
+	}
+	if result.OsVersion != "unknown" {
+		t.Errorf("OsVersion = %q, want unknown", result.OsVersion)
+	}
+}
+
+// cbExportExitHandler serves a fixed export reply with a fixed exit status.
+func cbExportExitHandler(reply string, status uint32) func(ch ssh.Channel, command string) {
+	return func(ch ssh.Channel, command string) {
+		if strings.HasPrefix(command, "/export") {
+			if reply != "" {
+				_, _ = ch.Write([]byte(reply))
+			}
+			_ = ch.CloseWrite()
+			_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
+			_ = ch.Close()
+			return
+		}
+		cbRouterHandler(cbTestExport)(ch, command)
+	}
+}
+
+func TestConfigBackupExportFailures(t *testing.T) {
+	cases := []struct {
+		name     string
+		reply    string
+		status   uint32
+		wantCode pb.ConfigBackupErrorCode
+	}{
+		{"exit with valid-looking output", cbTestExport, 1, pb.ConfigBackupErrorCode_EXPORT_FAILED},
+		{"exit with empty output", "", 1, pb.ConfigBackupErrorCode_EXPORT_EMPTY},
+		{"exit with failure text", "failure: no such command\n", 1, pb.ConfigBackupErrorCode_EXPORT_FAILED},
+		{"permission denied", "no permission\n", 0, pb.ConfigBackupErrorCode_PERMISSION_DENIED},
+		{"incomplete", "just some words\n", 0, pb.ConfigBackupErrorCode_EXPORT_INCOMPLETE},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetHostKeyStore(t)
+			addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbExportExitHandler(tc.reply, tc.status))
+			defer cleanup()
+			host, port := cbAddrPort(t, addr)
+
+			job := cbJob(host, port)
+			out := testQueue()
+			executeConfigBackupJob(context.Background(), job, out)
+
+			result := cbReceiveConfigBackupResult(t, out)
+			if result.ErrorCode != tc.wantCode {
+				t.Fatalf("code = %v (%q), want %v", result.ErrorCode, result.ErrorDetail, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestParseExportModelVariants(t *testing.T) {
+	cases := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{"no model", "/interface bridge\nadd name=bridge1\n", ""},
+		{"comment without equals", "# no key value\n/interface\n", ""},
+		{"other key", "# date = today\n/interface\n", ""},
+		{"model", "# model = hEX\n/interface\n", "hEX"},
+	}
+	for _, tc := range cases {
+		if got := parseExportModel(tc.output); got != tc.want {
+			t.Errorf("%s: parseExportModel = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+type cbErrWriter struct{}
+
+func (cbErrWriter) Write([]byte) (int, error) { return 0, errors.New("write boom") }
+
+// cbFailAfterWriter accepts the first `remaining` bytes so the gzip header
+// lands, then fails — surfacing the error on Close rather than Write.
+type cbFailAfterWriter struct{ remaining int }
+
+func (w *cbFailAfterWriter) Write(p []byte) (int, error) {
+	if w.remaining >= len(p) {
+		w.remaining -= len(p)
+		return len(p), nil
+	}
+	w.remaining = 0
+	return 0, errors.New("close boom")
+}
+
+func TestGzipToErrors(t *testing.T) {
+	if err := gzipTo(cbErrWriter{}, []byte("data")); err == nil {
+		t.Error("write failure should surface")
+	}
+	if err := gzipTo(&cbFailAfterWriter{remaining: 10}, []byte("payload")); err == nil {
+		t.Error("close failure should surface")
+	}
+	var buf bytes.Buffer
+	if err := gzipTo(&buf, []byte("ok")); err != nil {
+		t.Fatalf("gzipTo failed: %v", err)
+	}
+}
+
+func TestConfigBackupGzipFailure(t *testing.T) {
+	resetHostKeyStore(t)
+	orig := gzipTo
+	defer func() { gzipTo = orig }()
+	gzipTo = func(io.Writer, []byte) error { return errors.New("gzip boom") }
+
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbRouterHandler(cbTestExport))
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	job := cbJob(host, port)
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), job, out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_INTERNAL {
+		t.Fatalf("code = %v (%q), want INTERNAL", result.ErrorCode, result.ErrorDetail)
+	}
+	if !strings.Contains(result.ErrorDetail, "gzip boom") {
+		t.Errorf("detail = %q, want gzip boom", result.ErrorDetail)
+	}
+}
+
+func TestConfigBackupCancelDuringSession(t *testing.T) {
+	resetHostKeyStore(t)
+	started := make(chan struct{}, 4)
+	release := make(chan struct{})
+	handler := func(ch ssh.Channel, _ string) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		_ = ch.CloseWrite()
+		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+		_ = ch.Close()
+	}
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
+	defer cleanup()
+	defer close(release)
+	host, port := cbAddrPort(t, addr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-started
+		cancel()
+	}()
+
+	job := cbJob(host, port)
+	job.ConfigBackup.Mode = pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE
+	out := testQueue()
+	executeConfigBackupJob(ctx, job, out)
+	<-done
+
+	select {
+	case queued := <-out.items:
+		t.Fatalf("unexpected result after session cancel: %+v", queued)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+func TestConfigBackupJobTimeoutDuringSession(t *testing.T) {
+	resetHostKeyStore(t)
+	release := make(chan struct{})
+	handler := func(ch ssh.Channel, _ string) {
+		<-release
+		_ = ch.CloseWrite()
+		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+		_ = ch.Close()
+	}
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
+	defer cleanup()
+	defer close(release)
+	host, port := cbAddrPort(t, addr)
+
+	job := cbJob(host, port)
+	job.ConfigBackup.TimeoutMs = 200
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), job, out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_TIMEOUT {
+		t.Fatalf("code = %v (%q), want TIMEOUT", result.ErrorCode, result.ErrorDetail)
 	}
 }

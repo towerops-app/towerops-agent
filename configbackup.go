@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -43,7 +44,11 @@ var configBackupVendors = map[string]configBackupVendor{"mikrotik": mikrotikBack
 // and queue the result unless the session is ending.
 func executeConfigBackupJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	started := time.Now()
+	var fingerprint string
 	finish := func(result *pb.ConfigBackupResult) {
+		if result.HostKeyFingerprint == "" {
+			result.HostKeyFingerprint = fingerprint
+		}
 		result.DurationMs = uint32(time.Since(started).Milliseconds())
 		result.Timestamp = time.Now().Unix()
 		sendResult(ctx, out, "config_backup_result", result, job.JobId)
@@ -74,18 +79,18 @@ func executeConfigBackupJob(ctx context.Context, job *pb.AgentJob, out *resultQu
 		return
 	}
 
-	client, fingerprint, err := configBackupDial(jobCtx, job)
+	client, fp, err := configBackupDial(jobCtx, job)
+	fingerprint = fp
 	if ctx.Err() != nil {
 		return
 	}
 	if err != nil {
 		code, detail := classifyConfigBackupError(err, job)
 		result := &pb.ConfigBackupResult{
-			DeviceId:           job.DeviceId,
-			JobId:              job.JobId,
-			ErrorCode:          code,
-			ErrorDetail:        detail,
-			HostKeyFingerprint: fingerprint,
+			DeviceId:    job.DeviceId,
+			JobId:       job.JobId,
+			ErrorCode:   code,
+			ErrorDetail: detail,
 		}
 		finish(result)
 		return
@@ -108,9 +113,6 @@ func executeConfigBackupJob(ctx context.Context, job *pb.AgentJob, out *resultQu
 	}
 	if ctx.Err() != nil {
 		return
-	}
-	if result.HostKeyFingerprint == "" {
-		result.HostKeyFingerprint = fingerprint
 	}
 	finish(result)
 }
@@ -369,11 +371,7 @@ func (v mikrotikBackupVendor) Backup(ctx context.Context, c *ssh.Client, job *pb
 	}
 
 	var gz bytes.Buffer
-	w := gzip.NewWriter(&gz)
-	if _, err := w.Write(out); err != nil {
-		return configBackupError(job, jobID, deviceID, pb.ConfigBackupErrorCode_INTERNAL, err.Error())
-	}
-	if err := w.Close(); err != nil {
+	if err := gzipTo(&gz, out); err != nil {
 		return configBackupError(job, jobID, deviceID, pb.ConfigBackupErrorCode_INTERNAL, err.Error())
 	}
 
@@ -389,6 +387,16 @@ func (v mikrotikBackupVendor) Backup(ctx context.Context, c *ssh.Client, job *pb
 		Identity:        identity,
 		IncludesSecrets: job.IncludeSecrets,
 	}
+}
+
+// gzipTo writes gzip-compressed data to dst. Declared as a var so tests can
+// inject writer failures at the call site.
+var gzipTo = func(dst io.Writer, data []byte) error {
+	w := gzip.NewWriter(dst)
+	if _, err := w.Write(data); err != nil {
+		return err
+	}
+	return w.Close()
 }
 
 // classifyExportOutput maps RouterOS failure text in stdout/stderr to an
