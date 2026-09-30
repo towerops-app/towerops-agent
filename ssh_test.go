@@ -621,6 +621,19 @@ func startTestSSHServer(t *testing.T, handler func(ch ssh.Channel)) (string, fun
 		t.Fatal(err)
 	}
 
+	return startTestSSHServerWithSigner(t, signer, func(ch ssh.Channel, _ string) { handler(ch) })
+}
+
+// startTestSSHServerWithSigner is startTestSSHServer with a caller-supplied
+// host key; the handler additionally receives the exec command so tests can
+// dispatch per command across the job's multiple sessions.
+func startTestSSHServerWithSigner(
+	t *testing.T,
+	signer ssh.Signer,
+	handler func(ch ssh.Channel, command string),
+) (string, func()) {
+	t.Helper()
+
 	config := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 			return nil, nil // Accept any password
@@ -660,7 +673,7 @@ func startTestSSHServer(t *testing.T, handler func(ch ssh.Channel)) (string, fun
 				for req := range requests {
 					if req.Type == "exec" {
 						_ = req.Reply(true, nil)
-						handler(ch)
+						handler(ch, string(req.Payload[4:]))
 						return
 					}
 					_ = req.Reply(false, nil)

@@ -273,6 +273,7 @@ func runSessionWithResultsAndScheduling(
 		mikrotik:        newWorkerPool(20),
 		ping:            newWorkerPool(50),
 		checks:          newWorkerPool(50),
+		backup:          newWorkerPool(4),
 		notices:         notices,
 		targets:         &targetGates{},
 		localScheduling: localScheduling,
@@ -586,16 +587,17 @@ func (s *session) heartbeat() *pb.AgentHeartbeat {
 	}
 	localIPs, subnets := localVantagePoint()
 	return &pb.AgentHeartbeat{
-		Version:             version,
-		UptimeSeconds:       uint64(time.Since(processStart).Seconds()),
-		Arch:                runtime.GOARCH,
-		Hostname:            s.hostname,
-		IpAddress:           s.ws.LocalIP(),
-		Container:           runningInContainer(),
-		SchedulesJobs:       localScheduling,
-		LocalIps:            localIPs,
-		InterfaceSubnets:    subnets,
-		ReportsVantagePoint: true,
+		Version:              version,
+		UptimeSeconds:        uint64(time.Since(processStart).Seconds()),
+		Arch:                 runtime.GOARCH,
+		Hostname:             s.hostname,
+		IpAddress:            s.ws.LocalIP(),
+		Container:            runningInContainer(),
+		SchedulesJobs:        localScheduling,
+		LocalIps:             localIPs,
+		InterfaceSubnets:     subnets,
+		ReportsVantagePoint:  true,
+		SupportsConfigBackup: true,
 	}
 }
 
@@ -1070,6 +1072,7 @@ type jobPools struct {
 	mikrotik        *workerPool
 	ping            *workerPool
 	checks          *workerPool
+	backup          *workerPool
 	notices         chan<- outbound
 	scheduler       *recurringScheduler
 	targets         *targetGates
@@ -1079,9 +1082,15 @@ type jobPools struct {
 func (p *jobPools) stop(timeout time.Duration) []string {
 	pools := map[string]*workerPool{
 		"snmp": p.snmp, "mikrotik": p.mikrotik, "ping": p.ping, "checks": p.checks,
+		"backup": p.backup,
 	}
 	done := make(chan string, len(pools))
 	for name, pool := range pools {
+		if pool == nil {
+			// Partially-constructed pools (tests) have nothing to drain.
+			done <- name
+			continue
+		}
 		go func() {
 			pool.stop()
 			done <- name
@@ -1151,6 +1160,9 @@ func submitJob(
 	case pb.JobType_PING:
 		pool = pools.ping
 		execute = func() { executePingJob(ctx, job, out) }
+	case pb.JobType_CONFIG_BACKUP:
+		pool = pools.backup
+		execute = func() { executeConfigBackupJob(ctx, job, out) }
 	case pb.JobType_DISCOVER, pb.JobType_POLL:
 		pool = pools.snmp
 		execute = func() { executeSnmpJob(ctx, job, out) }
@@ -1174,6 +1186,15 @@ func submitJob(
 
 	ok := pool.submitMode(ctx, task(gated), wait)
 	if !ok {
+		if job.JobType == pb.JobType_CONFIG_BACKUP {
+			sendResult(ctx, out, "config_backup_result", &pb.ConfigBackupResult{
+				DeviceId:  job.DeviceId,
+				JobId:     job.JobId,
+				ErrorCode: pb.ConfigBackupErrorCode_AGENT_BUSY,
+				Timestamp: time.Now().Unix(),
+			}, job.JobId)
+			return false
+		}
 		reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
 	}
 	return ok
@@ -1194,6 +1215,9 @@ func jobTargetKey(job *pb.AgentJob) string {
 	}
 	if job.MikrotikDevice != nil && job.MikrotikDevice.Ip != "" {
 		return prefix + job.MikrotikDevice.Ip
+	}
+	if job.ConfigBackup != nil && job.ConfigBackup.Host != "" {
+		return prefix + job.ConfigBackup.Host
 	}
 	// Probe jobs carry the target in their candidates (snmp_device is nil):
 	// key on the shared address so a probe cannot run concurrently with a

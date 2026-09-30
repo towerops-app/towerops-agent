@@ -36,6 +36,7 @@ const (
 	JobType_TEST_CREDENTIALS JobType = 3
 	JobType_PING             JobType = 4
 	JobType_CREDENTIAL_PROBE JobType = 7 // Try an ordered list of SNMP credentials against one target
+	JobType_CONFIG_BACKUP    JobType = 8 // Vendor-neutral device config backup over SSH
 )
 
 // Enum value maps for JobType.
@@ -47,6 +48,7 @@ var (
 		3: "TEST_CREDENTIALS",
 		4: "PING",
 		7: "CREDENTIAL_PROBE",
+		8: "CONFIG_BACKUP",
 	}
 	JobType_value = map[string]int32{
 		"DISCOVER":         0,
@@ -55,6 +57,7 @@ var (
 		"TEST_CREDENTIALS": 3,
 		"PING":             4,
 		"CREDENTIAL_PROBE": 7,
+		"CONFIG_BACKUP":    8,
 	}
 )
 
@@ -83,6 +86,137 @@ func (x JobType) Number() protoreflect.EnumNumber {
 // Deprecated: Use JobType.Descriptor instead.
 func (JobType) EnumDescriptor() ([]byte, []int) {
 	return file_proto_agent_proto_rawDescGZIP(), []int{0}
+}
+
+// BACKUP exports the device configuration; PROBE connects and authenticates
+// and reports the login's capabilities (version, identity, group policies)
+// without exporting anything.
+type ConfigBackupMode int32
+
+const (
+	ConfigBackupMode_CONFIG_BACKUP_MODE_BACKUP ConfigBackupMode = 0
+	ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE  ConfigBackupMode = 1
+)
+
+// Enum value maps for ConfigBackupMode.
+var (
+	ConfigBackupMode_name = map[int32]string{
+		0: "CONFIG_BACKUP_MODE_BACKUP",
+		1: "CONFIG_BACKUP_MODE_PROBE",
+	}
+	ConfigBackupMode_value = map[string]int32{
+		"CONFIG_BACKUP_MODE_BACKUP": 0,
+		"CONFIG_BACKUP_MODE_PROBE":  1,
+	}
+)
+
+func (x ConfigBackupMode) Enum() *ConfigBackupMode {
+	p := new(ConfigBackupMode)
+	*p = x
+	return p
+}
+
+func (x ConfigBackupMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ConfigBackupMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_agent_proto_enumTypes[1].Descriptor()
+}
+
+func (ConfigBackupMode) Type() protoreflect.EnumType {
+	return &file_proto_agent_proto_enumTypes[1]
+}
+
+func (x ConfigBackupMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ConfigBackupMode.Descriptor instead.
+func (ConfigBackupMode) EnumDescriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{1}
+}
+
+type ConfigBackupErrorCode int32
+
+const (
+	ConfigBackupErrorCode_CONFIG_BACKUP_OK   ConfigBackupErrorCode = 0
+	ConfigBackupErrorCode_AUTH_FAILED        ConfigBackupErrorCode = 1
+	ConfigBackupErrorCode_UNREACHABLE        ConfigBackupErrorCode = 2
+	ConfigBackupErrorCode_CONNECTION_REFUSED ConfigBackupErrorCode = 3
+	ConfigBackupErrorCode_TIMEOUT            ConfigBackupErrorCode = 4
+	ConfigBackupErrorCode_HOST_KEY_MISMATCH  ConfigBackupErrorCode = 5
+	ConfigBackupErrorCode_PERMISSION_DENIED  ConfigBackupErrorCode = 6
+	ConfigBackupErrorCode_EXPORT_FAILED      ConfigBackupErrorCode = 7
+	ConfigBackupErrorCode_EXPORT_INCOMPLETE  ConfigBackupErrorCode = 8
+	ConfigBackupErrorCode_EXPORT_EMPTY       ConfigBackupErrorCode = 9
+	ConfigBackupErrorCode_TOO_LARGE          ConfigBackupErrorCode = 10
+	ConfigBackupErrorCode_AGENT_BUSY         ConfigBackupErrorCode = 11
+	ConfigBackupErrorCode_UNSUPPORTED_VENDOR ConfigBackupErrorCode = 12
+	ConfigBackupErrorCode_INTERNAL           ConfigBackupErrorCode = 13
+)
+
+// Enum value maps for ConfigBackupErrorCode.
+var (
+	ConfigBackupErrorCode_name = map[int32]string{
+		0:  "CONFIG_BACKUP_OK",
+		1:  "AUTH_FAILED",
+		2:  "UNREACHABLE",
+		3:  "CONNECTION_REFUSED",
+		4:  "TIMEOUT",
+		5:  "HOST_KEY_MISMATCH",
+		6:  "PERMISSION_DENIED",
+		7:  "EXPORT_FAILED",
+		8:  "EXPORT_INCOMPLETE",
+		9:  "EXPORT_EMPTY",
+		10: "TOO_LARGE",
+		11: "AGENT_BUSY",
+		12: "UNSUPPORTED_VENDOR",
+		13: "INTERNAL",
+	}
+	ConfigBackupErrorCode_value = map[string]int32{
+		"CONFIG_BACKUP_OK":   0,
+		"AUTH_FAILED":        1,
+		"UNREACHABLE":        2,
+		"CONNECTION_REFUSED": 3,
+		"TIMEOUT":            4,
+		"HOST_KEY_MISMATCH":  5,
+		"PERMISSION_DENIED":  6,
+		"EXPORT_FAILED":      7,
+		"EXPORT_INCOMPLETE":  8,
+		"EXPORT_EMPTY":       9,
+		"TOO_LARGE":          10,
+		"AGENT_BUSY":         11,
+		"UNSUPPORTED_VENDOR": 12,
+		"INTERNAL":           13,
+	}
+)
+
+func (x ConfigBackupErrorCode) Enum() *ConfigBackupErrorCode {
+	p := new(ConfigBackupErrorCode)
+	*p = x
+	return p
+}
+
+func (x ConfigBackupErrorCode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ConfigBackupErrorCode) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_agent_proto_enumTypes[2].Descriptor()
+}
+
+func (ConfigBackupErrorCode) Type() protoreflect.EnumType {
+	return &file_proto_agent_proto_enumTypes[2]
+}
+
+func (x ConfigBackupErrorCode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ConfigBackupErrorCode.Descriptor instead.
+func (ConfigBackupErrorCode) EnumDescriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{2}
 }
 
 type QueryType int32
@@ -115,11 +249,11 @@ func (x QueryType) String() string {
 }
 
 func (QueryType) Descriptor() protoreflect.EnumDescriptor {
-	return file_proto_agent_proto_enumTypes[1].Descriptor()
+	return file_proto_agent_proto_enumTypes[3].Descriptor()
 }
 
 func (QueryType) Type() protoreflect.EnumType {
-	return &file_proto_agent_proto_enumTypes[1]
+	return &file_proto_agent_proto_enumTypes[3]
 }
 
 func (x QueryType) Number() protoreflect.EnumNumber {
@@ -128,7 +262,7 @@ func (x QueryType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use QueryType.Descriptor instead.
 func (QueryType) EnumDescriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{1}
+	return file_proto_agent_proto_rawDescGZIP(), []int{3}
 }
 
 // Which round of a two-phase discovery a DISCOVER job represents. Phase one
@@ -169,11 +303,11 @@ func (x DiscoveryPhase) String() string {
 }
 
 func (DiscoveryPhase) Descriptor() protoreflect.EnumDescriptor {
-	return file_proto_agent_proto_enumTypes[2].Descriptor()
+	return file_proto_agent_proto_enumTypes[4].Descriptor()
 }
 
 func (DiscoveryPhase) Type() protoreflect.EnumType {
-	return &file_proto_agent_proto_enumTypes[2]
+	return &file_proto_agent_proto_enumTypes[4]
 }
 
 func (x DiscoveryPhase) Number() protoreflect.EnumNumber {
@@ -182,7 +316,7 @@ func (x DiscoveryPhase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use DiscoveryPhase.Descriptor instead.
 func (DiscoveryPhase) EnumDescriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{2}
+	return file_proto_agent_proto_rawDescGZIP(), []int{4}
 }
 
 // Configuration received from the API
@@ -1786,6 +1920,270 @@ func (x *HeartbeatResponse) GetStatus() string {
 	return ""
 }
 
+type ConfigBackupJob struct {
+	state                      protoimpl.MessageState `protogen:"open.v1"`
+	Vendor                     string                 `protobuf:"bytes,1,opt,name=vendor,proto3" json:"vendor,omitempty"` // "mikrotik"
+	Mode                       ConfigBackupMode       `protobuf:"varint,2,opt,name=mode,proto3,enum=towerops.agent.ConfigBackupMode" json:"mode,omitempty"`
+	Host                       string                 `protobuf:"bytes,3,opt,name=host,proto3" json:"host,omitempty"`
+	SshPort                    uint32                 `protobuf:"varint,4,opt,name=ssh_port,json=sshPort,proto3" json:"ssh_port,omitempty"`
+	Username                   string                 `protobuf:"bytes,5,opt,name=username,proto3" json:"username,omitempty"`
+	Password                   string                 `protobuf:"bytes,6,opt,name=password,proto3" json:"password,omitempty"`
+	IncludeSecrets             bool                   `protobuf:"varint,7,opt,name=include_secrets,json=includeSecrets,proto3" json:"include_secrets,omitempty"`
+	ExpectedHostKeyFingerprint string                 `protobuf:"bytes,8,opt,name=expected_host_key_fingerprint,json=expectedHostKeyFingerprint,proto3" json:"expected_host_key_fingerprint,omitempty"` // SHA256:... ; empty = first use
+	TimeoutMs                  uint32                 `protobuf:"varint,9,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`                                                       // 0 = agent default (120000)
+	MaxConfigBytes             uint64                 `protobuf:"varint,10,opt,name=max_config_bytes,json=maxConfigBytes,proto3" json:"max_config_bytes,omitempty"`                                     // 0 = agent default (16 MiB)
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
+}
+
+func (x *ConfigBackupJob) Reset() {
+	*x = ConfigBackupJob{}
+	mi := &file_proto_agent_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfigBackupJob) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfigBackupJob) ProtoMessage() {}
+
+func (x *ConfigBackupJob) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfigBackupJob.ProtoReflect.Descriptor instead.
+func (*ConfigBackupJob) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *ConfigBackupJob) GetVendor() string {
+	if x != nil {
+		return x.Vendor
+	}
+	return ""
+}
+
+func (x *ConfigBackupJob) GetMode() ConfigBackupMode {
+	if x != nil {
+		return x.Mode
+	}
+	return ConfigBackupMode_CONFIG_BACKUP_MODE_BACKUP
+}
+
+func (x *ConfigBackupJob) GetHost() string {
+	if x != nil {
+		return x.Host
+	}
+	return ""
+}
+
+func (x *ConfigBackupJob) GetSshPort() uint32 {
+	if x != nil {
+		return x.SshPort
+	}
+	return 0
+}
+
+func (x *ConfigBackupJob) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *ConfigBackupJob) GetPassword() string {
+	if x != nil {
+		return x.Password
+	}
+	return ""
+}
+
+func (x *ConfigBackupJob) GetIncludeSecrets() bool {
+	if x != nil {
+		return x.IncludeSecrets
+	}
+	return false
+}
+
+func (x *ConfigBackupJob) GetExpectedHostKeyFingerprint() string {
+	if x != nil {
+		return x.ExpectedHostKeyFingerprint
+	}
+	return ""
+}
+
+func (x *ConfigBackupJob) GetTimeoutMs() uint32 {
+	if x != nil {
+		return x.TimeoutMs
+	}
+	return 0
+}
+
+func (x *ConfigBackupJob) GetMaxConfigBytes() uint64 {
+	if x != nil {
+		return x.MaxConfigBytes
+	}
+	return 0
+}
+
+type ConfigBackupResult struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	DeviceId           string                 `protobuf:"bytes,1,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
+	JobId              string                 `protobuf:"bytes,2,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	ErrorCode          ConfigBackupErrorCode  `protobuf:"varint,3,opt,name=error_code,json=errorCode,proto3,enum=towerops.agent.ConfigBackupErrorCode" json:"error_code,omitempty"`
+	ErrorDetail        string                 `protobuf:"bytes,4,opt,name=error_detail,json=errorDetail,proto3" json:"error_detail,omitempty"`                        // sanitized, <= 300 chars, never router output beyond that
+	ConfigGzip         []byte                 `protobuf:"bytes,5,opt,name=config_gzip,json=configGzip,proto3" json:"config_gzip,omitempty"`                           // empty for PROBE or on error
+	ConfigBytes        uint64                 `protobuf:"varint,6,opt,name=config_bytes,json=configBytes,proto3" json:"config_bytes,omitempty"`                       // uncompressed size
+	HostKeyFingerprint string                 `protobuf:"bytes,7,opt,name=host_key_fingerprint,json=hostKeyFingerprint,proto3" json:"host_key_fingerprint,omitempty"` // always, when a handshake happened
+	OsVersion          string                 `protobuf:"bytes,8,opt,name=os_version,json=osVersion,proto3" json:"os_version,omitempty"`
+	Model              string                 `protobuf:"bytes,9,opt,name=model,proto3" json:"model,omitempty"`
+	Identity           string                 `protobuf:"bytes,10,opt,name=identity,proto3" json:"identity,omitempty"`
+	UserPolicies       []string               `protobuf:"bytes,11,rep,name=user_policies,json=userPolicies,proto3" json:"user_policies,omitempty"` // PROBE: the login's group policies
+	IncludesSecrets    bool                   `protobuf:"varint,12,opt,name=includes_secrets,json=includesSecrets,proto3" json:"includes_secrets,omitempty"`
+	DurationMs         uint32                 `protobuf:"varint,13,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	Timestamp          int64                  `protobuf:"varint,14,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *ConfigBackupResult) Reset() {
+	*x = ConfigBackupResult{}
+	mi := &file_proto_agent_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfigBackupResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfigBackupResult) ProtoMessage() {}
+
+func (x *ConfigBackupResult) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfigBackupResult.ProtoReflect.Descriptor instead.
+func (*ConfigBackupResult) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *ConfigBackupResult) GetDeviceId() string {
+	if x != nil {
+		return x.DeviceId
+	}
+	return ""
+}
+
+func (x *ConfigBackupResult) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+func (x *ConfigBackupResult) GetErrorCode() ConfigBackupErrorCode {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return ConfigBackupErrorCode_CONFIG_BACKUP_OK
+}
+
+func (x *ConfigBackupResult) GetErrorDetail() string {
+	if x != nil {
+		return x.ErrorDetail
+	}
+	return ""
+}
+
+func (x *ConfigBackupResult) GetConfigGzip() []byte {
+	if x != nil {
+		return x.ConfigGzip
+	}
+	return nil
+}
+
+func (x *ConfigBackupResult) GetConfigBytes() uint64 {
+	if x != nil {
+		return x.ConfigBytes
+	}
+	return 0
+}
+
+func (x *ConfigBackupResult) GetHostKeyFingerprint() string {
+	if x != nil {
+		return x.HostKeyFingerprint
+	}
+	return ""
+}
+
+func (x *ConfigBackupResult) GetOsVersion() string {
+	if x != nil {
+		return x.OsVersion
+	}
+	return ""
+}
+
+func (x *ConfigBackupResult) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+func (x *ConfigBackupResult) GetIdentity() string {
+	if x != nil {
+		return x.Identity
+	}
+	return ""
+}
+
+func (x *ConfigBackupResult) GetUserPolicies() []string {
+	if x != nil {
+		return x.UserPolicies
+	}
+	return nil
+}
+
+func (x *ConfigBackupResult) GetIncludesSecrets() bool {
+	if x != nil {
+		return x.IncludesSecrets
+	}
+	return false
+}
+
+func (x *ConfigBackupResult) GetDurationMs() uint32 {
+	if x != nil {
+		return x.DurationMs
+	}
+	return 0
+}
+
+func (x *ConfigBackupResult) GetTimestamp() int64 {
+	if x != nil {
+		return x.Timestamp
+	}
+	return 0
+}
+
 type AgentJobList struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Jobs          []*AgentJob            `protobuf:"bytes,1,rep,name=jobs,proto3" json:"jobs,omitempty"`
@@ -1795,7 +2193,7 @@ type AgentJobList struct {
 
 func (x *AgentJobList) Reset() {
 	*x = AgentJobList{}
-	mi := &file_proto_agent_proto_msgTypes[20]
+	mi := &file_proto_agent_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1807,7 +2205,7 @@ func (x *AgentJobList) String() string {
 func (*AgentJobList) ProtoMessage() {}
 
 func (x *AgentJobList) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[20]
+	mi := &file_proto_agent_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1820,7 +2218,7 @@ func (x *AgentJobList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentJobList.ProtoReflect.Descriptor instead.
 func (*AgentJobList) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{20}
+	return file_proto_agent_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *AgentJobList) GetJobs() []*AgentJob {
@@ -1850,13 +2248,14 @@ type AgentJob struct {
 	MaxResultBytes  uint32           `protobuf:"varint,13,opt,name=max_result_bytes,json=maxResultBytes,proto3" json:"max_result_bytes,omitempty"`
 	DiscoveryPhase  DiscoveryPhase   `protobuf:"varint,14,opt,name=discovery_phase,json=discoveryPhase,proto3,enum=towerops.agent.DiscoveryPhase" json:"discovery_phase,omitempty"` // Discovery round; echoed back on SnmpResult
 	CredentialProbe *CredentialProbe `protobuf:"bytes,15,opt,name=credential_probe,json=credentialProbe,proto3" json:"credential_probe,omitempty"`                                  // Present on CREDENTIAL_PROBE jobs
+	ConfigBackup    *ConfigBackupJob `protobuf:"bytes,16,opt,name=config_backup,json=configBackup,proto3" json:"config_backup,omitempty"`                                           // Present on CONFIG_BACKUP jobs
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
 
 func (x *AgentJob) Reset() {
 	*x = AgentJob{}
-	mi := &file_proto_agent_proto_msgTypes[21]
+	mi := &file_proto_agent_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1868,7 +2267,7 @@ func (x *AgentJob) String() string {
 func (*AgentJob) ProtoMessage() {}
 
 func (x *AgentJob) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[21]
+	mi := &file_proto_agent_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1881,7 +2280,7 @@ func (x *AgentJob) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentJob.ProtoReflect.Descriptor instead.
 func (*AgentJob) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{21}
+	return file_proto_agent_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *AgentJob) GetJobId() string {
@@ -1989,6 +2388,13 @@ func (x *AgentJob) GetCredentialProbe() *CredentialProbe {
 	return nil
 }
 
+func (x *AgentJob) GetConfigBackup() *ConfigBackupJob {
+	if x != nil {
+		return x.ConfigBackup
+	}
+	return nil
+}
+
 type SnmpDevice struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Ip        string                 `protobuf:"bytes,1,opt,name=ip,proto3" json:"ip,omitempty"`
@@ -2009,7 +2415,7 @@ type SnmpDevice struct {
 
 func (x *SnmpDevice) Reset() {
 	*x = SnmpDevice{}
-	mi := &file_proto_agent_proto_msgTypes[22]
+	mi := &file_proto_agent_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2021,7 +2427,7 @@ func (x *SnmpDevice) String() string {
 func (*SnmpDevice) ProtoMessage() {}
 
 func (x *SnmpDevice) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[22]
+	mi := &file_proto_agent_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2034,7 +2440,7 @@ func (x *SnmpDevice) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnmpDevice.ProtoReflect.Descriptor instead.
 func (*SnmpDevice) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{22}
+	return file_proto_agent_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *SnmpDevice) GetIp() string {
@@ -2124,7 +2530,7 @@ type SnmpQuery struct {
 
 func (x *SnmpQuery) Reset() {
 	*x = SnmpQuery{}
-	mi := &file_proto_agent_proto_msgTypes[23]
+	mi := &file_proto_agent_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2136,7 +2542,7 @@ func (x *SnmpQuery) String() string {
 func (*SnmpQuery) ProtoMessage() {}
 
 func (x *SnmpQuery) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[23]
+	mi := &file_proto_agent_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2149,7 +2555,7 @@ func (x *SnmpQuery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnmpQuery.ProtoReflect.Descriptor instead.
 func (*SnmpQuery) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{23}
+	return file_proto_agent_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *SnmpQuery) GetQueryType() QueryType {
@@ -2204,7 +2610,7 @@ type SnmpResult struct {
 
 func (x *SnmpResult) Reset() {
 	*x = SnmpResult{}
-	mi := &file_proto_agent_proto_msgTypes[24]
+	mi := &file_proto_agent_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2216,7 +2622,7 @@ func (x *SnmpResult) String() string {
 func (*SnmpResult) ProtoMessage() {}
 
 func (x *SnmpResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[24]
+	mi := &file_proto_agent_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2229,7 +2635,7 @@ func (x *SnmpResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnmpResult.ProtoReflect.Descriptor instead.
 func (*SnmpResult) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{24}
+	return file_proto_agent_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *SnmpResult) GetDeviceId() string {
@@ -2332,13 +2738,17 @@ type AgentHeartbeat struct {
 	// guessing wrong either strands stale addresses or wipes good ones on every
 	// heartbeat from an old agent.
 	ReportsVantagePoint bool `protobuf:"varint,10,opt,name=reports_vantage_point,json=reportsVantagePoint,proto3" json:"reports_vantage_point,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// True when the agent implements JobType CONFIG_BACKUP and sends results on
+	// "config_backup_result". Servers fall back to the legacy MikroTik backup
+	// job for agents without it.
+	SupportsConfigBackup bool `protobuf:"varint,11,opt,name=supports_config_backup,json=supportsConfigBackup,proto3" json:"supports_config_backup,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *AgentHeartbeat) Reset() {
 	*x = AgentHeartbeat{}
-	mi := &file_proto_agent_proto_msgTypes[25]
+	mi := &file_proto_agent_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2350,7 +2760,7 @@ func (x *AgentHeartbeat) String() string {
 func (*AgentHeartbeat) ProtoMessage() {}
 
 func (x *AgentHeartbeat) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[25]
+	mi := &file_proto_agent_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2363,7 +2773,7 @@ func (x *AgentHeartbeat) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentHeartbeat.ProtoReflect.Descriptor instead.
 func (*AgentHeartbeat) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{25}
+	return file_proto_agent_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *AgentHeartbeat) GetVersion() string {
@@ -2436,6 +2846,13 @@ func (x *AgentHeartbeat) GetReportsVantagePoint() bool {
 	return false
 }
 
+func (x *AgentHeartbeat) GetSupportsConfigBackup() bool {
+	if x != nil {
+		return x.SupportsConfigBackup
+	}
+	return false
+}
+
 type AgentError struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	DeviceId      string                 `protobuf:"bytes,1,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
@@ -2448,7 +2865,7 @@ type AgentError struct {
 
 func (x *AgentError) Reset() {
 	*x = AgentError{}
-	mi := &file_proto_agent_proto_msgTypes[26]
+	mi := &file_proto_agent_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2460,7 +2877,7 @@ func (x *AgentError) String() string {
 func (*AgentError) ProtoMessage() {}
 
 func (x *AgentError) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[26]
+	mi := &file_proto_agent_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2473,7 +2890,7 @@ func (x *AgentError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentError.ProtoReflect.Descriptor instead.
 func (*AgentError) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{26}
+	return file_proto_agent_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *AgentError) GetDeviceId() string {
@@ -2519,7 +2936,7 @@ type CredentialTestResult struct {
 
 func (x *CredentialTestResult) Reset() {
 	*x = CredentialTestResult{}
-	mi := &file_proto_agent_proto_msgTypes[27]
+	mi := &file_proto_agent_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2531,7 +2948,7 @@ func (x *CredentialTestResult) String() string {
 func (*CredentialTestResult) ProtoMessage() {}
 
 func (x *CredentialTestResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[27]
+	mi := &file_proto_agent_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2544,7 +2961,7 @@ func (x *CredentialTestResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialTestResult.ProtoReflect.Descriptor instead.
 func (*CredentialTestResult) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{27}
+	return file_proto_agent_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *CredentialTestResult) GetTestId() string {
@@ -2617,7 +3034,7 @@ type CredentialProbe struct {
 
 func (x *CredentialProbe) Reset() {
 	*x = CredentialProbe{}
-	mi := &file_proto_agent_proto_msgTypes[28]
+	mi := &file_proto_agent_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2629,7 +3046,7 @@ func (x *CredentialProbe) String() string {
 func (*CredentialProbe) ProtoMessage() {}
 
 func (x *CredentialProbe) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[28]
+	mi := &file_proto_agent_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2642,7 +3059,7 @@ func (x *CredentialProbe) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialProbe.ProtoReflect.Descriptor instead.
 func (*CredentialProbe) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{28}
+	return file_proto_agent_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *CredentialProbe) GetCandidates() []*SnmpDevice {
@@ -2696,7 +3113,7 @@ type CredentialProbeResult struct {
 
 func (x *CredentialProbeResult) Reset() {
 	*x = CredentialProbeResult{}
-	mi := &file_proto_agent_proto_msgTypes[29]
+	mi := &file_proto_agent_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2708,7 +3125,7 @@ func (x *CredentialProbeResult) String() string {
 func (*CredentialProbeResult) ProtoMessage() {}
 
 func (x *CredentialProbeResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[29]
+	mi := &file_proto_agent_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2721,7 +3138,7 @@ func (x *CredentialProbeResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialProbeResult.ProtoReflect.Descriptor instead.
 func (*CredentialProbeResult) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{29}
+	return file_proto_agent_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *CredentialProbeResult) GetProbeId() string {
@@ -2794,7 +3211,7 @@ type MikrotikDevice struct {
 
 func (x *MikrotikDevice) Reset() {
 	*x = MikrotikDevice{}
-	mi := &file_proto_agent_proto_msgTypes[30]
+	mi := &file_proto_agent_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2806,7 +3223,7 @@ func (x *MikrotikDevice) String() string {
 func (*MikrotikDevice) ProtoMessage() {}
 
 func (x *MikrotikDevice) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[30]
+	mi := &file_proto_agent_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2819,7 +3236,7 @@ func (x *MikrotikDevice) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MikrotikDevice.ProtoReflect.Descriptor instead.
 func (*MikrotikDevice) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{30}
+	return file_proto_agent_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *MikrotikDevice) GetIp() string {
@@ -2877,7 +3294,7 @@ type MikrotikCommand struct {
 
 func (x *MikrotikCommand) Reset() {
 	*x = MikrotikCommand{}
-	mi := &file_proto_agent_proto_msgTypes[31]
+	mi := &file_proto_agent_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2889,7 +3306,7 @@ func (x *MikrotikCommand) String() string {
 func (*MikrotikCommand) ProtoMessage() {}
 
 func (x *MikrotikCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[31]
+	mi := &file_proto_agent_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2902,7 +3319,7 @@ func (x *MikrotikCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MikrotikCommand.ProtoReflect.Descriptor instead.
 func (*MikrotikCommand) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{31}
+	return file_proto_agent_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *MikrotikCommand) GetCommand() string {
@@ -2939,7 +3356,7 @@ type MikrotikResult struct {
 
 func (x *MikrotikResult) Reset() {
 	*x = MikrotikResult{}
-	mi := &file_proto_agent_proto_msgTypes[32]
+	mi := &file_proto_agent_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2951,7 +3368,7 @@ func (x *MikrotikResult) String() string {
 func (*MikrotikResult) ProtoMessage() {}
 
 func (x *MikrotikResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[32]
+	mi := &file_proto_agent_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2964,7 +3381,7 @@ func (x *MikrotikResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MikrotikResult.ProtoReflect.Descriptor instead.
 func (*MikrotikResult) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{32}
+	return file_proto_agent_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *MikrotikResult) GetDeviceId() string {
@@ -3011,7 +3428,7 @@ type MikrotikSentence struct {
 
 func (x *MikrotikSentence) Reset() {
 	*x = MikrotikSentence{}
-	mi := &file_proto_agent_proto_msgTypes[33]
+	mi := &file_proto_agent_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3023,7 +3440,7 @@ func (x *MikrotikSentence) String() string {
 func (*MikrotikSentence) ProtoMessage() {}
 
 func (x *MikrotikSentence) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[33]
+	mi := &file_proto_agent_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3036,7 +3453,7 @@ func (x *MikrotikSentence) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MikrotikSentence.ProtoReflect.Descriptor instead.
 func (*MikrotikSentence) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{33}
+	return file_proto_agent_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *MikrotikSentence) GetAttributes() map[string]string {
@@ -3070,7 +3487,7 @@ type SnmpTrap struct {
 
 func (x *SnmpTrap) Reset() {
 	*x = SnmpTrap{}
-	mi := &file_proto_agent_proto_msgTypes[34]
+	mi := &file_proto_agent_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3082,7 +3499,7 @@ func (x *SnmpTrap) String() string {
 func (*SnmpTrap) ProtoMessage() {}
 
 func (x *SnmpTrap) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[34]
+	mi := &file_proto_agent_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3095,7 +3512,7 @@ func (x *SnmpTrap) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnmpTrap.ProtoReflect.Descriptor instead.
 func (*SnmpTrap) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{34}
+	return file_proto_agent_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *SnmpTrap) GetSourceIp() string {
@@ -3301,9 +3718,42 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\bhostname\x18\x02 \x01(\tR\bhostname\x12%\n" +
 	"\x0euptime_seconds\x18\x03 \x01(\x04R\ruptimeSeconds\"+\n" +
 	"\x11HeartbeatResponse\x12\x16\n" +
-	"\x06status\x18\x01 \x01(\tR\x06status\"<\n" +
+	"\x06status\x18\x01 \x01(\tR\x06status\"\xfb\x02\n" +
+	"\x0fConfigBackupJob\x12\x16\n" +
+	"\x06vendor\x18\x01 \x01(\tR\x06vendor\x124\n" +
+	"\x04mode\x18\x02 \x01(\x0e2 .towerops.agent.ConfigBackupModeR\x04mode\x12\x12\n" +
+	"\x04host\x18\x03 \x01(\tR\x04host\x12\x19\n" +
+	"\bssh_port\x18\x04 \x01(\rR\asshPort\x12\x1a\n" +
+	"\busername\x18\x05 \x01(\tR\busername\x12\x1a\n" +
+	"\bpassword\x18\x06 \x01(\tR\bpassword\x12'\n" +
+	"\x0finclude_secrets\x18\a \x01(\bR\x0eincludeSecrets\x12A\n" +
+	"\x1dexpected_host_key_fingerprint\x18\b \x01(\tR\x1aexpectedHostKeyFingerprint\x12\x1d\n" +
+	"\n" +
+	"timeout_ms\x18\t \x01(\rR\ttimeoutMs\x12(\n" +
+	"\x10max_config_bytes\x18\n" +
+	" \x01(\x04R\x0emaxConfigBytes\"\x87\x04\n" +
+	"\x12ConfigBackupResult\x12\x1b\n" +
+	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12\x15\n" +
+	"\x06job_id\x18\x02 \x01(\tR\x05jobId\x12D\n" +
+	"\n" +
+	"error_code\x18\x03 \x01(\x0e2%.towerops.agent.ConfigBackupErrorCodeR\terrorCode\x12!\n" +
+	"\ferror_detail\x18\x04 \x01(\tR\verrorDetail\x12\x1f\n" +
+	"\vconfig_gzip\x18\x05 \x01(\fR\n" +
+	"configGzip\x12!\n" +
+	"\fconfig_bytes\x18\x06 \x01(\x04R\vconfigBytes\x120\n" +
+	"\x14host_key_fingerprint\x18\a \x01(\tR\x12hostKeyFingerprint\x12\x1d\n" +
+	"\n" +
+	"os_version\x18\b \x01(\tR\tosVersion\x12\x14\n" +
+	"\x05model\x18\t \x01(\tR\x05model\x12\x1a\n" +
+	"\bidentity\x18\n" +
+	" \x01(\tR\bidentity\x12#\n" +
+	"\ruser_policies\x18\v \x03(\tR\fuserPolicies\x12)\n" +
+	"\x10includes_secrets\x18\f \x01(\bR\x0fincludesSecrets\x12\x1f\n" +
+	"\vduration_ms\x18\r \x01(\rR\n" +
+	"durationMs\x12\x1c\n" +
+	"\ttimestamp\x18\x0e \x01(\x03R\ttimestamp\"<\n" +
 	"\fAgentJobList\x12,\n" +
-	"\x04jobs\x18\x01 \x03(\v2\x18.towerops.agent.AgentJobR\x04jobs\"\xf9\x05\n" +
+	"\x04jobs\x18\x01 \x03(\v2\x18.towerops.agent.AgentJobR\x04jobs\"\xbf\x06\n" +
 	"\bAgentJob\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x122\n" +
 	"\bjob_type\x18\x02 \x01(\x0e2\x17.towerops.agent.JobTypeR\ajobType\x12\x1b\n" +
@@ -3322,7 +3772,8 @@ const file_proto_agent_proto_rawDesc = "" +
 	"deadlineMs\x12(\n" +
 	"\x10max_result_bytes\x18\r \x01(\rR\x0emaxResultBytes\x12G\n" +
 	"\x0fdiscovery_phase\x18\x0e \x01(\x0e2\x1e.towerops.agent.DiscoveryPhaseR\x0ediscoveryPhase\x12J\n" +
-	"\x10credential_probe\x18\x0f \x01(\v2\x1f.towerops.agent.CredentialProbeR\x0fcredentialProbe\"\xfb\x02\n" +
+	"\x10credential_probe\x18\x0f \x01(\v2\x1f.towerops.agent.CredentialProbeR\x0fcredentialProbe\x12D\n" +
+	"\rconfig_backup\x18\x10 \x01(\v2\x1f.towerops.agent.ConfigBackupJobR\fconfigBackup\"\xfb\x02\n" +
 	"\n" +
 	"SnmpDevice\x12\x0e\n" +
 	"\x02ip\x18\x01 \x01(\tR\x02ip\x12\x1c\n" +
@@ -3359,7 +3810,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x0fdiscovery_phase\x18\v \x01(\x0e2\x1e.towerops.agent.DiscoveryPhaseR\x0ediscoveryPhase\x1a<\n" +
 	"\x0eOidValuesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe3\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x99\x03\n" +
 	"\x0eAgentHeartbeat\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x1a\n" +
 	"\bhostname\x18\x02 \x01(\tR\bhostname\x12%\n" +
@@ -3372,7 +3823,8 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x11interface_subnets\x18\b \x03(\tR\x10interfaceSubnets\x12%\n" +
 	"\x0eschedules_jobs\x18\t \x01(\bR\rschedulesJobs\x122\n" +
 	"\x15reports_vantage_point\x18\n" +
-	" \x01(\bR\x13reportsVantagePoint\"x\n" +
+	" \x01(\bR\x13reportsVantagePoint\x124\n" +
+	"\x16supports_config_backup\x18\v \x01(\bR\x14supportsConfigBackup\"x\n" +
 	"\n" +
 	"AgentError\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12\x15\n" +
@@ -3446,14 +3898,35 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\ttimestamp\x18\t \x01(\x03R\ttimestamp\x1a;\n" +
 	"\rVarbindsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01*q\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01*\x84\x01\n" +
 	"\aJobType\x12\f\n" +
 	"\bDISCOVER\x10\x00\x12\b\n" +
 	"\x04POLL\x10\x01\x12\f\n" +
 	"\bMIKROTIK\x10\x02\x12\x14\n" +
 	"\x10TEST_CREDENTIALS\x10\x03\x12\b\n" +
 	"\x04PING\x10\x04\x12\x14\n" +
-	"\x10CREDENTIAL_PROBE\x10\a\"\x04\b\x05\x10\x05\"\x04\b\x06\x10\x06*\x1e\n" +
+	"\x10CREDENTIAL_PROBE\x10\a\x12\x11\n" +
+	"\rCONFIG_BACKUP\x10\b\"\x04\b\x05\x10\x05\"\x04\b\x06\x10\x06*O\n" +
+	"\x10ConfigBackupMode\x12\x1d\n" +
+	"\x19CONFIG_BACKUP_MODE_BACKUP\x10\x00\x12\x1c\n" +
+	"\x18CONFIG_BACKUP_MODE_PROBE\x10\x01*\xa3\x02\n" +
+	"\x15ConfigBackupErrorCode\x12\x14\n" +
+	"\x10CONFIG_BACKUP_OK\x10\x00\x12\x0f\n" +
+	"\vAUTH_FAILED\x10\x01\x12\x0f\n" +
+	"\vUNREACHABLE\x10\x02\x12\x16\n" +
+	"\x12CONNECTION_REFUSED\x10\x03\x12\v\n" +
+	"\aTIMEOUT\x10\x04\x12\x15\n" +
+	"\x11HOST_KEY_MISMATCH\x10\x05\x12\x15\n" +
+	"\x11PERMISSION_DENIED\x10\x06\x12\x11\n" +
+	"\rEXPORT_FAILED\x10\a\x12\x15\n" +
+	"\x11EXPORT_INCOMPLETE\x10\b\x12\x10\n" +
+	"\fEXPORT_EMPTY\x10\t\x12\r\n" +
+	"\tTOO_LARGE\x10\n" +
+	"\x12\x0e\n" +
+	"\n" +
+	"AGENT_BUSY\x10\v\x12\x16\n" +
+	"\x12UNSUPPORTED_VENDOR\x10\f\x12\f\n" +
+	"\bINTERNAL\x10\r*\x1e\n" +
 	"\tQueryType\x12\a\n" +
 	"\x03GET\x10\x00\x12\b\n" +
 	"\x04WALK\x10\x01*i\n" +
@@ -3474,95 +3947,102 @@ func file_proto_agent_proto_rawDescGZIP() []byte {
 	return file_proto_agent_proto_rawDescData
 }
 
-var file_proto_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 41)
+var file_proto_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
+var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 43)
 var file_proto_agent_proto_goTypes = []any{
 	(JobType)(0),                  // 0: towerops.agent.JobType
-	(QueryType)(0),                // 1: towerops.agent.QueryType
-	(DiscoveryPhase)(0),           // 2: towerops.agent.DiscoveryPhase
-	(*AgentConfig)(nil),           // 3: towerops.agent.AgentConfig
-	(*Device)(nil),                // 4: towerops.agent.Device
-	(*SnmpConfig)(nil),            // 5: towerops.agent.SnmpConfig
-	(*Sensor)(nil),                // 6: towerops.agent.Sensor
-	(*Interface)(nil),             // 7: towerops.agent.Interface
-	(*MetricBatch)(nil),           // 8: towerops.agent.MetricBatch
-	(*Metric)(nil),                // 9: towerops.agent.Metric
-	(*SensorReading)(nil),         // 10: towerops.agent.SensorReading
-	(*InterfaceStat)(nil),         // 11: towerops.agent.InterfaceStat
-	(*NeighborDiscovery)(nil),     // 12: towerops.agent.NeighborDiscovery
-	(*MonitoringCheck)(nil),       // 13: towerops.agent.MonitoringCheck
-	(*Check)(nil),                 // 14: towerops.agent.Check
-	(*HttpCheckConfig)(nil),       // 15: towerops.agent.HttpCheckConfig
-	(*TcpCheckConfig)(nil),        // 16: towerops.agent.TcpCheckConfig
-	(*DnsCheckConfig)(nil),        // 17: towerops.agent.DnsCheckConfig
-	(*SslCheckConfig)(nil),        // 18: towerops.agent.SslCheckConfig
-	(*CheckResult)(nil),           // 19: towerops.agent.CheckResult
-	(*CheckList)(nil),             // 20: towerops.agent.CheckList
-	(*HeartbeatMetadata)(nil),     // 21: towerops.agent.HeartbeatMetadata
-	(*HeartbeatResponse)(nil),     // 22: towerops.agent.HeartbeatResponse
-	(*AgentJobList)(nil),          // 23: towerops.agent.AgentJobList
-	(*AgentJob)(nil),              // 24: towerops.agent.AgentJob
-	(*SnmpDevice)(nil),            // 25: towerops.agent.SnmpDevice
-	(*SnmpQuery)(nil),             // 26: towerops.agent.SnmpQuery
-	(*SnmpResult)(nil),            // 27: towerops.agent.SnmpResult
-	(*AgentHeartbeat)(nil),        // 28: towerops.agent.AgentHeartbeat
-	(*AgentError)(nil),            // 29: towerops.agent.AgentError
-	(*CredentialTestResult)(nil),  // 30: towerops.agent.CredentialTestResult
-	(*CredentialProbe)(nil),       // 31: towerops.agent.CredentialProbe
-	(*CredentialProbeResult)(nil), // 32: towerops.agent.CredentialProbeResult
-	(*MikrotikDevice)(nil),        // 33: towerops.agent.MikrotikDevice
-	(*MikrotikCommand)(nil),       // 34: towerops.agent.MikrotikCommand
-	(*MikrotikResult)(nil),        // 35: towerops.agent.MikrotikResult
-	(*MikrotikSentence)(nil),      // 36: towerops.agent.MikrotikSentence
-	(*SnmpTrap)(nil),              // 37: towerops.agent.SnmpTrap
-	nil,                           // 38: towerops.agent.Sensor.MetadataEntry
-	nil,                           // 39: towerops.agent.HttpCheckConfig.HeadersEntry
-	nil,                           // 40: towerops.agent.SnmpResult.OidValuesEntry
-	nil,                           // 41: towerops.agent.MikrotikCommand.ArgsEntry
-	nil,                           // 42: towerops.agent.MikrotikSentence.AttributesEntry
-	nil,                           // 43: towerops.agent.SnmpTrap.VarbindsEntry
+	(ConfigBackupMode)(0),         // 1: towerops.agent.ConfigBackupMode
+	(ConfigBackupErrorCode)(0),    // 2: towerops.agent.ConfigBackupErrorCode
+	(QueryType)(0),                // 3: towerops.agent.QueryType
+	(DiscoveryPhase)(0),           // 4: towerops.agent.DiscoveryPhase
+	(*AgentConfig)(nil),           // 5: towerops.agent.AgentConfig
+	(*Device)(nil),                // 6: towerops.agent.Device
+	(*SnmpConfig)(nil),            // 7: towerops.agent.SnmpConfig
+	(*Sensor)(nil),                // 8: towerops.agent.Sensor
+	(*Interface)(nil),             // 9: towerops.agent.Interface
+	(*MetricBatch)(nil),           // 10: towerops.agent.MetricBatch
+	(*Metric)(nil),                // 11: towerops.agent.Metric
+	(*SensorReading)(nil),         // 12: towerops.agent.SensorReading
+	(*InterfaceStat)(nil),         // 13: towerops.agent.InterfaceStat
+	(*NeighborDiscovery)(nil),     // 14: towerops.agent.NeighborDiscovery
+	(*MonitoringCheck)(nil),       // 15: towerops.agent.MonitoringCheck
+	(*Check)(nil),                 // 16: towerops.agent.Check
+	(*HttpCheckConfig)(nil),       // 17: towerops.agent.HttpCheckConfig
+	(*TcpCheckConfig)(nil),        // 18: towerops.agent.TcpCheckConfig
+	(*DnsCheckConfig)(nil),        // 19: towerops.agent.DnsCheckConfig
+	(*SslCheckConfig)(nil),        // 20: towerops.agent.SslCheckConfig
+	(*CheckResult)(nil),           // 21: towerops.agent.CheckResult
+	(*CheckList)(nil),             // 22: towerops.agent.CheckList
+	(*HeartbeatMetadata)(nil),     // 23: towerops.agent.HeartbeatMetadata
+	(*HeartbeatResponse)(nil),     // 24: towerops.agent.HeartbeatResponse
+	(*ConfigBackupJob)(nil),       // 25: towerops.agent.ConfigBackupJob
+	(*ConfigBackupResult)(nil),    // 26: towerops.agent.ConfigBackupResult
+	(*AgentJobList)(nil),          // 27: towerops.agent.AgentJobList
+	(*AgentJob)(nil),              // 28: towerops.agent.AgentJob
+	(*SnmpDevice)(nil),            // 29: towerops.agent.SnmpDevice
+	(*SnmpQuery)(nil),             // 30: towerops.agent.SnmpQuery
+	(*SnmpResult)(nil),            // 31: towerops.agent.SnmpResult
+	(*AgentHeartbeat)(nil),        // 32: towerops.agent.AgentHeartbeat
+	(*AgentError)(nil),            // 33: towerops.agent.AgentError
+	(*CredentialTestResult)(nil),  // 34: towerops.agent.CredentialTestResult
+	(*CredentialProbe)(nil),       // 35: towerops.agent.CredentialProbe
+	(*CredentialProbeResult)(nil), // 36: towerops.agent.CredentialProbeResult
+	(*MikrotikDevice)(nil),        // 37: towerops.agent.MikrotikDevice
+	(*MikrotikCommand)(nil),       // 38: towerops.agent.MikrotikCommand
+	(*MikrotikResult)(nil),        // 39: towerops.agent.MikrotikResult
+	(*MikrotikSentence)(nil),      // 40: towerops.agent.MikrotikSentence
+	(*SnmpTrap)(nil),              // 41: towerops.agent.SnmpTrap
+	nil,                           // 42: towerops.agent.Sensor.MetadataEntry
+	nil,                           // 43: towerops.agent.HttpCheckConfig.HeadersEntry
+	nil,                           // 44: towerops.agent.SnmpResult.OidValuesEntry
+	nil,                           // 45: towerops.agent.MikrotikCommand.ArgsEntry
+	nil,                           // 46: towerops.agent.MikrotikSentence.AttributesEntry
+	nil,                           // 47: towerops.agent.SnmpTrap.VarbindsEntry
 }
 var file_proto_agent_proto_depIdxs = []int32{
-	4,  // 0: towerops.agent.AgentConfig.devices:type_name -> towerops.agent.Device
-	14, // 1: towerops.agent.AgentConfig.checks:type_name -> towerops.agent.Check
-	5,  // 2: towerops.agent.Device.snmp:type_name -> towerops.agent.SnmpConfig
-	6,  // 3: towerops.agent.Device.sensors:type_name -> towerops.agent.Sensor
-	7,  // 4: towerops.agent.Device.interfaces:type_name -> towerops.agent.Interface
-	38, // 5: towerops.agent.Sensor.metadata:type_name -> towerops.agent.Sensor.MetadataEntry
-	9,  // 6: towerops.agent.MetricBatch.metrics:type_name -> towerops.agent.Metric
-	10, // 7: towerops.agent.Metric.sensor_reading:type_name -> towerops.agent.SensorReading
-	11, // 8: towerops.agent.Metric.interface_stat:type_name -> towerops.agent.InterfaceStat
-	12, // 9: towerops.agent.Metric.neighbor_discovery:type_name -> towerops.agent.NeighborDiscovery
-	13, // 10: towerops.agent.Metric.monitoring_check:type_name -> towerops.agent.MonitoringCheck
-	19, // 11: towerops.agent.Metric.check_result:type_name -> towerops.agent.CheckResult
-	15, // 12: towerops.agent.Check.http:type_name -> towerops.agent.HttpCheckConfig
-	16, // 13: towerops.agent.Check.tcp:type_name -> towerops.agent.TcpCheckConfig
-	17, // 14: towerops.agent.Check.dns:type_name -> towerops.agent.DnsCheckConfig
-	18, // 15: towerops.agent.Check.ssl:type_name -> towerops.agent.SslCheckConfig
-	39, // 16: towerops.agent.HttpCheckConfig.headers:type_name -> towerops.agent.HttpCheckConfig.HeadersEntry
-	14, // 17: towerops.agent.CheckList.checks:type_name -> towerops.agent.Check
-	24, // 18: towerops.agent.AgentJobList.jobs:type_name -> towerops.agent.AgentJob
-	0,  // 19: towerops.agent.AgentJob.job_type:type_name -> towerops.agent.JobType
-	25, // 20: towerops.agent.AgentJob.snmp_device:type_name -> towerops.agent.SnmpDevice
-	26, // 21: towerops.agent.AgentJob.queries:type_name -> towerops.agent.SnmpQuery
-	33, // 22: towerops.agent.AgentJob.mikrotik_device:type_name -> towerops.agent.MikrotikDevice
-	34, // 23: towerops.agent.AgentJob.mikrotik_commands:type_name -> towerops.agent.MikrotikCommand
-	2,  // 24: towerops.agent.AgentJob.discovery_phase:type_name -> towerops.agent.DiscoveryPhase
-	31, // 25: towerops.agent.AgentJob.credential_probe:type_name -> towerops.agent.CredentialProbe
-	1,  // 26: towerops.agent.SnmpQuery.query_type:type_name -> towerops.agent.QueryType
-	0,  // 27: towerops.agent.SnmpResult.job_type:type_name -> towerops.agent.JobType
-	40, // 28: towerops.agent.SnmpResult.oid_values:type_name -> towerops.agent.SnmpResult.OidValuesEntry
-	2,  // 29: towerops.agent.SnmpResult.discovery_phase:type_name -> towerops.agent.DiscoveryPhase
-	25, // 30: towerops.agent.CredentialProbe.candidates:type_name -> towerops.agent.SnmpDevice
-	41, // 31: towerops.agent.MikrotikCommand.args:type_name -> towerops.agent.MikrotikCommand.ArgsEntry
-	36, // 32: towerops.agent.MikrotikResult.sentences:type_name -> towerops.agent.MikrotikSentence
-	42, // 33: towerops.agent.MikrotikSentence.attributes:type_name -> towerops.agent.MikrotikSentence.AttributesEntry
-	43, // 34: towerops.agent.SnmpTrap.varbinds:type_name -> towerops.agent.SnmpTrap.VarbindsEntry
-	35, // [35:35] is the sub-list for method output_type
-	35, // [35:35] is the sub-list for method input_type
-	35, // [35:35] is the sub-list for extension type_name
-	35, // [35:35] is the sub-list for extension extendee
-	0,  // [0:35] is the sub-list for field type_name
+	6,  // 0: towerops.agent.AgentConfig.devices:type_name -> towerops.agent.Device
+	16, // 1: towerops.agent.AgentConfig.checks:type_name -> towerops.agent.Check
+	7,  // 2: towerops.agent.Device.snmp:type_name -> towerops.agent.SnmpConfig
+	8,  // 3: towerops.agent.Device.sensors:type_name -> towerops.agent.Sensor
+	9,  // 4: towerops.agent.Device.interfaces:type_name -> towerops.agent.Interface
+	42, // 5: towerops.agent.Sensor.metadata:type_name -> towerops.agent.Sensor.MetadataEntry
+	11, // 6: towerops.agent.MetricBatch.metrics:type_name -> towerops.agent.Metric
+	12, // 7: towerops.agent.Metric.sensor_reading:type_name -> towerops.agent.SensorReading
+	13, // 8: towerops.agent.Metric.interface_stat:type_name -> towerops.agent.InterfaceStat
+	14, // 9: towerops.agent.Metric.neighbor_discovery:type_name -> towerops.agent.NeighborDiscovery
+	15, // 10: towerops.agent.Metric.monitoring_check:type_name -> towerops.agent.MonitoringCheck
+	21, // 11: towerops.agent.Metric.check_result:type_name -> towerops.agent.CheckResult
+	17, // 12: towerops.agent.Check.http:type_name -> towerops.agent.HttpCheckConfig
+	18, // 13: towerops.agent.Check.tcp:type_name -> towerops.agent.TcpCheckConfig
+	19, // 14: towerops.agent.Check.dns:type_name -> towerops.agent.DnsCheckConfig
+	20, // 15: towerops.agent.Check.ssl:type_name -> towerops.agent.SslCheckConfig
+	43, // 16: towerops.agent.HttpCheckConfig.headers:type_name -> towerops.agent.HttpCheckConfig.HeadersEntry
+	16, // 17: towerops.agent.CheckList.checks:type_name -> towerops.agent.Check
+	1,  // 18: towerops.agent.ConfigBackupJob.mode:type_name -> towerops.agent.ConfigBackupMode
+	2,  // 19: towerops.agent.ConfigBackupResult.error_code:type_name -> towerops.agent.ConfigBackupErrorCode
+	28, // 20: towerops.agent.AgentJobList.jobs:type_name -> towerops.agent.AgentJob
+	0,  // 21: towerops.agent.AgentJob.job_type:type_name -> towerops.agent.JobType
+	29, // 22: towerops.agent.AgentJob.snmp_device:type_name -> towerops.agent.SnmpDevice
+	30, // 23: towerops.agent.AgentJob.queries:type_name -> towerops.agent.SnmpQuery
+	37, // 24: towerops.agent.AgentJob.mikrotik_device:type_name -> towerops.agent.MikrotikDevice
+	38, // 25: towerops.agent.AgentJob.mikrotik_commands:type_name -> towerops.agent.MikrotikCommand
+	4,  // 26: towerops.agent.AgentJob.discovery_phase:type_name -> towerops.agent.DiscoveryPhase
+	35, // 27: towerops.agent.AgentJob.credential_probe:type_name -> towerops.agent.CredentialProbe
+	25, // 28: towerops.agent.AgentJob.config_backup:type_name -> towerops.agent.ConfigBackupJob
+	3,  // 29: towerops.agent.SnmpQuery.query_type:type_name -> towerops.agent.QueryType
+	0,  // 30: towerops.agent.SnmpResult.job_type:type_name -> towerops.agent.JobType
+	44, // 31: towerops.agent.SnmpResult.oid_values:type_name -> towerops.agent.SnmpResult.OidValuesEntry
+	4,  // 32: towerops.agent.SnmpResult.discovery_phase:type_name -> towerops.agent.DiscoveryPhase
+	29, // 33: towerops.agent.CredentialProbe.candidates:type_name -> towerops.agent.SnmpDevice
+	45, // 34: towerops.agent.MikrotikCommand.args:type_name -> towerops.agent.MikrotikCommand.ArgsEntry
+	40, // 35: towerops.agent.MikrotikResult.sentences:type_name -> towerops.agent.MikrotikSentence
+	46, // 36: towerops.agent.MikrotikSentence.attributes:type_name -> towerops.agent.MikrotikSentence.AttributesEntry
+	47, // 37: towerops.agent.SnmpTrap.varbinds:type_name -> towerops.agent.SnmpTrap.VarbindsEntry
+	38, // [38:38] is the sub-list for method output_type
+	38, // [38:38] is the sub-list for method input_type
+	38, // [38:38] is the sub-list for extension type_name
+	38, // [38:38] is the sub-list for extension extendee
+	0,  // [0:38] is the sub-list for field type_name
 }
 
 func init() { file_proto_agent_proto_init() }
@@ -3588,8 +4068,8 @@ func file_proto_agent_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_agent_proto_rawDesc), len(file_proto_agent_proto_rawDesc)),
-			NumEnums:      3,
-			NumMessages:   41,
+			NumEnums:      5,
+			NumMessages:   43,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
