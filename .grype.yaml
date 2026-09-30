@@ -41,3 +41,62 @@ ignore:
     package:
       name: glibc-2.44
       type: apk
+
+  # All five CVEs below are unfixed upstream: the newest glibc-2.44 Wolfi
+  # publishes is 2.44-r7 (already installed by the Dockerfile's
+  # `apk upgrade`), and packages.wolfi.dev/os/security.json lists secfixes
+  # only through r6. The fixes land in glibc 2.45. Each entry has its own
+  # reachability case - do not widen or merge them. Delete each when a
+  # fixed glibc ships in wolfi-base.
+
+  # CVE-2026-86805 (GLIBC-SA-2026-0022): TOCTOU in ld.so when expanding
+  # $ORIGIN in DT_RPATH of an AT_SECURE (setuid/setgid or file-capability)
+  # program. Two preconditions fail in this image: there is no setuid/setgid
+  # binary at all (the Dockerfile rm's linux-pam's unix_chkpwd, the only one
+  # installed), and the sole file-capability binary, /usr/bin/ping, has no
+  # DT_RPATH/DT_RUNPATH - verified `readelf -d` — so $ORIGIN is never
+  # expanded under AT_SECURE.
+  - vulnerability: CVE-2026-86805
+    package:
+      name: glibc-2.44
+      type: apk
+
+  # CVE-2026-95818 (GLIBC-SA-2026-0023): stack buffer overflow in ld.so when
+  # an AT_SECURE program's DT_RPATH/DT_RUNPATH begins with $ORIGIN followed
+  # by NUL or '/'. Same reachability answer as CVE-2026-86805 above: no
+  # setuid/setgid binaries in the image and ping, the only file-capability
+  # binary, carries no RPATH/RUNPATH.
+  - vulnerability: CVE-2026-95818
+    package:
+      name: glibc-2.44
+      type: apk
+
+  # CVE-2026-8674 (GLIBC-SA-2026-0021): assertion failure aborting the
+  # process when glibc's DNS stub resolver initializes from a resolv.conf
+  # search list, or a LOCALDOMAIN variable, containing a ~200+ character
+  # domain. Neither input is attacker-reachable here: resolv.conf is
+  # container-managed, the agent sets no LOCALDOMAIN for its exec'd
+  # children, and the only glibc-linked child (ping) receives an IP literal
+  # that never reaches the resolver anyway. The agent itself is
+  # CGO_ENABLED=0 and uses Go's own resolver.
+  - vulnerability: CVE-2026-8674
+    package:
+      name: glibc-2.44
+      type: apk
+
+  # CVE-2026-77117: hang in glibc's iconv SHIFT_JISX0213 -> UCS-4 converter.
+  # The image ships no gconv modules at all (/usr/lib/gconv is absent), no
+  # iconv binary, and no localedef; nothing in it can instantiate the
+  # converter. The agent binary is CGO_ENABLED=0.
+  - vulnerability: CVE-2026-77117
+    package:
+      name: glibc-2.44
+      type: apk
+
+  # CVE-2026-80489: hang in glibc's iconv EUC-JISX0213 -> UCS-4 converter.
+  # Same reachability answer as CVE-2026-77117: no gconv modules ship in the
+  # image, so the converter code is not present to be reached.
+  - vulnerability: CVE-2026-80489
+    package:
+      name: glibc-2.44
+      type: apk
