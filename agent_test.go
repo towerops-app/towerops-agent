@@ -4155,7 +4155,7 @@ func TestResultQueueRequeuedDiscoveryReleasesGeneralLane(t *testing.T) {
 	if got := len(out.slots); got != 0 {
 		t.Fatalf("general lane holds %d tokens after ack, want 0 (leaked token)", got)
 	}
-	if got := len(out.discSlots); got != 2 {
+	if got := len(out.reservedSlots); got != 2 {
 		t.Fatalf("discovery lane holds %d tokens after ack, want 2 (d2/d3 still in flight)", got)
 	}
 }

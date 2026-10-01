@@ -830,3 +830,124 @@ func TestConfigBackupJobTimeoutDuringSession(t *testing.T) {
 		t.Fatalf("code = %v (%q), want TIMEOUT", result.ErrorCode, result.ErrorDetail)
 	}
 }
+
+func TestConfigBackupGateWaitReportsTimeout(t *testing.T) {
+	// A job parked on the per-target gate must still honor its deadline: the
+	// server sweeps dispatches that never answer, so waiting silently is a
+	// lost job. Hold the device's gate and submit with a short timeout.
+	resetHostKeyStore(t)
+	origJitter := dispatchJitterMax
+	dispatchJitterMax = 0
+	t.Cleanup(func() { dispatchJitterMax = origJitter })
+	origDial := sshDial
+	sshDial = func(context.Context, string, string, *ssh.ClientConfig) (*ssh.Client, error) {
+		t.Error("dial attempted while the device gate was held")
+		return nil, errors.New("should not dial")
+	}
+	t.Cleanup(func() { sshDial = origDial })
+
+	pools := &jobPools{
+		backup:  newWorkerPool(1),
+		targets: &targetGates{},
+		notices: make(chan outbound, 8),
+	}
+	defer func() { pools.backup.stop() }()
+
+	job := cbJob("192.0.2.1", 22)
+	job.ConfigBackup.TimeoutMs = 150
+	defer pools.targets.acquire(context.Background(), jobTargetKey(job))()
+
+	out := testQueue()
+	if !submitJob(context.Background(), job, pools, out, func() {}, false) {
+		t.Fatal("submitJob rejected a fresh pool")
+	}
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_TIMEOUT {
+		t.Fatalf("code = %v (%q), want TIMEOUT", result.ErrorCode, result.ErrorDetail)
+	}
+	if result.ErrorDetail != "job deadline expired waiting for the device" {
+		t.Fatalf("detail = %q, want the gate-wait message", result.ErrorDetail)
+	}
+}
+
+func TestConfigBackupGateWaitSessionCancel(t *testing.T) {
+	// A session that ends while a job waits on the device gate reports
+	// nothing — the channel that would carry the result is gone.
+	resetHostKeyStore(t)
+	origJitter := dispatchJitterMax
+	dispatchJitterMax = 0
+	t.Cleanup(func() { dispatchJitterMax = origJitter })
+
+	pools := &jobPools{
+		backup:  newWorkerPool(1),
+		targets: &targetGates{},
+		notices: make(chan outbound, 8),
+	}
+	defer func() { pools.backup.stop() }()
+
+	job := cbJob("192.0.2.1", 22)
+	defer pools.targets.acquire(context.Background(), jobTargetKey(job))()
+
+	session, endSession := context.WithCancel(context.Background())
+	out := testQueue()
+	if !submitJob(session, job, pools, out, func() {}, false) {
+		t.Fatal("submitJob rejected a fresh pool")
+	}
+	endSession()
+
+	select {
+	case queued := <-out.items:
+		t.Fatalf("unexpected result after session cancel: %+v", queued)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func TestConfigBackupDialClassification(t *testing.T) {
+	origDial := sshDial
+	defer func() { sshDial = origDial }()
+
+	t.Run("tcp connect timeout reports unreachable", func(t *testing.T) {
+		sshDial = func(context.Context, string, string, *ssh.ClientConfig) (*ssh.Client, error) {
+			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: context.DeadlineExceeded}
+		}
+		job := cbJob("192.0.2.1", 22)
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_UNREACHABLE {
+			t.Fatalf("code = %v (%q), want UNREACHABLE", result.ErrorCode, result.ErrorDetail)
+		}
+	})
+
+	t.Run("handshake stalled past dial budget reports timeout", func(t *testing.T) {
+		origTimeout := configBackupDialTimeout
+		configBackupDialTimeout = 50 * time.Millisecond
+		defer func() { configBackupDialTimeout = origTimeout }()
+
+		// The handshake outlives dialCtx; its conn close surfaces as a
+		// handshake error that must not classify as AUTH_FAILED.
+		sshDial = func(ctx context.Context, _, _ string, _ *ssh.ClientConfig) (*ssh.Client, error) {
+			<-ctx.Done()
+			return nil, errors.New("ssh: handshake failed: read tcp: use of closed network connection")
+		}
+		job := cbJob("192.0.2.1", 22)
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_TIMEOUT {
+			t.Fatalf("code = %v (%q), want TIMEOUT", result.ErrorCode, result.ErrorDetail)
+		}
+	})
+}
+
+func TestConfigBackupResultUsesReservedLane(t *testing.T) {
+	if !usesReservedLane(&pb.ConfigBackupResult{}) {
+		t.Fatal("backup result should qualify for the reserved spool lane")
+	}
+	if usesReservedLane(&pb.SnmpResult{JobType: pb.JobType_POLL}) {
+		t.Fatal("poll result must not use the reserved lane")
+	}
+}
