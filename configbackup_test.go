@@ -342,6 +342,16 @@ func TestConfigBackupPoolRejection(t *testing.T) {
 	if result.ErrorCode != pb.ConfigBackupErrorCode_AGENT_BUSY {
 		t.Fatalf("code = %v, want AGENT_BUSY", result.ErrorCode)
 	}
+
+	// The rejection must free the device gate it took before submit, or the
+	// device stays blocked for the rest of the session.
+	gateCtx, gateCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer gateCancel()
+	r := pools.targets.acquire(gateCtx, jobTargetKey(job))
+	if r == nil {
+		t.Fatal("rejection leaked the device gate")
+	}
+	r()
 }
 
 func TestConfigBackupContextCancel(t *testing.T) {
