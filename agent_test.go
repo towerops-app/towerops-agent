@@ -24,6 +24,7 @@ import (
 
 	"github.com/gosnmp/gosnmp"
 	"github.com/towerops-app/towerops-agent/pb"
+	"golang.org/x/crypto/ssh"
 	"google.golang.org/protobuf/proto"
 	"pgregory.net/rapid"
 )
@@ -1329,6 +1330,7 @@ func TestPoolOverloadReportsEveryJobClassWithoutUsingResultSpool(t *testing.T) {
 		ping:     newWorkerPool(1),
 		checks:   newWorkerPool(1),
 		notices:  notices,
+		targets:  &targetGates{},
 	}
 	t.Cleanup(func() { p.snmp.stop(); p.mikrotik.stop(); p.ping.stop(); p.checks.stop() })
 
@@ -1393,6 +1395,22 @@ func TestPoolOverloadReportsEveryJobClassWithoutUsingResultSpool(t *testing.T) {
 			t.Fatalf("rejected job %q error broke the server telemetry contract: %q", result.JobId, result.Message)
 		}
 		delete(want, result.JobId)
+	}
+
+	// Every rejected job's coordinator must have released its device gate —
+	// a leaked gate would block that device for the rest of the session.
+	gateCtx, gateCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer gateCancel()
+	for _, key := range []string{
+		jobTargetKey(&pb.AgentJob{DeviceId: "device-1", JobType: pb.JobType_POLL}),
+		jobTargetKey(&pb.AgentJob{DeviceId: "device-2", JobType: pb.JobType_MIKROTIK}),
+		jobTargetKey(&pb.AgentJob{DeviceId: "device-3", JobType: pb.JobType_PING}),
+	} {
+		r := p.targets.acquire(gateCtx, key)
+		if r == nil {
+			t.Fatalf("rejection leaked the device gate for %q", key)
+		}
+		r()
 	}
 
 	logs := agtCaptureLogs(t)
@@ -1677,6 +1695,43 @@ func TestRunSessionConnectError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "connect:") {
 		t.Errorf("expected 'connect:' in error, got: %v", err)
+	}
+}
+
+// join's send path must fail deterministically on a dead conn — a write to a
+// CloseNow'd conn returns net.ErrClosed every time, unlike racing a server
+// close. Pins agent.go's "send join" error return.
+func TestJoinSendErrorOnClosedConn(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		buf := make([]byte, 4096)
+		n, _ := conn.Read(buf)
+		key := extractWSKey(string(buf[:n]))
+		accept := computeAcceptKey(key)
+		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+		_, _ = conn.Write([]byte(resp))
+		time.Sleep(time.Second)
+	}()
+
+	ws, err := wsDial(context.Background(), "ws://"+ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ws.Close()
+
+	s := &session{ws: ws, ctx: context.Background(), topic: "agent:test"}
+	if err := s.join("token"); err == nil {
+		t.Error("join must fail on a closed conn")
 	}
 }
 
@@ -3895,8 +3950,9 @@ func TestPropAgtDecodeBinaryPayload(t *testing.T) {
 	})
 }
 
-// Jobs for the same device target must never run concurrently, even when they
-// land in different worker pools; jobs for different targets stay parallel.
+// Jobs for the same device target must never run concurrently within a
+// protocol family; jobs for different targets — or different protocol families
+// on the same target — stay parallel.
 func TestJobsForSameTargetSerialize(t *testing.T) {
 	origJitter := dispatchJitterMax
 	dispatchJitterMax = 0
@@ -3946,7 +4002,7 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
 	})
 
-	t.Run("across pools", func(t *testing.T) {
+	t.Run("mikrotik is not gated behind snmp", func(t *testing.T) {
 		origDial := mikrotikDial
 		origSnmp := snmpDial
 		defer func() { mikrotikDial = origDial; snmpDial = origSnmp }()
@@ -3984,15 +4040,18 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 		}, pools, out)
 
+		// RouterOS API and SNMP are different protocols on different pools: a
+		// hung RouterOS call must not pin an SNMP poll to the same device.
 		select {
 		case <-snmpStarted:
-			t.Fatal("SNMP job ran concurrently with a MikroTik job for the same target")
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(2 * time.Second):
+			t.Fatal("SNMP job waited on the MikroTik job's gate")
 		}
+		// Stronger than just starting: the SNMP result must arrive while the
+		// MikroTik job is still parked on release.
+		_ = wantResult[*pb.SnmpResult](t, out, "result", 2*time.Second)
 		releaseOnce.Do(func() { close(release) })
-
-		_ = wantResult[*pb.MikrotikResult](t, out, "mikrotik_result", time.Second)
-		_ = wantResult[*pb.SnmpResult](t, out, "result", time.Second)
+		_ = wantResult[*pb.MikrotikResult](t, out, "mikrotik_result", 2*time.Second)
 	})
 
 	t.Run("ping is not gated behind snmp", func(t *testing.T) {
@@ -4040,10 +4099,11 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("ping queued behind an in-flight SNMP job for the same target")
 		}
+		// The ping's result must be queued while the SNMP job is still parked
+		// — not just doPing returned — or the assertion proves nothing.
+		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", 2*time.Second)
 		releaseOnce.Do(func() { close(release) })
-
-		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
-		_ = wantResult[*pb.SnmpResult](t, out, "result", time.Second)
+		_ = wantResult[*pb.SnmpResult](t, out, "result", 2*time.Second)
 	})
 
 	t.Run("different targets stay parallel", func(t *testing.T) {
@@ -4081,6 +4141,87 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
 		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
 	})
+}
+
+// A task the session cancelled before a worker picked it up must unwind
+// without executing: the worker still runs the task's bookkeeping (done,
+// gate release) but skips execute.
+func TestQueuedJobSkipsAfterSessionEnds(t *testing.T) {
+	origJitter := dispatchJitterMax
+	dispatchJitterMax = 0
+	t.Cleanup(func() { dispatchJitterMax = origJitter })
+	origPing := doPing
+	defer func() { doPing = origPing }()
+	firstStarted := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var ranFor []string
+	var mu sync.Mutex
+	doPing = func(_ context.Context, ip string, _ int) (float64, error) {
+		mu.Lock()
+		ranFor = append(ranFor, ip)
+		mu.Unlock()
+		select {
+		case firstStarted <- struct{}{}:
+		default:
+		}
+		<-release
+		return 1, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pools := &jobPools{
+		ping:    newWorkerPool(1),
+		targets: &targetGates{},
+		notices: make(chan outbound, 8),
+	}
+	defer pools.ping.stop()
+	out := testQueue()
+
+	// The first ping occupies the single worker until release closes.
+	submitJob(ctx, &pb.AgentJob{
+		JobId:      "held",
+		JobType:    pb.JobType_PING,
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+	}, pools, out, func() {}, false)
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first ping never ran")
+	}
+
+	// The second ping must be enqueued (not just submitted) before its
+	// session ends, so the cancelled task is what the freed worker picks up.
+	// Same-package access: watch the queue depth until the submit lands.
+	sess2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan struct{})
+	submitJob(sess2, &pb.AgentJob{
+		JobId:      "queued",
+		JobType:    pb.JobType_PING,
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.2"},
+	}, pools, out, func() { close(done2) }, false)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(pools.ping.tasks) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("queued ping never reached the pool queue")
+		}
+		runtime.Gosched()
+	}
+	cancel2()
+	close(release)
+
+	select {
+	case <-done2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled queued job never ran its bookkeeping")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, ip := range ranFor {
+		if ip == "10.0.0.2" {
+			t.Fatal("cancelled queued job executed")
+		}
+	}
 }
 
 // The reserved discovery lane must hold discovery results even when the
@@ -4245,6 +4386,177 @@ func TestJobCancelledWhileGated(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("cancelled gated job did not complete bookkeeping")
+	}
+}
+
+// The wait=true path acquires the device gate in the caller's goroutine:
+// a cancelled context unwinds with done() and no gate held.
+func TestSubmitJobWaitAcquireCancel(t *testing.T) {
+	pools := testPools(t)
+	releaseGate := pools.targets.acquire(context.Background(), "ping:10.0.0.7")
+	defer releaseGate()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan struct{})
+	ok := submitJob(ctx, &pb.AgentJob{
+		JobId:      "wait-cancel",
+		JobType:    pb.JobType_PING,
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.7"},
+	}, pools, testQueue(), func() { close(done) }, true)
+	if ok {
+		t.Fatal("submitJob accepted a job whose ctx was already cancelled")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("done never ran")
+	}
+}
+
+// A wait=true submit onto a closed pool must report the rejection and free
+// the gate it took — otherwise the device is blocked for the session.
+func TestSubmitJobWaitPoolRejectionFreesGate(t *testing.T) {
+	pool := newWorkerPool(1)
+	pool.stop()
+	pools := &jobPools{
+		ping:    pool,
+		targets: &targetGates{},
+		notices: make(chan outbound, 8),
+	}
+	done := make(chan struct{})
+	job := &pb.AgentJob{
+		JobId:      "wait-reject",
+		JobType:    pb.JobType_PING,
+		DeviceId:   "device-r",
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.8"},
+	}
+	if submitJob(context.Background(), job, pools, testQueue(), func() { close(done) }, true) {
+		t.Fatal("submitJob accepted onto a stopped pool")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("done never ran after rejection")
+	}
+	gateCtx, gateCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer gateCancel()
+	r := pools.targets.acquire(gateCtx, jobTargetKey(job))
+	if r == nil {
+		t.Fatal("rejection leaked the device gate")
+	}
+	r()
+}
+
+// A finished job must release its device gate, or every later job for that
+// device blocks forever. Two sequential pings against the same target both
+// run.
+func TestSequentialJobsOnSameTargetBothRun(t *testing.T) {
+	origJitter := dispatchJitterMax
+	dispatchJitterMax = 0
+	t.Cleanup(func() { dispatchJitterMax = origJitter })
+	origPing := doPing
+	defer func() { doPing = origPing }()
+	ran := make(chan string, 2)
+	doPing = func(_ context.Context, ip string, _ int) (float64, error) {
+		ran <- ip
+		return 1, nil
+	}
+
+	pools := testPools(t)
+	for _, id := range []string{"first", "second"} {
+		done := make(chan struct{})
+		submitJob(context.Background(), &pb.AgentJob{
+			JobId:      "seq-" + id,
+			JobType:    pb.JobType_PING,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.9"},
+		}, pools, testQueue(), func() { close(done) }, false)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("job %s never ran — the first job's gate was never released", id)
+		}
+		select {
+		case ip := <-ran:
+			if ip != "10.0.0.9" {
+				t.Fatalf("ping ran for %q, want 10.0.0.9", ip)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("job %s never executed", id)
+		}
+	}
+}
+
+// Different job kinds on the same device must not serialize: a backup waits
+// behind no poll, and a ping behind neither. One job per kind runs
+// concurrently on the same target.
+func TestDifferentKindsOnSameTargetRunConcurrently(t *testing.T) {
+	origJitter := dispatchJitterMax
+	dispatchJitterMax = 0
+	t.Cleanup(func() { dispatchJitterMax = origJitter })
+
+	pools := testPools(t)
+
+	// Hold a ping slot open so the concurrency is observable, then submit a
+	// backup for the same device: it must not block on the ping's gate.
+	pingStarted := make(chan struct{})
+	pingRelease := make(chan struct{})
+	origPing := doPing
+	defer func() { doPing = origPing }()
+	doPing = func(_ context.Context, _ string, _ int) (float64, error) {
+		close(pingStarted)
+		<-pingRelease
+		return 1, nil
+	}
+	defer close(pingRelease)
+
+	pools.backup = newWorkerPool(1)
+	t.Cleanup(pools.backup.stop)
+
+	submitJob(context.Background(), &pb.AgentJob{
+		JobId:      "conc-ping",
+		JobType:    pb.JobType_PING,
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.10"},
+	}, pools, testQueue(), func() {}, false)
+	select {
+
+	case <-pingStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ping never ran")
+	}
+
+	backupRan := make(chan struct{})
+	job := &pb.AgentJob{
+		JobId:   "conc-backup",
+		JobType: pb.JobType_CONFIG_BACKUP,
+		ConfigBackup: &pb.ConfigBackupJob{
+			Host:     "10.0.0.10",
+			Vendor:   "mikrotik",
+			Username: "u",
+		},
+	}
+	// The backup's dial is replaced by an instant failure so the test needs
+	// no SSH server; reaching executeConfigBackupJobCtx is the assertion.
+	origDial := sshDial
+	defer func() { sshDial = origDial }()
+	sshDial = func(context.Context, string, string, *ssh.ClientConfig) (*ssh.Client, error) {
+		close(backupRan)
+		return nil, errors.New("dial stubbed")
+	}
+
+	backupDone := make(chan struct{})
+	submitJob(context.Background(), job, pools, testQueue(), func() { close(backupDone) }, false)
+	select {
+	case <-backupRan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("backup waited on the ping's gate — the kinds must not serialize")
+	}
+	// Let the coordinator finish before returning so it cannot race the
+	// cleanup that restores the package vars above.
+	select {
+	case <-backupDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("backup job never completed")
 	}
 }
 

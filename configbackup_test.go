@@ -320,7 +320,9 @@ func TestConfigBackupEmptyExport(t *testing.T) {
 }
 
 func TestConfigBackupPoolRejection(t *testing.T) {
-	// A stopped pool rejects every submission, exercising the AGENT_BUSY path.
+	// A stopped pool rejects every submission. The rejection is reported
+	// asynchronously — the coordinator goroutine owns gate acquire and pool
+	// submit — so the AGENT_BUSY result is what proves the path ran.
 	pool := newWorkerPool(1)
 	pool.stop()
 	ctx := context.Background()
@@ -333,10 +335,8 @@ func TestConfigBackupPoolRejection(t *testing.T) {
 	out := testQueue()
 
 	job := cbJob("192.0.2.1", 22)
-	ok := submitJob(ctx, job, pools, out, func() {}, false)
-
-	if ok {
-		t.Fatal("submitJob succeeded on saturated pool")
+	if !submitJob(ctx, job, pools, out, func() {}, false) {
+		t.Fatal("submitJob must always accept dispatch; rejection arrives as a result")
 	}
 	result := cbReceiveConfigBackupResult(t, out)
 	if result.ErrorCode != pb.ConfigBackupErrorCode_AGENT_BUSY {
@@ -770,6 +770,9 @@ func TestConfigBackupCancelDuringSession(t *testing.T) {
 	resetHostKeyStore(t)
 	started := make(chan struct{}, 4)
 	release := make(chan struct{})
+	// The handler holds the session channel open until release closes, so the
+	// probe can only finish after the cancel lands and the job context's
+	// AfterFunc has closed the SSH client — no result can race sendResult.
 	handler := func(ch ssh.Channel, _ string) {
 		select {
 		case started <- struct{}{}:
@@ -786,18 +789,34 @@ func TestConfigBackupCancelDuringSession(t *testing.T) {
 	host, port := cbAddrPort(t, addr)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		<-started
-		cancel()
-	}()
-
+	defer cancel()
+	jobDone := make(chan struct{})
 	job := cbJob(host, port)
 	job.ConfigBackup.Mode = pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE
 	out := testQueue()
-	executeConfigBackupJob(ctx, job, out)
-	<-done
+
+	go func() {
+		defer close(jobDone)
+		executeConfigBackupJob(ctx, job, out)
+	}()
+
+	// Cancel once the first session channel opens — that is the moment the
+	// job is provably mid-probe. If the job exits first, the cancel arrived
+	// too early or the session never opened, and the test has nothing to say.
+	select {
+	case <-started:
+		cancel()
+	case <-jobDone:
+		t.Fatal("job ended before the SSH session opened")
+	case <-time.After(5 * time.Second):
+		t.Fatal("no session channel opened; probe never reached the handler")
+	}
+
+	select {
+	case <-jobDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled job did not unwind")
+	}
 
 	select {
 	case queued := <-out.items:
@@ -891,11 +910,19 @@ func TestConfigBackupGateWaitSessionCancel(t *testing.T) {
 
 	session, endSession := context.WithCancel(context.Background())
 	out := testQueue()
-	if !submitJob(session, job, pools, out, func() {}, false) {
+	done := make(chan struct{})
+	if !submitJob(session, job, pools, out, func() { close(done) }, false) {
 		t.Fatal("submitJob rejected a fresh pool")
 	}
 	endSession()
 
+	select {
+	case <-done:
+		// The coordinator observed the cancel and unwound; nothing after this
+		// point can race the cleanup that restores dispatchJitterMax.
+	case <-time.After(2 * time.Second):
+		t.Fatal("coordinator never unwound after session cancel")
+	}
 	select {
 	case queued := <-out.items:
 		t.Fatalf("unexpected result after session cancel: %+v", queued)
