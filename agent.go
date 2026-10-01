@@ -273,7 +273,7 @@ func runSessionWithResultsAndScheduling(
 		mikrotik:        newWorkerPool(20),
 		ping:            newWorkerPool(50),
 		checks:          newWorkerPool(50),
-		backup:          newWorkerPool(4),
+		backup:          newWorkerPool(8),
 		notices:         notices,
 		targets:         &targetGates{},
 		localScheduling: localScheduling,
@@ -1173,24 +1173,51 @@ func submitJob(
 		return false
 	}
 
-	// Jitter spreads the start times of jobs pushed in one batch; the target
-	// gate then serializes jobs for the same device across every pool.
 	target := jobTargetKey(job)
-	gated := func() {
+
+	if wait {
+		// Recurring schedulers already run one goroutine per assignment, so
+		// acquiring the gate here costs that goroutine, not a pool worker —
+		// and the blocked wait is itself the backpressure that stops stale
+		// polls of a dead device from piling up and later running back-to-back.
 		jitterDispatch(ctx, dispatchJitter())
 		release := pools.targets.acquire(ctx, target)
 		if release == nil {
-			return
+			done()
+			return false
 		}
-		defer release()
-		execute()
+		if !pool.submitMode(ctx, func() { defer release(); task(execute)() }, true) {
+			release()
+			reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
+			done()
+			return false
+		}
+		return true
 	}
 
-	ok := pool.submitMode(ctx, task(gated), wait)
-	if !ok {
-		reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
-	}
-	return ok
+	// The one-shot path cannot block the session event loop, so the gate wait
+	// runs on a short-lived coordinator goroutine instead of a worker. The
+	// jitter is read here — the coordinator reads no package globals, which
+	// keeps tests that restore dispatchJitterMax race-free.
+	delay := dispatchJitter()
+	go func() {
+		jitterDispatch(ctx, delay)
+		release := pools.targets.acquire(ctx, target)
+		if release == nil {
+			done()
+			return
+		}
+		// The gate moves into the queued task so the worker frees it on every
+		// exit path — success, panic past the pool's recover, or task's early
+		// cancelled-context return.
+		if !pool.submitMode(ctx, func() { defer release(); task(execute)() }, false) {
+			release()
+			reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
+			done()
+		}
+	}()
+
+	return true
 }
 
 // submitConfigBackupJob dispatches a CONFIG_BACKUP job with its own deadline.
@@ -1224,36 +1251,54 @@ func submitConfigBackupJob(
 		)
 	}
 
-	task := func() {
-		defer done()
-		defer cancel()
-		jitterDispatch(jobCtx, dispatchJitter())
+	// Read the jitter here, not inside the goroutine: the coordinator must not
+	// touch package globals that tests restore from cleanup.
+	delay := dispatchJitter()
+	go func() {
+		jitterDispatch(jobCtx, delay)
+		// Acquire the gate here rather than on a worker, so a device already
+		// mid-backup doesn't pin a backup-pool slot other devices could use.
 		release := pools.targets.acquire(jobCtx, jobTargetKey(job))
 		if release == nil {
+			cancel()
 			report(pb.ConfigBackupErrorCode_TIMEOUT, "job deadline expired waiting for the device")
+			done()
 			return
 		}
-		defer release()
-		executeConfigBackupJobCtx(ctx, jobCtx, job, out)
-	}
-
-	if ok := pools.backup.submitMode(ctx, task, wait); !ok {
-		cancel()
-		report(pb.ConfigBackupErrorCode_AGENT_BUSY, "")
-		return false
-	}
+		task := func() {
+			defer release()
+			defer done()
+			defer cancel()
+			executeConfigBackupJobCtx(ctx, jobCtx, job, out)
+		}
+		if !pools.backup.submitMode(ctx, task, wait) {
+			release()
+			cancel()
+			report(pb.ConfigBackupErrorCode_AGENT_BUSY, "")
+			done()
+		}
+	}()
 	return true
 }
 
 // jobTargetKey identifies the device a job runs against so jobs for the same
 // target serialize. The device IP is preferred; jobs without one fall back to
-// the server-assigned device ID, then the job ID. PING jobs get their own
-// namespace: a stalled SNMP walk must not delay the outage signal a ping
-// delivers.
+// the server-assigned device ID, then the job ID. The key is per protocol,
+// not per job type: every SNMP job (POLL, DISCOVER, CREDENTIAL_PROBE,
+// TEST_CREDENTIALS) shares the bare key so a device never serves two SNMP
+// walks at once. PING (ICMP), CONFIG_BACKUP (SSH) and MIKROTIK (RouterOS API)
+// each get a namespace — a stalled poll must not delay the outage signal a
+// ping delivers, and a backup queued behind a running poll can wait out the
+// poll's whole deadline, longer than the backup's dispatch budget.
 func jobTargetKey(job *pb.AgentJob) string {
 	prefix := ""
-	if job.JobType == pb.JobType_PING {
+	switch job.JobType {
+	case pb.JobType_PING:
 		prefix = "ping:"
+	case pb.JobType_CONFIG_BACKUP:
+		prefix = "config_backup:"
+	case pb.JobType_MIKROTIK:
+		prefix = "mikrotik:"
 	}
 	if job.SnmpDevice != nil && job.SnmpDevice.Ip != "" {
 		return prefix + job.SnmpDevice.Ip
