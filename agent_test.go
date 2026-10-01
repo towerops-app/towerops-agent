@@ -4116,7 +4116,7 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 		release := make(chan struct{})
 		var releaseOnce sync.Once
 		defer releaseOnce.Do(func() { close(release) })
-		started := make(chan string, 2)
+		started := make(chan string, 4)
 		doPing = func(_ context.Context, ip string, _ int) (float64, error) {
 			started <- ip
 			<-release
@@ -4155,7 +4155,7 @@ func TestQueuedJobSkipsAfterSessionEnds(t *testing.T) {
 	t.Cleanup(func() { dispatchJitterMax = origJitter })
 	origPing := doPing
 	defer func() { doPing = origPing }()
-	firstStarted := make(chan struct{}, 1)
+	firstStarted := make(chan struct{}, 4)
 	release := make(chan struct{})
 	var ranFor []string
 	var mu sync.Mutex

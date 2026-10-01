@@ -1472,6 +1472,7 @@ func submitCheck(
 	}, wait)
 	if !ok {
 		reportPoolRejection(ctx, pools.notices, "", check.Id, "CHECK")
+		done()
 	}
 	return ok
 }
