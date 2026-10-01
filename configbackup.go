@@ -377,10 +377,17 @@ func (v mikrotikBackupVendor) Probe(ctx context.Context, c *ssh.Client, job *pb.
 	if err != nil {
 		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx), err.Error())
 	}
-	for _, p := range strings.Split(strings.TrimSpace(string(out)), ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			result.UserPolicies = append(result.UserPolicies, p)
+	// RouterOS renders the policy list comma-separated in newer versions and
+	// semicolon-separated in older ones; entries prefixed with ! are denied
+	// rather than granted, so they are skipped for the missing-policy check.
+	for _, p := range strings.FieldsFunc(strings.TrimSpace(string(out)), func(r rune) bool {
+		return r == ',' || r == ';'
+	}) {
+		p = strings.TrimSpace(p)
+		if p == "" || strings.HasPrefix(p, "!") {
+			continue
 		}
+		result.UserPolicies = append(result.UserPolicies, p)
 	}
 	return result
 }

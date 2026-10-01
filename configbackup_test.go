@@ -70,7 +70,7 @@ func cbRouterHandler(export string) func(ch ssh.Channel, command string) {
 		case strings.Contains(command, "system identity get name"):
 			out = "test-router\n"
 		case strings.Contains(command, "user group get"):
-			out = "read,write,ssh\n"
+			out = "read;write;ssh;!policy\n"
 		case strings.HasPrefix(command, "/export"):
 			out = export
 		default:
