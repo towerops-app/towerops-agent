@@ -1730,8 +1730,11 @@ func TestJoinSendErrorOnClosedConn(t *testing.T) {
 	_ = ws.Close()
 
 	s := &session{ws: ws, ctx: context.Background(), topic: "agent:test"}
-	if err := s.join("token"); err == nil {
-		t.Error("join must fail on a closed conn")
+	// Assert the send path, not just "an error": if the write ever stopped
+	// failing, join would block on nil channels until joinTimeout and still
+	// return an error — the test would pass slowly for the wrong reason.
+	if err := s.join("token"); err == nil || !strings.Contains(err.Error(), "send join") {
+		t.Fatalf("join error = %v, want send join failure", err)
 	}
 }
 
@@ -4331,6 +4334,11 @@ func TestJobTargetKey(t *testing.T) {
 			JobType:  pb.JobType_PING,
 			DeviceId: "dev-8",
 		}, "ping:device:dev-8"},
+		{"config backup gets its own namespace", &pb.AgentJob{
+			JobId:        "j11",
+			JobType:      pb.JobType_CONFIG_BACKUP,
+			ConfigBackup: &pb.ConfigBackupJob{Host: "10.0.0.1"},
+		}, "config_backup:10.0.0.1"},
 		{"credential probe keys on candidate ip", &pb.AgentJob{
 			JobId:   "j9",
 			JobType: pb.JobType_CREDENTIAL_PROBE,
