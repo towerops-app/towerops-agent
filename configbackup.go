@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -26,10 +27,13 @@ var errConfigBackupHostKeyMismatch = errors.New("config backup host key mismatch
 
 const (
 	configBackupDefaultTimeoutMs = 120_000
-	configBackupDialTimeout      = 15 * time.Second
 	maxConfigBackupDetailLen     = 300
 	defaultMaxConfigBytes        = 16 << 20
 )
+
+// configBackupDialTimeout is a var so tests can shrink the dial budget, the
+// same way ssh_test.go shrinks sshBackupTimeout.
+var configBackupDialTimeout = 15 * time.Second
 
 // configBackupVendor is implemented per vendor. Both methods return a result
 // (never an error): failures are encoded as ErrorCode/ErrorDetail.
@@ -40,9 +44,31 @@ type configBackupVendor interface {
 
 var configBackupVendors = map[string]configBackupVendor{"mikrotik": mikrotikBackupVendor{}}
 
-// executeConfigBackupJob runs one CONFIG_BACKUP job: dial, probe or export,
-// and queue the result unless the session is ending.
+// configBackupTimeout resolves the whole-job deadline: the server starts its
+// accounting when the job is dispatched, so the budget must cover queueing,
+// the jitter delay, the per-target gate, and the SSH work — not just the
+// execution. submitJob builds jobCtx from this at dispatch time.
+func configBackupTimeout(job *pb.AgentJob) time.Duration {
+	timeout := time.Duration(job.ConfigBackup.GetTimeoutMs()) * time.Millisecond
+	if timeout <= 0 {
+		timeout = configBackupDefaultTimeoutMs * time.Millisecond
+	}
+	return timeout
+}
+
+// executeConfigBackupJob runs one CONFIG_BACKUP job without a caller-supplied
+// deadline; the timeout then starts at execution. Used by tests.
 func executeConfigBackupJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
+	executeConfigBackupJobCtx(ctx, ctx, job, out)
+}
+
+// executeConfigBackupJobCtx runs one CONFIG_BACKUP job: dial, probe or export,
+// and queue the result unless the session is ending. sessionCtx reports on the
+// agent session and is what results are sent through — a job deadline that has
+// already fired must not suppress the TIMEOUT result it produced. jobCtx
+// carries the whole-job deadline (dispatch to completion); when it has none it
+// is given the configured timeout so a direct call still cannot hang.
+func executeConfigBackupJobCtx(sessionCtx, jobCtx context.Context, job *pb.AgentJob, out *resultQueue) {
 	started := time.Now()
 	var fingerprint string
 	finish := func(result *pb.ConfigBackupResult) {
@@ -51,7 +77,13 @@ func executeConfigBackupJob(ctx context.Context, job *pb.AgentJob, out *resultQu
 		}
 		result.DurationMs = uint32(time.Since(started).Milliseconds())
 		result.Timestamp = time.Now().Unix()
-		sendResult(ctx, out, "config_backup_result", result, job.JobId)
+		sendResult(sessionCtx, out, "config_backup_result", result, job.JobId)
+		slog.Info("config backup finished",
+			"job_id", job.JobId,
+			"device_id", job.DeviceId,
+			"error_code", result.ErrorCode.String(),
+			"duration_ms", result.DurationMs,
+		)
 	}
 	fail := func(code pb.ConfigBackupErrorCode, detail string) {
 		finish(&pb.ConfigBackupResult{
@@ -68,20 +100,19 @@ func executeConfigBackupJob(ctx context.Context, job *pb.AgentJob, out *resultQu
 		return
 	}
 
-	timeout := time.Duration(cb.TimeoutMs) * time.Millisecond
-	if timeout <= 0 {
-		timeout = configBackupDefaultTimeoutMs * time.Millisecond
+	if _, ok := jobCtx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		jobCtx, cancel = context.WithTimeout(jobCtx, configBackupTimeout(job))
+		defer cancel()
 	}
-	jobCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
-	if ctx.Err() != nil {
+	if sessionCtx.Err() != nil {
 		return
 	}
 
 	client, fp, err := configBackupDial(jobCtx, job)
 	fingerprint = fp
-	if ctx.Err() != nil {
+	if sessionCtx.Err() != nil {
 		return
 	}
 	if err != nil {
@@ -111,7 +142,7 @@ func executeConfigBackupJob(ctx context.Context, job *pb.AgentJob, out *resultQu
 	} else {
 		result = vendor.Backup(jobCtx, client, cb, job.JobId, job.DeviceId)
 	}
-	if ctx.Err() != nil {
+	if sessionCtx.Err() != nil {
 		return
 	}
 	finish(result)
@@ -128,7 +159,8 @@ func configBackupDial(ctx context.Context, job *pb.AgentJob) (*ssh.Client, strin
 		User:            cb.Username,
 		Auth:            []ssh.AuthMethod{ssh.Password(cb.Password)},
 		HostKeyCallback: configBackupHostKeyCallback(expected, &observed),
-		Timeout:         configBackupDialTimeout,
+		// Timeout is intentionally unset: sshDial never calls ssh.Dial, so the
+		// field would be ignored. The context deadline below is the bound.
 	}
 
 	port := cb.SshPort
@@ -136,8 +168,19 @@ func configBackupDial(ctx context.Context, job *pb.AgentJob) (*ssh.Client, strin
 		port = 22
 	}
 	addr := net.JoinHostPort(cb.Host, strconv.Itoa(int(port)))
-	conn, err := sshDial(ctx, "tcp", addr, config)
+	// TCP connect plus handshake share one dial budget so a filtered port
+	// fails fast instead of burning the whole job deadline.
+	dialCtx, cancel := context.WithTimeout(ctx, configBackupDialTimeout)
+	defer cancel()
+	conn, err := sshDial(dialCtx, "tcp", addr, config)
 	if err != nil {
+		// The AfterFunc conn close that aborts a stalled handshake surfaces as
+		// "ssh: handshake failed: …closed", which classifyConfigBackupError
+		// would read as AUTH_FAILED. Tag it with the deadline so it reports
+		// TIMEOUT instead.
+		if dialCtx.Err() != nil {
+			err = fmt.Errorf("%w: %w", dialCtx.Err(), err)
+		}
 		return nil, observed, err
 	}
 	return conn, observed, nil
@@ -171,6 +214,11 @@ func classifyConfigBackupError(err error, job *pb.AgentJob) (pb.ConfigBackupErro
 	switch {
 	case errors.Is(err, errConfigBackupHostKeyMismatch):
 		code = pb.ConfigBackupErrorCode_HOST_KEY_MISMATCH
+	case isDialTimeout(err):
+		// A TCP connect that hit the dial deadline is a filtered or dead
+		// host, not a slow job — report it ahead of the generic deadline
+		// check, which Go's *net.OpError also satisfies.
+		code = pb.ConfigBackupErrorCode_UNREACHABLE
 	case errors.Is(err, context.DeadlineExceeded):
 		code = pb.ConfigBackupErrorCode_TIMEOUT
 	case isAuthFailure(err):
@@ -201,6 +249,14 @@ func isAuthFailure(err error) bool {
 func isConnRefused(err error) bool {
 	var opErr *net.OpError
 	return errors.As(err, &opErr) && strings.Contains(opErr.Err.Error(), "refused")
+}
+
+// isDialTimeout reports a TCP connect that timed out — *net.OpError with
+// Op "dial". On modern Go these also satisfy errors.Is(DeadlineExceeded),
+// so callers must check this case first.
+func isDialTimeout(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial" && opErr.Timeout()
 }
 
 func isUnreachable(err error) bool {

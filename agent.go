@@ -977,14 +977,14 @@ func decodeBinaryPayload(event string, raw json.RawMessage, msg proto.Message) b
 
 // outbound is one pre-encoded protobuf result addressed to a Phoenix channel
 // event. Keeping the payload process-wide allows a later WebSocket session to
-// retry it without retaining mutable executor state. discovery marks results
-// eligible for the reserved spool lane; discSlot records which lane's slot the
-// result holds so ack can release it.
+// retry it without retaining mutable executor state. reserved marks results
+// eligible for the reserved spool lane; reservedSlot records which lane's slot
+// the result holds so ack can release it.
 type outbound struct {
-	event     string
-	payload   json.RawMessage
-	discovery bool
-	discSlot  bool
+	event        string
+	payload      json.RawMessage
+	reserved     bool
+	reservedSlot bool
 	// attempts counts server-rejected deliveries; handleResultReply retries
 	// the first rejection and drops the second.
 	attempts int
@@ -994,35 +994,36 @@ type outbound struct {
 // the session writer has a result in flight. Failed writes use a dedicated
 // one-item retry lane so they remain ahead of newer queued measurements.
 //
-// A quarter of the slots are reserved for discovery results so a flood of
-// pings and checks cannot evict them; discovery results overflow into the
-// general lane when their reserve is exhausted, never the reverse.
+// A quarter of the slots are reserved for results the server cannot retry —
+// discovery data and config backups — so a flood of pings and checks cannot
+// evict them; they overflow into the general lane when the reserve is
+// exhausted, never the reverse.
 type resultQueue struct {
-	items       chan outbound
-	retries     chan outbound
-	slots       chan struct{}
-	discSlots   chan struct{}
-	agentCtx    context.Context
-	dropped     atomic.Uint64
-	lastDropLog atomic.Int64
+	items         chan outbound
+	retries       chan outbound
+	slots         chan struct{}
+	reservedSlots chan struct{}
+	agentCtx      context.Context
+	dropped       atomic.Uint64
+	lastDropLog   atomic.Int64
 }
 
 func newResultQueueForAgent(agentCtx context.Context, size int) *resultQueue {
-	discovery := size / 4
+	reserved := size / 4
 	return &resultQueue{
-		items:     make(chan outbound, size),
-		retries:   make(chan outbound, 1),
-		slots:     make(chan struct{}, size-discovery),
-		discSlots: make(chan struct{}, discovery),
-		agentCtx:  agentCtx,
+		items:         make(chan outbound, size),
+		retries:       make(chan outbound, 1),
+		slots:         make(chan struct{}, size-reserved),
+		reservedSlots: make(chan struct{}, reserved),
+		agentCtx:      agentCtx,
 	}
 }
 
 func (q *resultQueue) enqueue(result outbound) bool {
-	if result.discovery {
+	if result.reserved {
 		select {
-		case q.discSlots <- struct{}{}:
-			result.discSlot = true
+		case q.reservedSlots <- struct{}{}:
+			result.reservedSlot = true
 			q.items <- result
 			return true
 		default:
@@ -1030,10 +1031,10 @@ func (q *resultQueue) enqueue(result outbound) bool {
 	}
 	select {
 	case q.slots <- struct{}{}:
-		// A requeued discovery result can land here when its reserved lane
+		// A requeued reserved result can land here when its reserved lane
 		// is full; the flag must record the lane actually taken or ack
 		// releases the wrong token.
-		result.discSlot = false
+		result.reservedSlot = false
 		q.items <- result
 		return true
 	default:
@@ -1042,8 +1043,8 @@ func (q *resultQueue) enqueue(result outbound) bool {
 }
 
 func (q *resultQueue) ack(result outbound) {
-	if result.discSlot {
-		<-q.discSlots
+	if result.reservedSlot {
+		<-q.reservedSlots
 		return
 	}
 	<-q.slots
@@ -1135,6 +1136,10 @@ func submitJob(
 ) bool {
 	slog.Info("starting job", "job_id", job.JobId, "type", job.JobType)
 
+	if job.JobType == pb.JobType_CONFIG_BACKUP {
+		return submitConfigBackupJob(ctx, job, pools, out, done, wait)
+	}
+
 	task := func(execute func()) func() {
 		return func() {
 			defer done()
@@ -1160,9 +1165,6 @@ func submitJob(
 	case pb.JobType_PING:
 		pool = pools.ping
 		execute = func() { executePingJob(ctx, job, out) }
-	case pb.JobType_CONFIG_BACKUP:
-		pool = pools.backup
-		execute = func() { executeConfigBackupJob(ctx, job, out) }
 	case pb.JobType_DISCOVER, pb.JobType_POLL:
 		pool = pools.snmp
 		execute = func() { executeSnmpJob(ctx, job, out) }
@@ -1186,18 +1188,61 @@ func submitJob(
 
 	ok := pool.submitMode(ctx, task(gated), wait)
 	if !ok {
-		if job.JobType == pb.JobType_CONFIG_BACKUP {
-			sendResult(ctx, out, "config_backup_result", &pb.ConfigBackupResult{
-				DeviceId:  job.DeviceId,
-				JobId:     job.JobId,
-				ErrorCode: pb.ConfigBackupErrorCode_AGENT_BUSY,
-				Timestamp: time.Now().Unix(),
-			}, job.JobId)
-			return false
-		}
 		reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
 	}
 	return ok
+}
+
+// submitConfigBackupJob dispatches a CONFIG_BACKUP job with its own deadline.
+// Unlike the shared path, the job context is created at dispatch — the server
+// starts its dispatch sweep when the job is sent, so the pool queue, the
+// jitter delay, and the per-target gate all count against the same budget as
+// the SSH work. A job that burns its budget waiting for the gate still reports
+// TIMEOUT rather than never answering.
+func submitConfigBackupJob(
+	ctx context.Context,
+	job *pb.AgentJob,
+	pools *jobPools,
+	out *resultQueue,
+	done func(),
+	wait bool,
+) bool {
+	jobCtx, cancel := context.WithTimeout(ctx, configBackupTimeout(job))
+	report := func(code pb.ConfigBackupErrorCode, detail string) {
+		sendResult(ctx, out, "config_backup_result", &pb.ConfigBackupResult{
+			DeviceId:    job.DeviceId,
+			JobId:       job.JobId,
+			ErrorCode:   code,
+			ErrorDetail: detail,
+			Timestamp:   time.Now().Unix(),
+		}, job.JobId)
+		slog.Warn("config backup not completed",
+			"job_id", job.JobId,
+			"device_id", job.DeviceId,
+			"error_code", code.String(),
+			"detail", detail,
+		)
+	}
+
+	task := func() {
+		defer done()
+		defer cancel()
+		jitterDispatch(jobCtx, dispatchJitter())
+		release := pools.targets.acquire(jobCtx, jobTargetKey(job))
+		if release == nil {
+			report(pb.ConfigBackupErrorCode_TIMEOUT, "job deadline expired waiting for the device")
+			return
+		}
+		defer release()
+		executeConfigBackupJobCtx(ctx, jobCtx, job, out)
+	}
+
+	if ok := pools.backup.submitMode(ctx, task, wait); !ok {
+		cancel()
+		report(pb.ConfigBackupErrorCode_AGENT_BUSY, "")
+		return false
+	}
+	return true
 }
 
 // jobTargetKey identifies the device a job runs against so jobs for the same
@@ -1257,15 +1302,18 @@ func encodeOutbound(event string, msg proto.Message, jobID string) (outbound, bo
 	}
 	encoded := base64.StdEncoding.EncodeToString(bin)
 	payload, _ := json.Marshal(map[string]string{"binary": encoded})
-	return outbound{event: event, payload: payload, discovery: isDiscoveryResult(msg)}, true
+	return outbound{event: event, payload: payload, reserved: usesReservedLane(msg)}, true
 }
 
-// isDiscoveryResult reports whether a result message carries discovery data
-// and therefore qualifies for the reserved spool lane.
-func isDiscoveryResult(msg proto.Message) bool {
+// usesReservedLane reports whether a result message carries data the server
+// cannot re-request — a discovery report or a config backup — and therefore
+// qualifies for the reserved spool lane.
+func usesReservedLane(msg proto.Message) bool {
 	switch m := msg.(type) {
 	case *pb.SnmpResult:
 		return m.JobType == pb.JobType_DISCOVER
+	case *pb.ConfigBackupResult:
+		return true
 	default:
 		return false
 	}

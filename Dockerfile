@@ -34,7 +34,12 @@ RUN adduser -D -u 1000 towerops && \
     chown towerops /usr/local/bin/towerops-agent /data && \
     setcap cap_net_raw,cap_net_bind_service+ep /usr/local/bin/towerops-agent && \
     setcap cap_net_raw+p /usr/local/bin/ping && \
-    apk del libcap-utils
+    apk del libcap-utils && \
+    # linux-pam stays installed (libcap needs it), and it ships a setgid-shadow
+    # helper nothing in this image invokes. Removing it leaves no setuid or
+    # setgid binary at all, which takes the ld.so AT_SECURE vulnerabilities
+    # (CVE-2026-86805, CVE-2026-95818 - see .grype.yaml) off the table entirely.
+    rm -f /usr/bin/unix_chkpwd
 ENV TOWEROPS_HOST_KEYS_FILE=/data/known_hosts.json
 # Without a persistent volume, container recreation resets the TOFU store and
 # defeats host-key and TLS-certificate pinning.
