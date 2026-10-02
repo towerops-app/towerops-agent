@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
@@ -4878,6 +4879,48 @@ func TestDrainResults(t *testing.T) {
 		}
 	})
 
+	t.Run("waits for in-flight jobs before reporting drained", func(t *testing.T) {
+		results := newResultQueue(4)
+		s := newDrainableSession(t, results)
+
+		release := make(chan struct{})
+		if !s.pools.snmp.submit(context.Background(), func() {
+			<-release
+			results.enqueue(outbound{event: "result"})
+		}) {
+			t.Fatal("submit failed")
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		done := make(chan bool, 1)
+		go func() { done <- s.drainResults(ctx) }()
+		select {
+		case <-done:
+			t.Fatal("drain finished while a job was still running")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		// The job finishes and publishes; the drain must still wait for the
+		// result to be delivered.
+		close(release)
+		item := <-results.items
+		select {
+		case <-done:
+			t.Fatal("drain finished before the job's result was acked")
+		case <-time.After(30 * time.Millisecond):
+		}
+		results.ack(item)
+		select {
+		case drained := <-done:
+			if !drained {
+				t.Fatal("drain returned false after the job finished")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("drain did not finish after the job completed")
+		}
+	})
+
 	t.Run("returns false when the context expires with slots held", func(t *testing.T) {
 		results := newResultQueue(4)
 		s := newDrainableSession(t, results)
@@ -4892,6 +4935,62 @@ func TestDrainResults(t *testing.T) {
 			t.Fatal("drain reported success with an undelivered result")
 		}
 	})
+}
+
+// A self-update whose exec fails after draining must not leave the session
+// connected but refusing jobs: the drained session is ended so the reconnect
+// rebuilds the scheduler and pools.
+func TestAbortDrainedSessionEndsSession(t *testing.T) {
+	t.Cleanup(func() { drainedSession.Store(nil) })
+	pools := testPools(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &session{
+		ctx:        ctx,
+		cancel:     cancel,
+		results:    newResultQueue(4),
+		pools:      pools,
+		scheduler:  pools.scheduler,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		abortCh:    make(chan error, 1),
+	}
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), time.Second)
+	defer drainCancel()
+	if !s.drainResults(drainCtx) {
+		t.Fatal("drain failed")
+	}
+
+	abortDrainedSession()
+	if s.ctx.Err() == nil {
+		t.Fatal("drained session was not cancelled after the update returned")
+	}
+	if err := s.sessionErr(); !errors.Is(err, errSelfUpdateAborted) {
+		t.Fatalf("sessionErr = %v, want %v", err, errSelfUpdateAborted)
+	}
+	if drainedSession.Load() != nil {
+		t.Fatal("drained session was not cleared")
+	}
+	// A second return (no drain this time) is a no-op.
+	abortDrainedSession()
+}
+
+func TestPutFrameBufferDropsOversizedBuffers(t *testing.T) {
+	small := new(bytes.Buffer)
+	small.WriteString("heartbeat")
+	putFrameBuffer(small)
+	if small.Len() != 0 {
+		t.Fatal("small buffer was not reset for reuse")
+	}
+
+	big := bytes.NewBuffer(make([]byte, 0, 2*maxPooledFrameBuffer))
+	big.WriteString("backup")
+	putFrameBuffer(big)
+	// An oversized buffer is left untouched for the GC instead of being
+	// reset and pooled.
+	if big.Len() == 0 {
+		t.Fatal("oversized buffer was reset and pooled")
+	}
 }
 
 func TestHandleMessageRefusesJobsDuringDrain(t *testing.T) {
@@ -5121,7 +5220,8 @@ func TestSubmitJobDispatchSaturated(t *testing.T) {
 		targets: &targetGates{},
 	}
 	t.Cleanup(func() { pools.ping.stop() })
-	// Fill the ping dispatch semaphore so the next one-shot job is rejected
+	// Fill the ping dispatch semaphore and hold the job's target, so the job
+	// would have to park on the gate with no slot left: it is rejected
 	// instead of spawning an unbounded coordinator.
 	for range cap(pools.ping.dispatch) {
 		if !pools.ping.acquireDispatch() {
@@ -5140,10 +5240,10 @@ func TestSubmitJobDispatchSaturated(t *testing.T) {
 		SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1"},
 		DeviceId:   "dev-sat",
 	}
+	defer pools.targets.acquire(context.Background(), jobTargetKey(job))()
 	done := make(chan struct{})
-	if submitJob(context.Background(), job, pools, testQueue(), func() { close(done) }, false) {
-		t.Fatal("saturated dispatch accepted a job")
-	}
+	// Rejection is reported asynchronously after jitter.
+	submitJob(context.Background(), job, pools, testQueue(), func() { close(done) }, false)
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -5191,9 +5291,8 @@ func TestSubmitConfigBackupDispatchSaturated(t *testing.T) {
 			Password: "p",
 		},
 	}
-	if submitConfigBackupJob(context.Background(), job, pools, out, func() { close(done) }, false) {
-		t.Fatal("saturated backup dispatch accepted a job")
-	}
+	defer pools.targets.acquire(context.Background(), jobTargetKey(job))()
+	submitConfigBackupJob(context.Background(), job, pools, out, func() { close(done) }, false)
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -5202,6 +5301,43 @@ func TestSubmitConfigBackupDispatchSaturated(t *testing.T) {
 	result := wantResult[*pb.ConfigBackupResult](t, out, "config_backup_result", time.Second)
 	if result.ErrorCode != pb.ConfigBackupErrorCode_AGENT_BUSY {
 		t.Fatalf("error code = %v, want AGENT_BUSY", result.ErrorCode)
+	}
+}
+
+// Recurring backups wait for the device instead of failing AGENT_BUSY when
+// the one-shot dispatch slots are exhausted, matching submitJob's wait path.
+func TestSubmitConfigBackupWaitIgnoresDispatchSlots(t *testing.T) {
+	pools := &jobPools{
+		backup:  newWorkerPool(1),
+		notices: make(chan outbound, 4),
+		targets: &targetGates{},
+	}
+	t.Cleanup(func() { pools.backup.stop() })
+	for range cap(pools.backup.dispatch) {
+		pools.backup.acquireDispatch()
+	}
+	defer func() {
+		for range cap(pools.backup.dispatch) {
+			pools.backup.releaseDispatch()
+		}
+	}()
+	job := &pb.AgentJob{
+		JobId:        "cb-wait",
+		JobType:      pb.JobType_CONFIG_BACKUP,
+		DeviceId:     "dev-wait",
+		ConfigBackup: &pb.ConfigBackupJob{Host: "192.0.2.1", Username: "u", Password: "p", TimeoutMs: 50},
+	}
+	// Hold the device so the wait path parks on the gate until the job
+	// deadline.
+	defer pools.targets.acquire(context.Background(), jobTargetKey(job))()
+
+	out := testQueue()
+	if submitConfigBackupJob(context.Background(), job, pools, out, func() {}, true) {
+		t.Fatal("wait path reported success for a backup that never ran")
+	}
+	result := wantResult[*pb.ConfigBackupResult](t, out, "config_backup_result", time.Second)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_TIMEOUT {
+		t.Fatalf("error code = %v (%q), want TIMEOUT from the gate wait", result.ErrorCode, result.ErrorDetail)
 	}
 }
 

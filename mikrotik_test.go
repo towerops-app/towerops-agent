@@ -1324,9 +1324,43 @@ func TestExecuteEmitsArgsInSortedOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Sorted key order makes emission deterministic; ?-query words are
-	// order-sensitive on RouterOS (?#|/?#! operators).
+	// Sorted key order makes emission deterministic.
 	want := []string{"/interface/print", ".proplist=name,type", "?disabled=false", "?type=ether", "=name=ether1"}
+	if !slices.Equal(receivedWords, want) {
+		t.Fatalf("words = %v, want %v", receivedWords, want)
+	}
+}
+
+// "?#" operator words must follow the query words they combine. Plain sorting
+// put "?#|" before every "?name" word, so an OR query in Args was always
+// applied to an empty query stack.
+func TestExecuteEmitsQueryOperatorsAfterOperands(t *testing.T) {
+	clientR, serverW := io.Pipe()
+	serverR, clientW := io.Pipe()
+
+	conn := &readWriteCloser{r: clientR, w: clientW}
+	c := &mikrotikClient{conn: conn}
+
+	var receivedWords []string
+	go func() {
+		defer func() { _ = serverW.Close() }()
+		sc := &mikrotikClient{conn: &readWriteCloser{r: serverR, w: serverW}}
+		receivedWords, _ = sc.readSentence()
+		_ = sc.writeSentence([]string{"!done"})
+	}()
+
+	args := map[string]string{
+		"?#|":       "",
+		"?#!":       "",
+		"?type":     "ether",
+		"?disabled": "false",
+		"name":      "ether1",
+	}
+	if _, err := c.execute("/interface/print", args); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"/interface/print", "?disabled=false", "?type=ether", "=name=ether1", "?#!=", "?#|="}
 	if !slices.Equal(receivedWords, want) {
 		t.Fatalf("words = %v, want %v", receivedWords, want)
 	}

@@ -121,8 +121,9 @@ func TestTokenBucketWaitRefundsOnCancel(t *testing.T) {
 	}
 }
 
-// waitDebt must block only while the balance is negative and must not consume
-// a token, so a paced walk does not charge the limiter twice per request.
+// waitDebt must block only until the next send is affordable and must not
+// consume a token, so a paced walk does not charge the limiter twice per
+// request.
 func TestTokenBucketWaitDebt(t *testing.T) {
 	b := newTokenBucket(100, nil) // burst of 10, then 10ms per token
 
@@ -137,7 +138,7 @@ func TestTokenBucketWaitDebt(t *testing.T) {
 	}
 
 	// Push the balance negative like OnSent charge does: waitDebt must sleep
-	// off roughly one token interval before returning.
+	// off the debt plus its own slot before returning.
 	for range 11 {
 		b.charge()
 	}
@@ -174,6 +175,111 @@ func TestTokenBucketWaitDebtCancelled(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("cancelled waitDebt did not return")
+	}
+}
+
+// Concurrent walkers in waitDebt must get distinct, ordered slots. Polling for
+// a non-negative balance woke every walker the instant the debt cleared, so
+// they all sent at once — a burst far beyond the bucket's.
+func TestTokenBucketWaitDebtSpreadsWalkers(t *testing.T) {
+	b := newTokenBucket(100, nil) // burst of 10, then 10ms per token
+	for range 11 {
+		b.charge() // balance -1: ~10ms of debt shared by every walker
+	}
+
+	const walkers = 5
+	start := time.Now()
+	finished := make(chan time.Duration, walkers)
+	for range walkers {
+		go func() {
+			if !b.waitDebt(context.Background()) {
+				t.Error("waitDebt failed")
+			}
+			finished <- time.Since(start)
+		}()
+	}
+	var first, last time.Duration
+	for i := range walkers {
+		d := <-finished
+		if i == 0 || d < first {
+			first = d
+		}
+		if d > last {
+			last = d
+		}
+	}
+	// Slots are 10ms apart, so five walkers span ~40ms. A thundering herd
+	// finishes within a millisecond or two of each other.
+	if spread := last - first; spread < 25*time.Millisecond {
+		t.Fatalf("walkers finished within %v of each other, want slots spread ~40ms apart", spread)
+	}
+}
+
+// Under sustained wait() load the balance never returns to zero, so a walker
+// that polled for a non-negative balance starved until its job deadline. A
+// reserving walker queues behind the load and finishes promptly.
+func TestTokenBucketWaitDebtNotStarvedByWaiters(t *testing.T) {
+	b := newTokenBucket(1000, nil) // burst of 100, then 1ms per token
+	for range 100 {
+		b.charge()
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				b.wait(context.Background())
+			}
+		}()
+	}
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	time.Sleep(20 * time.Millisecond) // let the waiters drive the balance negative
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for i := range 5 {
+		if !b.waitDebt(ctx) {
+			t.Fatalf("waitDebt %d starved under sustained wait load: %v", i, ctx.Err())
+		}
+	}
+}
+
+// refund must refill before adding and cap at the burst: after setRate lowers
+// the burst, cancelled waiters' refunds must not leave the balance above it.
+func TestTokenBucketRefundCapsAtBurst(t *testing.T) {
+	current := time.Now()
+	b := newTokenBucket(100, func() time.Time { return current }) // burst 10
+
+	// Queue reservations, then lower the rate so the burst drops to 1.
+	for range 20 {
+		b.reserve()
+	}
+	b.setRate(10)
+	// Time passes and every queued waiter is cancelled and refunds.
+	current = current.Add(5 * time.Second)
+	for range 20 {
+		b.refund()
+	}
+	if b.tokens > b.burst {
+		t.Fatalf("tokens = %v after refunds, want <= burst %v", b.tokens, b.burst)
+	}
+	// Only the burst is available immediately; the next caller must wait.
+	if d := b.reserve(); d != 0 {
+		t.Fatalf("first reserve waited %v, want 0 within burst", d)
+	}
+	if d := b.reserve(); d == 0 {
+		t.Fatal("second reserve did not wait; refunds lifted the balance above the burst")
 	}
 }
 

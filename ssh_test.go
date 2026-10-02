@@ -9,11 +9,13 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -918,5 +920,60 @@ func TestSSHBackupOutputBounded(t *testing.T) {
 	_, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass")
 	if !errors.Is(err, errConfigBackupTooLarge) {
 		t.Fatalf("err = %v, want errConfigBackupTooLarge", err)
+	}
+}
+
+// TestSSHBackupPinnedRSAOffersSHA2: an RSA pin is stored as "ssh-rsa" (the
+// key type), but must still negotiate with a device that has disabled SHA-1
+// signatures and only signs rsa-sha2-256/512.
+func TestSSHBackupPinnedRSAOffersSHA2(t *testing.T) {
+	resetHostKeyStore(t)
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := ssh.NewSignerFromKey(rsaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerWithAlgorithms(base.(ssh.AlgorithmSigner), []string{ssh.KeyAlgoRSASHA256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, cleanup := startTestSSHServerWithSigner(t, signer, func(ch ssh.Channel, _ string) {
+		_, _ = ch.Write([]byte("# RouterOS config\n"))
+		_ = ch.CloseWrite()
+		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+		_ = ch.Close()
+	})
+	defer cleanup()
+
+	_, port, _ := net.SplitHostPort(addr)
+	var portNum uint16
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
+
+	// First use pins the RSA key, then the pinned reconnect must succeed.
+	for i := 0; i < 2; i++ {
+		if _, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass"); err != nil {
+			t.Fatalf("connect %d failed: %v", i, err)
+		}
+	}
+	if got := globalHostKeys.pinnedKeyAlgorithm("ssh:" + addr); got != ssh.KeyAlgoRSA {
+		t.Fatalf("pinned type = %q, want %q", got, ssh.KeyAlgoRSA)
+	}
+}
+
+func TestHostKeyAlgorithmsFor(t *testing.T) {
+	tests := map[string][]string{
+		ssh.KeyAlgoRSA:         {ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA},
+		ssh.CertAlgoRSAv01:     {ssh.CertAlgoRSASHA512v01, ssh.CertAlgoRSASHA256v01, ssh.CertAlgoRSAv01},
+		ssh.KeyAlgoED25519:     {ssh.KeyAlgoED25519},
+		ssh.KeyAlgoECDSA256:    {ssh.KeyAlgoECDSA256},
+		ssh.CertAlgoED25519v01: {ssh.CertAlgoED25519v01},
+	}
+	for keyType, want := range tests {
+		if got := hostKeyAlgorithmsFor(keyType); !slices.Equal(got, want) {
+			t.Errorf("hostKeyAlgorithmsFor(%q) = %v, want %v", keyType, got, want)
+		}
 	}
 }

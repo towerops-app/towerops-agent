@@ -137,11 +137,15 @@ func legacyMikrotikLoginResponse(password, challenge string) (string, error) {
 }
 
 // execute sends a command and reads the full response. Args are emitted in
-// sorted key order because map iteration order is random and RouterOS query
-// words (?#|, ?#!) are order-sensitive.
+// sorted key order so the sentence is deterministic despite random map
+// iteration, except that "?#" query-stack operator keys (?#|, ?#!, ...) are
+// emitted after every other key: RouterOS applies an operator to the query
+// words already pushed, and "?#" sorts before every "?name". A map cannot
+// express arbitrary query order, so callers needing a specific sequence (e.g.
+// an operator between particular operands) must use cmd.Words instead.
 func (c *mikrotikClient) execute(command string, args map[string]string) (*mikrotikResponse, error) {
 	words := []string{command}
-	for _, k := range slices.Sorted(maps.Keys(args)) {
+	for _, k := range sortedMikrotikArgKeys(args) {
 		v := args[k]
 		if strings.HasPrefix(k, "?") || strings.HasPrefix(k, ".") {
 			words = append(words, k+"="+v)
@@ -151,6 +155,22 @@ func (c *mikrotikClient) execute(command string, args map[string]string) (*mikro
 	}
 
 	return c.executeWords(words)
+}
+
+// sortedMikrotikArgKeys returns args' keys sorted, with "?#" query operator
+// keys moved after all other keys (still sorted among themselves) so they
+// follow the operands they combine.
+func sortedMikrotikArgKeys(args map[string]string) []string {
+	return slices.SortedFunc(maps.Keys(args), func(a, b string) int {
+		aOp, bOp := strings.HasPrefix(a, "?#"), strings.HasPrefix(b, "?#")
+		if aOp != bOp {
+			if aOp {
+				return 1
+			}
+			return -1
+		}
+		return strings.Compare(a, b)
+	})
 }
 
 func (c *mikrotikClient) executeWords(words []string) (*mikrotikResponse, error) {

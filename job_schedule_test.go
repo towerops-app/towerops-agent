@@ -76,12 +76,12 @@ func fireManualTimer(t *testing.T, timer *manualScheduleTimer) {
 }
 
 // fireFirstTickDelay releases a new entry's staggered first tick and verifies
-// the delay stays below the entry's interval.
+// the delay stays below both the entry's interval and the stagger cap.
 func fireFirstTickDelay(t *testing.T, clock *manualScheduleClock, interval time.Duration) {
 	t.Helper()
 	timer := nextManualTimer(t, clock)
-	if timer.interval <= 0 || timer.interval >= interval {
-		t.Fatalf("first tick delay = %s, want within [0, %s)", timer.interval, interval)
+	if window := min(interval, maxFirstTickDelay); timer.interval <= 0 || timer.interval >= window {
+		t.Fatalf("first tick delay = %s, want within [0, %s)", timer.interval, window)
 	}
 	fireManualTimer(t, timer.timer)
 }
@@ -246,8 +246,8 @@ func TestRecurringSchedulerReplacementAndRemoval(t *testing.T) {
 		t.Fatal("superseded replacement did not stop")
 	}
 	close(oldRun.done)
-	fireFirstTickDelay(t, clock, time.Minute)
 
+	// A changed assignment skips the first-tick stagger.
 	newRun := nextInvocation(t, runs)
 	_ = nextManualTimer(t, clock)
 	entry := scheduler.jobs["job-1"]
@@ -487,6 +487,17 @@ func TestFirstTickDelay(t *testing.T) {
 		t.Fatalf("first tick delays collapsed to %d distinct offsets", len(offsets))
 	}
 
+	// Long intervals are capped so an entry restarted by every reconnect still
+	// fires well within a session instead of up to a full interval later.
+	for _, iv := range []time.Duration{time.Hour, 24 * time.Hour} {
+		for i := range 64 {
+			id := fmt.Sprintf("backup:device-%d", i)
+			if delay := firstTickDelay(id, iv); delay < 0 || delay >= maxFirstTickDelay {
+				t.Fatalf("firstTickDelay(%q, %s) = %s, want within [0, %s)", id, iv, delay, maxFirstTickDelay)
+			}
+		}
+	}
+
 	// Non-interval entries are never delayed.
 	if delay := firstTickDelay("job-1", 0); delay != 0 {
 		t.Fatalf("firstTickDelay with zero interval = %s, want 0", delay)
@@ -501,5 +512,74 @@ func TestPayloadFingerprintUnmarshalable(t *testing.T) {
 	}
 	if payloadFingerprint(&pb.AgentJob{JobId: "ok"}) == nil {
 		t.Fatal("fingerprint nil for a valid payload")
+	}
+}
+
+// Regression: an hourly job on an agent that reconnects more often than its
+// hash offset must still run every session. Each reconnect builds a fresh
+// scheduler, so the first tick has to land within the capped stagger window.
+func TestRecurringSchedulerLongIntervalRunsEachReconnect(t *testing.T) {
+	for session := range 3 {
+		clock := newManualScheduleClock()
+		scheduler := newRecurringScheduler(context.Background(), clock)
+		runs := make(chan scheduleInvocation, 2)
+		scheduler.replace(&scheduler.checks, []scheduleSpec{
+			testScheduleSpec("ssl:example.com", "ssl", time.Hour, runs),
+		})
+
+		var delay time.Duration
+		select {
+		case run := <-runs:
+			// Zero offset: dispatched without a stagger timer.
+			close(run.done)
+		case timer := <-clock.requests:
+			delay = timer.interval
+			if delay >= maxFirstTickDelay {
+				t.Fatalf("session %d: first tick delay = %s, want below %s", session, delay, maxFirstTickDelay)
+			}
+			fireManualTimer(t, timer.timer)
+			close(nextInvocation(t, runs).done)
+		case <-time.After(time.Second):
+			t.Fatalf("session %d: scheduler neither ran nor staggered the job", session)
+		}
+
+		scheduler.cancelAll()
+		if !scheduler.wait(time.Second) {
+			t.Fatalf("session %d: scheduler did not stop", session)
+		}
+	}
+}
+
+// Regression: an operator fixing a daily backup's credentials replaces the
+// assignment in place, and the new payload must run promptly rather than wait
+// out a hash offset of up to a day.
+func TestRecurringSchedulerChangedPayloadRunsImmediately(t *testing.T) {
+	clock := newManualScheduleClock()
+	scheduler := newRecurringScheduler(context.Background(), clock)
+	runs := make(chan scheduleInvocation, 2)
+
+	scheduler.replace(&scheduler.jobs, []scheduleSpec{
+		testScheduleSpec("backup:device-1", "bad-credentials", 24*time.Hour, runs),
+	})
+	fireFirstTickDelay(t, clock, 24*time.Hour)
+	first := nextInvocation(t, runs)
+	if timer := nextManualTimer(t, clock); timer.interval != 24*time.Hour {
+		t.Fatalf("timer interval = %s, want 24h", timer.interval)
+	}
+	close(first.done)
+
+	scheduler.replace(&scheduler.jobs, []scheduleSpec{
+		testScheduleSpec("backup:device-1", "fixed-credentials", 24*time.Hour, runs),
+	})
+	fixed := nextInvocation(t, runs)
+	// The next timer is the 24h interval, not a first-tick stagger.
+	if timer := nextManualTimer(t, clock); timer.interval != 24*time.Hour {
+		t.Fatalf("changed assignment created %s timer, want 24h interval with no stagger", timer.interval)
+	}
+	close(fixed.done)
+
+	scheduler.cancelAll()
+	if !scheduler.wait(time.Second) {
+		t.Fatal("scheduler did not stop")
 	}
 }

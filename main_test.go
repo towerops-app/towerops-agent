@@ -968,6 +968,9 @@ func TestRunMainForgetHostKeyBadStore(t *testing.T) {
 func TestRunForgetHostKeysEdgeCases(t *testing.T) {
 	t.Run("blank entries are skipped", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "known_hosts.json")
+		if err := os.WriteFile(path, []byte(`{}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		if code := runForgetHostKeys(path, []string{"  ", ""}); code != 0 {
 			t.Fatalf("exit = %d, want 0", code)
 		}
@@ -981,18 +984,46 @@ func TestRunForgetHostKeysEdgeCases(t *testing.T) {
 		}
 		orig := hostKeyCreateTemp
 		t.Cleanup(func() { hostKeyCreateTemp = orig })
-		calls := 0
-		hostKeyCreateTemp = func(d, p string) (hostKeyTempFile, error) {
-			// The first call is initHostKeyStore's bootstrap save; the forget
-			// save is the one that must fail.
-			calls++
-			if calls > 1 {
-				return nil, errors.New("create temp failed")
-			}
-			return orig(d, p)
+		hostKeyCreateTemp = func(string, string) (hostKeyTempFile, error) {
+			return nil, errors.New("create temp failed")
 		}
 		if code := runForgetHostKeys(path, []string{"192.0.2.9:22"}); code != 1 {
 			t.Fatalf("exit = %d, want 1", code)
 		}
 	})
+}
+
+// TestRunForgetHostKeysNoopLeavesFileUntouched: forgetting an address with no
+// entry must not rewrite the store, and a missing store is an error rather
+// than a silent no-op against the wrong path.
+func TestRunForgetHostKeysNoopLeavesFileUntouched(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "known_hosts.json")
+	original := []byte(`{"ssh:192.0.2.9:22":"ssh-ed25519 aabb"}`)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := hostKeyCreateTemp
+	t.Cleanup(func() { hostKeyCreateTemp = orig })
+	hostKeyCreateTemp = func(string, string) (hostKeyTempFile, error) {
+		t.Fatal("forget of an unknown host wrote the store")
+		return nil, nil
+	}
+	if code := runForgetHostKeys(path, []string{"203.0.113.1:22"}); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) {
+		t.Fatal("store file was replaced")
+	}
+
+	if code := runForgetHostKeys(filepath.Join(t.TempDir(), "absent.json"), []string{"192.0.2.9:22"}); code != 1 {
+		t.Fatalf("missing store exit = %d, want 1", code)
+	}
 }

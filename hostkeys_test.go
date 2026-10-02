@@ -421,7 +421,7 @@ func TestHmSaveMarshalError(t *testing.T) {
 func TestHmSaveCreateTempError(t *testing.T) {
 	// filepath.Dir of a path in a missing directory makes os.CreateTemp fail.
 	s := newHostKeyStore(filepath.Join(t.TempDir(), "missing", "known_hosts.json"))
-	err := s.save()
+	err := s.persist(true)
 	if err == nil {
 		t.Fatal("expected CreateTemp error")
 	}
@@ -468,7 +468,7 @@ func TestHmSaveTempFileFailures(t *testing.T) {
 
 			s := newHostKeyStore(filepath.Join(dir, "known_hosts.json"))
 			s.keys["h:22"] = "fp"
-			err := s.save()
+			err := s.persist(true)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("expected %q, got %v", tt.wantErr, err)
 			}
@@ -491,7 +491,7 @@ func TestHmSaveRenameError(t *testing.T) {
 	}
 
 	s := &hostKeyStore{path: path, keys: map[string]string{"h:22": "fp"}}
-	err := s.save()
+	err := s.persist(true)
 	if err == nil {
 		t.Fatal("expected rename error")
 	}
@@ -777,8 +777,9 @@ func TestHostKeyStoreSavedGenCoverage(t *testing.T) {
 		if err := s.verifySSHKey("ssh:192.0.2.25:22", key); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
-		// Force savedGen behind gen so the matching-entry path must save.
+		// Mark the entry unsaved so the matching-entry path must save.
 		s.mu.Lock()
+		s.pending["ssh:192.0.2.25:22"] = s.gen
 		s.savedGen = 0
 		s.mu.Unlock()
 		if err := s.verifySSHKey("ssh:192.0.2.25:22", key); err != nil {
@@ -794,6 +795,7 @@ func TestHostKeyStoreSavedGenCoverage(t *testing.T) {
 		}
 		failSave(t)
 		s.mu.Lock()
+		s.pending["ssh:192.0.2.26:22"] = s.gen
 		s.savedGen = 0
 		s.mu.Unlock()
 		if err := s.verifySSHKey("ssh:192.0.2.26:22", key); err == nil {
@@ -852,4 +854,169 @@ func TestHostKeyStoreSaveFailsOnDirectorySync(t *testing.T) {
 	if err := s.verify("ssh:192.0.2.31:22", "fp31"); err == nil {
 		t.Fatal("expected directory-sync failure to propagate")
 	}
+}
+
+// TestHostKeyStoreFailedFirstUseKeepsTrustedMatchesOffDisk: a failed first-use
+// save rolls back only its own entry, so later matches on already-durable
+// entries neither write nor inherit the save failure (a full or read-only
+// disk must not fail every known device closed).
+func TestHostKeyStoreFailedFirstUseKeepsTrustedMatchesOffDisk(t *testing.T) {
+	s, _ := hmTNewStore(t)
+	if err := s.verify("ssh:192.0.2.40:22", "fp40"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	orig := hostKeyCreateTemp
+	t.Cleanup(func() { hostKeyCreateTemp = orig })
+	calls := 0
+	hostKeyCreateTemp = func(string, string) (hostKeyTempFile, error) {
+		calls++
+		return nil, errors.New("disk full")
+	}
+
+	if err := s.verify("ssh:192.0.2.41:22", "fp41"); err == nil {
+		t.Fatal("first-use with failing save must fail closed")
+	}
+	calls = 0
+	for i := 0; i < 3; i++ {
+		if err := s.verify("ssh:192.0.2.40:22", "fp40"); err != nil {
+			t.Fatalf("match on a durable entry after a failed first-use: %v", err)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("matches on a durable entry wrote %d times, want 0", calls)
+	}
+}
+
+// TestHostKeyStoreSaveSkipsCoveredGeneration: a save whose mutation another
+// save already persisted returns without another fsync.
+func TestHostKeyStoreSaveSkipsCoveredGeneration(t *testing.T) {
+	s, _ := hmTNewStore(t)
+	if err := s.verify("ssh:192.0.2.42:22", "fp42"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	orig := hostKeyCreateTemp
+	t.Cleanup(func() { hostKeyCreateTemp = orig })
+	hostKeyCreateTemp = func(string, string) (hostKeyTempFile, error) {
+		t.Fatal("save rewrote an already-persisted generation")
+		return nil, nil
+	}
+	if err := s.save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+}
+
+// TestHostKeyStoreRespectsOutOfProcessForget: a running store must not
+// resurrect an entry --forget-host-key removed from the file, and must accept
+// the device's new key without a restart.
+func TestHostKeyStoreRespectsOutOfProcessForget(t *testing.T) {
+	daemon, path := hmTNewStore(t)
+	for _, h := range []string{"ssh:192.0.2.50:22", "ssh:192.0.2.51:22"} {
+		if err := daemon.verify(h, "old-"+h); err != nil {
+			t.Fatalf("seed %s: %v", h, err)
+		}
+	}
+
+	// The CLI forgets one entry from a separate store instance.
+	if code := runForgetHostKeys(path, []string{"192.0.2.50:22"}); code != 0 {
+		t.Fatalf("forget exit = %d", code)
+	}
+
+	// An unrelated first-use in the daemon saves the whole map.
+	if err := daemon.verify("ssh:192.0.2.52:22", "fp52"); err != nil {
+		t.Fatalf("first-use: %v", err)
+	}
+	persisted := hmTReadStore(t, path)
+	if _, ok := persisted["ssh:192.0.2.50:22"]; ok {
+		t.Fatalf("daemon save resurrected a forgotten entry: %v", persisted)
+	}
+	if persisted["ssh:192.0.2.51:22"] == "" || persisted["ssh:192.0.2.52:22"] == "" {
+		t.Fatalf("merge dropped entries: %v", persisted)
+	}
+
+	// Forget again, then the device presents a new key: the daemon re-reads
+	// the changed file instead of rejecting it as a MITM.
+	if code := runForgetHostKeys(path, []string{"192.0.2.51:22"}); code != 0 {
+		t.Fatalf("forget exit = %d", code)
+	}
+	if err := daemon.verify("ssh:192.0.2.51:22", "new-key"); err != nil {
+		t.Fatalf("new key after out-of-process forget rejected: %v", err)
+	}
+	if got := hmTReadStore(t, path)["ssh:192.0.2.51:22"]; got != "new-key" {
+		t.Fatalf("re-trusted entry = %q, want new-key", got)
+	}
+
+	// A real mismatch is still rejected.
+	if err := daemon.verify("ssh:192.0.2.52:22", "attacker"); err == nil {
+		t.Fatal("mismatch accepted")
+	}
+}
+
+// TestHostKeyStorePinRefreshesAfterOutOfProcessForget: the pinned algorithm
+// is dropped once the entry is forgotten on disk, so a device with a new key
+// type can negotiate.
+func TestHostKeyStorePinRefreshesAfterOutOfProcessForget(t *testing.T) {
+	daemon, path := hmTNewStore(t)
+	key := hmTSSHPublicKey(t)
+	if err := daemon.verifySSHKey("ssh:192.0.2.53:22", key); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if got := daemon.pinnedKeyAlgorithm("ssh:192.0.2.53:22"); got != ssh.KeyAlgoED25519 {
+		t.Fatalf("pin = %q", got)
+	}
+	if code := runForgetHostKeys(path, []string{"192.0.2.53:22"}); code != 0 {
+		t.Fatalf("forget exit = %d", code)
+	}
+	if got := daemon.pinnedKeyAlgorithm("ssh:192.0.2.53:22"); got != "" {
+		t.Fatalf("pin after forget = %q, want empty", got)
+	}
+}
+
+// TestHostKeyStoreMergeKeepsLocalChanges: out-of-process additions are folded
+// in, and an unparsable file fails the save rather than being overwritten.
+func TestHostKeyStoreMergeKeepsLocalChanges(t *testing.T) {
+	daemon, path := hmTNewStore(t)
+	if err := daemon.verify("ssh:192.0.2.60:22", "fp60"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	other := newHostKeyStore(path)
+	if err := other.verify("ssh:192.0.2.61:22", "fp61"); err != nil {
+		t.Fatalf("other: %v", err)
+	}
+	if err := daemon.verify("ssh:192.0.2.62:22", "fp62"); err != nil {
+		t.Fatalf("daemon: %v", err)
+	}
+	persisted := hmTReadStore(t, path)
+	for _, h := range []string{"ssh:192.0.2.60:22", "ssh:192.0.2.61:22", "ssh:192.0.2.62:22"} {
+		if persisted[h] == "" {
+			t.Fatalf("%s missing after merge: %v", h, persisted)
+		}
+	}
+
+	if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := daemon.verify("ssh:192.0.2.63:22", "fp63"); err == nil {
+		t.Fatal("first-use over a corrupt store file must fail closed")
+	}
+	if data, _ := os.ReadFile(path); string(data) != "not json" {
+		t.Fatalf("corrupt store file was overwritten: %q", data)
+	}
+	// Durable entries still match without touching the file.
+	if err := daemon.verify("ssh:192.0.2.60:22", "fp60"); err != nil {
+		t.Fatalf("durable match: %v", err)
+	}
+}
+
+func hmTReadStore(t *testing.T, path string) map[string]string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]string
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
 }

@@ -387,3 +387,110 @@ func waitForGateRefs(t *testing.T, gates *targetGates, key string, want int) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// An uncontended one-shot job goes straight to the queue: dispatch slots
+// held by jobs parked on other targets must not reject it while workers idle.
+func TestDispatchGatedUncontendedIgnoresParkedSlots(t *testing.T) {
+	pool := newWorkerPool(1)
+	defer pool.stop()
+	for range cap(pool.dispatch) {
+		pool.acquireDispatch()
+	}
+	defer func() {
+		for range cap(pool.dispatch) {
+			pool.releaseDispatch()
+		}
+	}()
+
+	gates := &targetGates{}
+	ran := make(chan struct{})
+	pool.dispatchGated(context.Background(), context.Background(), gates, "10.0.0.1", 0,
+		func(release func()) { defer release(); close(ran) },
+		func(r dispatchFailure) { t.Errorf("dispatch failed: %v", r) })
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("uncontended job never ran")
+	}
+}
+
+// One stalled target may park only its share of the dispatch slots, so jobs
+// for other targets keep flowing.
+func TestDispatchGatedTargetWaitLimit(t *testing.T) {
+	pool := newWorkerPool(4)
+	defer pool.stop()
+	gates := &targetGates{}
+	hold := gates.acquire(context.Background(), "slow")
+
+	limit := pool.targetWaitLimit()
+	if limit >= cap(pool.dispatch) {
+		t.Fatalf("target wait limit %d does not leave slots for other targets", limit)
+	}
+	var ran atomic.Int32
+	for range limit {
+		pool.dispatchGated(context.Background(), context.Background(), gates, "slow", 0,
+			func(release func()) { defer release(); ran.Add(1) },
+			func(r dispatchFailure) { t.Errorf("parked job failed: %v", r) })
+	}
+	waitForGateRefs(t, gates, "slow", limit+1)
+
+	failed := make(chan dispatchFailure, 1)
+	pool.dispatchGated(context.Background(), context.Background(), gates, "slow", 0,
+		func(release func()) { release(); t.Error("over-limit job ran") },
+		func(r dispatchFailure) { failed <- r })
+	select {
+	case r := <-failed:
+		if r != dispatchBacklogged {
+			t.Fatalf("failure = %v, want dispatchBacklogged", r)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("over-limit job was not rejected")
+	}
+
+	other := make(chan struct{})
+	pool.dispatchGated(context.Background(), context.Background(), gates, "fast", 0,
+		func(release func()) { defer release(); close(other) },
+		func(r dispatchFailure) { t.Errorf("other target failed: %v", r) })
+	select {
+	case <-other:
+	case <-time.After(time.Second):
+		t.Fatal("a stalled target starved another target")
+	}
+
+	hold()
+	deadline := time.Now().Add(time.Second)
+	for ran.Load() != int32(limit) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d parked jobs ran after release", ran.Load(), limit)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for !pool.idle() {
+		if time.Now().After(deadline) {
+			t.Fatal("pool never went idle")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestDispatchGatedCancelledDuringJitter(t *testing.T) {
+	pool := newWorkerPool(1)
+	defer pool.stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	failed := make(chan dispatchFailure, 1)
+	pool.dispatchGated(ctx, ctx, &targetGates{}, "k", 20*time.Millisecond,
+		func(release func()) { release(); t.Error("cancelled job ran") },
+		func(r dispatchFailure) { failed <- r })
+	if pool.idle() {
+		t.Fatal("pool idle while a coordinator was pending")
+	}
+	cancel()
+	select {
+	case r := <-failed:
+		if r != dispatchCancelled {
+			t.Fatalf("failure = %v, want dispatchCancelled", r)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled job never reported")
+	}
+}

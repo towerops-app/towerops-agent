@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -193,9 +194,9 @@ func (s *icmpSocket) readErr() error {
 	return s.err
 }
 
-// register installs a waiter under key. A waiter registered on an already
-// dead socket simply never fires: the ping waits out its timeout like any
-// unanswered request, and sharedSocket replaces the socket on the next call.
+// register installs a waiter under key. A waiter registered on a socket that
+// dies before the echo request is written is never fired; doICMPPing notices
+// the closed-connection write error and retries once on a fresh socket.
 func (s *icmpSocket) register(key pingKey, dst net.IP) *pingWaiter {
 	w := &pingWaiter{dst: dst, ch: make(chan icmpReply, 1)}
 	s.mu.Lock()
@@ -222,14 +223,29 @@ func (s *icmpSocket) waiterFor(id, seq int) *pingWaiter {
 	return s.waiters[pingKey{id: -1, seq: seq}]
 }
 
+// icmpReadBackoffMax caps the pause between consecutive transient read errors
+// so a socket stuck returning errors cannot spin the read loop.
+var icmpReadBackoffMax = 100 * time.Millisecond
+
 func (s *icmpSocket) readLoop() {
 	rb := make([]byte, 1500)
+	transient := 0
 	for {
 		n, peer, err := s.conn.ReadFrom(rb)
 		if err != nil {
-			s.fail(fmt.Errorf("icmp read: %w", err))
-			return
+			if !isTransientICMPReadError(err) {
+				s.fail(fmt.Errorf("icmp read: %w", err))
+				return
+			}
+			// One bad read must not fail every in-flight ping: skip it, and
+			// back off only when errors keep coming back to back.
+			if transient > 0 {
+				time.Sleep(min(time.Duration(transient)*time.Millisecond, icmpReadBackoffMax))
+			}
+			transient++
+			continue
 		}
+		transient = 0
 		rm, err := icmp.ParseMessage(s.proto, rb[:n])
 		if err != nil {
 			continue
@@ -238,12 +254,37 @@ func (s *icmpSocket) readLoop() {
 	}
 }
 
+// isTransientICMPReadError reports whether a ReadFrom error leaves the socket
+// usable. On raw ICMP sockets the kernel reports a pending ICMP hard error
+// (sk_err) once on the next recvfrom - ECONNREFUSED, EHOSTUNREACH and the like
+// - which says nothing about the socket itself. A closed socket and anything
+// unrecognised are fatal, so sharedSocket opens a fresh one.
+func isTransientICMPReadError(err error) bool {
+	if errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	for _, errno := range []syscall.Errno{
+		syscall.ECONNREFUSED, syscall.EHOSTUNREACH, syscall.ENETUNREACH,
+		syscall.EHOSTDOWN, syscall.ENETDOWN, syscall.EAGAIN, syscall.EINTR,
+		syscall.ENOBUFS, syscall.EMSGSIZE,
+	} {
+		if errors.Is(err, errno) {
+			return true
+		}
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 // dispatch routes one parsed ICMP message to its waiter. Echo replies match
 // on (id, seq) and are additionally checked against the pinged address so a
 // stray reply from another host can never satisfy a ping. Unreachable,
 // time-exceeded and packet-too-big errors quote the original datagram; the
-// quoted echo (id, seq) identifies the waiter, which is failed immediately
-// instead of sitting out its full timeout.
+// quoted echo (id, seq) identifies the waiter and the quoted destination must
+// be the pinged address - the shared raw socket sees every ICMP error on the
+// host, so another process's request or a stale error after sequence wrap
+// must not fail an unrelated ping. A matching error fails the waiter
+// immediately instead of letting it sit out its full timeout.
 func (s *icmpSocket) dispatch(rm *icmp.Message, src net.IP) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -273,12 +314,12 @@ func (s *icmpSocket) dispatch(rm *icmp.Message, src net.IP) {
 		case *icmp.PacketTooBig:
 			quoted = body.Data
 		}
-		id, seq, ok := quotedEchoIDSeq(quoted, s.proto == 1)
+		id, seq, dst, ok := quotedEchoIDSeq(quoted, s.proto == 1)
 		if !ok {
 			return
 		}
 		w := s.waiterFor(id, seq)
-		if w == nil {
+		if w == nil || !dst.Equal(w.dst) {
 			return
 		}
 		var what string
@@ -317,34 +358,37 @@ func (s *icmpSocket) fail(err error) {
 	_ = s.conn.Close()
 }
 
-// quotedEchoIDSeq extracts the echo identifier and sequence of the original
-// datagram quoted inside an ICMP error body. The quote is the original IP
-// header followed by the first 8 bytes of the ICMP echo request, which is
-// enough to route the error to the ping that sent it.
-func quotedEchoIDSeq(data []byte, isIPv4 bool) (id, seq int, ok bool) {
+// quotedEchoIDSeq extracts the echo identifier, sequence and destination of
+// the original datagram quoted inside an ICMP error body. The quote is the
+// original IP header followed by the first 8 bytes of the ICMP echo request,
+// which is enough to route the error to the ping that sent it. dst aliases
+// data.
+func quotedEchoIDSeq(data []byte, isIPv4 bool) (id, seq int, dst net.IP, ok bool) {
 	var icmpData []byte
 	var echoType byte
 	if isIPv4 {
 		echoType = byte(ipv4.ICMPTypeEcho)
 		if len(data) < 20 || data[0]>>4 != 4 || data[9] != 1 {
-			return 0, 0, false
+			return 0, 0, nil, false
 		}
 		ihl := int(data[0]&0x0f) * 4
 		if ihl < 20 || len(data) < ihl+8 {
-			return 0, 0, false
+			return 0, 0, nil, false
 		}
+		dst = net.IP(data[16:20])
 		icmpData = data[ihl:]
 	} else {
 		echoType = byte(ipv6.ICMPTypeEchoRequest)
 		if len(data) < 48 || data[0]>>4 != 6 || data[6] != 58 {
-			return 0, 0, false
+			return 0, 0, nil, false
 		}
+		dst = net.IP(data[24:40])
 		icmpData = data[40:]
 	}
 	if icmpData[0] != echoType {
-		return 0, 0, false
+		return 0, 0, nil, false
 	}
-	return int(binary.BigEndian.Uint16(icmpData[4:6])), int(binary.BigEndian.Uint16(icmpData[6:8])), true
+	return int(binary.BigEndian.Uint16(icmpData[4:6])), int(binary.BigEndian.Uint16(icmpData[6:8])), dst, true
 }
 
 // doICMPPing performs an ICMP ping over the given network type.
@@ -352,11 +396,6 @@ func quotedEchoIDSeq(data []byte, isIPv4 bool) (id, seq int, ok bool) {
 // a keyed waiter; the matching reply, an ICMP error quoting the request, the
 // context, or the timeout ends the wait.
 func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, timeoutMs int) (float64, error) {
-	sock, err := sharedSocket(network)
-	if err != nil {
-		return 0, err
-	}
-
 	var msgType icmp.Type
 	if isIPv4 {
 		msgType = ipv4.ICMPTypeEcho
@@ -390,20 +429,17 @@ func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, tim
 		dst = &net.IPAddr{IP: ip}
 	}
 
-	key := pingKey{id: sock.replyID, seq: seq}
-	waiter := sock.register(key, ip)
-	defer sock.unregister(key, waiter)
-
-	start := time.Now()
-	if _, err := sock.conn.WriteTo(wb, dst); err != nil {
-		return 0, fmt.Errorf("icmp write: %w", err)
+	waiter, start, err := sendEcho(network, seq, ip, wb, dst)
+	if err != nil {
+		return 0, err
 	}
+	defer waiter.sock.unregister(waiter.key, waiter.w)
 
 	timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
 	defer timer.Stop()
 
 	select {
-	case reply := <-waiter.ch:
+	case reply := <-waiter.w.ch:
 		if reply.err != nil {
 			return 0, reply.err
 		}
@@ -412,6 +448,41 @@ func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, tim
 		return 0, fmt.Errorf("icmp reply timeout after %d ms", timeoutMs)
 	case <-ctx.Done():
 		return 0, fmt.Errorf("icmp ping: %w", ctx.Err())
+	}
+}
+
+// sentEcho is a written echo request's registration on the socket it went out
+// on; the caller unregisters it when the ping ends.
+type sentEcho struct {
+	sock *icmpSocket
+	key  pingKey
+	w    *pingWaiter
+}
+
+// sendEcho registers a waiter on the shared socket for network and writes the
+// echo request. The socket can be closed between sharedSocket returning it
+// and the write - its read loop failed, or it was torn down - so a
+// closed-connection write marks that socket dead and is retried once on a
+// fresh one rather than reporting a healthy device down.
+func sendEcho(network string, seq int, ip net.IP, wb []byte, dst net.Addr) (sentEcho, time.Time, error) {
+	for attempt := 0; ; attempt++ {
+		sock, err := sharedSocket(network)
+		if err != nil {
+			return sentEcho{}, time.Time{}, err
+		}
+		key := pingKey{id: sock.replyID, seq: seq}
+		w := sock.register(key, ip)
+		start := time.Now()
+		_, err = sock.conn.WriteTo(wb, dst)
+		if err == nil {
+			return sentEcho{sock: sock, key: key, w: w}, start, nil
+		}
+		sock.unregister(key, w)
+		if attempt == 0 && errors.Is(err, net.ErrClosed) {
+			sock.fail(fmt.Errorf("icmp write: %w", err))
+			continue
+		}
+		return sentEcho{}, time.Time{}, fmt.Errorf("icmp write: %w", err)
 	}
 }
 

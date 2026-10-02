@@ -49,7 +49,7 @@ func runMain(ctx context.Context, args []string) int {
 	trapCommunity := fs.String("trap-community", "", "Only accept traps carrying this community string (or set TOWEROPS_TRAP_COMMUNITY; default: any)")
 	hostKeysFile := fs.String("host-keys-file", envOrDefault(defaultHostKeysPath, "TOWEROPS_HOST_KEYS_FILE"), "Path to the SSH and TLS trust-on-first-use store")
 	var forgetHostKeys stringListFlag
-	fs.Var(&forgetHostKeys, "forget-host-key", "Remove the stored SSH/TLS trust-on-first-use entry for ip:port and exit (repeatable)")
+	fs.Var(&forgetHostKeys, "forget-host-key", "Remove the stored SSH/TLS trust-on-first-use entry for ip:port and exit (repeatable; a running agent picks up the removal without a restart)")
 	legacyScheduling := fs.Bool("legacy-scheduling", envBool(false, "TOWEROPS_LEGACY_SCHEDULING"), "Disable local recurring scheduling and request legacy server pushes")
 	snmpRate := fs.Uint("snmp-rate", envUint(defaultSNMPPDURate, "TOWEROPS_SNMP_RATE"), "Maximum SNMP request packets per second process-wide (0 disables)")
 	showHelp := fs.Bool("help", false, "Show this help message and exit")
@@ -171,10 +171,18 @@ func (f *stringListFlag) Set(value string) error {
 }
 
 // runForgetHostKeys removes each entry from the trust-on-first-use store and
-// reports per host. It returns the exit code for runMain.
+// reports per host. It returns the exit code for runMain. The file is only
+// rewritten when an entry is actually removed. A running agent sharing the
+// file re-reads it before its next write and before rejecting a changed key,
+// so it neither resurrects the entry nor needs a restart.
 func runForgetHostKeys(path string, hosts []string) int {
-	if err := initHostKeyStore(path); err != nil {
+	if _, err := os.Stat(path); err != nil {
 		fmt.Fprintf(os.Stderr, "error: host key store: %v\n", err)
+		return 1
+	}
+	store := newHostKeyStore(path)
+	if store.loadErr != nil {
+		fmt.Fprintf(os.Stderr, "error: host key store: %v\n", store.loadErr)
 		return 1
 	}
 	exit := 0
@@ -183,7 +191,7 @@ func runForgetHostKeys(path string, hosts []string) int {
 		if host == "" {
 			continue
 		}
-		removed, err := getHostKeyStore().forget(host)
+		removed, err := store.forget(host)
 		switch {
 		case err != nil:
 			fmt.Fprintf(os.Stderr, "error: forget %s: %v\n", host, err)

@@ -35,6 +35,16 @@ var interfaceAddrs = (*net.Interface).Addrs
 var errRestartRequested = errors.New("restart requested")
 var errChannelReloaded = errors.New("channel reloaded")
 var errSessionCancelled = errors.New("session cancelled")
+
+// errSelfUpdateAborted ends a session whose self-update drain ran but whose
+// re-exec never happened. The drain closed the scheduler and stopped job
+// intake for good, so the only way back to a working session is a fresh one.
+var errSelfUpdateAborted = errors.New("self-update aborted after drain")
+
+// drainedSession is the session a self-update drain stopped, if any. When
+// the update returns — exec failed, so the process is still this one — that
+// session is ended so the reconnect rebuilds its scheduler and pools.
+var drainedSession atomic.Pointer[session]
 var joinTimeout = 10 * time.Second
 var heartbeatInterval = 60 * time.Second
 var channelHeartbeatInterval = 25 * time.Second
@@ -79,9 +89,10 @@ type channelMsg struct {
 type writeRequest struct {
 	data []byte
 	ack  chan error
-	// release returns a pooled frame buffer after the write completes; nil
-	// for frames not built by marshalChannelFrame.
-	release func()
+	// buf is the pooled frame buffer data was built in, returned to the
+	// pool once the write completes; nil for frames not built by
+	// marshalChannelFrame.
+	buf *bytes.Buffer
 }
 
 // inFlightWrite is a result frame handed to the writer but not yet
@@ -154,8 +165,8 @@ func runAgentWithScheduling(
 		if ctx.Err() != nil {
 			return
 		}
-		if errors.Is(err, errRestartRequested) {
-			slog.Info("restart requested, reconnecting immediately")
+		if errors.Is(err, errRestartRequested) || errors.Is(err, errSelfUpdateAborted) {
+			slog.Info("restart requested, reconnecting immediately", "reason", err)
 			retryDelay = initialRetryDelay
 			continue
 		}
@@ -192,6 +203,9 @@ type session struct {
 	msgCh      chan []byte
 	errCh      chan error
 	writeErrCh chan error
+	// abortCh carries errSelfUpdateAborted when a drained session must be
+	// replaced because the re-exec it was drained for did not happen.
+	abortCh    chan error
 	readerDone chan struct{}
 	writerDone chan struct{}
 
@@ -264,6 +278,7 @@ func runSessionWithResultsAndScheduling(
 		msgCh:           make(chan []byte, 100),
 		errCh:           make(chan error, 1),
 		writeErrCh:      make(chan error, 1),
+		abortCh:         make(chan error, 1),
 		readerDone:      make(chan struct{}),
 		writerDone:      make(chan struct{}),
 	}
@@ -304,6 +319,7 @@ func runSessionWithResultsAndScheduling(
 	drain := s.drainResults
 	drainResultSpool.Store(&drain)
 	defer drainResultSpool.Store(nil)
+	defer drainedSession.CompareAndSwap(s, nil)
 
 	// Publish update-critical deployment metadata as soon as the join is
 	// accepted. A full queue is non-fatal because the ticker will retry.
@@ -341,8 +357,8 @@ func (s *session) write() {
 		}
 		// The frame bytes were fully consumed by WriteText — pooled buffers
 		// return to the pool whether the write succeeded or not.
-		if request.release != nil {
-			request.release()
+		if request.buf != nil {
+			putFrameBuffer(request.buf)
 		}
 		if err != nil {
 			slog.Error("websocket write", "error", err)
@@ -430,7 +446,16 @@ func (s *session) nextRef() string {
 // marshal copies that otherwise dominate allocation under result floods.
 var framePool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
+// maxPooledFrameBuffer caps the buffers returned to framePool. A base64
+// config backup can grow a frame to several MiB; pooling it would pin that
+// memory and hand it to the next heartbeat, so oversized buffers are left
+// for the garbage collector instead.
+const maxPooledFrameBuffer = 64 << 10
+
 func putFrameBuffer(buf *bytes.Buffer) {
+	if buf.Cap() > maxPooledFrameBuffer {
+		return
+	}
 	buf.Reset()
 	framePool.Put(buf)
 }
@@ -455,7 +480,7 @@ func appendBinaryPayload(buf *bytes.Buffer, msg proto.Message) error {
 // directly into a pooled buffer instead of running a struct marshal. Topic
 // and event are internal ASCII identifiers, so strconv quoting is safe; the
 // ref is written as a JSON string when present. Callers must release the
-// buffer (via the writeRequest release hook or putFrameBuffer) before
+// buffer (via the writeRequest buf field or putFrameBuffer) before
 // reusing or discarding the data slice.
 func marshalChannelFrame(topic, event string, payload json.RawMessage, ref *string) (*bytes.Buffer, []byte) {
 	buf := framePool.Get().(*bytes.Buffer)
@@ -486,8 +511,8 @@ func (s *session) sendBinary(event string, msg proto.Message) bool {
 	buf, data := marshalChannelFrame(s.topic, event, payload.Bytes(), nil)
 	putFrameBuffer(payload)
 	if !enqueueWrite(s.ctx, s.writeCh, writeRequest{
-		data:    data,
-		release: func() { putFrameBuffer(buf) },
+		data: data,
+		buf:  buf,
 	}, event) {
 		putFrameBuffer(buf)
 		return false
@@ -510,9 +535,9 @@ func (s *session) queueResultWrite(result outbound, spooled bool) (*inFlightWrit
 	buf, data := marshalChannelFrame(s.topic, result.event, result.payload, &ref)
 	ack := make(chan error, 1)
 	if !enqueueWrite(s.ctx, s.writeCh, writeRequest{
-		data:    data,
-		ack:     ack,
-		release: func() { putFrameBuffer(buf) },
+		data: data,
+		ack:  ack,
+		buf:  buf,
 	}, result.event) {
 		putFrameBuffer(buf)
 		delete(s.pending, ref)
@@ -587,18 +612,28 @@ func (s *session) prunePending() {
 }
 
 // drainResults prepares the session for a self-update re-exec: the recurring
-// scheduler is stopped, new job and check submissions are refused, and the
-// spool is flushed until every slot is free — the semaphores hold a token per
-// in-use slot — meaning every enqueued or in-flight result was written to the
-// websocket and acked. The session loop keeps delivering results
-// concurrently; drain only gates acceptance. Returns false when the caller's
-// bounded context expires first.
+// scheduler is stopped, new job and check submissions are refused, in-flight
+// jobs — queued, running, or still in jitter or a gate wait — are allowed to
+// finish, and the spool is flushed until every slot is free — the semaphores
+// hold a token per in-use slot — meaning every enqueued or in-flight result
+// was written to the websocket and acked. The session loop keeps delivering
+// results concurrently; drain only gates acceptance. Returns false when the
+// caller's bounded context expires first.
+//
+// The drain cannot be undone in place — the scheduler is closed for good —
+// so the session is recorded in drainedSession and ended by
+// abortDrainedSession if the re-exec does not happen.
 func (s *session) drainResults(ctx context.Context) bool {
+	drainedSession.Store(s)
 	s.scheduler.cancelAll()
 	s.pools.stopAccepting.Store(true)
 
+	// Pools are checked before the spool: a job sends its result before its
+	// task returns, so once every pool is idle its result is already queued
+	// and the spool check below covers it.
 	drained := func() bool {
-		return len(s.results.items) == 0 &&
+		return s.pools.idle() &&
+			len(s.results.items) == 0 &&
 			len(s.results.slots) == 0 &&
 			len(s.results.reservedSlots) == 0
 	}
@@ -612,6 +647,19 @@ func (s *session) drainResults(ctx context.Context) bool {
 		}
 	}
 	return true
+}
+
+// abortDrainedSession ends the session a self-update drain stopped, if any.
+// It runs whenever the update returns: a successful exec never does, so a
+// return means the process — and the drained, job-refusing session — lives
+// on. The reconnect that follows builds a fresh scheduler and pools.
+func abortDrainedSession() {
+	s := drainedSession.Swap(nil)
+	if s == nil {
+		return
+	}
+	slog.Warn("self-update did not re-exec after draining; reconnecting to restore job intake")
+	s.fail(s.abortCh, errSelfUpdateAborted)
 }
 
 // handleResultReply consumes a phx_reply addressed to this channel. A reply
@@ -679,6 +727,11 @@ func (s *session) sessionErr() error {
 	select {
 	case err := <-s.writeErrCh:
 		return fmt.Errorf("write: %w", err)
+	default:
+	}
+	select {
+	case err := <-s.abortCh:
+		return err
 	default:
 	}
 	return errSessionCancelled
@@ -799,6 +852,10 @@ func (s *session) loop(ctx context.Context) error {
 			// in-flight write is already resolved on its channel.
 			s.settleInFlight(inFlight)
 			return fmt.Errorf("write: %w", err)
+
+		case err := <-s.abortCh:
+			s.settleInFlight(inFlight)
+			return err
 
 		case err := <-ackCh:
 			w := inFlight
@@ -1063,6 +1120,7 @@ func handleMessage(
 			if err := doSelfUpdate(updateCtx, payload.URL, payload.Checksum); err != nil {
 				slog.Error("self-update failed", "error", err)
 			}
+			abortDrainedSession()
 		}()
 
 	default:
@@ -1239,6 +1297,16 @@ type jobPools struct {
 	stopAccepting atomic.Bool
 }
 
+// idle reports whether every pool has finished all admitted work.
+func (p *jobPools) idle() bool {
+	for _, pool := range []*workerPool{p.snmp, p.mikrotik, p.ping, p.checks, p.backup} {
+		if pool != nil && !pool.idle() {
+			return false
+		}
+	}
+	return true
+}
+
 func (p *jobPools) stop(timeout time.Duration) []string {
 	pools := map[string]*workerPool{
 		"snmp": p.snmp, "mikrotik": p.mikrotik, "ping": p.ping, "checks": p.checks,
@@ -1354,37 +1422,20 @@ func submitJob(
 		return true
 	}
 
-	// The one-shot path cannot block the session event loop, so the gate wait
-	// runs on a coordinator goroutine instead of a worker. The dispatch
-	// semaphore bounds those coordinators: a push larger than workers plus
-	// queue is rejected as AGENT_BUSY instead of spawning unbounded
-	// goroutines that bypass the pool's own backpressure. The jitter is read
-	// here — the coordinator reads no package globals, which keeps tests that
-	// restore dispatchJitterMax race-free.
-	delay := dispatchJitter()
-	if !pool.acquireDispatch() {
-		reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
-		done()
-		return false
-	}
-	go func() {
-		defer pool.releaseDispatch()
-		jitterDispatch(ctx, delay)
-		release := pools.targets.acquire(ctx, target)
-		if release == nil {
+	// The one-shot path cannot block the session event loop, so jitter and
+	// the gate wait run off it in dispatchGated. Only jobs parked on a busy
+	// target hold a dispatch slot; an uncontended job is refused only when the
+	// pool queue is genuinely full. The jitter is read here — the coordinator
+	// reads no package globals, which keeps tests that restore
+	// dispatchJitterMax race-free.
+	pool.dispatchGated(ctx, ctx, pools.targets, target, dispatchJitter(),
+		func(release func()) { defer release(); task(execute)() },
+		func(reason dispatchFailure) {
+			if reason != dispatchCancelled {
+				reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
+			}
 			done()
-			return
-		}
-		// The gate moves into the queued task so the worker frees it on every
-		// exit path — success, panic past the pool's recover, or task's early
-		// cancelled-context return.
-		if !pool.submitMode(ctx, func() { defer release(); task(execute)() }, false) {
-			release()
-			reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
-			done()
-		}
-	}()
-
+		})
 	return true
 }
 
@@ -1419,43 +1470,55 @@ func submitConfigBackupJob(
 		)
 	}
 
-	// Read the jitter here, not inside the goroutine: the coordinator must not
-	// touch package globals that tests restore from cleanup.
+	// Read the jitter here, not inside the coordinator: it must not touch
+	// package globals that tests restore from cleanup.
 	delay := dispatchJitter()
-	// The coordinator goroutine counts against the dispatch semaphore so a
-	// flood of backup jobs cannot spawn unbounded goroutines ahead of the
-	// pool queue.
-	if !pools.backup.acquireDispatch() {
-		report(pb.ConfigBackupErrorCode_AGENT_BUSY, "backup dispatcher saturated")
-		cancel()
-		done()
-		return false
+	key := jobTargetKey(job)
+	task := func(release func()) {
+		defer release()
+		defer done()
+		defer cancel()
+		executeConfigBackupJobCtx(ctx, jobCtx, job, out)
 	}
-	go func() {
-		defer pools.backup.releaseDispatch()
+
+	if wait {
+		// Recurring backups run on their scheduler goroutine like submitJob's
+		// wait path: the jitter, gate and queue waits are the backpressure,
+		// so a busy dispatcher delays the backup instead of failing it.
 		jitterDispatch(jobCtx, delay)
-		// Acquire the gate here rather than on a worker, so a device already
-		// mid-backup doesn't pin a backup-pool slot other devices could use.
-		release := pools.targets.acquire(jobCtx, jobTargetKey(job))
+		release := pools.targets.acquire(jobCtx, key)
 		if release == nil {
 			cancel()
 			report(pb.ConfigBackupErrorCode_TIMEOUT, "job deadline expired waiting for the device")
 			done()
-			return
+			return false
 		}
-		task := func() {
-			defer release()
-			defer done()
-			defer cancel()
-			executeConfigBackupJobCtx(ctx, jobCtx, job, out)
-		}
-		if !pools.backup.submitMode(ctx, task, wait) {
+		if !pools.backup.submitMode(ctx, func() { task(release) }, true) {
 			release()
 			cancel()
 			report(pb.ConfigBackupErrorCode_AGENT_BUSY, "")
 			done()
+			return false
 		}
-	}()
+		return true
+	}
+
+	// The gate is acquired by the coordinator rather than a worker, so a
+	// device already mid-backup doesn't pin a backup-pool slot other devices
+	// could use.
+	pools.backup.dispatchGated(jobCtx, ctx, pools.targets, key, delay, task,
+		func(reason dispatchFailure) {
+			cancel()
+			switch reason {
+			case dispatchCancelled:
+				report(pb.ConfigBackupErrorCode_TIMEOUT, "job deadline expired waiting for the device")
+			case dispatchBacklogged:
+				report(pb.ConfigBackupErrorCode_AGENT_BUSY, "backup dispatcher saturated")
+			default:
+				report(pb.ConfigBackupErrorCode_AGENT_BUSY, "")
+			}
+			done()
+		})
 	return true
 }
 

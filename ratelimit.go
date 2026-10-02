@@ -98,11 +98,20 @@ func (b *tokenBucket) charge() {
 
 // refund returns a token whose reservation was abandoned — the caller never
 // transmitted — so a cancelled wait does not leave debt behind for the next
-// caller to sleep off.
+// caller to sleep off. It refills first and caps at the burst, so refunds
+// after setRate lowered the burst (or after an idle spell) cannot lift the
+// balance above it and let the next callers exceed the configured burst.
 func (b *tokenBucket) refund() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.rate <= 0 {
+		return
+	}
+	b.refillLocked(b.now())
 	b.tokens++
+	if b.tokens > b.burst {
+		b.tokens = b.burst
+	}
 }
 
 // wait blocks until one token is available — including paying off debt
@@ -124,33 +133,33 @@ func (b *tokenBucket) wait(ctx context.Context) bool {
 	}
 }
 
-// waitDebt blocks until the bucket's outstanding debt (a negative balance
-// accumulated by charge) is repaid by the refiller, or ctx is cancelled.
-// Unlike wait it does not consume a token: it exists to pace a sequence of
-// requests where each send is already charged by OnSent, e.g. inside a
-// gosnmp walkFn between one response and the next request.
+// waitDebt blocks until the bucket can afford one more send, or ctx is
+// cancelled. It exists to pace a sequence of requests where each send is
+// already charged by OnSent, e.g. inside a gosnmp walkFn between one response
+// and the next request.
+//
+// It reserves a token like wait, so concurrent walkers (and wait callers) get
+// distinct, ordered slots instead of polling for a non-negative balance —
+// which under sustained load never arrives, and when it does wakes every
+// walker at once. Once its slot comes up it hands the token back, so the
+// OnSent charge for the send that follows is the only token the send costs.
 func (b *tokenBucket) waitDebt(ctx context.Context) bool {
-	for {
-		b.mu.Lock()
-		if b.rate <= 0 {
-			b.mu.Unlock()
-			return true
-		}
-		b.refillLocked(b.now())
-		if b.tokens >= 0 {
-			b.mu.Unlock()
-			return ctx.Err() == nil
-		}
-		delay := time.Duration(-b.tokens / b.rate * float64(time.Second))
-		b.mu.Unlock()
+	if ctx.Err() != nil {
+		return false
+	}
+	delay := b.reserve()
+	if delay > 0 {
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			b.refund()
 			return false
 		case <-timer.C:
 		}
 	}
+	b.refund()
+	return ctx.Err() == nil
 }
 
 // snmpSentHook returns the gosnmp OnSent callback that charges every

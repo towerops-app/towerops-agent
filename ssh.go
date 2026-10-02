@@ -58,7 +58,7 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 		HostKeyCallback: sshHostKeyCallback(),
 	}
 	if alg := getHostKeyStore().pinnedKeyAlgorithm("ssh:" + addr); alg != "" {
-		config.HostKeyAlgorithms = []string{alg}
+		config.HostKeyAlgorithms = hostKeyAlgorithmsFor(alg)
 	}
 
 	conn, err := sshDial(ctx, "tcp", addr, config)
@@ -98,6 +98,21 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 	}
 
 	return string(output), nil
+}
+
+// hostKeyAlgorithmsFor maps a pinned key type to the signature algorithms
+// that verify it. key.Type() reports an RSA key as "ssh-rsa", which is also
+// the SHA-1 signature algorithm; offering only that fails negotiation with
+// devices that disable SHA-1 (strong-crypto RouterOS, OpenSSH 8.8+), so RSA
+// keys and certificates offer the SHA-2 variants first.
+func hostKeyAlgorithmsFor(keyType string) []string {
+	switch keyType {
+	case ssh.KeyAlgoRSA:
+		return []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA}
+	case ssh.CertAlgoRSAv01:
+		return []string{ssh.CertAlgoRSASHA512v01, ssh.CertAlgoRSASHA256v01, ssh.CertAlgoRSAv01}
+	}
+	return []string{keyType}
 }
 
 const defaultPingTimeoutMs = 5000
