@@ -976,6 +976,16 @@ func TestRunForgetHostKeysEdgeCases(t *testing.T) {
 		}
 	})
 
+	t.Run("unparseable store exits 1", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "known_hosts.json")
+		if err := os.WriteFile(path, []byte(`{not json`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if code := runForgetHostKeys(path, []string{"192.0.2.9:22"}); code != 1 {
+			t.Fatalf("exit = %d, want 1", code)
+		}
+	})
+
 	t.Run("forget failure exits 1", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "known_hosts.json")

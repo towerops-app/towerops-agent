@@ -1366,6 +1366,26 @@ func TestExecuteEmitsQueryOperatorsAfterOperands(t *testing.T) {
 	}
 }
 
+// The sort algorithm decides which argument order the comparator sees, and
+// map iteration is random, so check both orientations directly.
+func TestCompareMikrotikArgKeys(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"?#|", "?type", 1},
+		{"?type", "?#|", -1},
+		{"?#!", "?#|", -1},
+		{"?disabled", "?type", -1},
+		{"name", "name", 0},
+	}
+	for _, tc := range cases {
+		if got := compareMikrotikArgKeys(tc.a, tc.b); got != tc.want {
+			t.Errorf("compareMikrotikArgKeys(%q, %q) = %d, want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
 func TestExecuteMikrotikBackupViaSSHDefaultsPort(t *testing.T) {
 	orig := sshBackup
 	defer func() { sshBackup = orig }()

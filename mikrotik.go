@@ -161,16 +161,20 @@ func (c *mikrotikClient) execute(command string, args map[string]string) (*mikro
 // keys moved after all other keys (still sorted among themselves) so they
 // follow the operands they combine.
 func sortedMikrotikArgKeys(args map[string]string) []string {
-	return slices.SortedFunc(maps.Keys(args), func(a, b string) int {
-		aOp, bOp := strings.HasPrefix(a, "?#"), strings.HasPrefix(b, "?#")
-		if aOp != bOp {
-			if aOp {
-				return 1
-			}
-			return -1
+	return slices.SortedFunc(maps.Keys(args), compareMikrotikArgKeys)
+}
+
+// compareMikrotikArgKeys orders "?#" operator keys after every other key and
+// sorts lexically within each group.
+func compareMikrotikArgKeys(a, b string) int {
+	aOp, bOp := strings.HasPrefix(a, "?#"), strings.HasPrefix(b, "?#")
+	if aOp != bOp {
+		if aOp {
+			return 1
 		}
-		return strings.Compare(a, b)
-	})
+		return -1
+	}
+	return strings.Compare(a, b)
 }
 
 func (c *mikrotikClient) executeWords(words []string) (*mikrotikResponse, error) {

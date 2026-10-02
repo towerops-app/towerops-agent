@@ -455,6 +455,14 @@ func TestHmSaveTempFileFailures(t *testing.T) {
 			wantErr:    "close boom",
 			wantClosed: true,
 		},
+		{
+			// Every write step succeeds but the temp file is gone before the
+			// pre-rename stat, so persist must fail rather than rename.
+			name:       "stat of temp file fails",
+			file:       &hmTFailingTempFile{name: "unused"},
+			wantErr:    "no such file",
+			wantClosed: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -718,6 +726,22 @@ func TestHostKeyStoreSavedGenCoverage(t *testing.T) {
 			return nil, errors.New("create temp failed")
 		}
 	}
+	// failSaveCovered fails this save after advancing savedGen to the current
+	// generation, standing in for a concurrent save that wrote the mutation
+	// between this caller's snapshot and its post-failure check. Setting
+	// savedGen before the mutation would not work: persist would see the
+	// generation covered and return nil without ever failing.
+	failSaveCovered := func(t *testing.T, s *hostKeyStore) {
+		t.Helper()
+		orig := hostKeyCreateTemp
+		t.Cleanup(func() { hostKeyCreateTemp = orig })
+		hostKeyCreateTemp = func(string, string) (hostKeyTempFile, error) {
+			s.mu.Lock()
+			s.savedGen = s.gen
+			s.mu.Unlock()
+			return nil, errors.New("create temp failed")
+		}
+	}
 
 	t.Run("first-use save failure with fresh savedGen rolls back", func(t *testing.T) {
 		s, _ := hmTNewStore(t)
@@ -733,10 +757,7 @@ func TestHostKeyStoreSavedGenCoverage(t *testing.T) {
 
 	t.Run("first-use save failure superseded by concurrent save keeps entry", func(t *testing.T) {
 		s, _ := hmTNewStore(t)
-		failSave(t)
-		s.mu.Lock()
-		s.savedGen = s.gen + 2 // a concurrent save already covered the mutation
-		s.mu.Unlock()
+		failSaveCovered(t, s)
 		if err := s.verify("ssh:192.0.2.21:22", "fp21"); err != nil {
 			t.Fatalf("expected nil for superseded save failure, got %v", err)
 		}
@@ -748,10 +769,7 @@ func TestHostKeyStoreSavedGenCoverage(t *testing.T) {
 		fp := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
 		// A typed namespaced entry seeded untyped migrates on verify.
 		s.keys["ssh:192.0.2.22:22"] = fp
-		failSave(t)
-		s.mu.Lock()
-		s.savedGen = s.gen + 2 // a concurrent save already covered the mutation
-		s.mu.Unlock()
+		failSaveCovered(t, s)
 		if err := s.verifySSHKey("ssh:192.0.2.22:22", key); err != nil {
 			t.Fatalf("expected nil for superseded migration failure, got %v", err)
 		}
@@ -814,10 +832,7 @@ func TestHostKeyStoreSavedGenCoverage(t *testing.T) {
 	t.Run("forget save failure superseded reports removed", func(t *testing.T) {
 		s, _ := hmTNewStore(t)
 		s.keys["ssh:192.0.2.28:22"] = "fp28"
-		failSave(t)
-		s.mu.Lock()
-		s.savedGen = s.gen + 2
-		s.mu.Unlock()
+		failSaveCovered(t, s)
 		if removed, err := s.forget("ssh:192.0.2.28:22"); err != nil || !removed {
 			t.Fatalf("forget = %v, %v; want true, nil", removed, err)
 		}
@@ -1019,4 +1034,67 @@ func hmTReadStore(t *testing.T, path string) map[string]string {
 		t.Fatal(err)
 	}
 	return m
+}
+
+// TestHostKeyStoreReadFileOpenError: an open failure other than "not exist"
+// (here ENOTDIR from a regular file used as a directory) is a load error.
+func TestHostKeyStoreReadFileOpenError(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := newHostKeyStore(filepath.Join(file, "known_hosts.json"))
+	if s.loadErr == nil || !strings.Contains(s.loadErr.Error(), "read host key store") {
+		t.Fatalf("loadErr = %v, want read error", s.loadErr)
+	}
+}
+
+// TestHostKeyStoreRefreshStatError: when the store path becomes unstattable
+// for a reason other than absence, refresh logs and reports no change, and a
+// save fails rather than writing over an unknown file.
+func TestHostKeyStoreRefreshStatError(t *testing.T) {
+	sub := filepath.Join(t.TempDir(), "sub")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s := newHostKeyStore(filepath.Join(sub, "known_hosts.json"))
+	if s.loadErr != nil {
+		t.Fatal(s.loadErr)
+	}
+	if err := os.Remove(sub); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sub, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if s.refresh() {
+		t.Fatal("refresh reported a change after a stat failure")
+	}
+	if err := s.persist(true); err == nil || !strings.Contains(err.Error(), "stat host key store") {
+		t.Fatalf("persist = %v, want stat error", err)
+	}
+}
+
+// TestHostKeyStoreMergeTakesOutOfProcessRewrite: an entry rewritten on disk
+// by another process replaces the in-memory value this process last saved.
+func TestHostKeyStoreMergeTakesOutOfProcessRewrite(t *testing.T) {
+	s, path := hmTNewStore(t)
+	if err := s.verify("tls:192.0.2.40:443", "fp-old"); err != nil {
+		t.Fatal(err)
+	}
+	// Write via rename so the file identity changes even within mtime
+	// granularity.
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, []byte(`{"tls:192.0.2.40:443":"fp-new-longer"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+	if !s.refresh() {
+		t.Fatal("refresh did not report the out-of-process rewrite")
+	}
+	if err := s.verify("tls:192.0.2.40:443", "fp-new-longer"); err != nil {
+		t.Fatalf("verify against rewritten entry: %v", err)
+	}
 }

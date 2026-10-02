@@ -264,6 +264,21 @@ func TestTargetGates(t *testing.T) {
 		r()
 	})
 
+	t.Run("tryAcquire with empty key or nil gates never blocks", func(t *testing.T) {
+		gates := &targetGates{}
+		r, holders := gates.tryAcquire("")
+		if r == nil || holders != 0 {
+			t.Fatalf("empty key tryAcquire = (%v, %d), want release and 0 holders", r != nil, holders)
+		}
+		r()
+		var nilGates *targetGates
+		r, holders = nilGates.tryAcquire("10.0.0.1")
+		if r == nil || holders != 0 {
+			t.Fatalf("nil gates tryAcquire = (%v, %d), want release and 0 holders", r != nil, holders)
+		}
+		r()
+	})
+
 	t.Run("pre-cancelled context never takes the gate", func(t *testing.T) {
 		gates := &targetGates{}
 		ctx, cancel := context.WithCancel(context.Background())

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,13 +161,33 @@ func TestTokenBucketWaitDebt(t *testing.T) {
 	}
 }
 
+// Cancelling while waitDebt sleeps off its slot must return false and hand
+// the reserved token back. The clock signals when waitDebt reserves, so the
+// cancel always lands after the up-front ctx check and the timer path is
+// exercised deterministically (the frozen clock keeps the debt outstanding).
 func TestTokenBucketWaitDebtCancelled(t *testing.T) {
-	b := newTokenBucket(1, nil)
+	fixed := time.Now()
+	var armed atomic.Bool
+	var once sync.Once
+	reserved := make(chan struct{})
+	b := newTokenBucket(1, func() time.Time {
+		if armed.Load() {
+			once.Do(func() { close(reserved) })
+		}
+		return fixed
+	})
 	b.charge() // burst goes negative: real debt to wait out
 	b.charge()
+	b.mu.Lock()
+	before := b.tokens
+	b.mu.Unlock()
+
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	armed.Store(true)
 	done := make(chan bool, 1)
 	go func() { done <- b.waitDebt(ctx) }()
+	<-reserved
 	cancel()
 	select {
 	case ok := <-done:
@@ -175,6 +196,12 @@ func TestTokenBucketWaitDebtCancelled(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("cancelled waitDebt did not return")
+	}
+	b.mu.Lock()
+	after := b.tokens
+	b.mu.Unlock()
+	if after != before {
+		t.Fatalf("tokens = %v after cancelled waitDebt, want %v — reservation not refunded", after, before)
 	}
 }
 

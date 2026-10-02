@@ -114,11 +114,13 @@ func readHostKeyFile(path string) (map[string]string, os.FileInfo, error) {
 		return nil, nil, fmt.Errorf("read host key store %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
+	// fstat on an open descriptor does not fail in practice; it shares the
+	// read's error path rather than carrying an unreachable branch of its own.
 	info, err := f.Stat()
-	if err != nil {
-		return nil, nil, fmt.Errorf("read host key store %s: %w", path, err)
+	var data []byte
+	if err == nil {
+		data, err = io.ReadAll(f)
 	}
-	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read host key store %s: %w", path, err)
 	}

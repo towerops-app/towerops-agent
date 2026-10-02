@@ -1138,6 +1138,30 @@ func TestSessionLoopReportsWriteFailureWhileContextAlive(t *testing.T) {
 	}
 }
 
+// The self-update abort arm of the loop select. abortDrainedSession publishes
+// errSelfUpdateAborted and then cancels, so in production this arm races the
+// cancellation arm (which returns the same error via sessionErr). With the
+// session context left alive this arm is the only ready case.
+func TestSessionLoopReportsAbortWhileContextAlive(t *testing.T) {
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     cancel,
+		writeCh:    make(chan writeRequest, 1),
+		msgCh:      make(chan []byte, 1),
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		abortCh:    make(chan error, 1),
+		results:    newResultQueue(1),
+	}
+	s.abortCh <- errSelfUpdateAborted
+
+	if err := s.loop(context.Background()); !errors.Is(err, errSelfUpdateAborted) {
+		t.Fatalf("loop error = %v, want %v", err, errSelfUpdateAborted)
+	}
+}
+
 func TestNewAgentIDIsUnique(t *testing.T) {
 	seen := make(map[string]struct{}, 1000)
 	for range 1000 {
@@ -5339,6 +5363,82 @@ func TestSubmitConfigBackupWaitIgnoresDispatchSlots(t *testing.T) {
 	if result.ErrorCode != pb.ConfigBackupErrorCode_TIMEOUT {
 		t.Fatalf("error code = %v (%q), want TIMEOUT from the gate wait", result.ErrorCode, result.ErrorDetail)
 	}
+}
+
+// A recurring backup that is queued runs on the backup pool, reports its
+// result, and frees the device gate when it finishes.
+func TestSubmitConfigBackupWaitRuns(t *testing.T) {
+	origDial := sshDial
+	sshDial = func(context.Context, string, string, *ssh.ClientConfig) (*ssh.Client, error) {
+		return nil, errors.New("connection refused")
+	}
+	t.Cleanup(func() { sshDial = origDial })
+
+	pools := &jobPools{
+		backup:  newWorkerPool(1),
+		notices: make(chan outbound, 4),
+		targets: &targetGates{},
+	}
+	t.Cleanup(func() { pools.backup.stop() })
+	job := cbJob("192.0.2.1", 22)
+
+	out := testQueue()
+	done := make(chan struct{})
+	if !submitConfigBackupJob(context.Background(), job, pools, out, func() { close(done) }, true) {
+		t.Fatal("wait path rejected a backup on an open pool")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("queued backup did not run done")
+	}
+	result := wantResult[*pb.ConfigBackupResult](t, out, "config_backup_result", time.Second)
+	if result.ErrorCode == pb.ConfigBackupErrorCode_AGENT_BUSY || result.ErrorCode == pb.ConfigBackupErrorCode_TIMEOUT {
+		t.Fatalf("error code = %v (%q), want the dial failure", result.ErrorCode, result.ErrorDetail)
+	}
+	// The task releases the gate just after done, so wait for it.
+	gateCtx, gateCancel := context.WithTimeout(context.Background(), time.Second)
+	defer gateCancel()
+	release := pools.targets.acquire(gateCtx, jobTargetKey(job))
+	if release == nil {
+		t.Fatal("device gate still held after the backup finished")
+	}
+	release()
+}
+
+// A recurring backup that gets the device gate but cannot be queued because
+// the backup pool has shut down must release the gate and report AGENT_BUSY.
+func TestSubmitConfigBackupWaitPoolClosed(t *testing.T) {
+	pools := &jobPools{
+		backup:  newWorkerPool(1),
+		notices: make(chan outbound, 4),
+		targets: &targetGates{},
+	}
+	pools.backup.stop()
+	job := &pb.AgentJob{
+		JobId:        "cb-closed",
+		JobType:      pb.JobType_CONFIG_BACKUP,
+		DeviceId:     "dev-closed",
+		ConfigBackup: &pb.ConfigBackupJob{Host: "192.0.2.1", Username: "u", Password: "p"},
+	}
+
+	out := testQueue()
+	doneCalls := 0
+	if submitConfigBackupJob(context.Background(), job, pools, out, func() { doneCalls++ }, true) {
+		t.Fatal("wait path reported success on a closed pool")
+	}
+	if doneCalls != 1 {
+		t.Fatalf("done called %d times, want 1", doneCalls)
+	}
+	result := wantResult[*pb.ConfigBackupResult](t, out, "config_backup_result", time.Second)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_AGENT_BUSY {
+		t.Fatalf("error code = %v (%q), want AGENT_BUSY", result.ErrorCode, result.ErrorDetail)
+	}
+	release, _ := pools.targets.tryAcquire(jobTargetKey(job))
+	if release == nil {
+		t.Fatal("device gate still held after the rejected backup")
+	}
+	release()
 }
 
 func TestSubmitCheckRefusedDuringDrain(t *testing.T) {
