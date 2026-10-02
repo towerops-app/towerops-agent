@@ -300,6 +300,24 @@ func TestExecPingCommandResult(t *testing.T) {
 			t.Fatalf("execPing response time = %v, want 12.345", got)
 		}
 	})
+
+	t.Run("ipv6 uses the ipv6 ping command", func(t *testing.T) {
+		origLookPath := pingLookPath
+		t.Cleanup(func() { pingLookPath = origLookPath })
+		pingLookPath = func(file string) (string, error) { return "/sbin/" + file, nil }
+
+		var gotCmd string
+		pingCommandOutput = func(_ context.Context, name string, _ ...string) ([]byte, error) {
+			gotCmd = name
+			return []byte("64 bytes from 2001:db8::1: time=1.5 ms"), nil
+		}
+		if _, err := execPing(context.Background(), "2001:db8::1", 1000); err != nil {
+			t.Fatalf("execPing returned error: %v", err)
+		}
+		if gotCmd != "ping6" {
+			t.Errorf("command = %q, want ping6 for an IPv6 target", gotCmd)
+		}
+	})
 }
 
 func TestPingDeviceFallbackToExec(t *testing.T) {
@@ -1090,6 +1108,21 @@ func TestTpTDoICMPPingReturnsOnContextCancel(t *testing.T) {
 	// The socket is shared, so cancelling one ping must not close it.
 	if got := conn.closes.Load(); got != 0 {
 		t.Errorf("Close called %d times, want 0 - the shared socket stays open", got)
+	}
+}
+
+func TestTpTDoICMPPingTimesOutWithoutReply(t *testing.T) {
+	// A scripted socket that never answers, so the timeout branch runs no
+	// matter how the host's network treats a real unreachable address.
+	conn := tpTNewFakeICMPConn()
+	tpTUseFakeICMPConn(t, conn)
+
+	_, err := doICMPPing(context.Background(), net.ParseIP("192.0.2.1"), "udp4", true, 20)
+	if err == nil {
+		t.Fatal("expected a timeout error when no reply arrives")
+	}
+	if !strings.Contains(err.Error(), "icmp reply timeout after 20 ms") {
+		t.Errorf("error = %q, want it to mention %q", err.Error(), "icmp reply timeout after 20 ms")
 	}
 }
 
