@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -82,6 +84,10 @@ func mikrotikConnect(ctx context.Context, ip string, port uint32, username, pass
 	}
 
 	c := &mikrotikClient{conn: conn}
+	// Login sentences can stall for mikrotikReadTimeout each; closing the conn
+	// on ctx cancellation aborts a wedged login instead of pinning the worker.
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 
 	resp, err := c.execute("/login", map[string]string{"name": username, "password": password})
 	if err != nil {
@@ -130,10 +136,13 @@ func legacyMikrotikLoginResponse(password, challenge string) (string, error) {
 	return "00" + hex.EncodeToString(digest[:]), nil
 }
 
-// execute sends a command and reads the full response.
+// execute sends a command and reads the full response. Args are emitted in
+// sorted key order because map iteration order is random and RouterOS query
+// words (?#|, ?#!) are order-sensitive.
 func (c *mikrotikClient) execute(command string, args map[string]string) (*mikrotikResponse, error) {
 	words := []string{command}
-	for k, v := range args {
+	for _, k := range slices.Sorted(maps.Keys(args)) {
+		v := args[k]
 		if strings.HasPrefix(k, "?") || strings.HasPrefix(k, ".") {
 			words = append(words, k+"="+v)
 		} else {
@@ -446,7 +455,12 @@ func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.
 		return
 	}
 
-	config, err := sshBackup(ctx, dev.Ip, uint16(dev.SshPort), dev.Username, dev.Password)
+	port := dev.SshPort
+	if port == 0 {
+		port = 22
+	}
+
+	config, err := sshBackup(ctx, dev.Ip, uint16(port), dev.Username, dev.Password)
 	if err != nil {
 		sendResult(ctx, out, "mikrotik_result", mikrotikError(
 			job,

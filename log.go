@@ -98,12 +98,10 @@ func (h *colorHandler) Handle(_ context.Context, r slog.Record) error {
 	buf = append(buf, r.Message...)
 
 	for _, a := range h.attrs {
-		buf = append(buf, ' ')
 		buf = appendAttr(buf, a.group, a.attr)
 	}
 
 	r.Attrs(func(a slog.Attr) bool {
-		buf = append(buf, ' ')
 		buf = appendAttr(buf, h.group, a)
 		return true
 	})
@@ -123,15 +121,16 @@ func appendAttr(buf []byte, group string, a slog.Attr) []byte {
 				group += "." + a.Key
 			}
 		}
-		for i, attr := range a.Value.Group() {
-			if i > 0 {
-				buf = append(buf, ' ')
-			}
+		for _, attr := range a.Value.Group() {
 			buf = appendAttr(buf, group, attr)
 		}
 		return buf
 	}
 
+	if a.Key == "" {
+		return buf
+	}
+	buf = append(buf, ' ')
 	if group != "" {
 		buf = append(buf, group...)
 		buf = append(buf, '.')
@@ -170,6 +169,9 @@ func (h *colorHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 }
 
 func (h *colorHandler) WithGroup(name string) slog.Handler {
+	if name == "" {
+		return h
+	}
 	g := name
 	if h.group != "" {
 		g = h.group + "." + name

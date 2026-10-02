@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -184,5 +185,35 @@ func TestWSConnReadLimit(t *testing.T) {
 	_, err = ws.ReadMessage(context.Background())
 	if !errors.Is(err, websocket.ErrMessageTooBig) {
 		t.Fatalf("ReadMessage error = %v, want ErrMessageTooBig", err)
+	}
+}
+
+// TestWSWriteTimeoutForScalesWithSize pins the write-deadline floor for small
+// frames and the size scaling at the 1Mbps floor rate that keeps multi-MiB
+// results from timing out on slow uplinks.
+func TestWSWriteTimeoutForScalesWithSize(t *testing.T) {
+	tests := []struct {
+		name string
+		size int
+		want time.Duration
+	}{
+		{"zero", 0, wsWriteTimeout},
+		{"small control frame", 256, wsWriteTimeout},
+		{"below threshold", wsSmallMessageSize - 1, wsWriteTimeout},
+		{"at threshold", wsSmallMessageSize, wsWriteTimeout},
+		{"just over threshold", wsSmallMessageSize + 1, wsWriteTimeout + (wsSmallMessageSize+1)*time.Second/wsMinWriteBytesPerSec},
+		{"8MiB result at 4Mbps needs ~28s plus margin", 8 << 20, wsWriteTimeout + 8388608*time.Second/wsMinWriteBytesPerSec},
+		{"max encoded payload", 14 << 20, wsWriteTimeout + 14680064*time.Second/wsMinWriteBytesPerSec},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := wsWriteTimeoutFor(tt.size); got != tt.want {
+				t.Errorf("wsWriteTimeoutFor(%d) = %v, want %v", tt.size, got, tt.want)
+			}
+		})
+	}
+
+	if wsWriteTimeoutFor(8<<20) <= wsWriteTimeoutFor(8<<20-1) {
+		t.Error("write timeout is not strictly increasing in size")
 	}
 }

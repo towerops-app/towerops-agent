@@ -48,6 +48,8 @@ func runMain(ctx context.Context, args []string) int {
 	trapPort := fs.Uint("trap-port", envUint(162, "TOWEROPS_TRAP_PORT", "TRAP_PORT"), "UDP port for the SNMP trap listener")
 	trapCommunity := fs.String("trap-community", "", "Only accept traps carrying this community string (or set TOWEROPS_TRAP_COMMUNITY; default: any)")
 	hostKeysFile := fs.String("host-keys-file", envOrDefault(defaultHostKeysPath, "TOWEROPS_HOST_KEYS_FILE"), "Path to the SSH and TLS trust-on-first-use store")
+	var forgetHostKeys stringListFlag
+	fs.Var(&forgetHostKeys, "forget-host-key", "Remove the stored SSH/TLS trust-on-first-use entry for ip:port and exit (repeatable)")
 	legacyScheduling := fs.Bool("legacy-scheduling", envBool(false, "TOWEROPS_LEGACY_SCHEDULING"), "Disable local recurring scheduling and request legacy server pushes")
 	snmpRate := fs.Uint("snmp-rate", envUint(defaultSNMPPDURate, "TOWEROPS_SNMP_RATE"), "Maximum SNMP request packets per second process-wide (0 disables)")
 	showHelp := fs.Bool("help", false, "Show this help message and exit")
@@ -74,7 +76,9 @@ func runMain(ctx context.Context, args []string) int {
 		*apiURL = os.Getenv("TOWEROPS_API_URL")
 	}
 	if !flagIsSet(fs, "token") {
-		*token = os.Getenv("TOWEROPS_AGENT_TOKEN")
+		// Mounted secrets often carry a trailing newline; --token-file trims
+		// for the same reason.
+		*token = strings.TrimSpace(os.Getenv("TOWEROPS_AGENT_TOKEN"))
 	}
 	if !flagIsSet(fs, "trap-community") {
 		*trapCommunity = envFirst("TOWEROPS_TRAP_COMMUNITY", "TRAP_COMMUNITY")
@@ -100,6 +104,12 @@ func runMain(ctx context.Context, args []string) int {
 	slog.SetDefault(slog.New(newLogHandler(os.Stderr, level, *logFormat)))
 	if !validLogLevel {
 		slog.Warn("ignoring unrecognised log level", "value", *logLevel)
+	}
+
+	// Forget-and-exit runs without credentials: its only prerequisite is the
+	// store itself, which --host-keys-file selects.
+	if len(forgetHostKeys) > 0 {
+		return runForgetHostKeys(*hostKeysFile, forgetHostKeys)
 	}
 
 	if *apiURL == "" || *token == "" {
@@ -147,6 +157,44 @@ func runMain(ctx context.Context, args []string) int {
 
 	slog.Info("towerops agent stopped")
 	return 0
+}
+
+// stringListFlag is a repeatable string flag; each --flag=value occurrence
+// appends to the slice.
+type stringListFlag []string
+
+func (f *stringListFlag) String() string { return strings.Join(*f, ",") }
+
+func (f *stringListFlag) Set(value string) error {
+	*f = append(*f, value)
+	return nil
+}
+
+// runForgetHostKeys removes each entry from the trust-on-first-use store and
+// reports per host. It returns the exit code for runMain.
+func runForgetHostKeys(path string, hosts []string) int {
+	if err := initHostKeyStore(path); err != nil {
+		fmt.Fprintf(os.Stderr, "error: host key store: %v\n", err)
+		return 1
+	}
+	exit := 0
+	for _, host := range hosts {
+		host = strings.TrimSpace(host)
+		if host == "" {
+			continue
+		}
+		removed, err := getHostKeyStore().forget(host)
+		switch {
+		case err != nil:
+			fmt.Fprintf(os.Stderr, "error: forget %s: %v\n", host, err)
+			exit = 1
+		case removed:
+			fmt.Fprintf(os.Stderr, "forgot host key entry for %s\n", host)
+		default:
+			fmt.Fprintf(os.Stderr, "no stored host key entry for %s\n", host)
+		}
+	}
+	return exit
 }
 
 // toWebSocketURL converts an HTTP(S) URL to a WebSocket URL.

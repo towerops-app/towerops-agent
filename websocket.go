@@ -20,6 +20,26 @@ const (
 	maxMessageSize     = 16 << 20
 )
 
+// wsMinWriteBytesPerSec is the assumed uplink floor (1 Mbps) used to scale the
+// write deadline. The fixed wsWriteTimeout alone lets an ~8MiB base64 result
+// exhaust 30s on a ~4Mbps link and tear down a healthy session on every
+// retry, so large frames get extra time instead.
+const wsMinWriteBytesPerSec = 125_000
+
+// wsSmallMessageSize bounds frames small enough that wsWriteTimeout still
+// covers them even at the floor rate; below it the deadline is unchanged.
+const wsSmallMessageSize = 1 << 20
+
+// wsWriteTimeoutFor returns the write deadline for a frame of size bytes.
+// Small frames keep the fixed wsWriteTimeout; larger ones get the extra time
+// needed to push the payload at the floor rate.
+func wsWriteTimeoutFor(size int) time.Duration {
+	if size <= wsSmallMessageSize {
+		return wsWriteTimeout
+	}
+	return wsWriteTimeout + time.Duration(size)*time.Second/wsMinWriteBytesPerSec
+}
+
 // wsConn keeps the small interface used by the agent while delegating the
 // WebSocket protocol to coder/websocket.
 type wsConn struct {
@@ -90,7 +110,7 @@ func (ws *wsConn) ReadMessage(ctx context.Context) ([]byte, error) {
 
 // WriteText writes one text message.
 func (ws *wsConn) WriteText(ctx context.Context, data []byte) error {
-	ctx, cancel := context.WithTimeout(ctx, wsWriteTimeout)
+	ctx, cancel := context.WithTimeout(ctx, wsWriteTimeoutFor(len(data)))
 	defer cancel()
 	return ws.conn.Write(ctx, websocket.MessageText, data)
 }

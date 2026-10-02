@@ -25,11 +25,51 @@ import (
 // job can report HOST_KEY_MISMATCH with the observed fingerprint.
 var errConfigBackupHostKeyMismatch = errors.New("config backup host key mismatch")
 
+// errConfigBackupTooLarge tags a session whose output crossed the caller's
+// byte cap so the job reports TOO_LARGE instead of the channel-close error.
+var errConfigBackupTooLarge = errors.New("config backup output exceeds the byte limit")
+
 const (
 	configBackupDefaultTimeoutMs = 120_000
 	maxConfigBackupDetailLen     = 300
 	defaultMaxConfigBytes        = 16 << 20
+	// configBackupStderrCap bounds the stderr copy of any session: failure
+	// details are truncated to maxConfigBackupDetailLen anyway.
+	configBackupStderrCap = 4 << 10
+	// configBackupMetaMaxBytes bounds the short metadata commands (version,
+	// identity, group policies); a device emitting more is malfunctioning.
+	configBackupMetaMaxBytes = 64 << 10
 )
+
+// boundedBuffer buffers at most limit bytes and discards the rest; Write never
+// fails so io.Copy keeps draining the channel and the remote cannot stall the
+// read loop on a dead writer. onOverflow runs once, on the first byte beyond
+// the limit.
+type boundedBuffer struct {
+	buf        bytes.Buffer
+	limit      uint64
+	overflow   bool
+	onOverflow func()
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	avail := b.limit - uint64(b.buf.Len())
+	if uint64(len(p)) > avail {
+		// avail <= len(p) < max int, so the conversion cannot overflow.
+		_, _ = b.buf.Write(p[:int(avail)])
+		if !b.overflow {
+			b.overflow = true
+			if b.onOverflow != nil {
+				b.onOverflow()
+			}
+		}
+		return len(p), nil
+	}
+	return b.buf.Write(p)
+}
+
+// Bytes returns the retained prefix, at most limit bytes.
+func (b *boundedBuffer) Bytes() []byte { return b.buf.Bytes() }
 
 // configBackupDialTimeout is a var so tests can shrink the dial budget, the
 // same way ssh_test.go shrinks sshBackupTimeout.
@@ -241,7 +281,6 @@ func classifyConfigBackupError(err error, job *pb.AgentJob) (pb.ConfigBackupErro
 func isAuthFailure(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "unable to authenticate") ||
-		strings.Contains(msg, "ssh: handshake failed") ||
 		strings.Contains(msg, "auth fail") ||
 		strings.Contains(msg, "permission denied")
 }
@@ -281,20 +320,30 @@ func firstLine(s string, max int) string {
 // mikrotikBackupVendor implements config backups over a RouterOS SSH session.
 type mikrotikBackupVendor struct{}
 
-// runSession runs cmd on a fresh session, returning stdout and stderr
-// separately. A non-zero exit keeps the captured stdout so callers can
-// classify the failure from device output.
-func runConfigBackupSession(c *ssh.Client, cmd string) (stdout, stderr []byte, err error) {
+// runConfigBackupSession runs cmd on a fresh session, returning stdout and
+// stderr separately. stdout is kept only up to maxBytes and stderr only to
+// configBackupStderrCap; when stdout crosses the cap the channel is closed to
+// abort the stream and the returned error is errConfigBackupTooLarge. A
+// non-zero exit keeps the captured stdout so callers can classify the failure
+// from device output.
+func runConfigBackupSession(c *ssh.Client, cmd string, maxBytes uint64) (stdout, stderr []byte, err error) {
 	session, err := c.NewSession()
 	if err != nil {
 		return nil, nil, err
 	}
 	defer func() { _ = session.Close() }()
 
-	var outBuf, errBuf bytes.Buffer
+	outBuf := boundedBuffer{
+		limit:      maxBytes,
+		onOverflow: func() { _ = session.Close() },
+	}
+	errBuf := boundedBuffer{limit: configBackupStderrCap}
 	session.Stdout = &outBuf
 	session.Stderr = &errBuf
 	runErr := session.Run(cmd)
+	if outBuf.overflow {
+		return outBuf.Bytes(), errBuf.Bytes(), errConfigBackupTooLarge
+	}
 	return outBuf.Bytes(), errBuf.Bytes(), runErr
 }
 
@@ -340,7 +389,7 @@ func mikrotikExportCommand(major int, includeSecrets bool) string {
 }
 
 func (mikrotikBackupVendor) readVersion(c *ssh.Client) (string, error) {
-	out, _, err := runConfigBackupSession(c, ":put [/system resource get version]")
+	out, _, err := runConfigBackupSession(c, ":put [/system resource get version]", configBackupMetaMaxBytes)
 	if err != nil {
 		return "", err
 	}
@@ -348,11 +397,30 @@ func (mikrotikBackupVendor) readVersion(c *ssh.Client) (string, error) {
 }
 
 func (mikrotikBackupVendor) readIdentity(c *ssh.Client) (string, error) {
-	out, _, err := runConfigBackupSession(c, ":put [/system identity get name]")
+	out, _, err := runConfigBackupSession(c, ":put [/system identity get name]", configBackupMetaMaxBytes)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// routerOSScriptEscaper escapes the characters that would terminate or expand
+// inside a RouterOS double-quoted string. Brackets cannot be escaped there —
+// RouterOS evaluates [..] as a command substitution even inside quotes — so
+// callers must reject values containing them.
+var routerOSScriptEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	`"`, `\"`,
+	`$`, `\$`,
+)
+
+// routerOSScriptString returns s safe for interpolation inside a RouterOS
+// double-quoted string literal, or false when s contains a bracket.
+func routerOSScriptString(s string) (string, bool) {
+	if strings.ContainsAny(s, "[]") {
+		return "", false
+	}
+	return routerOSScriptEscaper.Replace(s), true
 }
 
 // Probe gathers version, identity, and the login's group policies. It never
@@ -362,20 +430,25 @@ func (v mikrotikBackupVendor) Probe(ctx context.Context, c *ssh.Client, job *pb.
 
 	version, err := v.readVersion(c)
 	if err != nil {
-		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx), err.Error())
+		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx, err), err.Error())
 	}
 	result.OsVersion = version
 
 	identity, err := v.readIdentity(c)
 	if err != nil {
-		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx), err.Error())
+		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx, err), err.Error())
 	}
 	result.Identity = identity
 
-	policyCmd := fmt.Sprintf(":put [/user group get [/user get [find name=\"%s\"] group] policy]", job.Username)
-	out, _, err := runConfigBackupSession(c, policyCmd)
+	safeUser, ok := routerOSScriptString(job.Username)
+	if !ok {
+		return configBackupError(job, jobID, deviceID, pb.ConfigBackupErrorCode_INTERNAL,
+			"username cannot be embedded in a RouterOS script")
+	}
+	policyCmd := fmt.Sprintf(":put [/user group get [/user get [find name=\"%s\"] group] policy]", safeUser)
+	out, _, err := runConfigBackupSession(c, policyCmd, configBackupMetaMaxBytes)
 	if err != nil {
-		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx), err.Error())
+		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx, err), err.Error())
 	}
 	// RouterOS renders the policy list comma-separated in newer versions and
 	// semicolon-separated in older ones; entries prefixed with ! are denied
@@ -397,7 +470,7 @@ func (v mikrotikBackupVendor) Probe(ctx context.Context, c *ssh.Client, job *pb.
 func (v mikrotikBackupVendor) Backup(ctx context.Context, c *ssh.Client, job *pb.ConfigBackupJob, jobID, deviceID string) *pb.ConfigBackupResult {
 	version, err := v.readVersion(c)
 	if err != nil {
-		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx), err.Error())
+		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx, err), err.Error())
 	}
 
 	major := routerOSVersionMajor(version)
@@ -405,7 +478,15 @@ func (v mikrotikBackupVendor) Backup(ctx context.Context, c *ssh.Client, job *pb
 		major = 7 // Unparseable version strings are treated as modern RouterOS.
 	}
 
-	out, stderr, err := runConfigBackupSession(c, mikrotikExportCommand(major, job.IncludeSecrets))
+	maxBytes := job.MaxConfigBytes
+	if maxBytes == 0 {
+		maxBytes = defaultMaxConfigBytes
+	}
+	out, stderr, err := runConfigBackupSession(c, mikrotikExportCommand(major, job.IncludeSecrets), maxBytes)
+	if errors.Is(err, errConfigBackupTooLarge) {
+		return configBackupError(job, jobID, deviceID, pb.ConfigBackupErrorCode_TOO_LARGE,
+			fmt.Sprintf("export exceeded the %d byte limit", maxBytes))
+	}
 	combined := string(out)
 	if combined == "" {
 		combined = string(stderr)
@@ -422,15 +503,6 @@ func (v mikrotikBackupVendor) Backup(ctx context.Context, c *ssh.Client, job *pb
 	}
 	if code := classifyExportOutput(combined); code != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
 		return configBackupError(job, jobID, deviceID, code, firstLine(combined, maxConfigBackupDetailLen))
-	}
-
-	maxBytes := job.MaxConfigBytes
-	if maxBytes == 0 {
-		maxBytes = defaultMaxConfigBytes
-	}
-	if uint64(len(out)) > maxBytes {
-		return configBackupError(job, jobID, deviceID, pb.ConfigBackupErrorCode_TOO_LARGE,
-			fmt.Sprintf("export is %d bytes, limit is %d", len(out), maxBytes))
 	}
 
 	var gz bytes.Buffer
@@ -509,9 +581,13 @@ func parseExportModel(output string) string {
 	return ""
 }
 
-// sessionErrCode maps a session failure to TIMEOUT when the job deadline
-// fired (the AfterFunc conn close is what aborts the read).
-func sessionErrCode(ctx context.Context) pb.ConfigBackupErrorCode {
+// sessionErrCode maps a session failure to a result code: TOO_LARGE when the
+// output cap fired, TIMEOUT when the job deadline fired (the AfterFunc conn
+// close is what aborts the read), EXPORT_FAILED otherwise.
+func sessionErrCode(ctx context.Context, err error) pb.ConfigBackupErrorCode {
+	if errors.Is(err, errConfigBackupTooLarge) {
+		return pb.ConfigBackupErrorCode_TOO_LARGE
+	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return pb.ConfigBackupErrorCode_TIMEOUT
 	}

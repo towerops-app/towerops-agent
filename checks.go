@@ -624,7 +624,7 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 		return checkCritical, fmt.Sprintf("CRITICAL: Certificate for %s:%d is not valid until %s", host, port, cert.NotBefore.Format("2006-01-02"))
 	}
 	if expired {
-		return checkCritical, fmt.Sprintf("CRITICAL: Certificate for %s:%d expired %d days ago (%s)", host, port, -daysRemaining, expiresStr)
+		return checkCritical, fmt.Sprintf("CRITICAL: Certificate for %s:%d %s (%s)", host, port, certificateExpiryPhrase(-daysRemaining), expiresStr)
 	}
 
 	intermediates := x509.NewCertPool()
@@ -649,4 +649,13 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 func certificateDaysRemaining(now, notAfter time.Time) (days int, expired bool) {
 	days = int(notAfter.Sub(now).Hours() / 24)
 	return days, !notAfter.After(now)
+}
+
+// certificateExpiryPhrase describes how long ago a certificate expired.
+// daysAgo truncates sub-day durations to 0, which reads as "expired today".
+func certificateExpiryPhrase(daysAgo int) string {
+	if daysAgo == 0 {
+		return "expired today"
+	}
+	return fmt.Sprintf("expired %d days ago", daysAgo)
 }

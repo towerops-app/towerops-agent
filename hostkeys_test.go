@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -218,14 +219,16 @@ func TestSSHHostKeyCallbackLegacyAndNamespacedKeys(t *testing.T) {
 	if err := json.Unmarshal(persistedData, &persisted); err != nil {
 		t.Fatal(err)
 	}
-	if got := persisted["ssh:"+legacyAddress]; got != legacyKeys[legacyAddress] {
-		t.Fatalf("legacy key was not migrated to %q: %v", "ssh:"+legacyAddress, persisted)
+	// Entries are stored as "<key type> <fingerprint>" so the algorithm can be
+	// pinned on later dials; legacy entries migrate to this form on verify.
+	if got, want := persisted["ssh:"+legacyAddress], trustedKey.Type()+" "+legacyKeys[legacyAddress]; got != want {
+		t.Fatalf("legacy key migrated to %q = %q, want %q: %v", "ssh:"+legacyAddress, got, want, persisted)
 	}
 	if _, ok := persisted[legacyAddress]; ok {
 		t.Fatalf("migrated key remained under legacy name %q", legacyAddress)
 	}
-	if _, ok := persisted["ssh:"+newAddress]; !ok {
-		t.Fatalf("first-use key was not stored under %q: %v", "ssh:"+newAddress, persisted)
+	if got, want := persisted["ssh:"+newAddress], changedKey.Type()+" "+fmt.Sprintf("%x", sha256.Sum256(changedKey.Marshal())); got != want {
+		t.Fatalf("first-use key stored as %q = %q, want %q: %v", "ssh:"+newAddress, got, want, persisted)
 	}
 	if _, ok := persisted[newAddress]; ok {
 		t.Fatalf("first-use key was stored under legacy name %q", newAddress)
@@ -247,7 +250,9 @@ func TestHostKeyStoreLegacyMigrationRollsBackOnSaveFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { hostKeyMarshal = originalMarshal })
 
-	if err := s.verify("ssh:"+legacyHost, fingerprint); err != nil {
+	// A matching SSH key must verify even when migrating the legacy entry to
+	// its typed namespaced form cannot be persisted.
+	if err := s.verifyKey("ssh:"+legacyHost, fingerprint, ssh.KeyAlgoED25519); err != nil {
 		t.Fatalf("matching legacy key was rejected after migration save failure: %v", err)
 	}
 	if got := s.keys[legacyHost]; got != fingerprint {
@@ -525,5 +530,326 @@ func TestHmSaveSuccessWritesAtomically(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("expected only the store file, got %v", entries)
+	}
+}
+
+// TestHostKeyStorePinnedKeyAlgorithm covers the typed store entry that lets
+// executeMikrotikBackupContext pin HostKeyAlgorithms: first-use records the
+// presented key type, legacy and untyped entries yield "" until a successful
+// verify migrates them, and a nil store is safe for pre-init calls.
+func TestHostKeyStorePinnedKeyAlgorithm(t *testing.T) {
+	s, _ := hmTNewStore(t)
+	key := hmTSSHPublicKey(t)
+	host := "ssh:192.0.2.7:22"
+
+	if got := s.pinnedKeyAlgorithm(host); got != "" {
+		t.Fatalf("unpinned host algorithm = %q, want empty", got)
+	}
+	if got := (*hostKeyStore)(nil).pinnedKeyAlgorithm(host); got != "" {
+		t.Fatalf("nil store algorithm = %q, want empty", got)
+	}
+
+	if err := s.verifySSHKey(host, key); err != nil {
+		t.Fatalf("first use failed: %v", err)
+	}
+	if got, want := s.pinnedKeyAlgorithm(host), ssh.KeyAlgoED25519; got != want {
+		t.Fatalf("pinned algorithm = %q, want %q", got, want)
+	}
+	if got, want := s.keys[host], ssh.KeyAlgoED25519+" "+fmt.Sprintf("%x", sha256.Sum256(key.Marshal())); got != want {
+		t.Fatalf("stored entry = %q, want %q", got, want)
+	}
+
+	// A TLS entry stores no key type, so it never pins SSH algorithms.
+	tlsHost := "tls:192.0.2.7:8729"
+	if err := s.verify(tlsHost, "certfp"); err != nil {
+		t.Fatalf("tls verify failed: %v", err)
+	}
+	if got := s.pinnedKeyAlgorithm(tlsHost); got != "" {
+		t.Fatalf("tls entry algorithm = %q, want empty", got)
+	}
+
+	// A legacy (un-namespaced) entry matches, then migrates to the typed
+	// namespaced form.
+	legacyHost := "ssh:192.0.2.8:22"
+	s.keys["192.0.2.8:22"] = fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
+	if got := s.pinnedKeyAlgorithm(legacyHost); got != "" {
+		t.Fatalf("legacy entry algorithm = %q, want empty before migration", got)
+	}
+	if err := s.verifySSHKey(legacyHost, key); err != nil {
+		t.Fatalf("legacy verify failed: %v", err)
+	}
+	if got := s.pinnedKeyAlgorithm(legacyHost); got != ssh.KeyAlgoED25519 {
+		t.Fatalf("post-migration algorithm = %q, want ssh-ed25519", got)
+	}
+	if _, ok := s.keys["192.0.2.8:22"]; ok {
+		t.Fatal("legacy entry was not migrated")
+	}
+}
+
+// TestHostKeyStoreForget covers the recovery path behind --forget-host-key:
+// "ip:port" clears the ssh:, tls: and legacy forms at once, a verbatim
+// namespaced key removes only itself, unknown hosts report not-found, and a
+// save failure restores the entry.
+func TestHostKeyStoreForget(t *testing.T) {
+	s, path := hmTNewStore(t)
+	key := hmTSSHPublicKey(t)
+	fp := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
+	for _, h := range []string{"ssh:192.0.2.9:22", "tls:192.0.2.9:8729", "192.0.2.9:22"} {
+		if err := s.verifyKey(h, fp, ""); err != nil {
+			t.Fatalf("seed %s: %v", h, err)
+		}
+	}
+
+	removed, err := s.forget("192.0.2.9:22")
+	if err != nil || !removed {
+		t.Fatalf("forget = %v, %v; want true, nil", removed, err)
+	}
+	if len(s.keys) != 1 {
+		t.Fatalf("expected only tls: entry to survive, got %v", s.keys)
+	}
+	if _, ok := s.keys["tls:192.0.2.9:8729"]; !ok {
+		t.Fatalf("tls entry wrongly removed: %v", s.keys)
+	}
+
+	removed, err = s.forget("tls:192.0.2.9:8729")
+	if err != nil || !removed {
+		t.Fatalf("forget tls: = %v, %v; want true, nil", removed, err)
+	}
+	removed, err = s.forget("192.0.2.9:22")
+	if err != nil || removed {
+		t.Fatalf("forget unknown = %v, %v; want false, nil", removed, err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted map[string]string
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != 0 {
+		t.Fatalf("store file still holds entries: %v", persisted)
+	}
+}
+
+// TestHostKeyStoreReadsDoNotWaitOnSave: with the durable write split behind
+// saveMu, map reads (pinnedKeyAlgorithm) and mismatch rejects must not block
+// behind another verify's in-flight fsync — only the mutating caller awaits
+// its save.
+func TestHostKeyStoreReadsDoNotWaitOnSave(t *testing.T) {
+	s, _ := hmTNewStore(t)
+	key := hmTSSHPublicKey(t)
+
+	// Seed a durable typed entry plus a plain entry for the mismatch check.
+	if err := s.verifySSHKey("ssh:192.0.2.10:22", key); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	release := make(chan struct{})
+	// Deferred so a failing read assertion cannot leave the verify goroutine
+	// parked inside save() forever; the explicit call below unblocks the
+	// success path first.
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	defer closeRelease()
+	started := make(chan struct{}, 8)
+	original := hostKeyCreateTemp
+	t.Cleanup(func() { hostKeyCreateTemp = original })
+	hostKeyCreateTemp = func(dir, pattern string) (hostKeyTempFile, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		return original(dir, pattern)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.verifySSHKey("ssh:192.0.2.11:22", key)
+	}()
+	<-started // the first-use verify is now parked inside save()
+
+	fast := make(chan string, 2)
+	go func() {
+		fast <- s.pinnedKeyAlgorithm("ssh:192.0.2.10:22")
+	}()
+	go func() {
+		if err := s.verify("ssh:192.0.2.10:22", "different-fingerprint"); err != nil {
+			fast <- "mismatch-rejected"
+		} else {
+			fast <- "mismatch-accepted"
+		}
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-fast:
+			switch got {
+			case ssh.KeyAlgoED25519, "mismatch-rejected":
+			default:
+				t.Fatalf("unexpected read result %q", got)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("read blocked behind an in-flight save")
+		}
+	}
+
+	closeRelease()
+	if err := <-done; err != nil {
+		t.Fatalf("first-use verify failed after release: %v", err)
+	}
+	if got := s.keys["ssh:192.0.2.11:22"]; got == "" {
+		t.Fatalf("new host key was not stored: %v", s.keys)
+	}
+}
+
+// TestHostKeyStoreSavedGenCoverage exercises the "a concurrent save already
+// persisted this generation" guards that keep verifyKey and forget from
+// rolling back mutations another save already wrote. The test drives savedGen
+// ahead under mu to stand in for that concurrent save.
+func TestHostKeyStoreSavedGenCoverage(t *testing.T) {
+	failSave := func(t *testing.T) {
+		t.Helper()
+		orig := hostKeyCreateTemp
+		t.Cleanup(func() { hostKeyCreateTemp = orig })
+		hostKeyCreateTemp = func(string, string) (hostKeyTempFile, error) {
+			return nil, errors.New("create temp failed")
+		}
+	}
+
+	t.Run("first-use save failure with fresh savedGen rolls back", func(t *testing.T) {
+		s, _ := hmTNewStore(t)
+		failSave(t)
+		err := s.verify("ssh:192.0.2.20:22", "fp20")
+		if err == nil {
+			t.Fatal("expected persist failure")
+		}
+		if _, ok := s.keys["ssh:192.0.2.20:22"]; ok {
+			t.Fatal("rolled-back entry still present")
+		}
+	})
+
+	t.Run("first-use save failure superseded by concurrent save keeps entry", func(t *testing.T) {
+		s, _ := hmTNewStore(t)
+		failSave(t)
+		s.mu.Lock()
+		s.savedGen = s.gen + 2 // a concurrent save already covered the mutation
+		s.mu.Unlock()
+		if err := s.verify("ssh:192.0.2.21:22", "fp21"); err != nil {
+			t.Fatalf("expected nil for superseded save failure, got %v", err)
+		}
+	})
+
+	t.Run("migration save failure superseded returns nil", func(t *testing.T) {
+		s, _ := hmTNewStore(t)
+		key := hmTSSHPublicKey(t)
+		fp := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
+		// A typed namespaced entry seeded untyped migrates on verify.
+		s.keys["ssh:192.0.2.22:22"] = fp
+		failSave(t)
+		s.mu.Lock()
+		s.savedGen = s.gen + 2 // a concurrent save already covered the mutation
+		s.mu.Unlock()
+		if err := s.verifySSHKey("ssh:192.0.2.22:22", key); err != nil {
+			t.Fatalf("expected nil for superseded migration failure, got %v", err)
+		}
+	})
+
+	t.Run("untyped-entry migration save failure keeps verify working", func(t *testing.T) {
+		s, _ := hmTNewStore(t)
+		key := hmTSSHPublicKey(t)
+		fp := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
+		s.keys["ssh:192.0.2.24:22"] = fp // untyped: written by an older release
+		failSave(t)
+		if err := s.verifySSHKey("ssh:192.0.2.24:22", key); err != nil {
+			t.Fatalf("untyped migration must not fail the verify: %v", err)
+		}
+		if s.keys["ssh:192.0.2.24:22"] != fp {
+			t.Fatal("untyped entry was not restored after failed migration")
+		}
+	})
+
+	t.Run("typed-entry verify saves again when savedGen lags", func(t *testing.T) {
+		s, _ := hmTNewStore(t)
+		key := hmTSSHPublicKey(t)
+		if err := s.verifySSHKey("ssh:192.0.2.25:22", key); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		// Force savedGen behind gen so the matching-entry path must save.
+		s.mu.Lock()
+		s.savedGen = 0
+		s.mu.Unlock()
+		if err := s.verifySSHKey("ssh:192.0.2.25:22", key); err != nil {
+			t.Fatalf("repeat verify failed: %v", err)
+		}
+	})
+
+	t.Run("typed-entry verify fails closed when the save fails", func(t *testing.T) {
+		s, _ := hmTNewStore(t)
+		key := hmTSSHPublicKey(t)
+		if err := s.verifySSHKey("ssh:192.0.2.26:22", key); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		failSave(t)
+		s.mu.Lock()
+		s.savedGen = 0
+		s.mu.Unlock()
+		if err := s.verifySSHKey("ssh:192.0.2.26:22", key); err == nil {
+			t.Fatal("expected save failure to propagate")
+		}
+	})
+
+	t.Run("forget reports a loadErr store", func(t *testing.T) {
+		s, _ := hmTNewStore(t)
+		s.loadErr = errors.New("store unreadable")
+		if removed, err := s.forget("ssh:192.0.2.27:22"); err == nil || removed {
+			t.Fatalf("forget = %v, %v; want false with loadErr", removed, err)
+		}
+	})
+
+	t.Run("forget save failure superseded reports removed", func(t *testing.T) {
+		s, _ := hmTNewStore(t)
+		s.keys["ssh:192.0.2.28:22"] = "fp28"
+		failSave(t)
+		s.mu.Lock()
+		s.savedGen = s.gen + 2
+		s.mu.Unlock()
+		if removed, err := s.forget("ssh:192.0.2.28:22"); err != nil || !removed {
+			t.Fatalf("forget = %v, %v; want true, nil", removed, err)
+		}
+	})
+
+	t.Run("forget save failure restores removed keys", func(t *testing.T) {
+		s, _ := hmTNewStore(t)
+		s.keys["ssh:192.0.2.29:22"] = "fp29"
+		failSave(t)
+		if removed, err := s.forget("ssh:192.0.2.29:22"); err == nil || removed {
+			t.Fatalf("forget = %v, %v; want false, err", removed, err)
+		}
+		if s.keys["ssh:192.0.2.29:22"] != "fp29" {
+			t.Fatal("removed key was not restored after save failure")
+		}
+	})
+
+	t.Run("pinnedKeyAlgorithm returns empty on a broken store", func(t *testing.T) {
+		s, _ := hmTNewStore(t)
+		s.loadErr = errors.New("store unreadable")
+		s.keys["ssh:192.0.2.30:22"] = "ssh-ed25519 fp30"
+		if got := s.pinnedKeyAlgorithm("ssh:192.0.2.30:22"); got != "" {
+			t.Fatalf("pinnedKeyAlgorithm = %q, want empty", got)
+		}
+	})
+}
+
+func TestHostKeyStoreSaveFailsOnDirectorySync(t *testing.T) {
+	s, _ := hmTNewStore(t)
+	orig := syncDirectory
+	t.Cleanup(func() { syncDirectory = orig })
+	syncDirectory = func(string) error { return errors.New("dir sync failed") }
+
+	if err := s.verify("ssh:192.0.2.31:22", "fp31"); err == nil {
+		t.Fatal("expected directory-sync failure to propagate")
 	}
 }

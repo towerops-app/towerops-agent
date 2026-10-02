@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -647,36 +648,40 @@ func startTestSSHServerWithSigner(
 	}
 
 	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer func() { _ = conn.Close() }()
-
-		sconn, chans, reqs, err := ssh.NewServerConn(conn, config)
-		if err != nil {
-			return
-		}
-		defer func() { _ = sconn.Close() }()
-		go ssh.DiscardRequests(reqs)
-
-		for newChannel := range chans {
-			if newChannel.ChannelType() != "session" {
-				_ = newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
-				continue
-			}
-			ch, requests, err := newChannel.Accept()
+		for {
+			conn, err := ln.Accept()
 			if err != nil {
-				continue
+				return
 			}
 			go func() {
-				for req := range requests {
-					if req.Type == "exec" {
-						_ = req.Reply(true, nil)
-						handler(ch, string(req.Payload[4:]))
-						return
+				defer func() { _ = conn.Close() }()
+
+				sconn, chans, reqs, err := ssh.NewServerConn(conn, config)
+				if err != nil {
+					return
+				}
+				defer func() { _ = sconn.Close() }()
+				go ssh.DiscardRequests(reqs)
+
+				for newChannel := range chans {
+					if newChannel.ChannelType() != "session" {
+						_ = newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
+						continue
 					}
-					_ = req.Reply(false, nil)
+					ch, requests, err := newChannel.Accept()
+					if err != nil {
+						continue
+					}
+					go func() {
+						for req := range requests {
+							if req.Type == "exec" {
+								_ = req.Reply(true, nil)
+								handler(ch, string(req.Payload[4:]))
+								return
+							}
+							_ = req.Reply(false, nil)
+						}
+					}()
 				}
 			}()
 		}
@@ -807,5 +812,111 @@ func TestChkTSSHDialConnectionRefused(t *testing.T) {
 	}
 	if client != nil {
 		t.Fatalf("expected a nil client on dial failure, got %v", client)
+	}
+}
+
+// TestSSHBackupPinsStoredHostKeyAlgorithm: once an endpoint has a typed TOFU
+// entry, executeMikrotikBackupContext must restrict HostKeyAlgorithms to the
+// pinned key type so a reordering of x/crypto's preference list cannot make a
+// dual-key device present a different key and trip a false MITM error.
+func TestSSHBackupPinsStoredHostKeyAlgorithm(t *testing.T) {
+	resetHostKeyStore(t)
+	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
+		_, _ = ch.Write([]byte("# RouterOS config\n"))
+		_ = ch.CloseWrite()
+		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+		_ = ch.Close()
+	})
+	defer cleanup()
+
+	_, port, _ := net.SplitHostPort(addr)
+	var portNum uint16
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
+
+	origDial := sshDial
+	defer func() { sshDial = origDial }()
+	var captured *ssh.ClientConfig
+	sshDial = func(ctx context.Context, network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
+		captured = config
+		return chkTOrigSSHDial(ctx, network, addr, config)
+	}
+
+	// First connect trusts on first use; nothing pinned yet.
+	if _, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass"); err != nil {
+		t.Fatalf("first connect failed: %v", err)
+	}
+	if len(captured.HostKeyAlgorithms) != 0 {
+		t.Fatalf("first-use HostKeyAlgorithms = %v, want unset", captured.HostKeyAlgorithms)
+	}
+
+	// Second connect offers only the pinned key type.
+	captured = nil
+	if _, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass"); err != nil {
+		t.Fatalf("pinned connect failed: %v", err)
+	}
+	if len(captured.HostKeyAlgorithms) != 1 || captured.HostKeyAlgorithms[0] != ssh.KeyAlgoECDSA256 {
+		t.Fatalf("pinned HostKeyAlgorithms = %v, want [%s]", captured.HostKeyAlgorithms, ssh.KeyAlgoECDSA256)
+	}
+
+	// An endpoint with no entry is unpinned.
+	if _, err := executeMikrotikBackupContext(context.Background(), "127.0.0.2", portNum, "admin", "pass"); err == nil {
+		t.Fatal("dial to a dead address should fail")
+	}
+	if len(captured.HostKeyAlgorithms) != 0 {
+		t.Fatalf("unpinned HostKeyAlgorithms = %v, want unset", captured.HostKeyAlgorithms)
+	}
+}
+
+// TestSSHBackupPinnedAlgorithmRejectsOtherKeyTypes proves the pin is active:
+// an RSA pin against an ecdsa-only server must fail the handshake with "no
+// common algorithm", not merely a host key mismatch.
+func TestSSHBackupPinnedAlgorithmRejectsOtherKeyTypes(t *testing.T) {
+	resetHostKeyStore(t)
+	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) { _ = ch.Close() })
+	defer cleanup()
+
+	globalHostKeys.keys["ssh:"+addr] = storedHostKeyEntry(strings.Repeat("ab", 32), ssh.KeyAlgoRSA)
+
+	_, port, _ := net.SplitHostPort(addr)
+	var portNum uint16
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
+
+	_, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass")
+	if err == nil {
+		t.Fatal("connect succeeded despite an RSA-only pin against an ecdsa server")
+	}
+	if !strings.Contains(err.Error(), "no common algorithm") {
+		t.Fatalf("err = %v, want a host-key-algorithm negotiation failure", err)
+	}
+}
+
+// TestSSHBackupOutputBounded: a device that streams more than the cap must be
+// cut off with errConfigBackupTooLarge while retaining only the capped prefix.
+func TestSSHBackupOutputBounded(t *testing.T) {
+	resetHostKeyStore(t)
+	orig := sshBackupMaxOutputBytes
+	sshBackupMaxOutputBytes = 256
+	defer func() { sshBackupMaxOutputBytes = orig }()
+
+	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
+		chunk := bytes.Repeat([]byte("x"), 4096)
+		for range 64 { // 256 KiB of spam past the 256-byte cap
+			if _, err := ch.Write(chunk); err != nil {
+				return
+			}
+		}
+		_ = ch.CloseWrite()
+		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+		_ = ch.Close()
+	})
+	defer cleanup()
+
+	_, port, _ := net.SplitHostPort(addr)
+	var portNum uint16
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
+
+	_, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass")
+	if !errors.Is(err, errConfigBackupTooLarge) {
+		t.Fatalf("err = %v, want errConfigBackupTooLarge", err)
 	}
 }

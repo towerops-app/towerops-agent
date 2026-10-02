@@ -4,7 +4,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 	"time"
@@ -50,6 +52,7 @@ type scheduleEntry struct {
 	stopped     chan struct{}
 	predecessor <-chan struct{}
 	spec        scheduleSpec
+	fingerprint []byte
 }
 
 // recurringScheduler owns the credential-bearing assignment inventory for one
@@ -130,6 +133,17 @@ func interval(seconds uint32) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// payloadFingerprint marshals the payload once so replace can detect unchanged
+// assignments without a protobuf reflection walk on every inbound frame. A nil
+// result marks an unmarshalable payload, which is treated as always changed.
+func payloadFingerprint(payload proto.Message) []byte {
+	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
 func (s *recurringScheduler) replace(group *map[string]*scheduleEntry, specs []scheduleSpec) {
 	next := make(map[string]scheduleSpec, len(specs))
 	for _, spec := range specs {
@@ -151,7 +165,9 @@ func (s *recurringScheduler) replace(group *map[string]*scheduleEntry, specs []s
 
 	for id, spec := range next {
 		current := (*group)[id]
-		if current != nil && current.spec.interval == spec.interval && proto.Equal(current.spec.payload, spec.payload) {
+		fingerprint := payloadFingerprint(spec.payload)
+		if current != nil && current.spec.interval == spec.interval &&
+			fingerprint != nil && bytes.Equal(current.fingerprint, fingerprint) {
 			continue
 		}
 
@@ -171,6 +187,7 @@ func (s *recurringScheduler) replace(group *map[string]*scheduleEntry, specs []s
 			stopped:     make(chan struct{}),
 			predecessor: predecessor,
 			spec:        spec,
+			fingerprint: fingerprint,
 		}
 		(*group)[id] = entry
 		s.wg.Add(1)
@@ -193,6 +210,16 @@ func (s *recurringScheduler) run(ctx context.Context, entry *scheduleEntry) {
 		s.mu.Unlock()
 	}
 
+	if delay := firstTickDelay(entry.spec.id, entry.spec.interval); delay > 0 {
+		timer := s.clock.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C():
+		}
+	}
+
 	for {
 		if !s.runOnce(ctx, entry.spec) {
 			return
@@ -200,15 +227,29 @@ func (s *recurringScheduler) run(ctx context.Context, entry *scheduleEntry) {
 	}
 }
 
+// firstTickDelay returns the deterministic offset in [0, interval) that
+// staggers an entry's first tick. Reconnects replay the whole assignment
+// inventory at once, so spreading first ticks by a hash of the stable job ID
+// avoids a synchronized burst into bounded worker-pool queues.
+func firstTickDelay(id string, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(id))
+	return time.Duration(hash.Sum64() % uint64(interval))
+}
+
 // runOnce starts one tick promptly, then holds the next tick until both the
-// configured interval has elapsed and the task has completed. Scheduled
-// submission waits for bounded worker-pool capacity, so assignments cannot
-// lose every tick to a reconnect-synchronized queue burst.
+// configured interval has elapsed and the task has completed. The interval
+// timer starts before submission because submission waits for bounded
+// worker-pool capacity; measuring the period from dispatch keeps the
+// configured cadence instead of adding queue-wait time to every cycle.
 func (s *recurringScheduler) runOnce(ctx context.Context, spec scheduleSpec) bool {
 	done := make(chan struct{})
-	accepted := spec.submit(ctx, func() { close(done) })
 	timer := s.clock.NewTimer(spec.interval)
 	defer timer.Stop()
+	accepted := spec.submit(ctx, func() { close(done) })
 
 	if !accepted {
 		select {

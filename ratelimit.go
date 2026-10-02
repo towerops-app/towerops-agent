@@ -91,9 +91,18 @@ func (b *tokenBucket) reserve() time.Duration {
 
 // charge consumes one token without waiting, letting the balance go negative.
 // It is used where sleeping is unsafe (inside gosnmp's request deadline); the
-// debt is paid off by wait before the next request.
+// debt is paid off by wait or waitDebt before the next request.
 func (b *tokenBucket) charge() {
 	_ = b.reserve()
+}
+
+// refund returns a token whose reservation was abandoned — the caller never
+// transmitted — so a cancelled wait does not leave debt behind for the next
+// caller to sleep off.
+func (b *tokenBucket) refund() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tokens++
 }
 
 // wait blocks until one token is available — including paying off debt
@@ -108,17 +117,47 @@ func (b *tokenBucket) wait(ctx context.Context) bool {
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
+		b.refund()
 		return false
 	case <-timer.C:
 		return true
 	}
 }
 
+// waitDebt blocks until the bucket's outstanding debt (a negative balance
+// accumulated by charge) is repaid by the refiller, or ctx is cancelled.
+// Unlike wait it does not consume a token: it exists to pace a sequence of
+// requests where each send is already charged by OnSent, e.g. inside a
+// gosnmp walkFn between one response and the next request.
+func (b *tokenBucket) waitDebt(ctx context.Context) bool {
+	for {
+		b.mu.Lock()
+		if b.rate <= 0 {
+			b.mu.Unlock()
+			return true
+		}
+		b.refillLocked(b.now())
+		if b.tokens >= 0 {
+			b.mu.Unlock()
+			return ctx.Err() == nil
+		}
+		delay := time.Duration(-b.tokens / b.rate * float64(time.Second))
+		b.mu.Unlock()
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+	}
+}
+
 // snmpSentHook returns the gosnmp OnSent callback that charges every
 // transmitted packet — including retries — against the bucket. It never
 // sleeps: blocking inside OnSent would consume gosnmp's per-request deadline,
-// so the debt is paid by the next wait before the next request instead (see
-// rateLimitedQuerier).
+// so the debt is paid by the next wait or waitDebt before the next request
+// instead (see rateLimitedQuerier).
 func snmpSentHook(b *tokenBucket) func(*gosnmp.GoSNMP) {
 	return func(*gosnmp.GoSNMP) { b.charge() }
 }
@@ -139,32 +178,53 @@ func (r *rateLimitedQuerier) Get(oids []string) (*gosnmp.SnmpPacket, error) {
 	return r.q.Get(oids)
 }
 
-func (r *rateLimitedQuerier) WalkAll(rootOid string) ([]gosnmp.SnmpPDU, error) {
-	if !snmpPDUs.wait(r.ctx) {
-		return nil, r.ctx.Err()
+// pacedWalkFn wraps a gosnmp WalkFunc so the debt charged by OnSent for the
+// request just answered is repaid before gosnmp sends the next GETNEXT or
+// GETBULK. walkFn runs after each response and before the next request, so
+// the sleep never consumes gosnmp's per-request deadline — without it a walk
+// sends every packet back-to-back and the wire rate ignores the limiter.
+func (r *rateLimitedQuerier) pacedWalkFn(walkFn gosnmp.WalkFunc) gosnmp.WalkFunc {
+	return func(pdu gosnmp.SnmpPDU) error {
+		if err := walkFn(pdu); err != nil {
+			return err
+		}
+		if !snmpPDUs.waitDebt(r.ctx) {
+			return r.ctx.Err()
+		}
+		return nil
 	}
-	return r.q.WalkAll(rootOid)
+}
+
+func (r *rateLimitedQuerier) WalkAll(rootOid string) ([]gosnmp.SnmpPDU, error) {
+	var results []gosnmp.SnmpPDU
+	err := r.Walk(rootOid, func(pdu gosnmp.SnmpPDU) error {
+		results = append(results, pdu)
+		return nil
+	})
+	return results, err
 }
 
 func (r *rateLimitedQuerier) BulkWalkAll(rootOid string) ([]gosnmp.SnmpPDU, error) {
-	if !snmpPDUs.wait(r.ctx) {
-		return nil, r.ctx.Err()
-	}
-	return r.q.BulkWalkAll(rootOid)
+	var results []gosnmp.SnmpPDU
+	err := r.BulkWalk(rootOid, func(pdu gosnmp.SnmpPDU) error {
+		results = append(results, pdu)
+		return nil
+	})
+	return results, err
 }
 
 func (r *rateLimitedQuerier) Walk(rootOid string, walkFn gosnmp.WalkFunc) error {
 	if !snmpPDUs.wait(r.ctx) {
 		return r.ctx.Err()
 	}
-	return r.q.Walk(rootOid, walkFn)
+	return r.q.Walk(rootOid, r.pacedWalkFn(walkFn))
 }
 
 func (r *rateLimitedQuerier) BulkWalk(rootOid string, walkFn gosnmp.WalkFunc) error {
 	if !snmpPDUs.wait(r.ctx) {
 		return r.ctx.Err()
 	}
-	return r.q.BulkWalk(rootOid, walkFn)
+	return r.q.BulkWalk(rootOid, r.pacedWalkFn(walkFn))
 }
 
 // snmpPDUs is the process-wide token bucket for outbound SNMP request packets.

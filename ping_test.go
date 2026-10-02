@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -151,6 +152,26 @@ func TestParsePingTime(t *testing.T) {
 			output: "64 bytes from 10.0.0.1: icmp_seq=1 ttl=64 time=1.234\n",
 			want:   1.234,
 		},
+		{
+			name:   "busybox sub-millisecond reply",
+			output: "PING 127.0.0.1 (127.0.0.1): 56 data bytes\n64 bytes from 127.0.0.1: seq=0 ttl=64 time<1 ms\n--- 127.0.0.1 ping statistics ---",
+			want:   0,
+		},
+		{
+			name:   "busybox sub-millisecond reply without space",
+			output: "64 bytes from 10.0.0.1: seq=0 ttl=64 time<1ms",
+			want:   0,
+		},
+		{
+			name:    "busybox sub-millisecond reply with unparseable bound",
+			output:  "64 bytes from 10.0.0.1: seq=0 ttl=64 time<abc ms",
+			wantErr: true,
+		},
+		{
+			name:   "busybox sub-millisecond reply with bare bound",
+			output: "64 bytes from 10.0.0.1: seq=0 ttl=64 time<1",
+			want:   0,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -287,9 +308,13 @@ func TestPingDeviceFallbackToExec(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real ping in short mode")
 	}
-	// Mock icmpListenPacket to always fail → forces fallback to execPing
+	// Mock icmpListenPacket to always fail → forces fallback to execPing.
+	// closeSharedSockets drops any cached real socket so the stub sees the
+	// listen calls.
 	origListen := icmpListenPacket
 	defer func() { icmpListenPacket = origListen }()
+	closeSharedSockets()
+	defer closeSharedSockets()
 
 	icmpListenPacket = func(network, address string) (icmpConn, error) {
 		return nil, fmt.Errorf("permission denied")
@@ -309,6 +334,8 @@ func TestPingDeviceNonICMPError(t *testing.T) {
 	// fall back to exec - it should return the error directly.
 	origListen := icmpListenPacket
 	defer func() { icmpListenPacket = origListen }()
+	closeSharedSockets()
+	defer closeSharedSockets()
 
 	// First call (raw ICMP) returns errICMPUnavailable → triggers UDP fallback
 	// Second call (UDP ICMP) returns a real write error → not errICMPUnavailable
@@ -393,6 +420,8 @@ func TestIcmpPingUDPFallback(t *testing.T) {
 	// Mock raw ICMP to fail, forcing UDP fallback path in icmpPing
 	origListen := icmpListenPacket
 	defer func() { icmpListenPacket = origListen }()
+	closeSharedSockets()
+	defer closeSharedSockets()
 
 	calls := 0
 	icmpListenPacket = func(network, address string) (icmpConn, error) {
@@ -419,74 +448,111 @@ func TestIcmpPingUDPFallback(t *testing.T) {
 
 // --- tpT: scripted ICMP connection and property coverage -------------------
 
-// tpTFakeICMPConn is a scripted icmpConn. It records the echo request handed to
-// WriteTo so replies can be built from the live id/seq that doICMPPing picks,
-// then hands back one scripted packet per ReadFrom call.
+// tpTFakeICMPConn is a scripted icmpConn shared by every ping run against the
+// network it was installed for. WriteTo records the echo requests so replies
+// and errors can be built from the live id/seq each ping picked; ReadFrom
+// waits for the first request, hands back the scripted replies (each computed
+// from the most recent request), then serves packets queued by injectPacket
+// until the conn is closed.
+type tpTSentPacket struct {
+	pkt []byte
+	dst net.Addr
+}
+
+type tpTInjectedPacket struct {
+	pkt  []byte
+	peer net.Addr
+}
+
 type tpTFakeICMPConn struct {
-	mu          sync.Mutex
-	request     []byte
-	replies     []func(req []byte) []byte
-	consumed    int
-	peers       []net.Addr
-	readErr     error
-	writeErr    error
-	deadlineErr error
-	deadline    time.Time
-	onRead      func()
-	closes      atomic.Int32
-	closed      chan struct{}
-	localAddr   net.Addr
-	closeOnce   sync.Once
+	mu        sync.Mutex
+	sent      []tpTSentPacket
+	replies   []func(req []byte) []byte
+	consumed  int
+	peers     []net.Addr
+	readErr   error
+	writeErr  error
+	inject    chan tpTInjectedPacket
+	closes    atomic.Int32
+	closed    chan struct{}
+	wrote     chan struct{}
+	writeOnce sync.Once
+	localAddr net.Addr
+	closeOnce sync.Once
 }
 
 func tpTNewFakeICMPConn(replies ...func(req []byte) []byte) *tpTFakeICMPConn {
-	return &tpTFakeICMPConn{replies: replies, closed: make(chan struct{})}
+	return &tpTFakeICMPConn{
+		replies: replies,
+		inject:  make(chan tpTInjectedPacket, 64),
+		closed:  make(chan struct{}),
+		wrote:   make(chan struct{}),
+	}
 }
 
 func (c *tpTFakeICMPConn) LocalAddr() net.Addr {
 	return c.localAddr
 }
 
-func (c *tpTFakeICMPConn) WriteTo(b []byte, _ net.Addr) (int, error) {
+func (c *tpTFakeICMPConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if c.writeErr != nil {
 		return 0, c.writeErr
 	}
 	c.mu.Lock()
-	c.request = append([]byte(nil), b...)
+	c.sent = append(c.sent, tpTSentPacket{pkt: append([]byte(nil), b...), dst: addr})
 	c.mu.Unlock()
+	c.writeOnce.Do(func() { close(c.wrote) })
 	return len(b), nil
 }
 
 func (c *tpTFakeICMPConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	if c.onRead != nil {
-		c.onRead()
+	// Scripted replies belong to a request, so nothing is served before the
+	// first WriteTo. That also guarantees the ping's waiter is registered -
+	// doICMPPing registers before it writes.
+	select {
+	case <-c.wrote:
+	case <-c.closed:
+		return 0, nil, fmt.Errorf("tpT: conn closed")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.consumed >= len(c.replies) {
-		if c.readErr != nil {
-			return 0, nil, c.readErr
+	for {
+		c.mu.Lock()
+		if c.consumed < len(c.replies) {
+			replyIndex := c.consumed
+			c.consumed++
+			req := c.sent[len(c.sent)-1].pkt
+			c.mu.Unlock()
+			pkt := c.replies[replyIndex](req)
+			n := copy(b, pkt)
+			if replyIndex < len(c.peers) {
+				return n, c.peers[replyIndex], nil
+			}
+			return n, &net.IPAddr{IP: net.IPv4(127, 0, 0, 1)}, nil
 		}
-		return 0, nil, fmt.Errorf("tpT: no scripted reply #%d", c.consumed+1)
+		readErr := c.readErr
+		c.mu.Unlock()
+		if readErr != nil {
+			return 0, nil, readErr
+		}
+		select {
+		case pkt := <-c.inject:
+			n := copy(b, pkt.pkt)
+			if pkt.peer != nil {
+				return n, pkt.peer, nil
+			}
+			return n, &net.IPAddr{IP: net.IPv4(127, 0, 0, 1)}, nil
+		case <-c.closed:
+			return 0, nil, fmt.Errorf("tpT: conn closed")
+		}
 	}
-	replyIndex := c.consumed
-	pkt := c.replies[replyIndex](c.request)
-	c.consumed++
-	n := copy(b, pkt)
-	if replyIndex < len(c.peers) {
-		return n, c.peers[replyIndex], nil
-	}
-	return n, &net.IPAddr{IP: net.IPv4(127, 0, 0, 1)}, nil
 }
 
-func (c *tpTFakeICMPConn) SetDeadline(t time.Time) error {
-	if c.deadlineErr != nil {
-		return c.deadlineErr
+// injectPacket queues a packet for the next ReadFrom, as though it arrived
+// from peer.
+func (c *tpTFakeICMPConn) injectPacket(pkt []byte, peer net.Addr) {
+	select {
+	case c.inject <- tpTInjectedPacket{pkt: pkt, peer: peer}:
+	case <-c.closed:
 	}
-	c.mu.Lock()
-	c.deadline = t
-	c.mu.Unlock()
-	return nil
 }
 
 func (c *tpTFakeICMPConn) Close() error {
@@ -501,12 +567,38 @@ func (c *tpTFakeICMPConn) readsConsumed() int {
 	return c.consumed
 }
 
+// tpTWaitSent returns once the conn has recorded at least n echo requests and
+// hands back a snapshot of them.
+func tpTWaitSent(t *testing.T, c *tpTFakeICMPConn, n int) []tpTSentPacket {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.mu.Lock()
+		count := len(c.sent)
+		if count >= n {
+			sent := append([]tpTSentPacket(nil), c.sent...)
+			c.mu.Unlock()
+			return sent
+		}
+		c.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d sent packets, got %d", n, count)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // tpTUseFakeICMPConn points icmpListenPacket at conn and records the networks
-// it was asked for.
+// it was asked for. The shared-socket registry is reset on both ends so a
+// stale socket - real or scripted - can never bypass the stub.
 func tpTUseFakeICMPConn(t *testing.T, conn icmpConn) *[]string {
 	t.Helper()
+	closeSharedSockets()
 	orig := icmpListenPacket
-	t.Cleanup(func() { icmpListenPacket = orig })
+	t.Cleanup(func() {
+		icmpListenPacket = orig
+		closeSharedSockets()
+	})
 	networks := new([]string)
 	icmpListenPacket = func(network, _ string) (icmpConn, error) {
 		*networks = append(*networks, network)
@@ -515,9 +607,10 @@ func tpTUseFakeICMPConn(t *testing.T, conn icmpConn) *[]string {
 	return networks
 }
 
-// tpTEchoReplyFor turns the recorded echo request into an echo reply, offsetting
-// the id and seq so mismatched replies can be scripted too.
-func tpTEchoReplyFor(t *testing.T, isIPv4 bool, idDelta, seqDelta int) func(req []byte) []byte {
+// tpTEchoPacket turns a recorded echo request into an echo reply, offsetting
+// the id and seq so mismatched replies can be scripted too. It returns nil on
+// malformed input.
+func tpTEchoPacket(t *testing.T, isIPv4 bool, req []byte, idDelta, seqDelta int) []byte {
 	t.Helper()
 	proto := 1
 	replyType := icmp.Type(ipv4.ICMPTypeEchoReply)
@@ -525,27 +618,33 @@ func tpTEchoReplyFor(t *testing.T, isIPv4 bool, idDelta, seqDelta int) func(req 
 		proto = 58
 		replyType = ipv6.ICMPTypeEchoReply
 	}
+	parsed, err := icmp.ParseMessage(proto, req)
+	if err != nil {
+		t.Errorf("echo reply: request did not parse: %v", err)
+		return nil
+	}
+	echo, ok := parsed.Body.(*icmp.Echo)
+	if !ok {
+		t.Errorf("echo reply: request body was %T, want *icmp.Echo", parsed.Body)
+		return nil
+	}
+	reply := icmp.Message{
+		Type: replyType,
+		Body: &icmp.Echo{ID: echo.ID + idDelta, Seq: echo.Seq + seqDelta, Data: echo.Data},
+	}
+	wb, err := reply.Marshal(nil)
+	if err != nil {
+		t.Errorf("echo reply: marshal: %v", err)
+		return nil
+	}
+	return wb
+}
+
+// tpTEchoReplyFor adapts tpTEchoPacket to the scripted reply signature.
+func tpTEchoReplyFor(t *testing.T, isIPv4 bool, idDelta, seqDelta int) func(req []byte) []byte {
+	t.Helper()
 	return func(req []byte) []byte {
-		parsed, err := icmp.ParseMessage(proto, req)
-		if err != nil {
-			t.Errorf("scripted reply: request did not parse: %v", err)
-			return nil
-		}
-		echo, ok := parsed.Body.(*icmp.Echo)
-		if !ok {
-			t.Errorf("scripted reply: request body was %T, want *icmp.Echo", parsed.Body)
-			return nil
-		}
-		reply := icmp.Message{
-			Type: replyType,
-			Body: &icmp.Echo{ID: echo.ID + idDelta, Seq: echo.Seq + seqDelta, Data: echo.Data},
-		}
-		wb, err := reply.Marshal(nil)
-		if err != nil {
-			t.Errorf("scripted reply: marshal: %v", err)
-			return nil
-		}
-		return wb
+		return tpTEchoPacket(t, isIPv4, req, idDelta, seqDelta)
 	}
 }
 
@@ -584,6 +683,95 @@ func tpTEchoReplyWithIDFor(t *testing.T, isIPv4 bool, id int) func(req []byte) [
 // tpTStaticReply returns a reply function that always yields the same bytes.
 func tpTStaticReply(pkt []byte) func(req []byte) []byte {
 	return func([]byte) []byte { return pkt }
+}
+
+// tpTQuotedDatagram wraps req (a marshalled echo request) in the IP header a
+// router would quote inside an ICMP error, per RFC 792/4443. seqDelta mangles
+// the quoted sequence so unmatched errors can be scripted too.
+func tpTQuotedDatagram(t *testing.T, isIPv4 bool, req []byte, seqDelta int) []byte {
+	t.Helper()
+	proto := 1
+	if !isIPv4 {
+		proto = 58
+	}
+	parsed, err := icmp.ParseMessage(proto, req)
+	if err != nil {
+		t.Errorf("quoted datagram: request did not parse: %v", err)
+		return nil
+	}
+	echo, ok := parsed.Body.(*icmp.Echo)
+	if !ok {
+		t.Errorf("quoted datagram: request body was %T, want *icmp.Echo", parsed.Body)
+		return nil
+	}
+	if seqDelta != 0 {
+		binary.BigEndian.PutUint16(req[6:8], uint16(echo.Seq+seqDelta))
+	}
+	if !isIPv4 {
+		h := make([]byte, 40)
+		h[0] = 0x60 // version 6
+		h[6] = 58   // next header: ICMPv6
+		h[7] = 64   // hop limit
+		copy(h[24:40], net.ParseIP("2001:db8::1").To16())
+		return append(h, req...)
+	}
+	inner := req[:min(len(req), 8)]
+	hdr := ipv4.Header{
+		Version:  4,
+		Len:      20,
+		TOS:      0xc0,
+		TotalLen: 20 + len(inner),
+		TTL:      64,
+		Protocol: 1,
+		Dst:      net.IPv4(127, 0, 0, 1),
+	}
+	hb, err := hdr.Marshal()
+	if err != nil {
+		t.Errorf("quoted datagram: marshal IPv4 header: %v", err)
+		return nil
+	}
+	return append(hb, inner...)
+}
+
+// tpTICMPErrorPacket builds a marshalled ICMP error message (destination
+// unreachable, time exceeded, packet too big) that quotes req. Called from
+// both scripted replies and injected packets.
+func tpTICMPErrorPacket(t *testing.T, isIPv4 bool, typ icmp.Type, req []byte, seqDelta int) []byte {
+	t.Helper()
+	quoted := tpTQuotedDatagram(t, isIPv4, append([]byte(nil), req...), seqDelta)
+	if quoted == nil {
+		return nil
+	}
+	var body icmp.MessageBody
+	switch typ {
+	case ipv4.ICMPTypeDestinationUnreachable, ipv6.ICMPTypeDestinationUnreachable:
+		body = &icmp.DstUnreach{Data: quoted}
+	case ipv4.ICMPTypeTimeExceeded, ipv6.ICMPTypeTimeExceeded:
+		body = &icmp.TimeExceeded{Data: quoted}
+	case ipv6.ICMPTypePacketTooBig:
+		body = &icmp.PacketTooBig{MTU: 1280, Data: quoted}
+	default:
+		t.Errorf("icmp error reply: unsupported type %v", typ)
+		return nil
+	}
+	code := 1
+	if typ == ipv6.ICMPTypeDestinationUnreachable {
+		code = 3 // address unreachable
+	}
+	wb, err := (&icmp.Message{Type: typ, Code: code, Body: body}).Marshal(nil)
+	if err != nil {
+		t.Errorf("icmp error reply: marshal: %v", err)
+		return nil
+	}
+	return wb
+}
+
+// tpTICMPErrorFor adapts tpTICMPErrorPacket to the scripted reply signature.
+func tpTICMPErrorFor(t *testing.T, isIPv4 bool, typ icmp.Type, seqDelta int) func(req []byte) []byte {
+	t.Helper()
+	return func(req []byte) []byte {
+		return tpTICMPErrorPacket(t, isIPv4, typ, req, seqDelta)
+	}
 }
 
 func TestTpTDoICMPPingUDPMatchesSocketPort(t *testing.T) {
@@ -720,17 +908,10 @@ func TestTpTDoICMPPingUsesDistinctSequences(t *testing.T) {
 	t.Cleanup(func() { pingSeq.Store(originalSeq) })
 	pingSeq.Store(100)
 
-	conns := []*tpTFakeICMPConn{
-		tpTNewFakeICMPConn(tpTEchoReplyFor(t, true, 0, 0)),
-		tpTNewFakeICMPConn(tpTEchoReplyFor(t, true, 0, 0)),
-	}
-	origListen := icmpListenPacket
-	t.Cleanup(func() { icmpListenPacket = origListen })
-	var nextConn atomic.Uint32
-	icmpListenPacket = func(string, string) (icmpConn, error) {
-		index := nextConn.Add(1) - 1
-		return conns[index], nil
-	}
+	// Both pings share one socket; replies are injected after both requests
+	// are recorded, so each reply must reach its own waiter.
+	conn := tpTNewFakeICMPConn()
+	networks := tpTUseFakeICMPConn(t, conn)
 
 	origMarshal := icmpMarshal
 	t.Cleanup(func() { icmpMarshal = origMarshal })
@@ -748,21 +929,32 @@ func TestTpTDoICMPPingUsesDistinctSequences(t *testing.T) {
 	}
 
 	target := net.ParseIP("127.0.0.1")
-	results := make(chan error, len(conns))
-	for range conns {
+	results := make(chan error, 2)
+	for range 2 {
 		go func() {
-			_, err := doICMPPing(context.Background(), target, "ip4:icmp", true, 1000)
+			_, err := doICMPPing(context.Background(), target, "ip4:icmp", true, 3000)
 			results <- err
 		}()
 	}
+
+	sent := tpTWaitSent(t, conn, 2)
+	// Deliver the replies out of order; routing by (id, seq) must still land
+	// each on the right waiter.
+	conn.injectPacket(tpTEchoPacket(t, true, sent[1].pkt, 0, 0), &net.IPAddr{IP: target})
+	conn.injectPacket(tpTEchoPacket(t, true, sent[0].pkt, 0, 0), &net.IPAddr{IP: target})
+
 	var pingErrors []error
-	for range conns {
+	for range 2 {
 		if err := <-results; err != nil {
 			pingErrors = append(pingErrors, err)
 		}
 	}
 	if len(pingErrors) != 0 {
 		t.Fatalf("doICMPPing errors: %v", pingErrors)
+	}
+
+	if got := len(*networks); got != 1 {
+		t.Errorf("opened %d sockets, want one shared socket", got)
 	}
 
 	sequencesMu.Lock()
@@ -850,20 +1042,6 @@ func TestTpTDoICMPPingMarshalError(t *testing.T) {
 	}
 }
 
-func TestTpTDoICMPPingSetDeadlineError(t *testing.T) {
-	conn := tpTNewFakeICMPConn()
-	conn.deadlineErr = fmt.Errorf("no deadline for you")
-	tpTUseFakeICMPConn(t, conn)
-
-	_, err := doICMPPing(context.Background(), net.ParseIP("127.0.0.1"), "udp4", true, 1000)
-	if err == nil {
-		t.Fatal("expected an error when the deadline cannot be set")
-	}
-	if !strings.Contains(err.Error(), "set deadline: no deadline for you") {
-		t.Errorf("error = %q, want it to mention %q", err.Error(), "set deadline: no deadline for you")
-	}
-}
-
 func TestTpTDoICMPPingWriteError(t *testing.T) {
 	conn := tpTNewFakeICMPConn()
 	conn.writeErr = fmt.Errorf("network unreachable")
@@ -878,35 +1056,47 @@ func TestTpTDoICMPPingWriteError(t *testing.T) {
 	}
 }
 
-func TestTpTDoICMPPingClosesConnOnContextCancel(t *testing.T) {
+func TestTpTDoICMPPingReturnsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	conn := tpTNewFakeICMPConn()
-	conn.readErr = fmt.Errorf("use of closed connection")
-	// Cancelling from inside the read, then waiting for the close, pins the
-	// context-cancellation path without any timing assumptions.
-	conn.onRead = func() {
-		cancel()
-		<-conn.closed
-	}
 	tpTUseFakeICMPConn(t, conn)
 
-	_, err := doICMPPing(ctx, net.ParseIP("127.0.0.1"), "udp4", true, 5000)
-	if err == nil {
-		t.Fatal("expected an error after the connection was closed")
+	done := make(chan error, 1)
+	go func() {
+		_, err := doICMPPing(ctx, net.ParseIP("127.0.0.1"), "udp4", true, 30000)
+		done <- err
+	}()
+
+	// Wait until the request is actually in flight so the cancel lands while
+	// the ping is waiting on the shared socket's waiter.
+	tpTWaitSent(t, conn, 1)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error after the context was cancelled")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("error = %q, want a wrapped %q", err.Error(), context.Canceled)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("doICMPPing did not return after its context was cancelled")
 	}
-	if !strings.Contains(err.Error(), "icmp read: use of closed connection") {
-		t.Errorf("error = %q, want it to mention %q", err.Error(), "icmp read: use of closed connection")
-	}
-	if got := conn.closes.Load(); got < 2 {
-		t.Errorf("Close called %d times, want the cancellation close plus the deferred close", got)
+
+	// The socket is shared, so cancelling one ping must not close it.
+	if got := conn.closes.Load(); got != 0 {
+		t.Errorf("Close called %d times, want 0 - the shared socket stays open", got)
 	}
 }
 
 func TestTpTIcmpPingListenFailureFallsBack(t *testing.T) {
 	orig := icmpListenPacket
 	defer func() { icmpListenPacket = orig }()
+	closeSharedSockets()
+	defer closeSharedSockets()
 
 	var networks []string
 	icmpListenPacket = func(network, _ string) (icmpConn, error) {
@@ -924,6 +1114,131 @@ func TestTpTIcmpPingListenFailureFallsBack(t *testing.T) {
 	want := []string{"ip6:ipv6-icmp", "udp6"}
 	if len(networks) != len(want) || networks[0] != want[0] || networks[1] != want[1] {
 		t.Errorf("listened on %v, want %v", networks, want)
+	}
+}
+
+func TestTpTDoICMPPingUnreachableShortCircuits(t *testing.T) {
+	target := net.ParseIP("192.0.2.1") // TEST-NET-1, no echo reply will arrive
+	conn := tpTNewFakeICMPConn(tpTICMPErrorFor(t, true, ipv4.ICMPTypeDestinationUnreachable, 0))
+	tpTUseFakeICMPConn(t, conn)
+
+	start := time.Now()
+	_, err := doICMPPing(context.Background(), target, "ip4:icmp", true, 30000)
+	if err == nil {
+		t.Fatal("expected an unreachable error")
+	}
+	if !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("error = %q, want it to mention unreachable", err.Error())
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("doICMPPing returned after %v, want an immediate failure well under the 30s timeout", elapsed)
+	}
+	if got := conn.readsConsumed(); got != 1 {
+		t.Errorf("consumed %d replies, want 1", got)
+	}
+}
+
+func TestTpTDoICMPPingTimeExceededShortCircuits(t *testing.T) {
+	target := net.ParseIP("192.0.2.1")
+	conn := tpTNewFakeICMPConn(tpTICMPErrorFor(t, true, ipv4.ICMPTypeTimeExceeded, 0))
+	tpTUseFakeICMPConn(t, conn)
+
+	_, err := doICMPPing(context.Background(), target, "ip4:icmp", true, 30000)
+	if err == nil {
+		t.Fatal("expected a time-exceeded error")
+	}
+	if !strings.Contains(err.Error(), "time exceeded") {
+		t.Errorf("error = %q, want it to mention time exceeded", err.Error())
+	}
+}
+
+func TestTpTDoICMPPingIgnoresUnmatchedErrorThenAcceptsReply(t *testing.T) {
+	target := net.ParseIP("127.0.0.1")
+	// First error quotes a different sequence and must be ignored; the
+	// following echo reply still completes the ping.
+	conn := tpTNewFakeICMPConn(
+		tpTICMPErrorFor(t, true, ipv4.ICMPTypeDestinationUnreachable, 42),
+		tpTEchoReplyFor(t, true, 0, 0),
+	)
+	tpTUseFakeICMPConn(t, conn)
+
+	ms, err := doICMPPing(context.Background(), target, "ip4:icmp", true, 3000)
+	if err != nil {
+		t.Fatalf("doICMPPing: %v", err)
+	}
+	if ms < 0 {
+		t.Errorf("round-trip = %v ms, want >= 0", ms)
+	}
+	if got := conn.readsConsumed(); got != 2 {
+		t.Errorf("consumed %d replies, want 2 (unmatched error, then the reply)", got)
+	}
+}
+
+func TestTpTICMPErrorForIPv6(t *testing.T) {
+	target := net.ParseIP("::1")
+	conn := tpTNewFakeICMPConn(tpTICMPErrorFor(t, false, ipv6.ICMPTypeDestinationUnreachable, 0))
+	conn.peers = []net.Addr{&net.IPAddr{IP: net.ParseIP("fe80::1")}}
+	tpTUseFakeICMPConn(t, conn)
+
+	_, err := doICMPPing(context.Background(), target, "ip6:ipv6-icmp", false, 30000)
+	if err == nil {
+		t.Fatal("expected an unreachable error")
+	}
+	if !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("error = %q, want it to mention unreachable", err.Error())
+	}
+}
+
+func TestTpTDispatchRoutesByKey(t *testing.T) {
+	// Exercise the reply router directly: a reply for one (id, seq) must reach
+	// only its own waiter.
+	sock := &icmpSocket{proto: 1, replyID: os.Getpid() & 0xffff, waiters: make(map[pingKey]*pingWaiter)}
+	target := net.ParseIP("127.0.0.1")
+
+	w1 := sock.register(pingKey{id: 10, seq: 1}, target)
+	w2 := sock.register(pingKey{id: 10, seq: 2}, target)
+
+	reply := &icmp.Message{
+		Type: ipv4.ICMPTypeEchoReply,
+		Body: &icmp.Echo{ID: 10, Seq: 2},
+	}
+	sock.dispatch(reply, target)
+
+	select {
+	case r := <-w2.ch:
+		if r.err != nil {
+			t.Fatalf("w2 got error %v", r.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("w2 never received its echo reply")
+	}
+	select {
+	case <-w1.ch:
+		t.Fatal("w1 received a reply meant for w2")
+	default:
+	}
+
+	// A reply from a different source address never satisfies a waiter.
+	sock.dispatch(reply, net.ParseIP("192.0.2.99"))
+	select {
+	case <-w2.ch:
+		t.Fatal("wrong-source reply reached w2")
+	default:
+	}
+
+	// Waiters without a known identifier match on sequence alone.
+	w3 := sock.register(pingKey{id: -1, seq: 7}, target)
+	sock.dispatch(&icmp.Message{
+		Type: ipv4.ICMPTypeEchoReply,
+		Body: &icmp.Echo{ID: 4242, Seq: 7},
+	}, target)
+	select {
+	case r := <-w3.ch:
+		if r.err != nil {
+			t.Fatalf("w3 got error %v", r.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("w3 never received its echo reply")
 	}
 }
 
@@ -1008,5 +1323,172 @@ func TestTpTPeerIPMapsAddrKinds(t *testing.T) {
 				t.Fatalf("peerIP(%v) = %v, want %v", tc.addr, got, tc.want)
 			}
 		})
+	}
+}
+
+// --- coverage: socket registry, dispatch drops, and quote parsing ----------
+
+func TestTpTSharedSocketReplacesDeadSocket(t *testing.T) {
+	fresh := tpTNewFakeICMPConn()
+	tpTUseFakeICMPConn(t, fresh) // resets the registry first
+
+	// Seed a dead socket for the network: the dead entry must be dropped and
+	// a fresh socket installed.
+	dead := &icmpSocket{conn: tpTNewFakeICMPConn(), waiters: make(map[pingKey]*pingWaiter)}
+	dead.mu.Lock()
+	dead.err = errors.New("read failed")
+	dead.mu.Unlock()
+	sharedSockets.mu.Lock()
+	sharedSockets.m["ip4:icmp"] = dead
+	sharedSockets.mu.Unlock()
+
+	sock, err := sharedSocket("ip4:icmp")
+	if err != nil {
+		t.Fatalf("sharedSocket: %v", err)
+	}
+	if sock == dead {
+		t.Fatal("dead socket was not replaced")
+	}
+	sharedSockets.mu.Lock()
+	got := sharedSockets.m["ip4:icmp"]
+	sharedSockets.mu.Unlock()
+	if got != sock {
+		t.Fatal("registry did not record the replacement socket")
+	}
+}
+
+func TestTpTDispatchDropsMalformedAndUnmatched(t *testing.T) {
+	target := net.ParseIP("127.0.0.1")
+	sock := &icmpSocket{proto: 1, replyID: 1, waiters: make(map[pingKey]*pingWaiter)}
+	w := sock.register(pingKey{id: 1, seq: 9}, target)
+	defer sock.unregister(pingKey{id: 1, seq: 9}, w)
+
+	// Echo reply with a non-Echo body is ignored.
+	sock.dispatch(&icmp.Message{Type: ipv4.ICMPTypeEchoReply, Body: &icmp.DstUnreach{}}, target)
+
+	// A matching reply from a nil source is ignored.
+	sock.dispatch(&icmp.Message{
+		Type: ipv4.ICMPTypeEchoReply,
+		Body: &icmp.Echo{ID: 1, Seq: 9},
+	}, nil)
+
+	// An ICMP error whose quote cannot be parsed is ignored.
+	sock.dispatch(&icmp.Message{
+		Type: ipv4.ICMPTypeDestinationUnreachable, Code: 1,
+		Body: &icmp.DstUnreach{Data: []byte{1, 2, 3}},
+	}, target)
+
+	// An ICMP error quoting an unknown (id, seq) is ignored.
+	unknownReq, err := (&icmp.Message{
+		Type: ipv4.ICMPTypeEcho,
+		Body: &icmp.Echo{ID: 1, Seq: 77, Data: []byte("x")},
+	}).Marshal(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sock.dispatch(&icmp.Message{
+		Type: ipv4.ICMPTypeDestinationUnreachable, Code: 1,
+		Body: &icmp.DstUnreach{Data: tpTQuotedDatagram(t, true, unknownReq, 0)},
+	}, target)
+
+	select {
+	case r := <-w.ch:
+		t.Fatalf("waiter received unexpected reply %+v", r)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestTpTDispatchPacketTooBig(t *testing.T) {
+	target := net.ParseIP("::1")
+	sock := &icmpSocket{proto: 58, replyID: 1, waiters: make(map[pingKey]*pingWaiter)}
+	w := sock.register(pingKey{id: 1, seq: 3}, target)
+	defer sock.unregister(pingKey{id: 1, seq: 3}, w)
+
+	req, err := (&icmp.Message{
+		Type: ipv6.ICMPTypeEchoRequest,
+		Body: &icmp.Echo{ID: 1, Seq: 3, Data: []byte("x")},
+	}).Marshal(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sock.dispatch(&icmp.Message{
+		Type: ipv6.ICMPTypePacketTooBig, Code: 0,
+		Body: &icmp.PacketTooBig{MTU: 1280, Data: tpTQuotedDatagram(t, false, req, 0)},
+	}, target)
+
+	select {
+	case r := <-w.ch:
+		if r.err == nil || !strings.Contains(r.err.Error(), "packet too big") {
+			t.Fatalf("waiter error = %v, want packet too big", r.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter did not receive the packet-too-big failure")
+	}
+}
+
+func TestTpTFailIsIdempotent(t *testing.T) {
+	sock := &icmpSocket{
+		proto:   1,
+		waiters: make(map[pingKey]*pingWaiter),
+		conn:    tpTNewFakeICMPConn(),
+	}
+	sock.fail(errors.New("first"))
+	sock.fail(errors.New("second"))
+	if got := sock.readErr(); got == nil || got.Error() != "first" {
+		t.Fatalf("readErr = %v, want first failure retained", got)
+	}
+}
+
+func TestTpTQuotedEchoIDSeqRejectsMalformed(t *testing.T) {
+	echoReq, err := (&icmp.Message{
+		Type: ipv4.ICMPTypeEcho,
+		Body: &icmp.Echo{ID: 0x1234, Seq: 0xabcd, Data: []byte("x")},
+	}).Marshal(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validV4 := tpTQuotedDatagram(t, true, echoReq, 0)
+
+	cases := []struct {
+		name   string
+		data   []byte
+		isIPv4 bool
+	}{
+		{"v4 too short", validV4[:10], true},
+		{"v4 wrong version", func() []byte { d := append([]byte(nil), validV4...); d[0] = 0x60; return d }(), true},
+		{"v4 wrong protocol", func() []byte { d := append([]byte(nil), validV4...); d[9] = 6; return d }(), true},
+		{"v4 ihl beyond quote", func() []byte { d := append([]byte(nil), validV4...); d[0] = 0x4f; return d }(), true},
+		{"v4 non-echo icmp", func() []byte { d := append([]byte(nil), validV4...); d[20] = 3; return d }(), true},
+		{"v6 too short", make([]byte, 30), false},
+		{"v6 wrong version", func() []byte { d := make([]byte, 48); d[0] = 0x40; return d }(), false},
+		{"v6 wrong next header", func() []byte { d := make([]byte, 48); d[0] = 0x60; d[6] = 6; return d }(), false},
+		{"v6 non-echo icmp", func() []byte {
+			h := make([]byte, 40)
+			h[0] = 0x60
+			h[6] = 58
+			return append(h, 1, 0, 0, 0, 0, 1, 0, 2)
+		}(), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, ok := quotedEchoIDSeq(tc.data, tc.isIPv4); ok {
+				t.Fatal("malformed quote parsed successfully")
+			}
+		})
+	}
+
+	// Well-formed quotes extract the embedded id and seq.
+	if id, seq, ok := quotedEchoIDSeq(validV4, true); !ok || id != 0x1234 || seq != 0xabcd {
+		t.Fatalf("v4 quote = (%x, %x, %v), want (1234, abcd, true)", id, seq, ok)
+	}
+	v6req, err := (&icmp.Message{
+		Type: ipv6.ICMPTypeEchoRequest,
+		Body: &icmp.Echo{ID: 0x55, Seq: 0x66, Data: []byte("x")},
+	}).Marshal(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, seq, ok := quotedEchoIDSeq(tpTQuotedDatagram(t, false, v6req, 0), false); !ok || id != 0x55 || seq != 0x66 {
+		t.Fatalf("v6 quote = (%x, %x, %v), want (55, 66, true)", id, seq, ok)
 	}
 }

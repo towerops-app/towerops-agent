@@ -95,6 +95,19 @@ The legacy unprefixed variables `LOG_LEVEL`, `LOG_FORMAT`, `TRAP_ENABLED`,
 file instead of the environment and is preferred over `--token`, which is
 visible in the process table and warns on startup.
 
+`--forget-host-key <ip:port>` has no environment variable and may be repeated.
+It removes the `ssh:` and `tls:` trust-on-first-use entries (and any legacy
+un-namespaced entry) for that address from the `--host-keys-file` store and
+exits; no `--api-url` or `--token` is required. Use it after a RouterOS
+reinstall, certificate regeneration, or hardware swap instead of editing
+`known_hosts.json` by hand — the next job re-pins whatever the device
+presents, so run it only when the change is expected. In the published image:
+
+```console
+docker run --rm -v towerops-agent-data:/data --entrypoint /usr/local/bin/towerops-agent \
+  ghcr.io/towerops-app/towerops-agent:latest --forget-host-key 192.0.2.10:22
+```
+
 ## Architecture
 
 ```
@@ -240,7 +253,10 @@ the published image, `/data` must be mounted persistently and the path should
 be `/data/known_hosts.json`.
 
 **SSH or MikroTik TLS connections refused.** The host key or certificate
-changed since it was pinned.
+changed since it was pinned — a RouterOS reinstall, regenerated API-SSL
+certificate, or hardware swap all look like a MITM to the TOFU store. When the
+change is expected, remove the stale pin with `--forget-host-key <ip:port>`
+(repeatable; see [Configuration](#configuration)) so the next job can re-pin.
 
 **ICMP checks failing.** Standard Docker already grants `NET_RAW`, and the
 image binary carries `cap_net_raw+ep`. Under a hardened runtime that drops the
@@ -274,8 +290,9 @@ addresses are still recorded against the organization.
   interception after first contact but not against an attacker present on
   the very first connection — perform the first poll or backup on a trusted
   network, or pre-seed `known_hosts.json` with the device's fingerprint. A
-  rejected connection logs `TOFU`; remove the stored entry (or delete the
-  file) to re-pin a legitimately reinstalled device.
+  rejected connection logs `TOFU`; run the agent with
+  `--forget-host-key <ip:port>` to drop the stored entry and re-pin a
+  legitimately reinstalled or replaced device.
 - Reporting a vulnerability: [SECURITY.md](SECURITY.md).
 
 ## License

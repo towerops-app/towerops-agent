@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -88,6 +89,91 @@ func TestTokenBucketWaitHonoursCancellation(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("cancelled wait did not return")
+	}
+}
+
+// A cancelled wait must refund its reservation so a session teardown with
+// many blocked requests does not leave debt that stalls the next session.
+func TestTokenBucketWaitRefundsOnCancel(t *testing.T) {
+	current := time.Now()
+	b := newTokenBucket(1, func() time.Time { return current }) // 1 token/s
+
+	// Consume the burst token, then cancel the second wait while it sleeps
+	// off ~1s of debt. Without a refund the reservation stays on the bucket.
+	if !b.wait(context.Background()) {
+		t.Fatal("first wait failed inside the burst")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan bool, 1)
+	go func() { done <- b.wait(ctx) }()
+	cancel()
+	if ok := <-done; ok {
+		t.Fatal("wait succeeded after cancellation")
+	}
+
+	// The refunded bucket holds 0 tokens: one more reserve owes one interval,
+	// not the cancelled reservation's debt on top.
+	if d := b.reserve(); d != time.Second {
+		t.Fatalf("reserve after cancelled wait waited %v, want 1s — the reservation was not refunded", d)
+	}
+	if b.tokens != -1 {
+		t.Fatalf("tokens = %v, want -1 after the refund plus one reserve", b.tokens)
+	}
+}
+
+// waitDebt must block only while the balance is negative and must not consume
+// a token, so a paced walk does not charge the limiter twice per request.
+func TestTokenBucketWaitDebt(t *testing.T) {
+	b := newTokenBucket(100, nil) // burst of 10, then 10ms per token
+
+	// No debt: returns immediately, even on a cancelled context.
+	if !b.waitDebt(context.Background()) {
+		t.Fatal("waitDebt failed with no debt")
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if b.waitDebt(cancelled) {
+		t.Fatal("waitDebt ignored a cancelled context")
+	}
+
+	// Push the balance negative like OnSent charge does: waitDebt must sleep
+	// off roughly one token interval before returning.
+	for range 11 {
+		b.charge()
+	}
+	start := time.Now()
+	if !b.waitDebt(context.Background()) {
+		t.Fatal("waitDebt failed with outstanding debt")
+	}
+	if elapsed := time.Since(start); elapsed < 5*time.Millisecond {
+		t.Fatalf("waitDebt returned after %v, want ~10ms of debt repayment", elapsed)
+	}
+
+	// waitDebt must not consume a token: the refiller repaid the debt, so the
+	// balance is non-negative — a consumed token would leave it at -1.
+	b.mu.Lock()
+	tokens := b.tokens
+	b.mu.Unlock()
+	if tokens < 0 {
+		t.Fatalf("tokens = %v after waitDebt, want >= 0 — it consumed a token", tokens)
+	}
+}
+
+func TestTokenBucketWaitDebtCancelled(t *testing.T) {
+	b := newTokenBucket(1, nil)
+	b.charge() // burst goes negative: real debt to wait out
+	b.charge()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan bool, 1)
+	go func() { done <- b.waitDebt(ctx) }()
+	cancel()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("waitDebt succeeded after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled waitDebt did not return")
 	}
 }
 
@@ -214,16 +300,22 @@ func TestRateLimitedQuerier(t *testing.T) {
 	if _, err := q.Get([]string{"1.3.6.1"}); err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if _, err := q.WalkAll("1.3.6.1"); err != nil {
+	results, err := q.WalkAll("1.3.6.1")
+	if err != nil {
 		t.Fatalf("WalkAll: %v", err)
 	}
-	if !mock.walkAllCalled {
+	// WalkAll collects PDUs through the paced Walk path, so the delegate
+	// records a Walk root rather than a WalkAll call.
+	if len(mock.walkRoots) != 1 {
 		t.Fatal("WalkAll did not delegate")
 	}
-	if _, err := q.BulkWalkAll("1.3.6.1"); err != nil {
-		t.Fatalf("BulkWalkAll: %v", err)
+	if len(results) != 1 || results[0].Name != "1.3.6.1.1" {
+		t.Fatalf("WalkAll collected %v, want the walk's PDU", results)
 	}
-	if !mock.bulkWalkCalled {
+	if results, err := q.BulkWalkAll("1.3.6.1"); err != nil || len(results) != 1 {
+		t.Fatalf("BulkWalkAll = %v, %v; want one collected PDU", results, err)
+	}
+	if len(mock.bulkWalkRoots) != 1 {
 		t.Fatal("BulkWalkAll did not delegate")
 	}
 	var walked []gosnmp.SnmpPDU
@@ -239,7 +331,9 @@ func TestRateLimitedQuerier(t *testing.T) {
 	if err := q.BulkWalk("1.3.6.1", func(p gosnmp.SnmpPDU) error { return nil }); err != nil {
 		t.Fatalf("BulkWalk: %v", err)
 	}
-	if len(mock.bulkWalkRoots) != 1 {
+	// One root from BulkWalkAll routing through BulkWalk, plus the direct
+	// BulkWalk call above.
+	if len(mock.bulkWalkRoots) != 2 {
 		t.Fatal("BulkWalk did not delegate")
 	}
 }
@@ -280,5 +374,73 @@ func TestRateLimitedQuerierCancelledContext(t *testing.T) {
 	}
 	if delegated {
 		t.Fatal("querier delegated to the device despite cancellation")
+	}
+}
+
+// A walk must repay the OnSent debt between requests instead of dumping
+// every GETNEXT/GETBULK back-to-back. The mock charges the bucket per PDU
+// the way gosnmp's OnSent does per packet, so five PDUs at 100/s must take
+// roughly five token intervals (50ms); without pacing it returns instantly.
+func TestRateLimitedQuerierPacesWalks(t *testing.T) {
+	t.Cleanup(func() { setSNMPPDURate(defaultSNMPPDURate) })
+	setSNMPPDURate(100) // burst of 10, then 10ms per token
+
+	// Drop the burst so every step of the walk runs under debt.
+	snmpPDUs.mu.Lock()
+	snmpPDUs.tokens = 0
+	snmpPDUs.last = snmpPDUs.now()
+	snmpPDUs.mu.Unlock()
+
+	const pdus = 5
+	mock := &mockSnmpQuerier{
+		walkStepFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
+			out := make([]gosnmp.SnmpPDU, pdus)
+			for i := range out {
+				out[i].Name = fmt.Sprintf("%s.%d", rootOid, i+1)
+			}
+			return out, nil
+		},
+		onWalkPDU: func() { snmpPDUs.charge() },
+	}
+	q := &rateLimitedQuerier{ctx: context.Background(), q: mock}
+
+	start := time.Now()
+	results, err := q.WalkAll("1.3.6.1")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("WalkAll: %v", err)
+	}
+	if len(results) != pdus {
+		t.Fatalf("WalkAll collected %d PDUs, want %d", len(results), pdus)
+	}
+	// Each paced step sleeps until the last send's token is repaid (~10ms at
+	// 100/s); unpaced sends finish in microseconds.
+	if elapsed < 40*time.Millisecond {
+		t.Fatalf("walk of %d PDUs finished in %v; the limiter did not pace the requests", pdus, elapsed)
+	}
+}
+
+// pacedWalkFn must surface a walkFn error without touching the bucket, and a
+// cancelled ctx while repaying debt must end the walk.
+func TestPacedWalkFnErrorAndCancel(t *testing.T) {
+	t.Cleanup(func() { setSNMPPDURate(defaultSNMPPDURate) })
+
+	mock := &mockSnmpQuerier{}
+	q := &rateLimitedQuerier{ctx: context.Background(), q: mock}
+	paced := q.pacedWalkFn(func(gosnmp.SnmpPDU) error { return errors.New("walkFn failed") })
+	if err := paced(gosnmp.SnmpPDU{}); err == nil || err.Error() != "walkFn failed" {
+		t.Fatalf("pacedWalkFn = %v, want walkFn error", err)
+	}
+
+	// With debt outstanding and a cancelled ctx, the wrapped fn returns the
+	// ctx error instead of nil.
+	setSNMPPDURate(1)
+	snmpPDUs.charge()
+	ctx, cancel := context.WithCancel(context.Background())
+	q.ctx = ctx
+	paced = q.pacedWalkFn(func(gosnmp.SnmpPDU) error { return nil })
+	cancel()
+	if err := paced(gosnmp.SnmpPDU{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pacedWalkFn = %v, want context.Canceled", err)
 	}
 }

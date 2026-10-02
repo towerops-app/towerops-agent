@@ -195,14 +195,16 @@ func TestHandleMessage(t *testing.T) {
 		out := testQueue()
 		pools := testPools(t)
 		recurring := makeJobPayload(&pb.AgentJob{
-			JobId:           "poll:device-1",
-			JobType:         pb.JobType_POLL,
-			SnmpDevice:      &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
-			IntervalSeconds: 60,
+			JobId:      "poll:device-1",
+			JobType:    pb.JobType_POLL,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+			// A 1s interval keeps the deterministic first-tick offset
+			// (hash of the job ID mod interval) under the wait below.
+			IntervalSeconds: 1,
 		})
 
 		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "jobs", Payload: recurring}, "agent:test", pools, out)
-		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
+		_ = wantResult[*pb.SnmpResult](t, out, "result", 2*time.Second)
 		if _, ok := pools.scheduler.jobs["poll:device-1"]; !ok {
 			t.Fatal("recurring poll was not retained")
 		}
@@ -452,7 +454,9 @@ func TestHandleMessage(t *testing.T) {
 
 	t.Run("check_jobs valid", func(t *testing.T) {
 		checkList := &pb.CheckList{Checks: []*pb.Check{
-			{Id: "c1", CheckType: "tcp", IntervalSeconds: 60, TimeoutMs: 1000,
+			// A 1s interval keeps the deterministic first-tick offset
+			// (hash of the check ID mod interval) under the wait below.
+			{Id: "c1", CheckType: "tcp", IntervalSeconds: 1, TimeoutMs: 1000,
 				Config: &pb.Check_Tcp{Tcp: &pb.TcpCheckConfig{Host: "127.0.0.1", Port: 1}}},
 		}}
 		bin, _ := proto.Marshal(checkList)
@@ -460,7 +464,7 @@ func TestHandleMessage(t *testing.T) {
 
 		out := testQueue()
 		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "check_jobs", Payload: payload}, "agent:test", testPools(t), out)
-		_ = wantResult[*pb.CheckResult](t, out, "check_result", time.Second)
+		_ = wantResult[*pb.CheckResult](t, out, "check_result", 2*time.Second)
 	})
 
 	t.Run("explicit legacy check scheduling runs inventories once without retention", func(t *testing.T) {
@@ -3189,30 +3193,38 @@ func TestSessionLoopRetainsRetryWhenWriterQueueStalls(t *testing.T) {
 	}
 }
 
-func TestSendResultMsgReportsWriterFailure(t *testing.T) {
+func TestQueueResultWriteReportsWriterFailure(t *testing.T) {
 	sessionCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	writeCh := make(chan writeRequest)
 	wantErr := errors.New("broken pipe")
-	go func() {
-		request := <-writeCh
-		request.ack <- wantErr
-	}()
 	s := &session{
 		ctx:        sessionCtx,
 		cancel:     cancel,
 		writeCh:    writeCh,
 		errCh:      make(chan error, 1),
 		writeErrCh: make(chan error, 1),
+		results:    newResultQueue(1),
 	}
 
-	err := s.sendResultMsg(outbound{event: "result", payload: json.RawMessage(`{}`)})
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("sendResultMsg error = %v, want %v", err, wantErr)
+	go func() {
+		request := <-writeCh
+		request.ack <- wantErr
+	}()
+	w, err := s.queueResultWrite(outbound{event: "result", payload: json.RawMessage(`{}`)}, true)
+	if err != nil {
+		t.Fatalf("queueResultWrite error = %v", err)
+	}
+	if err := s.resolveInFlight(w, <-w.ack); !errors.Is(err, wantErr) {
+		t.Fatalf("resolveInFlight error = %v, want %v", err, wantErr)
+	}
+	// The failed spooled result is retained for the next session.
+	if retried, ok := s.results.takeRetry(); !ok || retried.event != "result" {
+		t.Fatal("failed write did not requeue the spooled result")
 	}
 }
 
-func TestSendResultMsgObservesSessionCancellation(t *testing.T) {
+func TestQueueResultWriteObservesSessionCancellation(t *testing.T) {
 	t.Run("before writer accepts request", func(t *testing.T) {
 		sessionCtx, cancel := context.WithCancel(context.Background())
 		cancel()
@@ -3224,74 +3236,46 @@ func TestSendResultMsgObservesSessionCancellation(t *testing.T) {
 			writeErrCh: make(chan error, 1),
 		}
 
-		if err := s.sendResultMsg(outbound{event: "result", payload: json.RawMessage(`{}`)}); !errors.Is(err, errSessionCancelled) {
-			t.Fatalf("sendResultMsg error = %v, want %v", err, errSessionCancelled)
-		}
-	})
-
-	t.Run("while writer owns request", func(t *testing.T) {
-		sessionCtx, cancel := context.WithCancel(context.Background())
-		writeCh := make(chan writeRequest)
-		go func() {
-			<-writeCh
-			cancel()
-		}()
-		s := &session{
-			ctx:        sessionCtx,
-			cancel:     cancel,
-			writeCh:    writeCh,
-			errCh:      make(chan error, 1),
-			writeErrCh: make(chan error, 1),
-		}
-
-		if err := s.sendResultMsg(outbound{event: "result", payload: json.RawMessage(`{}`)}); !errors.Is(err, errSessionCancelled) {
-			t.Fatalf("sendResultMsg error = %v, want %v", err, errSessionCancelled)
+		w, err := s.queueResultWrite(outbound{event: "result", payload: json.RawMessage(`{}`)}, true)
+		if w != nil || !errors.Is(err, errSessionCancelled) {
+			t.Fatalf("queueResultWrite = (%v, %v), want (nil, %v)", w, err, errSessionCancelled)
 		}
 	})
 }
 
-func TestCompletedResultWriteDrainsAcknowledgment(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		ack := make(chan error, 1)
-		ack <- nil
-		if ok, err := completedResultWrite("result", ack); !ok || err != nil {
-			t.Fatalf("completedResultWrite = (%t, %v), want (true, nil)", ok, err)
-		}
-	})
-
-	t.Run("write failure", func(t *testing.T) {
-		wantErr := errors.New("broken pipe")
-		ack := make(chan error, 1)
-		ack <- wantErr
-		ok, err := completedResultWrite("result", ack)
-		if !ok || !errors.Is(err, wantErr) {
-			t.Fatalf("completedResultWrite = (%t, %v), want true with wrapped error", ok, err)
-		}
-	})
-
-	t.Run("pending", func(t *testing.T) {
-		if ok, err := completedResultWrite("result", make(chan error)); ok || err != nil {
-			t.Fatalf("completedResultWrite = (%t, %v), want (false, nil)", ok, err)
-		}
-	})
-}
-
-func TestResultWriteAfterCancellationPrefersAcknowledgment(t *testing.T) {
+func TestSettleInFlightPrefersCompletedWrite(t *testing.T) {
+	results := newResultQueue(1)
+	if !results.enqueue(outbound{event: "result", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("failed to seed result queue")
+	}
+	result := <-results.items
 	s := &session{
 		errCh:      make(chan error, 1),
 		writeErrCh: make(chan error, 1),
+		results:    results,
 	}
 
+	// A write that completed before cancellation frees its spool slot.
 	ack := make(chan error, 1)
 	ack <- nil
-	if err := s.resultWriteAfterCancellation("result", ack); err != nil {
-		t.Fatalf("completed write lost to cancellation: %v", err)
+	s.settleInFlight(&inFlightWrite{result: result, ack: ack, spooled: true})
+	if len(results.slots) != 0 {
+		t.Fatal("completed write did not release the spool slot")
 	}
 
-	readErr := errors.New("connection reset")
-	s.errCh <- readErr
-	if err := s.resultWriteAfterCancellation("result", make(chan error)); !errors.Is(err, readErr) {
-		t.Fatalf("pending write cancellation error = %v, want %v", err, readErr)
+	// A write still pending at teardown is requeued for the next session.
+	result2 := outbound{event: "pending", payload: json.RawMessage(`{}`)}
+	results.enqueue(result2)
+	<-results.items
+	s.settleInFlight(&inFlightWrite{result: result2, ack: make(chan error), spooled: true})
+	if retried, ok := results.takeRetry(); !ok || retried.event != "pending" {
+		t.Fatal("pending write was not requeued")
+	}
+
+	// Notices hold no slot: a pending notice write is dropped, not requeued.
+	s.settleInFlight(&inFlightWrite{result: outbound{event: "notice"}, ack: make(chan error), spooled: false})
+	if _, ok := results.takeRetry(); ok {
+		t.Fatal("notice write must not be requeued into the result spool")
 	}
 }
 
@@ -4670,8 +4654,9 @@ func TestHandleResultReplyIgnoresUnrelatedReplies(t *testing.T) {
 	}
 }
 
-// TestPrunePendingDropsStaleEntries covers the TTL sweep: a pending result
-// older than pendingReplyTTL is dropped when the next result is tracked.
+// TestPrunePendingDropsStaleEntries covers the TTL sweep: the heartbeat-tick
+// prune drops a pending result older than pendingReplyTTL while leaving a
+// fresh entry in place.
 func TestPrunePendingDropsStaleEntries(t *testing.T) {
 	s := &session{pending: map[string]pendingResult{}}
 	s.pending["stale"] = pendingResult{
@@ -4679,6 +4664,10 @@ func TestPrunePendingDropsStaleEntries(t *testing.T) {
 		sentAt: time.Now().Add(-2 * pendingReplyTTL),
 	}
 	s.trackPending("fresh", outbound{event: "result"})
+
+	// Tracking alone no longer prunes: the sweep runs on the channel
+	// heartbeat tick, exercised directly here.
+	s.prunePending()
 
 	if _, ok := s.pending["stale"]; ok {
 		t.Fatal("stale pending entry survived the prune")
@@ -4836,6 +4825,110 @@ func TestHandleResultReplyDropsOversizedResult(t *testing.T) {
 	}
 }
 
+func TestDrainResults(t *testing.T) {
+	newDrainableSession := func(t *testing.T, results *resultQueue) *session {
+		t.Helper()
+		pools := testPools(t)
+		s := &session{
+			results:   results,
+			pools:     pools,
+			scheduler: pools.scheduler,
+		}
+		return s
+	}
+
+	t.Run("empty spool drains immediately and stops acceptance", func(t *testing.T) {
+		s := newDrainableSession(t, newResultQueue(4))
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if !s.drainResults(ctx) {
+			t.Fatal("empty spool did not drain")
+		}
+		if !s.pools.stopAccepting.Load() {
+			t.Fatal("drain did not stop job acceptance")
+		}
+	})
+
+	t.Run("returns true once queued and in-flight results release slots", func(t *testing.T) {
+		results := newResultQueue(4)
+		s := newDrainableSession(t, results)
+
+		if !results.enqueue(outbound{event: "result"}) {
+			t.Fatal("enqueue failed")
+		}
+		// Simulate an in-flight send: dequeued but not yet acked.
+		inFlight := <-results.items
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		done := make(chan bool, 1)
+		go func() { done <- s.drainResults(ctx) }()
+
+		// Delivered: the write ack releases the slot, and the drain sees it.
+		results.ack(inFlight)
+
+		select {
+		case drained := <-done:
+			if !drained {
+				t.Fatal("drain returned false after slots freed")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("drain did not observe freed slots")
+		}
+	})
+
+	t.Run("returns false when the context expires with slots held", func(t *testing.T) {
+		results := newResultQueue(4)
+		s := newDrainableSession(t, results)
+
+		if !results.enqueue(outbound{event: "result"}) {
+			t.Fatal("enqueue failed")
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		if s.drainResults(ctx) {
+			t.Fatal("drain reported success with an undelivered result")
+		}
+	})
+}
+
+func TestHandleMessageRefusesJobsDuringDrain(t *testing.T) {
+	for _, event := range []string{"jobs", "check_jobs", "discovery_job", "backup_job"} {
+		t.Run(event, func(t *testing.T) {
+			pools := testPools(t)
+			pools.stopAccepting.Store(true)
+			out := testQueue()
+
+			var payload json.RawMessage
+			if event == "check_jobs" {
+				list := &pb.CheckList{Checks: []*pb.Check{{Id: "c1", CheckType: "tcp"}}}
+				bin, _ := proto.Marshal(list)
+				payload, _ = json.Marshal(map[string]string{
+					"binary": base64.StdEncoding.EncodeToString(bin),
+				})
+			} else {
+				payload = makeJobPayload(&pb.AgentJob{
+					JobId:           "poll:device-1",
+					JobType:         pb.JobType_POLL,
+					IntervalSeconds: 60,
+				})
+			}
+
+			end, err := handleMessage(context.Background(),
+				channelMsg{Topic: "agent:test", Event: event, Payload: payload},
+				"agent:test", pools, out)
+			if end || err != nil {
+				t.Fatalf("handleMessage = (%v, %v), want (false, nil)", end, err)
+			}
+			if len(pools.scheduler.jobs) != 0 || len(pools.scheduler.checks) != 0 {
+				t.Fatal("draining session retained scheduled work")
+			}
+		})
+	}
+}
+
 func TestLocalVantagePoint(t *testing.T) {
 	upIface := net.Interface{Name: "eth0", Flags: net.FlagUp}
 	downIface := net.Interface{Name: "eth1", Flags: 0}
@@ -4908,4 +5001,221 @@ func TestLocalVantagePoint(t *testing.T) {
 			t.Fatalf("localVantagePoint = (%v, %v), want empty", localIPs, subnets)
 		}
 	})
+}
+
+func TestSendBinaryEnqueueFailure(t *testing.T) {
+	origTimeout := writeQueueTimeout
+	t.Cleanup(func() { writeQueueTimeout = origTimeout })
+	writeQueueTimeout = 5 * time.Millisecond
+
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writeCh := make(chan writeRequest, 1)
+	writeCh <- writeRequest{data: []byte("writer is stalled")}
+	s := &session{
+		ctx:        sessionCtx,
+		topic:      "agent:test",
+		cancel:     cancel,
+		writeCh:    writeCh,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+	}
+
+	if s.sendBinary("heartbeat", &pb.AgentHeartbeat{Hostname: "h"}) {
+		t.Fatal("sendBinary succeeded on a stalled writer queue")
+	}
+}
+
+func TestSessionLoopReturnsOnInFlightWriteError(t *testing.T) {
+	results := newResultQueue(2)
+	if !results.enqueue(outbound{event: "result", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("failed to seed result queue")
+	}
+	writeCh := make(chan writeRequest)
+	writeErr := errors.New("broken pipe")
+	go func() {
+		request := <-writeCh
+		request.ack <- writeErr
+	}()
+
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     cancel,
+		writeCh:    writeCh,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		results:    results,
+	}
+
+	err := s.loop(context.Background())
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("session loop error = %v, want %v", err, writeErr)
+	}
+	retried, ok := results.takeRetry()
+	if !ok || retried.event != "result" {
+		t.Fatal("failed in-flight write was not requeued")
+	}
+}
+
+func TestSessionLoopServicesInboundDuringInFlightWrite(t *testing.T) {
+	// The write ack arrives only after the loop has already consumed an
+	// inbound message: a blocked await would deadlock this test.
+	results := newResultQueue(2)
+	if !results.enqueue(outbound{event: "result", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("failed to seed result queue")
+	}
+	writeCh := make(chan writeRequest, 1)
+	msgCh := make(chan []byte, 1)
+	reply, _ := json.Marshal(channelMsg{
+		Topic:   "phoenix",
+		Event:   "heartbeat",
+		Payload: json.RawMessage(`{}`),
+	})
+
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	agentCtx, stopAgent := context.WithCancel(context.Background())
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     cancel,
+		writeCh:    writeCh,
+		msgCh:      msgCh,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		results:    results,
+		notices:    make(chan outbound, 1),
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.loop(agentCtx) }()
+
+	request := <-writeCh // result is now in flight
+	msgCh <- reply       // must be processed before the ack lands
+	// Wait until the inbound frame has been consumed; only then ack.
+	deadline := time.After(2 * time.Second)
+	for len(msgCh) > 0 {
+		select {
+		case <-deadline:
+			t.Fatal("loop did not service msgCh while a write was in flight")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	request.ack <- nil
+
+	stopAgent()
+	if err := <-done; err != nil {
+		t.Fatalf("session loop returned %v after agent shutdown", err)
+	}
+	if len(results.slots) != 0 {
+		t.Fatal("completed in-flight write did not release its slot")
+	}
+}
+
+func TestSubmitJobDispatchSaturated(t *testing.T) {
+	notices := make(chan outbound, 4)
+	pools := &jobPools{
+		ping:    newWorkerPool(1),
+		notices: notices,
+		targets: &targetGates{},
+	}
+	t.Cleanup(func() { pools.ping.stop() })
+	// Fill the ping dispatch semaphore so the next one-shot job is rejected
+	// instead of spawning an unbounded coordinator.
+	for range cap(pools.ping.dispatch) {
+		if !pools.ping.acquireDispatch() {
+			t.Fatal("dispatch slot unexpectedly unavailable")
+		}
+	}
+	defer func() {
+		for range cap(pools.ping.dispatch) {
+			pools.ping.releaseDispatch()
+		}
+	}()
+
+	job := &pb.AgentJob{
+		JobId:      "j-saturated",
+		JobType:    pb.JobType_PING,
+		SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1"},
+		DeviceId:   "dev-sat",
+	}
+	done := make(chan struct{})
+	if submitJob(context.Background(), job, pools, testQueue(), func() { close(done) }, false) {
+		t.Fatal("saturated dispatch accepted a job")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("rejected dispatch did not run done")
+	}
+	select {
+	case notice := <-notices:
+		var errMsg pb.AgentError
+		agtDecodeBinary(t, notice.payload, &errMsg)
+		if errMsg.JobId != "j-saturated" {
+			t.Fatalf("notice job id = %q, want j-saturated", errMsg.JobId)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no AGENT_BUSY notice for saturated dispatch")
+	}
+}
+
+func TestSubmitConfigBackupDispatchSaturated(t *testing.T) {
+	pools := &jobPools{
+		backup:  newWorkerPool(1),
+		notices: make(chan outbound, 4),
+		targets: &targetGates{},
+	}
+	t.Cleanup(func() { pools.backup.stop() })
+	for range cap(pools.backup.dispatch) {
+		if !pools.backup.acquireDispatch() {
+			t.Fatal("backup dispatch slot unexpectedly unavailable")
+		}
+	}
+	defer func() {
+		for range cap(pools.backup.dispatch) {
+			pools.backup.releaseDispatch()
+		}
+	}()
+
+	out := testQueue()
+	done := make(chan struct{})
+	job := &pb.AgentJob{
+		JobId:    "cb-saturated",
+		JobType:  pb.JobType_CONFIG_BACKUP,
+		DeviceId: "dev-sat",
+		ConfigBackup: &pb.ConfigBackupJob{
+			Host:     "192.0.2.1",
+			Username: "u",
+			Password: "p",
+		},
+	}
+	if submitConfigBackupJob(context.Background(), job, pools, out, func() { close(done) }, false) {
+		t.Fatal("saturated backup dispatch accepted a job")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("rejected backup dispatch did not run done")
+	}
+	result := wantResult[*pb.ConfigBackupResult](t, out, "config_backup_result", time.Second)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_AGENT_BUSY {
+		t.Fatalf("error code = %v, want AGENT_BUSY", result.ErrorCode)
+	}
+}
+
+func TestSubmitCheckRefusedDuringDrain(t *testing.T) {
+	pools := testPools(t)
+	pools.stopAccepting.Store(true)
+	done := make(chan struct{})
+	ok := submitCheck(context.Background(), &pb.Check{Id: "c1"}, pools, testQueue(), func() { close(done) }, false)
+	if ok {
+		t.Fatal("check submission accepted during drain")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("refused check did not run done")
+	}
 }
