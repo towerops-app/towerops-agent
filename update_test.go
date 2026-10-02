@@ -520,6 +520,12 @@ func TestSanitizeArgs(t *testing.T) {
 		{"trailing flag no value", []string{"agent", "--token"}, []string{"agent", "--token"}},
 		{"short flag with value", []string{"agent", "-token", "secret"}, []string{"agent", "-token", "***"}},
 		{"short equals syntax", []string{"agent", "-token=secret"}, []string{"agent", "-token=***"}},
+		{"trap community separate value", []string{"agent", "--trap-community", "public"}, []string{"agent", "--trap-community", "***"}},
+		{"trap community equals", []string{"agent", "--trap-community=public"}, []string{"agent", "--trap-community=***"}},
+		{"trap community trailing no value", []string{"agent", "--trap-community"}, []string{"agent", "--trap-community"}},
+		{"trap community single dash", []string{"agent", "-trap-community", "public"}, []string{"agent", "-trap-community", "***"}},
+		{"token flag prefix does not leak", []string{"agent", "--tokenized=secret"}, []string{"agent", "--tokenized=secret"}},
+		{"both secrets masked", []string{"agent", "--token", "a", "--trap-community", "b"}, []string{"agent", "--token", "***", "--trap-community", "***"}},
 	}
 
 	for _, tt := range tests {
@@ -592,6 +598,116 @@ func TestSelfUpdateFullHappyPath(t *testing.T) {
 	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
 	if err != nil {
 		t.Errorf("expected nil error on full happy path, got: %v", err)
+	}
+}
+
+func TestSelfUpdateDrainsSpoolBeforeExec(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	body := []byte("binary payload for drain test")
+	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	origDo := httpDo
+	origExe := osExecutable
+	origRename := osRename
+	origExec := syscallExec
+	defer func() {
+		httpDo = origDo
+		osExecutable = origExe
+		osRename = origRename
+		syscallExec = origExec
+		drainResultSpool.Store(nil)
+	}()
+	httpDo = srv.Client().Do
+
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, "test-agent")
+	osExecutable = func() (string, error) { return exePath, nil }
+	osRename = os.Rename
+
+	var drainCalled, execCalled bool
+	var sawDeadline bool
+	drain := func(ctx context.Context) bool {
+		drainCalled = true
+		deadline, ok := ctx.Deadline()
+		sawDeadline = ok && time.Until(deadline) <= spoolDrainTimeout
+		return true
+	}
+	drainResultSpool.Store(&drain)
+	syscallExec = func(argv0 string, argv []string, envv []string) error {
+		execCalled = true
+		if !drainCalled {
+			t.Error("re-exec ran before the spool drain")
+		}
+		return nil
+	}
+
+	if err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum); err != nil {
+		t.Fatalf("selfUpdateContext: %v", err)
+	}
+	if !drainCalled {
+		t.Error("drain hook never ran")
+	}
+	if !sawDeadline {
+		t.Error("drain hook context had no bounded deadline")
+	}
+	if !execCalled {
+		t.Error("re-exec never ran")
+	}
+}
+
+func TestSelfUpdateExecsWhenDrainStalls(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	body := []byte("binary payload for stalled drain test")
+	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	origDo := httpDo
+	origExe := osExecutable
+	origRename := osRename
+	origExec := syscallExec
+	origTimeout := spoolDrainTimeout
+	defer func() {
+		httpDo = origDo
+		osExecutable = origExe
+		osRename = origRename
+		syscallExec = origExec
+		spoolDrainTimeout = origTimeout
+		drainResultSpool.Store(nil)
+	}()
+	httpDo = srv.Client().Do
+	spoolDrainTimeout = 20 * time.Millisecond
+
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, "test-agent")
+	osExecutable = func() (string, error) { return exePath, nil }
+	osRename = os.Rename
+
+	drain := func(ctx context.Context) bool {
+		<-ctx.Done()
+		return false
+	}
+	drainResultSpool.Store(&drain)
+
+	var execCalled bool
+	syscallExec = func(argv0 string, argv []string, envv []string) error {
+		execCalled = true
+		return nil
+	}
+
+	if err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum); err != nil {
+		t.Fatalf("selfUpdateContext: %v", err)
+	}
+	if !execCalled {
+		t.Error("re-exec never ran after the drain timed out")
 	}
 }
 
@@ -1039,19 +1155,20 @@ func TestPropCliSanitizeArgs(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		others := filler.Draw(t, "others")
 		secret := "s3cr3t" + secretTail.Draw(t, "secret")
+		flag := rapid.SampledFrom([]string{"token", "trap-community"}).Draw(t, "flag")
 		form := rapid.IntRange(0, 3).Draw(t, "form")
 		pos := rapid.IntRange(0, len(others)).Draw(t, "pos")
 
 		var injected []string
 		switch form {
 		case 0:
-			injected = []string{"--token", secret}
+			injected = []string{"--" + flag, secret}
 		case 1:
-			injected = []string{"-token", secret}
+			injected = []string{"-" + flag, secret}
 		case 2:
-			injected = []string{"--token=" + secret}
+			injected = []string{"--" + flag + "=" + secret}
 		case 3:
-			injected = []string{"-token=" + secret}
+			injected = []string{"-" + flag + "=" + secret}
 		}
 
 		args := make([]string, 0, len(others)+len(injected))
@@ -1075,7 +1192,7 @@ func TestPropCliSanitizeArgs(t *testing.T) {
 			}
 		}
 		if out[pos] != injected[0] && out[pos] != strings.SplitN(injected[0], "=", 2)[0]+"=***" {
-			t.Fatalf("sanitizeArgs(%q) mangled the token flag: %q", before, out[pos])
+			t.Fatalf("sanitizeArgs(%q) mangled the secret flag: %q", before, out[pos])
 		}
 		if len(injected) == 2 && out[pos+1] != "***" {
 			t.Fatalf("sanitizeArgs(%q) token value = %q, want ***", before, out[pos+1])

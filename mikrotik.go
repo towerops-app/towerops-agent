@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -82,6 +84,10 @@ func mikrotikConnect(ctx context.Context, ip string, port uint32, username, pass
 	}
 
 	c := &mikrotikClient{conn: conn}
+	// Login sentences can stall for mikrotikReadTimeout each; closing the conn
+	// on ctx cancellation aborts a wedged login instead of pinning the worker.
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 
 	resp, err := c.execute("/login", map[string]string{"name": username, "password": password})
 	if err != nil {
@@ -130,10 +136,17 @@ func legacyMikrotikLoginResponse(password, challenge string) (string, error) {
 	return "00" + hex.EncodeToString(digest[:]), nil
 }
 
-// execute sends a command and reads the full response.
+// execute sends a command and reads the full response. Args are emitted in
+// sorted key order so the sentence is deterministic despite random map
+// iteration, except that "?#" query-stack operator keys (?#|, ?#!, ...) are
+// emitted after every other key: RouterOS applies an operator to the query
+// words already pushed, and "?#" sorts before every "?name". A map cannot
+// express arbitrary query order, so callers needing a specific sequence (e.g.
+// an operator between particular operands) must use cmd.Words instead.
 func (c *mikrotikClient) execute(command string, args map[string]string) (*mikrotikResponse, error) {
 	words := []string{command}
-	for k, v := range args {
+	for _, k := range sortedMikrotikArgKeys(args) {
+		v := args[k]
 		if strings.HasPrefix(k, "?") || strings.HasPrefix(k, ".") {
 			words = append(words, k+"="+v)
 		} else {
@@ -142,6 +155,26 @@ func (c *mikrotikClient) execute(command string, args map[string]string) (*mikro
 	}
 
 	return c.executeWords(words)
+}
+
+// sortedMikrotikArgKeys returns args' keys sorted, with "?#" query operator
+// keys moved after all other keys (still sorted among themselves) so they
+// follow the operands they combine.
+func sortedMikrotikArgKeys(args map[string]string) []string {
+	return slices.SortedFunc(maps.Keys(args), compareMikrotikArgKeys)
+}
+
+// compareMikrotikArgKeys orders "?#" operator keys after every other key and
+// sorts lexically within each group.
+func compareMikrotikArgKeys(a, b string) int {
+	aOp, bOp := strings.HasPrefix(a, "?#"), strings.HasPrefix(b, "?#")
+	if aOp != bOp {
+		if aOp {
+			return 1
+		}
+		return -1
+	}
+	return strings.Compare(a, b)
 }
 
 func (c *mikrotikClient) executeWords(words []string) (*mikrotikResponse, error) {
@@ -446,7 +479,12 @@ func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.
 		return
 	}
 
-	config, err := sshBackup(ctx, dev.Ip, uint16(dev.SshPort), dev.Username, dev.Password)
+	port := dev.SshPort
+	if port == 0 {
+		port = 22
+	}
+
+	config, err := sshBackup(ctx, dev.Ip, uint16(port), dev.Username, dev.Password)
 	if err != nil {
 		sendResult(ctx, out, "mikrotik_result", mikrotikError(
 			job,

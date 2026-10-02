@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -142,6 +143,10 @@ func TestClassifyConfigBackupError(t *testing.T) {
 		{"timeout", context.DeadlineExceeded, pb.ConfigBackupErrorCode_TIMEOUT, "deadline"},
 		{"auth", errors.New("ssh: handshake failed: ssh: unable to authenticate, attempted methods [none password]"),
 			pb.ConfigBackupErrorCode_AUTH_FAILED, "unable to authenticate"},
+		{"handshake EOF", errors.New("ssh: handshake failed: EOF"),
+			pb.ConfigBackupErrorCode_INTERNAL, "handshake failed"},
+		{"no common algorithm", errors.New("ssh: handshake failed: ssh: no common algorithm for key exchange"),
+			pb.ConfigBackupErrorCode_INTERNAL, "no common algorithm"},
 		{"refused", &net.OpError{Op: "dial", Err: errors.New("connect: connection refused")},
 			pb.ConfigBackupErrorCode_CONNECTION_REFUSED, "refused"},
 		{"unreachable", errors.New("dial tcp 10.0.0.1:22: i/o timeout"),
@@ -539,11 +544,192 @@ func TestFirstLineEdges(t *testing.T) {
 func TestSessionErrCode(t *testing.T) {
 	deadline, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
-	if got := sessionErrCode(deadline); got != pb.ConfigBackupErrorCode_TIMEOUT {
+	if got := sessionErrCode(deadline, io.EOF); got != pb.ConfigBackupErrorCode_TIMEOUT {
 		t.Errorf("deadline ctx = %v, want TIMEOUT", got)
 	}
-	if got := sessionErrCode(context.Background()); got != pb.ConfigBackupErrorCode_EXPORT_FAILED {
+	if got := sessionErrCode(context.Background(), io.EOF); got != pb.ConfigBackupErrorCode_EXPORT_FAILED {
 		t.Errorf("live ctx = %v, want EXPORT_FAILED", got)
+	}
+	if got := sessionErrCode(context.Background(), errConfigBackupTooLarge); got != pb.ConfigBackupErrorCode_TOO_LARGE {
+		t.Errorf("overflow err = %v, want TOO_LARGE", got)
+	}
+}
+
+func TestIsAuthFailure(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"unable to authenticate", errors.New("ssh: handshake failed: ssh: unable to authenticate, attempted methods [none password]"), true},
+		{"auth fail", errors.New("auth fail for user admin"), true},
+		{"permission denied", errors.New("permission denied (password)"), true},
+		{"handshake EOF", errors.New("ssh: handshake failed: EOF"), false},
+		{"no common algorithm", errors.New("ssh: handshake failed: ssh: no common algorithm for host key"), false},
+		{"kex error", errors.New("ssh: handshake failed: ssh: no common algorithm for key exchange"), false},
+		{"closed conn", errors.New("ssh: handshake failed: read tcp: use of closed network connection"), false},
+	}
+	for _, tc := range cases {
+		if got := isAuthFailure(tc.err); got != tc.want {
+			t.Errorf("%s: isAuthFailure = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestBoundedBuffer(t *testing.T) {
+	overflows := 0
+	buf := &boundedBuffer{limit: 8, onOverflow: func() { overflows++ }}
+
+	if n, err := buf.Write([]byte("hello")); n != 5 || err != nil {
+		t.Fatalf("first write = %d, %v; want 5, nil", n, err)
+	}
+	if got := string(buf.Bytes()); got != "hello" {
+		t.Fatalf("buf = %q, want %q", got, "hello")
+	}
+	if buf.overflow {
+		t.Fatal("overflow flagged before the limit")
+	}
+
+	// Crossing the limit keeps only the cap's worth of bytes, reports the
+	// full write to io.Copy, and fires onOverflow exactly once.
+	if n, err := buf.Write([]byte("abcdefgh")); n != 8 || err != nil {
+		t.Fatalf("crossing write = %d, %v; want 8, nil", n, err)
+	}
+	if got := string(buf.Bytes()); got != "helloabc" {
+		t.Fatalf("buf = %q, want %q", got, "helloabc")
+	}
+	if !buf.overflow || overflows != 1 {
+		t.Fatalf("overflow = %v, calls = %d; want true, 1", buf.overflow, overflows)
+	}
+
+	if n, err := buf.Write([]byte("more")); n != 4 || err != nil {
+		t.Fatalf("post-overflow write = %d, %v; want 4, nil", n, err)
+	}
+	if overflows != 1 || len(buf.Bytes()) != 8 {
+		t.Fatalf("post-overflow calls = %d, len = %d; want 1, 8", overflows, len(buf.Bytes()))
+	}
+}
+
+// TestRunConfigBackupSessionTooLarge streams more stdout than the caller's
+// cap and expects the sentinel plus a prompt return — the channel is closed
+// on overflow rather than read to the deadline.
+func TestRunConfigBackupSessionTooLarge(t *testing.T) {
+	resetHostKeyStore(t)
+	handler := func(ch ssh.Channel, _ string) {
+		chunk := bytes.Repeat([]byte("x"), 4096)
+		for range 64 { // 256 KiB > the 64-byte cap
+			if _, err := ch.Write(chunk); err != nil {
+				return
+			}
+		}
+		_ = ch.CloseWrite()
+		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+		_ = ch.Close()
+	}
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	client, _, err := configBackupDial(context.Background(), cbJob(host, port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	stdout, _, err := runConfigBackupSession(client, "flood", 64)
+	if !errors.Is(err, errConfigBackupTooLarge) {
+		t.Fatalf("err = %v, want errConfigBackupTooLarge", err)
+	}
+	if len(stdout) > 64 {
+		t.Fatalf("retained stdout = %d bytes, want <= 64", len(stdout))
+	}
+}
+
+// TestConfigBackupProbeEscapesUsername verifies a hostile username cannot
+// break out of the quoted script literal: quotable characters are escaped and
+// brackets, which RouterOS evaluates even inside quotes, are rejected before
+// the command is sent.
+func TestConfigBackupProbeEscapesUsername(t *testing.T) {
+	var mu sync.Mutex
+	var commands []string
+	handler := func(ch ssh.Channel, command string) {
+		mu.Lock()
+		commands = append(commands, command)
+		mu.Unlock()
+		cbRouterHandler(cbTestExport)(ch, command)
+	}
+
+	escaped := []struct {
+		name     string
+		username string
+		wantPart string
+	}{
+		{"quote", `ad"min`, `ad\"min`},
+		{"backslash", `ad\min`, `ad\\min`},
+		{"dollar", `ad$min`, `ad\$min`},
+	}
+	for _, tc := range escaped {
+		t.Run("escaped/"+tc.name, func(t *testing.T) {
+			resetHostKeyStore(t)
+			mu.Lock()
+			commands = nil
+			mu.Unlock()
+			addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
+			defer cleanup()
+			host, port := cbAddrPort(t, addr)
+
+			job := cbJob(host, port)
+			job.ConfigBackup.Mode = pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE
+			job.ConfigBackup.Username = tc.username
+			out := testQueue()
+			executeConfigBackupJob(context.Background(), job, out)
+
+			result := cbReceiveConfigBackupResult(t, out)
+			if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+				t.Fatalf("code = %v (%q), want OK", result.ErrorCode, result.ErrorDetail)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			var policy string
+			for _, c := range commands {
+				if strings.Contains(c, "user group get") {
+					policy = c
+				}
+			}
+			if !strings.Contains(policy, tc.wantPart) {
+				t.Fatalf("policy command = %q, want escaped %q", policy, tc.wantPart)
+			}
+		})
+	}
+
+	for _, username := range []string{`ad[min`, `ad]min`, "x[:log info \"pwned\"]"} {
+		t.Run("rejected/"+username, func(t *testing.T) {
+			resetHostKeyStore(t)
+			mu.Lock()
+			commands = nil
+			mu.Unlock()
+			addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
+			defer cleanup()
+			host, port := cbAddrPort(t, addr)
+
+			job := cbJob(host, port)
+			job.ConfigBackup.Mode = pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE
+			job.ConfigBackup.Username = username
+			out := testQueue()
+			executeConfigBackupJob(context.Background(), job, out)
+
+			result := cbReceiveConfigBackupResult(t, out)
+			if result.ErrorCode != pb.ConfigBackupErrorCode_INTERNAL {
+				t.Fatalf("code = %v (%q), want INTERNAL", result.ErrorCode, result.ErrorDetail)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, c := range commands {
+				if strings.Contains(c, "user group get") {
+					t.Fatalf("policy command sent for rejected username: %q", c)
+				}
+			}
+		})
 	}
 }
 

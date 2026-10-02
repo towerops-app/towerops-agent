@@ -19,6 +19,7 @@ import (
 	"net"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1296,4 +1297,162 @@ func TestPropHmWriteSentenceRoundtrip(t *testing.T) {
 			t.Fatalf("roundtrip mismatch: wrote %q, read %q", words, got)
 		}
 	})
+}
+
+func TestExecuteEmitsArgsInSortedOrder(t *testing.T) {
+	clientR, serverW := io.Pipe()
+	serverR, clientW := io.Pipe()
+
+	conn := &readWriteCloser{r: clientR, w: clientW}
+	c := &mikrotikClient{conn: conn}
+
+	var receivedWords []string
+	go func() {
+		defer func() { _ = serverW.Close() }()
+		sc := &mikrotikClient{conn: &readWriteCloser{r: serverR, w: serverW}}
+		receivedWords, _ = sc.readSentence()
+		_ = sc.writeSentence([]string{"!done"})
+	}()
+
+	args := map[string]string{
+		"name":      "ether1",
+		"?type":     "ether",
+		"?disabled": "false",
+		".proplist": "name,type",
+	}
+	if _, err := c.execute("/interface/print", args); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sorted key order makes emission deterministic.
+	want := []string{"/interface/print", ".proplist=name,type", "?disabled=false", "?type=ether", "=name=ether1"}
+	if !slices.Equal(receivedWords, want) {
+		t.Fatalf("words = %v, want %v", receivedWords, want)
+	}
+}
+
+// "?#" operator words must follow the query words they combine. Plain sorting
+// put "?#|" before every "?name" word, so an OR query in Args was always
+// applied to an empty query stack.
+func TestExecuteEmitsQueryOperatorsAfterOperands(t *testing.T) {
+	clientR, serverW := io.Pipe()
+	serverR, clientW := io.Pipe()
+
+	conn := &readWriteCloser{r: clientR, w: clientW}
+	c := &mikrotikClient{conn: conn}
+
+	var receivedWords []string
+	go func() {
+		defer func() { _ = serverW.Close() }()
+		sc := &mikrotikClient{conn: &readWriteCloser{r: serverR, w: serverW}}
+		receivedWords, _ = sc.readSentence()
+		_ = sc.writeSentence([]string{"!done"})
+	}()
+
+	args := map[string]string{
+		"?#|":       "",
+		"?#!":       "",
+		"?type":     "ether",
+		"?disabled": "false",
+		"name":      "ether1",
+	}
+	if _, err := c.execute("/interface/print", args); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"/interface/print", "?disabled=false", "?type=ether", "=name=ether1", "?#!=", "?#|="}
+	if !slices.Equal(receivedWords, want) {
+		t.Fatalf("words = %v, want %v", receivedWords, want)
+	}
+}
+
+// The sort algorithm decides which argument order the comparator sees, and
+// map iteration is random, so check both orientations directly.
+func TestCompareMikrotikArgKeys(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"?#|", "?type", 1},
+		{"?type", "?#|", -1},
+		{"?#!", "?#|", -1},
+		{"?disabled", "?type", -1},
+		{"name", "name", 0},
+	}
+	for _, tc := range cases {
+		if got := compareMikrotikArgKeys(tc.a, tc.b); got != tc.want {
+			t.Errorf("compareMikrotikArgKeys(%q, %q) = %d, want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+func TestExecuteMikrotikBackupViaSSHDefaultsPort(t *testing.T) {
+	orig := sshBackup
+	defer func() { sshBackup = orig }()
+
+	var gotPort uint16
+	sshBackup = func(_ context.Context, _ string, port uint16, _, _ string) (string, error) {
+		gotPort = port
+		return "config", nil
+	}
+
+	out := newResultQueue(1)
+	executeMikrotikBackupViaSSH(context.Background(), &pb.AgentJob{
+		JobId:    "backup:1",
+		DeviceId: "dev-1",
+	}, &pb.MikrotikDevice{Ip: "192.0.2.1"}, out, time.Now().Unix())
+
+	if gotPort != 22 {
+		t.Fatalf("ssh port = %d, want 22", gotPort)
+	}
+	result := decodeQueuedResult[*pb.MikrotikResult](t, <-out.items)
+	if result.Error != "" {
+		t.Fatalf("unexpected error: %s", result.Error)
+	}
+}
+
+func TestMikrotikConnectAbortsLoginOnContextCancel(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Accept and never reply so the login read stalls; ctx cancellation must
+	// close the conn and unblock it.
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		if conn, err := ln.Accept(); err == nil {
+			accepted <- conn
+			cancel()
+		}
+	}()
+	defer func() {
+		select {
+		case conn := <-accepted:
+			_ = conn.Close()
+		default:
+		}
+	}()
+
+	host, portStr, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	_, err = mikrotikConnect(ctx, host, uint32(port), "admin", "pw", false)
+	if err == nil {
+		t.Fatal("expected login error after context cancellation")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("login ignored ctx cancellation, blocked %s", elapsed)
+	}
 }

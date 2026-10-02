@@ -268,48 +268,69 @@ func TestAppendAttr(t *testing.T) {
 		{
 			name: "LogValuer",
 			attr: slog.Any("key", testLogValuer{}),
-			want: "key=resolved",
+			want: " key=resolved",
 		},
 		{
 			name: "space is quoted",
 			attr: slog.String("key", "two words"),
-			want: `key="two words"`,
+			want: ` key="two words"`,
 		},
 		{
 			name: "equals is quoted",
 			attr: slog.String("key", "left=right"),
-			want: `key="left=right"`,
+			want: ` key="left=right"`,
 		},
 		{
 			name: "quote is quoted",
 			attr: slog.String("key", `say "hello"`),
-			want: `key="say \"hello\""`,
+			want: ` key="say \"hello\""`,
 		},
 		{
 			name: "empty is quoted",
 			attr: slog.String("key", ""),
-			want: `key=""`,
+			want: ` key=""`,
 		},
 		{
 			name: "control character is quoted",
 			attr: slog.String("key", "line\nbreak"),
-			want: `key="line\nbreak"`,
+			want: ` key="line\nbreak"`,
 		},
 		{
 			name: "ordinary value is unquoted",
 			attr: slog.String("key", "value"),
-			want: "key=value",
+			want: " key=value",
 		},
 		{
 			name: "group value qualifies its attributes",
 			attr: slog.Group("group", slog.String("key", "value")),
-			want: "group.key=value",
+			want: " group.key=value",
 		},
 		{
 			name:  "handler group qualifies the key",
 			group: "handler",
 			attr:  slog.String("key", "value"),
-			want:  "handler.key=value",
+			want:  " handler.key=value",
+		},
+		{
+			name: "empty key attr is dropped",
+			attr: slog.String("", "value"),
+			want: "",
+		},
+		{
+			name:  "empty key attr under group is dropped",
+			group: "handler",
+			attr:  slog.String("", "value"),
+			want:  "",
+		},
+		{
+			name: "empty group is dropped",
+			attr: slog.Group("g"),
+			want: "",
+		},
+		{
+			name: "empty key inside group is dropped",
+			attr: slog.Group("g", slog.String("", "x"), slog.String("k", "v")),
+			want: " g.k=v",
 		},
 	}
 
@@ -319,5 +340,47 @@ func TestAppendAttr(t *testing.T) {
 				t.Errorf("appendAttr() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestColorHandlerWithGroupEmptyIsNoOp(t *testing.T) {
+	var buf bytes.Buffer
+	h := newColorHandler(&buf, slog.LevelDebug)
+
+	if got := h.WithGroup(""); got != slog.Handler(h) {
+		t.Fatalf("WithGroup(%q) did not return the receiver", "")
+	}
+
+	nested := h.WithGroup("outer")
+	if got := nested.WithGroup(""); got != nested {
+		t.Fatalf("WithGroup(%q) on a grouped handler did not return the receiver", "")
+	}
+
+	r := slog.NewRecord(time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC), slog.LevelInfo, "msg", 0)
+	r.AddAttrs(slog.String("k", "v"))
+	if err := nested.WithGroup("").Handle(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	if output := buf.String(); !strings.Contains(output, " outer.k=v\n") {
+		t.Errorf("WithGroup(%q) changed the output, got %q", "", output)
+	}
+}
+
+func TestColorHandlerDropsEmptyKeyAttrs(t *testing.T) {
+	var buf bytes.Buffer
+	h := newColorHandler(&buf, slog.LevelDebug).WithAttrs([]slog.Attr{slog.String("", "stored")})
+
+	r := slog.NewRecord(time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC), slog.LevelInfo, "msg", 0)
+	r.AddAttrs(slog.String("", "value"), slog.String("k", "v"))
+	if err := h.Handle(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+
+	output := buf.String()
+	if strings.Contains(output, "=value") || strings.Contains(output, "=stored") {
+		t.Errorf("empty-key attrs were rendered: %q", output)
+	}
+	if !strings.Contains(output, " k=v\n") {
+		t.Errorf("expected ' k=v' in output, got: %q", output)
 	}
 }

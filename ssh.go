@@ -18,6 +18,10 @@ import (
 
 var sshBackup = executeMikrotikBackupContext
 var sshBackupTimeout = 60 * time.Second
+
+// sshBackupMaxOutputBytes bounds the /export output a legacy SSH backup will
+// hold in memory. It is a var so tests can shrink it like sshBackupTimeout.
+var sshBackupMaxOutputBytes uint64 = defaultMaxConfigBytes
 var sshDial = func(ctx context.Context, network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, network, addr)
@@ -41,15 +45,22 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 	ctx, cancel := context.WithTimeout(ctx, sshBackupTimeout)
 	defer cancel()
 
+	addr := net.JoinHostPort(ip, strconv.Itoa(int(port)))
+
 	// SECURITY: TOFU (Trust-On-First-Use) host key verification.
-	// On first connection the key is stored; subsequent connections reject mismatches.
+	// On first connection the key is stored; subsequent connections reject
+	// mismatches. When a key is already pinned, HostKeyAlgorithms is
+	// restricted to its type so an x/crypto preference change cannot make a
+	// dual-key device present a different key and trip a false MITM error.
 	config := &ssh.ClientConfig{
 		User:            username,
 		Auth:            []ssh.AuthMethod{ssh.Password(password)},
 		HostKeyCallback: sshHostKeyCallback(),
 	}
+	if alg := getHostKeyStore().pinnedKeyAlgorithm("ssh:" + addr); alg != "" {
+		config.HostKeyAlgorithms = hostKeyAlgorithmsFor(alg)
+	}
 
-	addr := net.JoinHostPort(ip, strconv.Itoa(int(port)))
 	conn, err := sshDial(ctx, "tcp", addr, config)
 	if err != nil {
 		return "", fmt.Errorf("ssh dial %s: %w", addr, err)
@@ -64,7 +75,21 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 	}
 	defer func() { _ = session.Close() }()
 
-	output, err := session.CombinedOutput("/export compact")
+	// stdout and stderr are buffered separately and capped so a broken or
+	// hostile device cannot grow the heap until the job deadline; crossing
+	// the stdout cap closes the channel to abort the stream.
+	outBuf := boundedBuffer{
+		limit:      sshBackupMaxOutputBytes,
+		onOverflow: func() { _ = session.Close() },
+	}
+	errBuf := boundedBuffer{limit: configBackupStderrCap}
+	session.Stdout = &outBuf
+	session.Stderr = &errBuf
+	err = session.Run("/export compact")
+	output := append(outBuf.Bytes(), errBuf.Bytes()...)
+	if outBuf.overflow {
+		return "", fmt.Errorf("ssh command: %w", errConfigBackupTooLarge)
+	}
 	if err != nil {
 		if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
 			return "", fmt.Errorf("ssh command: %w: %s", err, trimmed)
@@ -73,6 +98,21 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 	}
 
 	return string(output), nil
+}
+
+// hostKeyAlgorithmsFor maps a pinned key type to the signature algorithms
+// that verify it. key.Type() reports an RSA key as "ssh-rsa", which is also
+// the SHA-1 signature algorithm; offering only that fails negotiation with
+// devices that disable SHA-1 (strong-crypto RouterOS, OpenSSH 8.8+), so RSA
+// keys and certificates offer the SHA-2 variants first.
+func hostKeyAlgorithmsFor(keyType string) []string {
+	switch keyType {
+	case ssh.KeyAlgoRSA:
+		return []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA}
+	case ssh.CertAlgoRSAv01:
+		return []string{ssh.CertAlgoRSASHA512v01, ssh.CertAlgoRSASHA256v01, ssh.CertAlgoRSAv01}
+	}
+	return []string{keyType}
 }
 
 const defaultPingTimeoutMs = 5000

@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -262,4 +263,249 @@ func TestTargetGates(t *testing.T) {
 		}
 		r()
 	})
+
+	t.Run("tryAcquire with empty key or nil gates never blocks", func(t *testing.T) {
+		gates := &targetGates{}
+		r, holders := gates.tryAcquire("")
+		if r == nil || holders != 0 {
+			t.Fatalf("empty key tryAcquire = (%v, %d), want release and 0 holders", r != nil, holders)
+		}
+		r()
+		var nilGates *targetGates
+		r, holders = nilGates.tryAcquire("10.0.0.1")
+		if r == nil || holders != 0 {
+			t.Fatalf("nil gates tryAcquire = (%v, %d), want release and 0 holders", r != nil, holders)
+		}
+		r()
+	})
+
+	t.Run("pre-cancelled context never takes the gate", func(t *testing.T) {
+		gates := &targetGates{}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		// A single acquire has an even chance of slipping through the old
+		// select; looping makes a regression effectively certain to fail.
+		for range 64 {
+			if r := gates.acquire(ctx, "10.0.0.1"); r != nil {
+				r()
+				t.Fatal("pre-cancelled acquire returned a release function")
+			}
+		}
+		if len(gates.gates) != 0 {
+			t.Fatalf("cancelled acquire left %d gate entries", len(gates.gates))
+		}
+	})
+
+	t.Run("released gate is deleted", func(t *testing.T) {
+		gates := &targetGates{}
+		release := gates.acquire(context.Background(), "job:123")
+		release()
+		if _, ok := gates.gates["job:123"]; ok {
+			t.Fatal("released gate key was not deleted")
+		}
+	})
+
+	t.Run("waiting acquirer keeps the gate alive", func(t *testing.T) {
+		gates := &targetGates{}
+		release := gates.acquire(context.Background(), "10.0.0.1")
+
+		waiter := make(chan func(), 1)
+		go func() { waiter <- gates.acquire(context.Background(), "10.0.0.1") }()
+		waitForGateRefs(t, gates, "10.0.0.1", 2)
+
+		// The holder releasing must not delete a gate that still has a
+		// waiter; if it did, the waiter would sit on an orphaned channel.
+		release()
+		r := <-waiter
+
+		// The waiter's gate is still the registered one, so a third
+		// acquirer must block until the waiter releases.
+		third := make(chan func(), 1)
+		go func() { third <- gates.acquire(context.Background(), "10.0.0.1") }()
+		select {
+		case <-third:
+			t.Fatal("gate deleted while a waiter was queued")
+		case <-time.After(50 * time.Millisecond):
+		}
+		r()
+		select {
+		case tr := <-third:
+			tr()
+		case <-time.After(time.Second):
+			t.Fatal("acquire did not proceed after release")
+		}
+		if len(gates.gates) != 0 {
+			t.Fatalf("%d gate entries left after all releases", len(gates.gates))
+		}
+	})
+
+	t.Run("cancelled waiter does not delete a live gate", func(t *testing.T) {
+		gates := &targetGates{}
+		release := gates.acquire(context.Background(), "10.0.0.1")
+		defer release()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan func(), 1)
+		go func() { done <- gates.acquire(ctx, "10.0.0.1") }()
+		waitForGateRefs(t, gates, "10.0.0.1", 2)
+		cancel()
+		if r := <-done; r != nil {
+			t.Fatal("cancelled waiter acquired the gate")
+		}
+		waitForGateRefs(t, gates, "10.0.0.1", 1)
+		if _, ok := gates.gates["10.0.0.1"]; !ok {
+			t.Fatal("cancelled waiter removed the holder's gate")
+		}
+	})
+
+	t.Run("concurrent churn leaves no keys", func(t *testing.T) {
+		gates := &targetGates{}
+		var wg sync.WaitGroup
+		for i := range 8 {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				key := fmt.Sprintf("10.0.0.%d", i%3)
+				for range 25 {
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+					if r := gates.acquire(ctx, key); r != nil {
+						r()
+					}
+					cancel()
+				}
+			}(i)
+		}
+		wg.Wait()
+		if len(gates.gates) != 0 {
+			t.Fatalf("%d gate entries left after concurrent churn", len(gates.gates))
+		}
+	})
+}
+
+// waitForGateRefs polls until the gate for key reports want references.
+func waitForGateRefs(t *testing.T, gates *targetGates, key string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		gates.mu.Lock()
+		refs := 0
+		if e, ok := gates.gates[key]; ok {
+			refs = e.refs
+		}
+		gates.mu.Unlock()
+		if refs == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("gate %q has %d refs, want %d", key, refs, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// An uncontended one-shot job goes straight to the queue: dispatch slots
+// held by jobs parked on other targets must not reject it while workers idle.
+func TestDispatchGatedUncontendedIgnoresParkedSlots(t *testing.T) {
+	pool := newWorkerPool(1)
+	defer pool.stop()
+	for range cap(pool.dispatch) {
+		pool.acquireDispatch()
+	}
+	defer func() {
+		for range cap(pool.dispatch) {
+			pool.releaseDispatch()
+		}
+	}()
+
+	gates := &targetGates{}
+	ran := make(chan struct{})
+	pool.dispatchGated(context.Background(), context.Background(), gates, "10.0.0.1", 0,
+		func(release func()) { defer release(); close(ran) },
+		func(r dispatchFailure) { t.Errorf("dispatch failed: %v", r) })
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("uncontended job never ran")
+	}
+}
+
+// One stalled target may park only its share of the dispatch slots, so jobs
+// for other targets keep flowing.
+func TestDispatchGatedTargetWaitLimit(t *testing.T) {
+	pool := newWorkerPool(4)
+	defer pool.stop()
+	gates := &targetGates{}
+	hold := gates.acquire(context.Background(), "slow")
+
+	limit := pool.targetWaitLimit()
+	if limit >= cap(pool.dispatch) {
+		t.Fatalf("target wait limit %d does not leave slots for other targets", limit)
+	}
+	var ran atomic.Int32
+	for range limit {
+		pool.dispatchGated(context.Background(), context.Background(), gates, "slow", 0,
+			func(release func()) { defer release(); ran.Add(1) },
+			func(r dispatchFailure) { t.Errorf("parked job failed: %v", r) })
+	}
+	waitForGateRefs(t, gates, "slow", limit+1)
+
+	failed := make(chan dispatchFailure, 1)
+	pool.dispatchGated(context.Background(), context.Background(), gates, "slow", 0,
+		func(release func()) { release(); t.Error("over-limit job ran") },
+		func(r dispatchFailure) { failed <- r })
+	select {
+	case r := <-failed:
+		if r != dispatchBacklogged {
+			t.Fatalf("failure = %v, want dispatchBacklogged", r)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("over-limit job was not rejected")
+	}
+
+	other := make(chan struct{})
+	pool.dispatchGated(context.Background(), context.Background(), gates, "fast", 0,
+		func(release func()) { defer release(); close(other) },
+		func(r dispatchFailure) { t.Errorf("other target failed: %v", r) })
+	select {
+	case <-other:
+	case <-time.After(time.Second):
+		t.Fatal("a stalled target starved another target")
+	}
+
+	hold()
+	deadline := time.Now().Add(time.Second)
+	for ran.Load() != int32(limit) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d parked jobs ran after release", ran.Load(), limit)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for !pool.idle() {
+		if time.Now().After(deadline) {
+			t.Fatal("pool never went idle")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestDispatchGatedCancelledDuringJitter(t *testing.T) {
+	pool := newWorkerPool(1)
+	defer pool.stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	failed := make(chan dispatchFailure, 1)
+	pool.dispatchGated(ctx, ctx, &targetGates{}, "k", 20*time.Millisecond,
+		func(release func()) { release(); t.Error("cancelled job ran") },
+		func(r dispatchFailure) { failed <- r })
+	if pool.idle() {
+		t.Fatal("pool idle while a coordinator was pending")
+	}
+	cancel()
+	select {
+	case r := <-failed:
+		if r != dispatchCancelled {
+			t.Fatalf("failure = %v, want dispatchCancelled", r)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled job never reported")
+	}
 }

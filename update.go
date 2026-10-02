@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -44,6 +45,17 @@ var httpDo = func(req *http.Request) (*http.Response, error) {
 	return http.DefaultClient.Do(req)
 }
 var syscallExec = syscall.Exec
+
+// drainResultSpool bounds how long the update path waits for the result spool
+// to flush before re-exec. It holds a func(ctx context.Context) bool reporting
+// whether the spool emptied in time; the agent/session layer registers it once
+// a resultQueue exists. No hook means nothing is drained — exec proceeds
+// unchanged.
+var drainResultSpool atomic.Pointer[func(context.Context) bool]
+
+// spoolDrainTimeout bounds the drain so a stalled session cannot delay the
+// upgrade indefinitely.
+var spoolDrainTimeout = 5 * time.Second
 var maxUpdateSize int64 = 100 << 20 // 100 MB
 
 var containerMarkerFiles = []string{"/.dockerenv", "/run/.containerenv"}
@@ -252,12 +264,27 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string
 	}
 	slog.Info("binary replaced", "path", currentExe)
 
+	// Flush spooled results before exec discards the process: the drain
+	// hook stops the session accepting new jobs and waits for the queue to
+	// empty. Bounded so a stalled session cannot stall the upgrade.
+	if drain := drainResultSpool.Load(); drain != nil {
+		drainCtx, drainCancel := context.WithTimeout(ctx, spoolDrainTimeout)
+		drained := (*drain)(drainCtx)
+		drainCancel()
+		if !drained {
+			slog.Warn("self-update drain timed out; spooled results and in-flight jobs are discarded by re-exec")
+		}
+	}
+
 	// Re-exec with same arguments
 	slog.Info("re-executing", "args", sanitizeArgs(os.Args))
 	return syscallExec(currentExe, os.Args, os.Environ())
 }
 
-func syncDirectory(path string) error {
+// syncDirectory is a var so tests can fail the post-rename fsync.
+var syncDirectory = syncDir
+
+func syncDir(path string) error {
 	dir, err := os.Open(path)
 	if err != nil {
 		return err
@@ -266,16 +293,30 @@ func syncDirectory(path string) error {
 	return dir.Sync()
 }
 
-// sanitizeArgs returns a copy of args with token values masked.
+// sanitizeArgs returns a copy of args with the values of flags that carry
+// secrets masked, so os.Args can be logged during re-exec without leaking
+// credentials.
 func sanitizeArgs(args []string) []string {
 	out := make([]string, len(args))
 	copy(out, args)
 	for i, a := range out {
-		if (a == "--token" || a == "-token") && i+1 < len(out) {
+		if sensitiveArg(a) && i+1 < len(out) {
 			out[i+1] = "***"
-		} else if strings.HasPrefix(a, "--token=") || strings.HasPrefix(a, "-token=") {
-			out[i] = a[:strings.Index(a, "=")+1] + "***"
+		} else if name, _, found := strings.Cut(a, "="); found && sensitiveArg(name) {
+			out[i] = name + "=***"
 		}
 	}
 	return out
+}
+
+// sensitiveArg reports whether a is a flag whose value is a secret. The flag's
+// value must never reach the logs, whether given as "--flag value" or
+// "--flag=value".
+func sensitiveArg(a string) bool {
+	for _, name := range []string{"token", "trap-community"} {
+		if a == "--"+name || a == "-"+name {
+			return true
+		}
+	}
+	return false
 }

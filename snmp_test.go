@@ -470,6 +470,7 @@ type mockSnmpQuerier struct {
 	walkFunc       func(rootOid string) ([]gosnmp.SnmpPDU, error)
 	bulkWalkFunc   func(rootOid string) ([]gosnmp.SnmpPDU, error)
 	walkStepFunc   func(rootOid string) ([]gosnmp.SnmpPDU, error)
+	onWalkPDU      func()
 	walkErrs       map[string]error
 	closeCalled    bool
 	walkAllCalled  bool
@@ -502,6 +503,9 @@ func (m *mockSnmpQuerier) runWalk(rootOid string, walkFn gosnmp.WalkFunc) error 
 		return err
 	}
 	for _, pdu := range pdus {
+		if m.onWalkPDU != nil {
+			m.onWalkPDU()
+		}
 		if err := walkFn(pdu); err != nil {
 			return err
 		}

@@ -893,3 +893,147 @@ func TestPropCliToWebSocketURL(t *testing.T) {
 		})
 	})
 }
+
+// TestRunMainEnvTokenTrimmed: mounted secrets commonly carry a trailing
+// newline; the env token must be trimmed like --token-file output, so a
+// whitespace-only value fails the required-args check instead of joining.
+func TestRunMainEnvTokenTrimmed(t *testing.T) {
+	t.Setenv("TOWEROPS_API_URL", "")
+	t.Setenv("TOWEROPS_AGENT_TOKEN", "  \n\t")
+	if code := runMain(context.Background(), nil); code != 1 {
+		t.Fatalf("whitespace env token exit = %d, want 1", code)
+	}
+
+	t.Setenv("TOWEROPS_AGENT_TOKEN", "  real-token\n")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if code := runMain(ctx, []string{
+		"--api-url=wss://example.com",
+		cliTHostKeysFlag(t),
+	}); code != 0 {
+		t.Fatalf("padded env token exit = %d, want 0", code)
+	}
+}
+
+// TestRunMainForgetHostKey exercises the recovery flag: it drops ssh:, tls:
+// and legacy entries for the address, runs without credentials, and exits 0
+// even for addresses that were never pinned.
+func TestRunMainForgetHostKey(t *testing.T) {
+	t.Setenv("TOWEROPS_API_URL", "")
+	t.Setenv("TOWEROPS_AGENT_TOKEN", "")
+
+	path := filepath.Join(t.TempDir(), "known_hosts.json")
+	if err := os.WriteFile(path, []byte(`{
+  "ssh:192.0.2.9:22": "ssh-ed25519 aabb",
+  "tls:192.0.2.9:8729": "ccdd",
+  "192.0.2.9:22": "eeff"
+}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	code := runMain(context.Background(), []string{
+		"--host-keys-file=" + path,
+		"--forget-host-key=192.0.2.9:22",
+		"--forget-host-key", "tls:192.0.2.9:8729",
+		"--forget-host-key=203.0.113.1:22",
+	})
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted map[string]string
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != 0 {
+		t.Fatalf("entries remained after forget: %v", persisted)
+	}
+}
+
+// TestRunMainForgetHostKeyBadStore exits 1 when the store cannot be opened.
+func TestRunMainForgetHostKeyBadStore(t *testing.T) {
+	code := runMain(context.Background(), []string{
+		"--host-keys-file=" + filepath.Join(t.TempDir(), "missing", "known_hosts.json"),
+		"--forget-host-key=192.0.2.9:22",
+	})
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+}
+
+func TestRunForgetHostKeysEdgeCases(t *testing.T) {
+	t.Run("blank entries are skipped", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "known_hosts.json")
+		if err := os.WriteFile(path, []byte(`{}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if code := runForgetHostKeys(path, []string{"  ", ""}); code != 0 {
+			t.Fatalf("exit = %d, want 0", code)
+		}
+	})
+
+	t.Run("unparseable store exits 1", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "known_hosts.json")
+		if err := os.WriteFile(path, []byte(`{not json`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if code := runForgetHostKeys(path, []string{"192.0.2.9:22"}); code != 1 {
+			t.Fatalf("exit = %d, want 1", code)
+		}
+	})
+
+	t.Run("forget failure exits 1", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "known_hosts.json")
+		if err := os.WriteFile(path, []byte(`{"192.0.2.9:22":"fp"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		orig := hostKeyCreateTemp
+		t.Cleanup(func() { hostKeyCreateTemp = orig })
+		hostKeyCreateTemp = func(string, string) (hostKeyTempFile, error) {
+			return nil, errors.New("create temp failed")
+		}
+		if code := runForgetHostKeys(path, []string{"192.0.2.9:22"}); code != 1 {
+			t.Fatalf("exit = %d, want 1", code)
+		}
+	})
+}
+
+// TestRunForgetHostKeysNoopLeavesFileUntouched: forgetting an address with no
+// entry must not rewrite the store, and a missing store is an error rather
+// than a silent no-op against the wrong path.
+func TestRunForgetHostKeysNoopLeavesFileUntouched(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "known_hosts.json")
+	original := []byte(`{"ssh:192.0.2.9:22":"ssh-ed25519 aabb"}`)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := hostKeyCreateTemp
+	t.Cleanup(func() { hostKeyCreateTemp = orig })
+	hostKeyCreateTemp = func(string, string) (hostKeyTempFile, error) {
+		t.Fatal("forget of an unknown host wrote the store")
+		return nil, nil
+	}
+	if code := runForgetHostKeys(path, []string{"203.0.113.1:22"}); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) {
+		t.Fatal("store file was replaced")
+	}
+
+	if code := runForgetHostKeys(filepath.Join(t.TempDir(), "absent.json"), []string{"192.0.2.9:22"}); code != 1 {
+		t.Fatalf("missing store exit = %d, want 1", code)
+	}
+}

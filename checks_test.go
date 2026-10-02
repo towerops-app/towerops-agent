@@ -1768,6 +1768,25 @@ func TestCertificateDaysRemainingRecentlyExpired(t *testing.T) {
 	}
 }
 
+func TestCertificateExpiryPhrase(t *testing.T) {
+	tests := []struct {
+		name    string
+		daysAgo int
+		want    string
+	}{
+		{"expired less than a day ago reads today", 0, "expired today"},
+		{"expired one day ago", 1, "expired 1 days ago"},
+		{"expired several days ago", 2, "expired 2 days ago"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := certificateExpiryPhrase(tt.daysAgo); got != tt.want {
+				t.Errorf("certificateExpiryPhrase(%d) = %q, want %q", tt.daysAgo, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestExecuteCheck_MissingSSLConfig(t *testing.T) {
 	result := ExecuteCheck(context.Background(), &pb.Check{
 		Id:        "chk-ssl-missing",
