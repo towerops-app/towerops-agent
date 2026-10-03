@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -57,6 +58,9 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 		Auth:            []ssh.AuthMethod{ssh.Password(password)},
 		HostKeyCallback: sshHostKeyCallback(),
 	}
+
+	routerOSSSHAlgorithms(config)
+
 	if alg := getHostKeyStore().pinnedKeyAlgorithm("ssh:" + addr); alg != "" {
 		config.HostKeyAlgorithms = hostKeyAlgorithmsFor(alg)
 	}
@@ -86,6 +90,14 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 	session.Stdout = &outBuf
 	session.Stderr = &errBuf
 	err = session.Run("/export compact")
+	// RouterOS 6 closes the exec channel without an exit-status, which
+	// surfaces as *ssh.ExitMissingError with the output still delivered.
+	// Tolerate it only while the context is live: a deadline-driven
+	// conn.Close produces the same error and must stay an error.
+	var exitMissing *ssh.ExitMissingError
+	if errors.As(err, &exitMissing) && ctx.Err() == nil {
+		err = nil
+	}
 	output := append(outBuf.Bytes(), errBuf.Bytes()...)
 	if outBuf.overflow {
 		return "", fmt.Errorf("ssh command: %w", errConfigBackupTooLarge)
@@ -98,6 +110,21 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 	}
 
 	return string(output), nil
+}
+
+// routerOSSSHAlgorithms widens the client config to every algorithm x/crypto
+// implements: RouterOS 6's SSH server offers only the legacy set (ssh-rsa,
+// diffie-hellman-group14-sha1, and on older 6.x only CBC ciphers and
+// gex/group1-sha1 key exchanges), which the default list excludes. All of
+// these connections are to operator-owned network devices whose host key is
+// pinned or accepted first-use, so the wider offer cannot be downgraded
+// below what the device itself supports.
+func routerOSSSHAlgorithms(c *ssh.ClientConfig) {
+	supported, insecure := ssh.SupportedAlgorithms(), ssh.InsecureAlgorithms()
+	c.KeyExchanges = append(supported.KeyExchanges, insecure.KeyExchanges...)
+	c.Ciphers = append(supported.Ciphers, insecure.Ciphers...)
+	c.MACs = append(supported.MACs, insecure.MACs...)
+	c.HostKeyAlgorithms = append(supported.HostKeys, insecure.HostKeys...)
 }
 
 // hostKeyAlgorithmsFor maps a pinned key type to the signature algorithms

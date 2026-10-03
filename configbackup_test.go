@@ -636,7 +636,7 @@ func TestRunConfigBackupSessionTooLarge(t *testing.T) {
 	}
 	defer func() { _ = client.Close() }()
 
-	stdout, _, err := runConfigBackupSession(client, "flood", 64)
+	stdout, _, err := runConfigBackupSession(context.Background(), client, "flood", 64)
 	if !errors.Is(err, errConfigBackupTooLarge) {
 		t.Fatalf("err = %v, want errConfigBackupTooLarge", err)
 	}
@@ -747,10 +747,10 @@ func TestRunConfigBackupSessionClosedClient(t *testing.T) {
 	_ = client.Close()
 
 	v := mikrotikBackupVendor{}
-	if _, err := v.readVersion(client); err == nil {
+	if _, err := v.readVersion(context.Background(), client); err == nil {
 		t.Error("readVersion on closed client should fail")
 	}
-	if _, err := v.readIdentity(client); err == nil {
+	if _, err := v.readIdentity(context.Background(), client); err == nil {
 		t.Error("readIdentity on closed client should fail")
 	}
 }
@@ -1172,5 +1172,89 @@ func TestConfigBackupResultUsesReservedLane(t *testing.T) {
 	}
 	if usesReservedLane(&pb.SnmpResult{JobType: pb.JobType_POLL}) {
 		t.Fatal("poll result must not use the reserved lane")
+	}
+}
+
+// cbRouterOS6Handler behaves like RouterOS 6: it reports a 6.x version and,
+// crucially, never sends an exit-status on the exec channel — session.Run on
+// the client surfaces that as *ssh.ExitMissingError, which the backup path
+// must tolerate or every ROS 6 backup reports EXPORT_FAILED.
+func cbRouterOS6Handler(export string, gotExport *string) func(ch ssh.Channel, command string) {
+	return func(ch ssh.Channel, command string) {
+		var out string
+		switch {
+		case strings.Contains(command, "system resource get version"):
+			out = "6.49.19 (stable)\n"
+		case strings.Contains(command, "system identity get name"):
+			out = "ros6-router\n"
+		case strings.Contains(command, "user group get"):
+			out = "read;write;ssh;!policy\n"
+		case strings.HasPrefix(command, "/export"):
+			*gotExport = command
+			out = export
+		default:
+			out = "failure: bad command\n"
+		}
+		_, _ = ch.Write([]byte(out))
+		_ = ch.CloseWrite()
+		_ = ch.Close() // no exit-status: what ROS 6 sends
+	}
+}
+
+func TestConfigBackupJobRouterOS6NoExitStatus(t *testing.T) {
+	resetHostKeyStore(t)
+	var gotExport string
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbRouterOS6Handler(cbTestExport, &gotExport))
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	job := cbJob(host, port)
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), job, out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+		t.Fatalf("code = %v (%q)", result.ErrorCode, result.ErrorDetail)
+	}
+	if gotExport != "/export" {
+		// ROS 6 includes secrets by default; the job asks for them, so the
+		// ROS 6 export is the bare command — hide-sensitive would strip them.
+		t.Fatalf("export command = %q, want /export (ROS 6 includes secrets by default)", gotExport)
+	}
+	if len(result.ConfigGzip) == 0 {
+		t.Fatal("ConfigGzip empty")
+	}
+}
+
+// TestConfigBackupJobLegacyAlgorithms serves SSH with a key exchange and
+// cipher only a very old RouterOS 6 offers (group1-sha1, aes128-cbc) — both
+// moved out of x/crypto's default client list.
+func TestConfigBackupJobLegacyAlgorithms(t *testing.T) {
+	resetHostKeyStore(t)
+
+	config := &ssh.ServerConfig{
+		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+			return nil, nil
+		},
+	}
+	config.Ciphers = []string{ssh.InsecureCipherAES128CBC}
+	config.KeyExchanges = []string{ssh.InsecureKeyExchangeDH1SHA1}
+	config.MACs = []string{ssh.HMACSHA1}
+	config.AddHostKey(cbNewSigner(t))
+
+	addr, cleanup := startTestSSHServerWithConfig(t, config, cbRouterHandler(cbTestExport))
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	job := cbJob(host, port)
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), job, out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+		t.Fatalf("code = %v (%q)", result.ErrorCode, result.ErrorDetail)
+	}
+	if len(result.ConfigGzip) == 0 {
+		t.Fatal("ConfigGzip empty")
 	}
 }
