@@ -19,9 +19,11 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/towerops-app/towerops-agent/pb"
 	"golang.org/x/crypto/ssh"
+	"google.golang.org/protobuf/proto"
 )
 
 // cbTestExport is a RouterOS-looking export good enough for validation.
@@ -171,6 +173,112 @@ func TestClassifyConfigBackupError(t *testing.T) {
 	}
 	if strings.Contains(detail, "hunter2") || !strings.Contains(detail, "***") {
 		t.Fatalf("password not scrubbed: %q", detail)
+	}
+}
+
+func TestConfigBackupErrorsRedactBeforeShortening(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		password string
+		detail   string
+		want     string
+	}{
+		{
+			name:     "password crosses detail limit",
+			password: "secret-password",
+			detail:   strings.Repeat("x", maxConfigBackupDetailLen-3) + "secret-password",
+			want:     strings.Repeat("x", maxConfigBackupDetailLen-3) + "***",
+		},
+		{
+			name:     "password contains newline",
+			password: "secret\npassword",
+			detail:   "connection failed: secret\npassword\nextra detail",
+			want:     "connection failed: ***",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := cbJob("192.0.2.1", 22)
+			job.ConfigBackup.Password = tc.password
+			t.Run("classified dial error", func(t *testing.T) {
+				_, detail := classifyConfigBackupError(errors.New(tc.detail), job)
+				if detail != tc.want {
+					t.Fatalf("detail = %q, want %q", detail, tc.want)
+				}
+			})
+			t.Run("vendor error", func(t *testing.T) {
+				result := configBackupError(job.ConfigBackup, job.JobId, job.DeviceId, pb.ConfigBackupErrorCode_INTERNAL, tc.detail)
+				if result.ErrorDetail != tc.want {
+					t.Fatalf("detail = %q, want %q", result.ErrorDetail, tc.want)
+				}
+			})
+		})
+	}
+}
+
+func TestConfigBackupErrorDetailsPreserveUTF8(t *testing.T) {
+	job := cbJob("192.0.2.1", 22)
+	detail := strings.Repeat("x", maxConfigBackupDetailLen-1) + "é"
+	code, message := classifyConfigBackupError(errors.New(detail), job)
+	for _, tc := range []struct {
+		name   string
+		result *pb.ConfigBackupResult
+	}{
+		{
+			name:   "classified dial error",
+			result: &pb.ConfigBackupResult{ErrorCode: code, ErrorDetail: message},
+		},
+		{
+			name:   "vendor error",
+			result: configBackupError(job.ConfigBackup, job.JobId, job.DeviceId, pb.ConfigBackupErrorCode_INTERNAL, detail),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !utf8.ValidString(tc.result.ErrorDetail) {
+				t.Errorf("detail contains an incomplete UTF-8 character: %q", tc.result.ErrorDetail)
+			}
+			if len(tc.result.ErrorDetail) > maxConfigBackupDetailLen {
+				t.Errorf("detail length = %d, exceeds byte limit %d", len(tc.result.ErrorDetail), maxConfigBackupDetailLen)
+			}
+			if _, err := proto.Marshal(tc.result); err != nil {
+				t.Errorf("marshal config backup error result: %v", err)
+			}
+		})
+	}
+}
+
+type cbCloseRecordingConn struct {
+	ssh.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *cbCloseRecordingConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestConfigBackupSessionCanceledAfterDialClosesClient(t *testing.T) {
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &cbCloseRecordingConn{closed: make(chan struct{}, 1)}
+	origDial := sshDial
+	t.Cleanup(func() { sshDial = origDial })
+	sshDial = func(context.Context, string, string, *ssh.ClientConfig) (*ssh.Client, error) {
+		cancel()
+		return &ssh.Client{Conn: conn}, nil
+	}
+	out := testQueue()
+	executeConfigBackupJobCtx(sessionCtx, context.Background(), cbJob("192.0.2.1", 22), out)
+
+	select {
+	case <-conn.closed:
+	default:
+		t.Fatal("successfully dialed SSH client was left open after session cancellation")
+	}
+	select {
+	case queued := <-out.items:
+		t.Fatalf("unexpected result after session cancellation: %+v", queued)
+	default:
 	}
 }
 
@@ -888,6 +996,30 @@ func TestConfigBackupExportFailures(t *testing.T) {
 				t.Fatalf("code = %v (%q), want %v", result.ErrorCode, result.ErrorDetail, tc.wantCode)
 			}
 		})
+	}
+}
+
+func TestConfigBackupSuccessfulExitFailureRedactsBeforeTruncating(t *testing.T) {
+	resetHostKeyStore(t)
+	const password = "secret-password"
+	prefix := "failure: " + strings.Repeat("x", maxConfigBackupDetailLen-3-len("failure: "))
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbExportExitHandler(prefix+password+"\n", 0))
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+	job := cbJob(host, port)
+	job.ConfigBackup.Password = password
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), job, out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_EXPORT_FAILED {
+		t.Fatalf("code = %v, want EXPORT_FAILED", result.ErrorCode)
+	}
+	if result.ErrorDetail != prefix+"***" {
+		t.Fatalf("detail = %q, want %q", result.ErrorDetail, prefix+"***")
+	}
+	if !utf8.ValidString(result.ErrorDetail) {
+		t.Fatalf("detail is not valid UTF-8: %q", result.ErrorDetail)
 	}
 }
 

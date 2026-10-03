@@ -128,6 +128,9 @@ func readHostKeyFile(path string) (map[string]string, os.FileInfo, error) {
 	if err := json.Unmarshal(data, &keys); err != nil {
 		return nil, nil, fmt.Errorf("parse host key store %s: %w", path, err)
 	}
+	if keys == nil {
+		return nil, nil, fmt.Errorf("parse host key store %s: expected a JSON object, got null", path)
+	}
 	return keys, info, nil
 }
 

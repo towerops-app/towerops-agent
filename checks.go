@@ -249,6 +249,9 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 			if !config.FollowRedirects {
 				return http.ErrUseLastResponse
 			}
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
 			if config.VerifySsl && tlsServerName != "" && len(via) > 0 &&
 				!strings.EqualFold(req.URL.Hostname(), via[len(via)-1].URL.Hostname()) {
 				return fmt.Errorf("refusing cross-host redirect while Host overrides TLS server name")
@@ -556,7 +559,7 @@ func dnsAnswerMatches(recordType string, results []string, expected string) bool
 func resolverForServer(server string, timeout time.Duration) *net.Resolver {
 	address := server
 	if _, _, err := net.SplitHostPort(server); err != nil {
-		address = net.JoinHostPort(server, "53")
+		address = net.JoinHostPort(strings.Trim(server, "[]"), "53")
 	}
 	return &net.Resolver{
 		PreferGo: true,

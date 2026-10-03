@@ -4,6 +4,20 @@
 # The CI gate fails the build at high severity or above; see .github/workflows/ci.yml.
 
 ignore:
+  # CVE-2026-97399 (GLIBC-SA-2026-0024): one-byte overread in the
+  # Power8-optimized strncasecmp implementation. The upstream CVE record
+  # limits affected platforms to Power8 and marks all others unaffected:
+  # https://github.com/CVEProject/cvelistV5/blob/main/cves/2026/97xxx/CVE-2026-97399.json
+  # CI publishes only linux/amd64 and linux/arm64, neither of which contains
+  # that implementation. Wolfi currently ships 2.44-r7; there is no package
+  # upgrade needed for these architectures. Remove this exception before
+  # adding a Power8/ppc64le build, or when Wolfi ships a patched package.
+  - vulnerability: CVE-2026-97399
+    reason: Power8-only code is absent from the published amd64 and arm64 images.
+    package:
+      name: glibc-2.44
+      type: apk
+
   # GO-2026-5932: "golang.org/x/crypto/openpgp is unmaintained, unsafe by
   # design, and has known security issues."
   #
