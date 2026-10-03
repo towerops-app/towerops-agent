@@ -171,17 +171,16 @@ func snmpSentHook(b *tokenBucket) func(*gosnmp.GoSNMP) {
 	return func(*gosnmp.GoSNMP) { b.charge() }
 }
 
-// rateLimitedQuerier takes a token from the process-wide bucket before each
-// SNMP request, so pacing happens before transmit and outside gosnmp's
-// request deadline. Combined with the OnSent charge this bounds real wire
-// traffic at the configured rate.
+// rateLimitedQuerier waits for a send slot before each SNMP request, outside
+// gosnmp's request deadline. waitDebt returns the reservation so OnSent alone
+// charges transmitted packets, including retries; unsent requests cost nothing.
 type rateLimitedQuerier struct {
 	ctx context.Context
 	q   snmpQuerier
 }
 
 func (r *rateLimitedQuerier) Get(oids []string) (*gosnmp.SnmpPacket, error) {
-	if !snmpPDUs.wait(r.ctx) {
+	if !snmpPDUs.waitDebt(r.ctx) {
 		return nil, r.ctx.Err()
 	}
 	return r.q.Get(oids)
@@ -223,14 +222,14 @@ func (r *rateLimitedQuerier) BulkWalkAll(rootOid string) ([]gosnmp.SnmpPDU, erro
 }
 
 func (r *rateLimitedQuerier) Walk(rootOid string, walkFn gosnmp.WalkFunc) error {
-	if !snmpPDUs.wait(r.ctx) {
+	if !snmpPDUs.waitDebt(r.ctx) {
 		return r.ctx.Err()
 	}
 	return r.q.Walk(rootOid, r.pacedWalkFn(walkFn))
 }
 
 func (r *rateLimitedQuerier) BulkWalk(rootOid string, walkFn gosnmp.WalkFunc) error {
-	if !snmpPDUs.wait(r.ctx) {
+	if !snmpPDUs.waitDebt(r.ctx) {
 		return r.ctx.Err()
 	}
 	return r.q.BulkWalk(rootOid, r.pacedWalkFn(walkFn))

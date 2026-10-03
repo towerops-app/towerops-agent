@@ -24,6 +24,7 @@ import (
 const (
 	mikrotikConnTimeout  = 30 * time.Second
 	mikrotikReadTimeout  = 30 * time.Second
+	mikrotikWriteTimeout = 30 * time.Second
 	mikrotikCloseTimeout = 2 * time.Second
 	maxMikrotikWordSize  = 10 << 20 // 10 MB
 	maxMikrotikResponse  = 16 << 20 // 16 MB aggregate decoded response
@@ -178,6 +179,11 @@ func compareMikrotikArgKeys(a, b string) int {
 }
 
 func (c *mikrotikClient) executeWords(words []string) (*mikrotikResponse, error) {
+	if conn, ok := c.conn.(net.Conn); ok {
+		if err := conn.SetWriteDeadline(time.Now().Add(mikrotikWriteTimeout)); err != nil {
+			return nil, fmt.Errorf("set write deadline: %w", err)
+		}
+	}
 	if err := c.writeSentence(words); err != nil {
 		return nil, err
 	}

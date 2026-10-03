@@ -360,11 +360,16 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 	deadline := startTime.Add(timeout)
 	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
 	defer dialCancel()
+	if contextDeadline, ok := dialCtx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
 	conn, err := tcpDialContext(dialCtx, "tcp", address)
 	if err != nil {
 		return checkCritical, fmt.Sprintf("Connection failed: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
+	stopCancel := context.AfterFunc(dialCtx, func() { _ = conn.Close() })
+	defer stopCancel()
 
 	// If send/expect strings are provided, keep both operations within the
 	// original end-to-end timeout budget.

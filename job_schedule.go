@@ -74,17 +74,22 @@ type recurringScheduler struct {
 	closed bool
 	jobs   map[string]*scheduleEntry
 	checks map[string]*scheduleEntry
-	wg     sync.WaitGroup
+	// Retiring inventories retain only completion barriers, never payloads.
+	retiringJobs   map[string]<-chan struct{}
+	retiringChecks map[string]<-chan struct{}
+	wg             sync.WaitGroup
 }
 
 func newRecurringScheduler(ctx context.Context, clock scheduleClock) *recurringScheduler {
 	schedulerCtx, cancel := context.WithCancel(ctx)
 	return &recurringScheduler{
-		ctx:    schedulerCtx,
-		cancel: cancel,
-		clock:  clock,
-		jobs:   make(map[string]*scheduleEntry),
-		checks: make(map[string]*scheduleEntry),
+		ctx:            schedulerCtx,
+		cancel:         cancel,
+		clock:          clock,
+		jobs:           make(map[string]*scheduleEntry),
+		checks:         make(map[string]*scheduleEntry),
+		retiringJobs:   make(map[string]<-chan struct{}),
+		retiringChecks: make(map[string]<-chan struct{}),
 	}
 }
 
@@ -163,10 +168,19 @@ func (s *recurringScheduler) replace(group *map[string]*scheduleEntry, specs []s
 	if s.closed {
 		return
 	}
+	retiring := s.retiringChecks
+	if group == &s.jobs {
+		retiring = s.retiringJobs
+	}
 
 	for id, current := range *group {
 		if _, ok := next[id]; !ok {
 			current.cancel()
+			var barrier <-chan struct{} = current.stopped
+			if current.predecessor != nil {
+				barrier = current.predecessor
+			}
+			s.retire(retiring, id, barrier)
 			delete(*group, id)
 		}
 	}
@@ -179,7 +193,7 @@ func (s *recurringScheduler) replace(group *map[string]*scheduleEntry, specs []s
 			continue
 		}
 
-		var predecessor <-chan struct{}
+		predecessor := retiring[id]
 		if current != nil {
 			current.cancel()
 			if current.predecessor != nil {
@@ -202,6 +216,25 @@ func (s *recurringScheduler) replace(group *map[string]*scheduleEntry, specs []s
 		s.wg.Add(1)
 		go s.run(ctx, entry)
 	}
+}
+
+// retire is called with s.mu held. A waiting replacement can stop before
+// its executor predecessor, so retain the executor's barrier in that case.
+func (s *recurringScheduler) retire(retiring map[string]<-chan struct{}, id string, barrier <-chan struct{}) {
+	if retiring[id] == barrier {
+		return
+	}
+	retiring[id] = barrier
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		<-barrier
+		s.mu.Lock()
+		if retiring[id] == barrier {
+			delete(retiring, id)
+		}
+		s.mu.Unlock()
+	}()
 }
 
 func (s *recurringScheduler) run(ctx context.Context, entry *scheduleEntry) {
@@ -315,6 +348,8 @@ func (s *recurringScheduler) cancelAll() {
 	}
 	clear(s.jobs)
 	clear(s.checks)
+	clear(s.retiringJobs)
+	clear(s.retiringChecks)
 	s.cancel()
 	s.mu.Unlock()
 }

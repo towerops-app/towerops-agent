@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -28,6 +29,79 @@ import (
 	"github.com/towerops-app/towerops-agent/pb"
 	"pgregory.net/rapid"
 )
+
+// Shorten real deadlines so stalled-peer tests exercise socket timeouts
+// without waiting for the production timeout.
+type boundedMikrotikConn struct {
+	net.Conn
+	deadline time.Time
+	err      error
+}
+
+func (c *boundedMikrotikConn) SetWriteDeadline(deadline time.Time) error {
+	c.deadline = deadline
+	if c.err != nil {
+		return c.err
+	}
+	return c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Millisecond))
+}
+
+func TestMikrotikCommandWriteTimeout(t *testing.T) {
+	for _, command := range []string{"/login", "/system/resource/print"} {
+		t.Run(command, func(t *testing.T) {
+			conn, peer := net.Pipe()
+			t.Cleanup(func() { _ = conn.Close(); _ = peer.Close() })
+			bounded := &boundedMikrotikConn{Conn: conn}
+			client := &mikrotikClient{conn: bounded}
+			start := time.Now()
+			done := make(chan error, 1)
+			go func() { _, err := client.execute(command, nil); done <- err }()
+			select {
+			case err := <-done:
+				var timeout net.Error
+				if !errors.As(err, &timeout) || !timeout.Timeout() {
+					t.Fatalf("execute error = %v, want socket timeout", err)
+				}
+				if delay := bounded.deadline.Sub(start); delay <= 0 || delay > 31*time.Second {
+					t.Fatalf("write deadline = %v after start, want bounded command deadline", delay)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("command write did not time out")
+			}
+		})
+	}
+}
+
+func TestMikrotikCommandWriteDeadlineFailure(t *testing.T) {
+	conn, peer := net.Pipe()
+	defer func() { _ = conn.Close(); _ = peer.Close() }()
+	want := errors.New("deadline unsupported")
+	client := &mikrotikClient{conn: &boundedMikrotikConn{Conn: conn, err: want}}
+	done := make(chan error, 1)
+	go func() { _, err := client.execute("/login", nil); done <- err }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, want) {
+			t.Fatalf("execute error = %v, want deadline failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("execute wrote after deadline setup failed")
+	}
+}
+
+func TestMikrotikCloseKeepsShortWriteDeadline(t *testing.T) {
+	conn, peer := net.Pipe()
+	defer func() { _ = conn.Close(); _ = peer.Close() }()
+	bounded := &boundedMikrotikConn{Conn: conn}
+	client := &mikrotikClient{conn: bounded}
+	start := time.Now()
+	if err := client.close(); err != nil {
+		t.Fatal(err)
+	}
+	if delay := bounded.deadline.Sub(start); delay <= 0 || delay > 3*time.Second {
+		t.Fatalf("close write deadline = %v after start, want short shutdown deadline", delay)
+	}
+}
 
 type nopCloser struct {
 	readWriter io.ReadWriter

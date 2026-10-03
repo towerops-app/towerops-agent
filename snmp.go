@@ -351,7 +351,7 @@ func buildSnmpResultFrames(
 		}
 		flush()
 	}
-	if frameSize > 0 || len(frames) == 0 {
+	if frameSize > 0 || len(frameRoots) > 0 || len(frames) == 0 {
 		flush()
 	}
 
