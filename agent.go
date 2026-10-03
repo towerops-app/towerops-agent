@@ -1493,10 +1493,15 @@ func submitConfigBackupJob(
 			done()
 			return false
 		}
-		if !pools.backup.submitMode(ctx, func() { task(release) }, true) {
+		if !pools.backup.submitMode(jobCtx, func() { task(release) }, true) {
 			release()
+			timedOut := errors.Is(jobCtx.Err(), context.DeadlineExceeded)
 			cancel()
-			report(pb.ConfigBackupErrorCode_AGENT_BUSY, "")
+			if timedOut {
+				report(pb.ConfigBackupErrorCode_TIMEOUT, "job deadline expired waiting for a worker")
+			} else {
+				report(pb.ConfigBackupErrorCode_AGENT_BUSY, "")
+			}
 			done()
 			return false
 		}

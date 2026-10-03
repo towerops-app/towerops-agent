@@ -1087,6 +1087,30 @@ func TestExecuteSnmpJobSplitsErrorStatusBatches(t *testing.T) {
 	}
 }
 
+func TestSnmpGetIntoSingleOIDTooBigFails(t *testing.T) {
+	const oid = ".1.3.6.1.2.1.1.1.0"
+	mock := &mockSnmpQuerier{
+		getFunc: func([]string) (*gosnmp.SnmpPacket, error) {
+			return &gosnmp.SnmpPacket{
+				Error: gosnmp.TooBig,
+				Variables: []gosnmp.SnmpPDU{
+					{Name: oid, Type: gosnmp.Null},
+				},
+			}, nil
+		},
+	}
+	values := make(map[string]string)
+	absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "192.0.2.1"}, []string{oid}, values)
+	if err == nil {
+		t.Error("single-OID TooBig response reported successful collection")
+	} else if !strings.Contains(err.Error(), fmt.Sprint(gosnmp.TooBig)) {
+		t.Errorf("error = %q, want TooBig status", err)
+	}
+	if absent != 0 || len(values) != 0 {
+		t.Fatalf("absent = %d, values = %v; oversized response must not count as an absent OID", absent, values)
+	}
+}
+
 // TestSnmpGetIntoUnhandledErrorStatus pins the default arm of the error-status
 // switch: an error status other than noSuchName/tooBig (here genErr) discards
 // the whole batch - no varbind from the failed response is recorded - and the

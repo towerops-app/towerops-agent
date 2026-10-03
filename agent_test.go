@@ -5365,6 +5365,71 @@ func TestSubmitConfigBackupWaitIgnoresDispatchSlots(t *testing.T) {
 	}
 }
 
+func TestSubmitConfigBackupWaitQueueHonorsJobDeadline(t *testing.T) {
+	origJitter := dispatchJitterMax
+	dispatchJitterMax = 0
+	pools := &jobPools{
+		backup:  newWorkerPool(1),
+		targets: &targetGates{},
+	}
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	releaseWorker := make(chan struct{})
+	submitted := make(chan bool, 1)
+	submitFinished := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		close(releaseWorker)
+		select {
+		case <-submitFinished:
+		case <-time.After(time.Second):
+			t.Error("backup submission did not finish during cleanup")
+		}
+		pools.backup.stop()
+		dispatchJitterMax = origJitter
+	})
+	started := make(chan struct{})
+	if !pools.backup.submit(sessionCtx, func() { close(started); <-releaseWorker }) {
+		t.Fatal("backup pool rejected blocker")
+	}
+	<-started
+	for range cap(pools.backup.tasks) {
+		if !pools.backup.submit(sessionCtx, func() {}) {
+			t.Fatal("backup pool rejected task before its queue was full")
+		}
+	}
+
+	job := cbJob("192.0.2.1", 22)
+	job.ConfigBackup.TimeoutMs = 50
+	out := testQueue()
+	done := make(chan struct{})
+	go func() {
+		defer close(submitFinished)
+		submitted <- submitConfigBackupJob(sessionCtx, job, pools, out, func() { close(done) }, true)
+	}()
+	select {
+	case accepted := <-submitted:
+		if accepted {
+			t.Fatal("expired backup was admitted to the saturated queue")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("backup queue admission stayed blocked after its job deadline")
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("expired backup did not complete bookkeeping")
+	}
+	result := wantResult[*pb.ConfigBackupResult](t, out, "config_backup_result", time.Second)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_TIMEOUT {
+		t.Fatalf("error code = %v (%q), want TIMEOUT from queue admission", result.ErrorCode, result.ErrorDetail)
+	}
+	release, _ := pools.targets.tryAcquire(jobTargetKey(job))
+	if release == nil {
+		t.Fatal("expired queue admission left the device gate held")
+	}
+	release()
+}
+
 // A recurring backup that is queued runs on the backup pool, reports its
 // result, and frees the device gate when it finishes.
 func TestSubmitConfigBackupWaitRuns(t *testing.T) {

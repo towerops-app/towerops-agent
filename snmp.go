@@ -427,11 +427,12 @@ func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[s
 		return absent, nil
 	case gosnmp.NoSuchName, gosnmp.TooBig:
 		if len(oids) == 1 {
-			if result.Error == gosnmp.NoSuchName {
-				// v1: the device answered — the OID is absent. Record empty.
-				into[canonicalOID(oids[0])] = ""
-				absent = 1
+			if result.Error == gosnmp.TooBig {
+				return 0, fmt.Errorf("OID %s: status %s", oids[0], result.Error)
 			}
+			// v1: the device answered — the OID is absent. Record empty.
+			into[canonicalOID(oids[0])] = ""
+			absent = 1
 			slog.Debug("snmp get oid skipped", "device", dev.Ip, "oid", oids[0], "status", result.Error, "error_index", result.ErrorIndex)
 			return absent, nil
 		}

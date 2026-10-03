@@ -152,6 +152,9 @@ func executeConfigBackupJobCtx(sessionCtx, jobCtx context.Context, job *pb.Agent
 
 	client, fp, err := configBackupDial(jobCtx, job)
 	fingerprint = fp
+	if client != nil {
+		defer func() { _ = client.Close() }()
+	}
 	if sessionCtx.Err() != nil {
 		return
 	}
@@ -166,7 +169,6 @@ func executeConfigBackupJobCtx(sessionCtx, jobCtx context.Context, job *pb.Agent
 		finish(result)
 		return
 	}
-	defer func() { _ = client.Close() }()
 	stopCancel := context.AfterFunc(jobCtx, func() { _ = client.Close() })
 	defer stopCancel()
 
@@ -271,11 +273,11 @@ func classifyConfigBackupError(err error, job *pb.AgentJob) (pb.ConfigBackupErro
 		code = pb.ConfigBackupErrorCode_INTERNAL
 	}
 
-	detail := firstLine(err.Error(), maxConfigBackupDetailLen)
+	detail := err.Error()
 	if pw := job.ConfigBackup.GetPassword(); pw != "" {
 		detail = strings.ReplaceAll(detail, pw, "***")
 	}
-	return code, detail
+	return code, firstLine(detail, maxConfigBackupDetailLen)
 }
 
 func isAuthFailure(err error) bool {
@@ -311,10 +313,7 @@ func firstLine(s string, max int) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		s = s[:i]
 	}
-	if len(s) > max {
-		s = s[:max]
-	}
-	return s
+	return truncateBytes(strings.ToValidUTF8(s, "\uFFFD"), max)
 }
 
 // mikrotikBackupVendor implements config backups over a RouterOS SSH session.
@@ -357,10 +356,10 @@ func runConfigBackupSession(ctx context.Context, c *ssh.Client, cmd string, maxB
 
 // configBackupError builds a failure result, scrubbing the password.
 func configBackupError(job *pb.ConfigBackupJob, jobID, deviceID string, code pb.ConfigBackupErrorCode, detail string) *pb.ConfigBackupResult {
-	detail = firstLine(detail, maxConfigBackupDetailLen)
 	if job.Password != "" {
 		detail = strings.ReplaceAll(detail, job.Password, "***")
 	}
+	detail = firstLine(detail, maxConfigBackupDetailLen)
 	return &pb.ConfigBackupResult{
 		DeviceId:    deviceID,
 		JobId:       jobID,
@@ -510,7 +509,7 @@ func (v mikrotikBackupVendor) Backup(ctx context.Context, c *ssh.Client, job *pb
 		return configBackupError(job, jobID, deviceID, pb.ConfigBackupErrorCode_EXPORT_FAILED, detail)
 	}
 	if code := classifyExportOutput(combined); code != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
-		return configBackupError(job, jobID, deviceID, code, firstLine(combined, maxConfigBackupDetailLen))
+		return configBackupError(job, jobID, deviceID, code, combined)
 	}
 
 	var gz bytes.Buffer

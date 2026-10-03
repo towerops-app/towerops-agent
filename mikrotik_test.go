@@ -1100,6 +1100,32 @@ func TestHmReadResponseExceedsMaxSentences(t *testing.T) {
 	}
 }
 
+func TestHmReadSentenceExceedsMaxBytes(t *testing.T) {
+	const wordSize = 9 << 20
+	word := bytes.Repeat([]byte{'x'}, wordSize)
+	var buf bytes.Buffer
+	buf.Grow(2*(len(encodeLength(wordSize))+wordSize) + 1)
+	for range 2 {
+		if _, err := buf.Write(encodeLength(wordSize)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := buf.Write(word); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := buf.WriteByte(0); err != nil {
+		t.Fatal(err)
+	}
+	client := &mikrotikClient{conn: &nopCloser{readWriter: &buf}}
+	_, err := client.readSentence()
+	if err == nil {
+		t.Fatal("sentence accepted individually valid words exceeding the aggregate byte limit")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("%d bytes", maxMikrotikResponse)) {
+		t.Fatalf("error = %q, want aggregate byte-limit error", err)
+	}
+}
+
 func TestHmReadSentenceDeadlineError(t *testing.T) {
 	// A closed net.Pipe rejects SetReadDeadline with io.ErrClosedPipe.
 	server, client := net.Pipe()

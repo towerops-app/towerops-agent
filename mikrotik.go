@@ -269,6 +269,7 @@ func (c *mikrotikClient) readSentence() ([]string, error) {
 		}
 	}
 	words := make([]string, 0, 16)
+	totalBytes := 0
 	for len(words) < maxMikrotikWords {
 		word, err := c.readWord()
 		if err != nil {
@@ -276,6 +277,10 @@ func (c *mikrotikClient) readSentence() ([]string, error) {
 		}
 		if word == "" {
 			return words, nil
+		}
+		totalBytes += len(word)
+		if totalBytes > maxMikrotikResponse {
+			return nil, fmt.Errorf("sentence exceeds %d bytes", maxMikrotikResponse)
 		}
 		words = append(words, word)
 	}

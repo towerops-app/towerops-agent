@@ -22,6 +22,7 @@ import (
 	"net/http/httptest"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -461,6 +462,33 @@ func TestHTTPCheck_FollowRedirectsTrue(t *testing.T) {
 	}
 	if !strings.Contains(output, "200") {
 		t.Fatalf("expected final 200 status in output, got %s", output)
+	}
+}
+
+func TestHTTPCheck_RedirectLoopStopsAfterTenRequests(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Bound the regression's failure path independently of the check timeout.
+		if requests.Add(1) > 10 {
+			w.WriteHeader(http.StatusLoopDetected)
+			return
+		}
+		http.Redirect(w, r, "/loop", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	status, output := executeHTTPCheck(ctx, &pb.HttpCheckConfig{
+		Url:             srv.URL + "/loop",
+		FollowRedirects: true,
+	}, 5000)
+
+	if count := requests.Load(); count != 10 {
+		t.Fatalf("made %d requests, want ten-request redirect limit; status = %d, output = %q", count, status, output)
+	}
+	if status != checkCritical || !strings.Contains(output, "stopped after 10 redirects") {
+		t.Fatalf("status = %d, output = %q; want critical redirect-limit error", status, output)
 	}
 }
 
@@ -1610,6 +1638,22 @@ func TestResolverForServerUsesRequestedNetwork(t *testing.T) {
 		t.Fatalf("dial requested TCP network: %v", err)
 	}
 	_ = conn.Close()
+}
+
+func TestResolverForServerBracketedIPv6UsesDefaultPort(t *testing.T) {
+	resolver := resolverForServer("[::1]", time.Second)
+	conn, err := resolver.Dial(context.Background(), "udp", "unused")
+	if err != nil {
+		t.Fatalf("dial bracketed IPv6 DNS server: %v", err)
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("close resolver connection: %v", err)
+		}
+	}()
+	if address := conn.RemoteAddr().String(); address != "[::1]:53" {
+		t.Fatalf("resolver address = %q, want [::1]:53", address)
+	}
 }
 
 func TestDNSCheck_RecordTypeCaseInsensitive(t *testing.T) {

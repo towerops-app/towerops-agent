@@ -90,6 +90,40 @@ func TestHostKeyStoreCorruptFileFailsClosed(t *testing.T) {
 	}
 }
 
+func TestHostKeyStoreNullFileFailsClosed(t *testing.T) {
+	for _, operation := range []string{"verify", "initialize"} {
+		t.Run(operation, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "known_hosts.json")
+			if err := os.WriteFile(path, []byte("null"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if operation == "verify" {
+				if err := newHostKeyStore(path).verify("host:22", "new-fingerprint"); err == nil {
+					t.Error("null host-key store allowed first-use trust")
+				}
+			} else {
+				original := globalHostKeys
+				sentinel := &hostKeyStore{}
+				globalHostKeys = sentinel
+				t.Cleanup(func() { globalHostKeys = original })
+				if err := initHostKeyStore(path); err == nil {
+					t.Error("initialization accepted a null host-key store")
+				}
+				if globalHostKeys != sentinel {
+					t.Error("failed initialization replaced the installed store")
+				}
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != "null" {
+				t.Fatalf("null host-key store was overwritten: %q", data)
+			}
+		})
+	}
+}
+
 func TestHostKeyStoreConcurrency(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "known_hosts.json")
