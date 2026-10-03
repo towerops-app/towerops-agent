@@ -1266,6 +1266,20 @@ func TestHmReadSentenceDeadlineError(t *testing.T) {
 	}
 }
 
+func TestReadResponseDeadlineError(t *testing.T) {
+	server, client := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = client.Close() })
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &mikrotikClient{conn: client}
+	_, err := c.readResponse()
+	if !errors.Is(err, io.ErrClosedPipe) || !strings.Contains(err.Error(), "set read deadline") {
+		t.Fatalf("readResponse error = %v, want wrapped read-deadline failure", err)
+	}
+}
+
 func TestHmCheckedMikrotikLength(t *testing.T) {
 	got, err := checkedMikrotikLength(0xFFFFFFFF)
 	if err != nil {
