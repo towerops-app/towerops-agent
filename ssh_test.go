@@ -510,6 +510,33 @@ func TestExecuteMikrotikBackupSuccess(t *testing.T) {
 	}
 }
 
+// TestExecuteMikrotikBackupNoExitStatus covers RouterOS 6: its SSH server
+// closes the exec channel without an exit-status, which session.Run reports
+// as *ssh.ExitMissingError. The output is still complete and the backup must
+// be returned, not rejected.
+func TestExecuteMikrotikBackupNoExitStatus(t *testing.T) {
+	resetHostKeyStore(t)
+
+	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
+		_, _ = ch.Write([]byte("# RouterOS config\n/ip address\nadd address=10.0.0.1/24\n"))
+		_ = ch.CloseWrite()
+		_ = ch.Close() // no exit-status: what ROS 6 sends
+	})
+	defer cleanup()
+
+	_, port, _ := net.SplitHostPort(addr)
+	var portNum uint16
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
+
+	config, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass")
+	if err != nil {
+		t.Fatalf("RouterOS 6 export must not fail on a missing exit-status: %v", err)
+	}
+	if !strings.Contains(config, "add address=10.0.0.1/24") {
+		t.Errorf("expected export content, got: %q", config)
+	}
+}
+
 func TestExecuteMikrotikBackupCommandError(t *testing.T) {
 	resetHostKeyStore(t)
 	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
@@ -643,6 +670,19 @@ func startTestSSHServerWithSigner(
 		},
 	}
 	config.AddHostKey(signer)
+
+	return startTestSSHServerWithConfig(t, config, handler)
+}
+
+// startTestSSHServerWithConfig is startTestSSHServerWithSigner with a
+// caller-owned ServerConfig, for tests that need to narrow the algorithm
+// set (e.g. to the legacy algorithms an old RouterOS 6 server offers).
+func startTestSSHServerWithConfig(
+	t *testing.T,
+	config *ssh.ServerConfig,
+	handler func(ch ssh.Channel, command string),
+) (string, func()) {
+	t.Helper()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -843,12 +883,14 @@ func TestSSHBackupPinsStoredHostKeyAlgorithm(t *testing.T) {
 		return chkTOrigSSHDial(ctx, network, addr, config)
 	}
 
-	// First connect trusts on first use; nothing pinned yet.
+	// First connect trusts on first use; nothing pinned yet, so the config
+	// offers the full RouterOS set (supported + insecure algorithms).
 	if _, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass"); err != nil {
 		t.Fatalf("first connect failed: %v", err)
 	}
-	if len(captured.HostKeyAlgorithms) != 0 {
-		t.Fatalf("first-use HostKeyAlgorithms = %v, want unset", captured.HostKeyAlgorithms)
+	wantHostKeys := append(ssh.SupportedAlgorithms().HostKeys, ssh.InsecureAlgorithms().HostKeys...)
+	if !slices.Equal(captured.HostKeyAlgorithms, wantHostKeys) {
+		t.Fatalf("first-use HostKeyAlgorithms = %v, want %v", captured.HostKeyAlgorithms, wantHostKeys)
 	}
 
 	// Second connect offers only the pinned key type.
@@ -860,12 +902,19 @@ func TestSSHBackupPinsStoredHostKeyAlgorithm(t *testing.T) {
 		t.Fatalf("pinned HostKeyAlgorithms = %v, want [%s]", captured.HostKeyAlgorithms, ssh.KeyAlgoECDSA256)
 	}
 
-	// An endpoint with no entry is unpinned.
-	if _, err := executeMikrotikBackupContext(context.Background(), "127.0.0.2", portNum, "admin", "pass"); err == nil {
-		t.Fatal("dial to a dead address should fail")
+	// An endpoint with no entry is unpinned. A closed port on 127.0.0.1 —
+	// not 127.0.0.2, which macOS never refuses — keeps the connect instant.
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(captured.HostKeyAlgorithms) != 0 {
-		t.Fatalf("unpinned HostKeyAlgorithms = %v, want unset", captured.HostKeyAlgorithms)
+	deadPort := dead.Addr().(*net.TCPAddr).Port
+	_ = dead.Close()
+	if _, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", uint16(deadPort), "admin", "pass"); err == nil {
+		t.Fatal("dial to a closed port should fail")
+	}
+	if !slices.Equal(captured.HostKeyAlgorithms, wantHostKeys) {
+		t.Fatalf("unpinned HostKeyAlgorithms = %v, want %v", captured.HostKeyAlgorithms, wantHostKeys)
 	}
 }
 

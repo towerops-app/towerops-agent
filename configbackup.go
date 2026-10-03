@@ -202,7 +202,7 @@ func configBackupDial(ctx context.Context, job *pb.AgentJob) (*ssh.Client, strin
 		// Timeout is intentionally unset: sshDial never calls ssh.Dial, so the
 		// field would be ignored. The context deadline below is the bound.
 	}
-
+	routerOSSSHAlgorithms(config)
 	port := cb.SshPort
 	if port == 0 {
 		port = 22
@@ -326,7 +326,7 @@ type mikrotikBackupVendor struct{}
 // abort the stream and the returned error is errConfigBackupTooLarge. A
 // non-zero exit keeps the captured stdout so callers can classify the failure
 // from device output.
-func runConfigBackupSession(c *ssh.Client, cmd string, maxBytes uint64) (stdout, stderr []byte, err error) {
+func runConfigBackupSession(ctx context.Context, c *ssh.Client, cmd string, maxBytes uint64) (stdout, stderr []byte, err error) {
 	session, err := c.NewSession()
 	if err != nil {
 		return nil, nil, err
@@ -341,6 +341,14 @@ func runConfigBackupSession(c *ssh.Client, cmd string, maxBytes uint64) (stdout,
 	session.Stdout = &outBuf
 	session.Stderr = &errBuf
 	runErr := session.Run(cmd)
+	// RouterOS 6 closes the exec channel without an exit-status, which
+	// surfaces as *ssh.ExitMissingError with the output still delivered.
+	// Tolerate it only while the job context is live: a deadline-driven
+	// conn.Close produces the same error and must stay an error.
+	var exitMissing *ssh.ExitMissingError
+	if errors.As(runErr, &exitMissing) && ctx.Err() == nil {
+		runErr = nil
+	}
 	if outBuf.overflow {
 		return outBuf.Bytes(), errBuf.Bytes(), errConfigBackupTooLarge
 	}
@@ -388,16 +396,16 @@ func mikrotikExportCommand(major int, includeSecrets bool) string {
 	return "/export hide-sensitive"
 }
 
-func (mikrotikBackupVendor) readVersion(c *ssh.Client) (string, error) {
-	out, _, err := runConfigBackupSession(c, ":put [/system resource get version]", configBackupMetaMaxBytes)
+func (mikrotikBackupVendor) readVersion(ctx context.Context, c *ssh.Client) (string, error) {
+	out, _, err := runConfigBackupSession(ctx, c, ":put [/system resource get version]", configBackupMetaMaxBytes)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 
-func (mikrotikBackupVendor) readIdentity(c *ssh.Client) (string, error) {
-	out, _, err := runConfigBackupSession(c, ":put [/system identity get name]", configBackupMetaMaxBytes)
+func (mikrotikBackupVendor) readIdentity(ctx context.Context, c *ssh.Client) (string, error) {
+	out, _, err := runConfigBackupSession(ctx, c, ":put [/system identity get name]", configBackupMetaMaxBytes)
 	if err != nil {
 		return "", err
 	}
@@ -428,13 +436,13 @@ func routerOSScriptString(s string) (string, bool) {
 func (v mikrotikBackupVendor) Probe(ctx context.Context, c *ssh.Client, job *pb.ConfigBackupJob, jobID, deviceID string) *pb.ConfigBackupResult {
 	result := &pb.ConfigBackupResult{DeviceId: deviceID, JobId: jobID}
 
-	version, err := v.readVersion(c)
+	version, err := v.readVersion(ctx, c)
 	if err != nil {
 		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx, err), err.Error())
 	}
 	result.OsVersion = version
 
-	identity, err := v.readIdentity(c)
+	identity, err := v.readIdentity(ctx, c)
 	if err != nil {
 		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx, err), err.Error())
 	}
@@ -446,7 +454,7 @@ func (v mikrotikBackupVendor) Probe(ctx context.Context, c *ssh.Client, job *pb.
 			"username cannot be embedded in a RouterOS script")
 	}
 	policyCmd := fmt.Sprintf(":put [/user group get [/user get [find name=\"%s\"] group] policy]", safeUser)
-	out, _, err := runConfigBackupSession(c, policyCmd, configBackupMetaMaxBytes)
+	out, _, err := runConfigBackupSession(ctx, c, policyCmd, configBackupMetaMaxBytes)
 	if err != nil {
 		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx, err), err.Error())
 	}
@@ -468,7 +476,7 @@ func (v mikrotikBackupVendor) Probe(ctx context.Context, c *ssh.Client, job *pb.
 // Backup exports the full configuration, classifies device-side failures, and
 // gzips the result.
 func (v mikrotikBackupVendor) Backup(ctx context.Context, c *ssh.Client, job *pb.ConfigBackupJob, jobID, deviceID string) *pb.ConfigBackupResult {
-	version, err := v.readVersion(c)
+	version, err := v.readVersion(ctx, c)
 	if err != nil {
 		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx, err), err.Error())
 	}
@@ -482,7 +490,7 @@ func (v mikrotikBackupVendor) Backup(ctx context.Context, c *ssh.Client, job *pb
 	if maxBytes == 0 {
 		maxBytes = defaultMaxConfigBytes
 	}
-	out, stderr, err := runConfigBackupSession(c, mikrotikExportCommand(major, job.IncludeSecrets), maxBytes)
+	out, stderr, err := runConfigBackupSession(ctx, c, mikrotikExportCommand(major, job.IncludeSecrets), maxBytes)
 	if errors.Is(err, errConfigBackupTooLarge) {
 		return configBackupError(job, jobID, deviceID, pb.ConfigBackupErrorCode_TOO_LARGE,
 			fmt.Sprintf("export exceeded the %d byte limit", maxBytes))
@@ -510,7 +518,7 @@ func (v mikrotikBackupVendor) Backup(ctx context.Context, c *ssh.Client, job *pb
 		return configBackupError(job, jobID, deviceID, pb.ConfigBackupErrorCode_INTERNAL, err.Error())
 	}
 
-	identity, _ := v.readIdentity(c)
+	identity, _ := v.readIdentity(ctx, c)
 
 	return &pb.ConfigBackupResult{
 		DeviceId:        deviceID,
