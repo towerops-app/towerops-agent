@@ -29,6 +29,94 @@ import (
 	"pgregory.net/rapid"
 )
 
+type observedTCPConn struct {
+	net.Conn
+	started  chan struct{}
+	deadline time.Time
+}
+
+func (c *observedTCPConn) Read(p []byte) (int, error) {
+	close(c.started)
+	return c.Conn.Read(p)
+}
+
+func (c *observedTCPConn) Write(p []byte) (int, error) {
+	close(c.started)
+	return c.Conn.Write(p)
+}
+
+func (c *observedTCPConn) SetDeadline(deadline time.Time) error {
+	c.deadline = deadline
+	return c.Conn.SetDeadline(deadline)
+}
+
+func TestTCPCheckCancelsEstablishedIO(t *testing.T) {
+	for _, operation := range []string{"read", "write"} {
+		t.Run(operation, func(t *testing.T) {
+			conn, peer := net.Pipe()
+			t.Cleanup(func() { _ = conn.Close(); _ = peer.Close() })
+			observed := &observedTCPConn{Conn: conn, started: make(chan struct{})}
+			orig := tcpDialContext
+			t.Cleanup(func() { tcpDialContext = orig })
+			tcpDialContext = func(context.Context, string, string) (net.Conn, error) { return observed, nil }
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			config := &pb.TcpCheckConfig{Host: "example.test", Port: 1234}
+			if operation == "read" {
+				config.Expect = "ready"
+			} else {
+				config.Send = "hello"
+			}
+			done := make(chan uint32, 1)
+			go func() { status, _ := executeTCPCheck(ctx, config, 60000); done <- status }()
+			select {
+			case <-observed.started:
+			case <-time.After(time.Second):
+				t.Fatal("socket operation did not start")
+			}
+			cancel()
+			select {
+			case status := <-done:
+				if status != checkCritical {
+					t.Fatalf("status = %d, want critical", status)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("canceled TCP check retained its worker")
+			}
+		})
+	}
+}
+
+func TestTCPCheckUsesParentDeadline(t *testing.T) {
+	conn, peer := net.Pipe()
+	t.Cleanup(func() { _ = conn.Close(); _ = peer.Close() })
+	observed := &observedTCPConn{Conn: conn, started: make(chan struct{})}
+	orig := tcpDialContext
+	t.Cleanup(func() { tcpDialContext = orig })
+	tcpDialContext = func(context.Context, string, string) (net.Conn, error) { return observed, nil }
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		executeTCPCheck(ctx, &pb.TcpCheckConfig{Host: "example.test", Port: 1234, Expect: "ready"}, 60000)
+		close(done)
+	}()
+	select {
+	case <-observed.started:
+	case <-time.After(time.Second):
+		t.Fatal("socket read did not start")
+	}
+	deadline, _ := ctx.Deadline()
+	if !observed.deadline.Equal(deadline) {
+		t.Errorf("socket deadline = %v, want parent deadline %v", observed.deadline, deadline)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("TCP check ignored parent deadline")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ExecuteCheck routing tests
 // ---------------------------------------------------------------------------

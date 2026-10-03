@@ -271,6 +271,91 @@ func TestRecurringSchedulerReplacementAndRemoval(t *testing.T) {
 	}
 }
 
+func TestRecurringSchedulerRemovalAndReaddition(t *testing.T) {
+	for _, groupName := range []string{"jobs", "checks"} {
+		for _, replaceFirst := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/replace=%t", groupName, replaceFirst), func(t *testing.T) {
+				clock := newManualScheduleClock()
+				scheduler := newRecurringScheduler(context.Background(), clock)
+				t.Cleanup(func() { scheduler.cancelAll(); scheduler.wait(time.Second) })
+				group := &scheduler.jobs
+				if groupName == "checks" {
+					group = &scheduler.checks
+				}
+				runs := make(chan scheduleInvocation, 4)
+				scheduler.replace(group, []scheduleSpec{testScheduleSpec("same-id", "old", time.Minute, runs)})
+				fireFirstTickDelay(t, clock, time.Minute)
+				oldRun := nextInvocation(t, runs)
+				released := false
+				defer func() {
+					if !released {
+						close(oldRun.done)
+					}
+				}()
+				_ = nextManualTimer(t, clock)
+				if replaceFirst {
+					scheduler.replace(group, []scheduleSpec{testScheduleSpec("same-id", "intermediate", time.Minute, runs)})
+				}
+				scheduler.replace(group, nil)
+				scheduler.replace(group, []scheduleSpec{testScheduleSpec("same-id", "new", time.Minute, runs)})
+				// Remove and re-add again while the replacement is still waiting.
+				scheduler.replace(group, nil)
+				scheduler.replace(group, []scheduleSpec{testScheduleSpec("same-id", "newest", time.Minute, runs)})
+				select {
+				case <-clock.requests:
+					t.Fatal("re-added assignment started its timer before removed execution completed")
+				case <-time.After(50 * time.Millisecond):
+				}
+				// Release the original execution, then the re-added entry's stagger.
+				close(oldRun.done)
+				released = true
+				fireFirstTickDelay(t, clock, time.Minute)
+				newRun := nextInvocation(t, runs)
+				close(newRun.done)
+			})
+		}
+	}
+}
+
+func TestRecurringSchedulerRetirementCleanupAndGroupIsolation(t *testing.T) {
+	clock := newManualScheduleClock()
+	scheduler := newRecurringScheduler(context.Background(), clock)
+	t.Cleanup(func() { scheduler.cancelAll(); scheduler.wait(time.Second) })
+	runs := make(chan scheduleInvocation, 4)
+	spec := testScheduleSpec("same-id", "old", time.Minute, runs)
+	scheduler.replace(&scheduler.jobs, []scheduleSpec{spec})
+	fireFirstTickDelay(t, clock, time.Minute)
+	jobRun := nextInvocation(t, runs)
+	jobReleased := false
+	defer func() {
+		if !jobReleased {
+			close(jobRun.done)
+		}
+	}()
+	_ = nextManualTimer(t, clock)
+	scheduler.replace(&scheduler.jobs, nil)
+
+	// A check with the same ID has its own inventory and must not wait for
+	// a retiring device job.
+	scheduler.replace(&scheduler.checks, []scheduleSpec{spec})
+	fireFirstTickDelay(t, clock, time.Minute)
+	checkRun := nextInvocation(t, runs)
+	defer close(checkRun.done)
+	_ = nextManualTimer(t, clock)
+	scheduler.replace(&scheduler.checks, nil)
+	close(jobRun.done)
+	jobReleased = true
+	checkRun.done <- struct{}{}
+	if !scheduler.wait(time.Second) {
+		t.Fatal("retiring entries did not finish")
+	}
+	scheduler.mu.Lock()
+	defer scheduler.mu.Unlock()
+	if len(scheduler.retiringJobs) != 0 || len(scheduler.retiringChecks) != 0 {
+		t.Fatal("completed assignments retained retirement barriers")
+	}
+}
+
 func TestRecurringSchedulerPreservesUnchangedAssignment(t *testing.T) {
 	clock := newManualScheduleClock()
 	scheduler := newRecurringScheduler(context.Background(), clock)

@@ -15,6 +15,77 @@ import (
 	"github.com/gosnmp/gosnmp"
 )
 
+func TestRateLimitedQuerierChargesOnlyTransmittedPackets(t *testing.T) {
+	for _, operation := range []string{"get", "walk", "bulk-walk"} {
+		for _, packets := range []int{0, 1, 3} {
+			t.Run(fmt.Sprintf("%s/packets=%d", operation, packets), func(t *testing.T) {
+				original := snmpPDUs
+				t.Cleanup(func() { snmpPDUs = original })
+				fixed := time.Now()
+				snmpPDUs = newTokenBucket(100, func() time.Time { return fixed })
+				hook := snmpSentHook(snmpPDUs)
+				transmit := func() {
+					for range packets {
+						hook(nil)
+					}
+				}
+				mock := &mockSnmpQuerier{
+					getFunc: func([]string) (*gosnmp.SnmpPacket, error) {
+						transmit()
+						if packets == 0 {
+							return nil, errors.New("request never sent")
+						}
+						return &gosnmp.SnmpPacket{}, nil
+					},
+					walkStepFunc: func(string) ([]gosnmp.SnmpPDU, error) {
+						transmit()
+						if packets == 0 {
+							return nil, errors.New("request never sent")
+						}
+						return []gosnmp.SnmpPDU{{Name: "1.3.6.1.1"}}, nil
+					},
+				}
+				q := &rateLimitedQuerier{ctx: context.Background(), q: mock}
+				var err error
+				switch operation {
+				case "get":
+					_, err = q.Get([]string{"1.3.6.1"})
+				case "walk":
+					err = q.Walk("1.3.6.1", func(gosnmp.SnmpPDU) error { return nil })
+				case "bulk-walk":
+					err = q.BulkWalk("1.3.6.1", func(gosnmp.SnmpPDU) error { return nil })
+				}
+				if (err != nil) != (packets == 0) {
+					t.Fatalf("operation error = %v for %d packets", err, packets)
+				}
+				if snmpPDUs.tokens != float64(10-packets) {
+					t.Fatalf("tokens = %v after %d packets, want %d", snmpPDUs.tokens, packets, 10-packets)
+				}
+			})
+		}
+	}
+}
+
+func TestRateLimitedQuerierCanceledBeforeAvailableSend(t *testing.T) {
+	for _, rate := range []float64{0, 100} {
+		t.Run(fmt.Sprintf("rate=%v", rate), func(t *testing.T) {
+			original := snmpPDUs
+			t.Cleanup(func() { snmpPDUs = original })
+			snmpPDUs = newTokenBucket(rate, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			mock := &mockSnmpQuerier{getFunc: func([]string) (*gosnmp.SnmpPacket, error) {
+				t.Error("canceled request reached device")
+				return &gosnmp.SnmpPacket{}, nil
+			}}
+			q := &rateLimitedQuerier{ctx: ctx, q: mock}
+			if _, err := q.Get([]string{"1.3.6.1"}); !errors.Is(err, context.Canceled) {
+				t.Fatalf("Get error = %v, want cancellation", err)
+			}
+		})
+	}
+}
+
 func TestTokenBucketReserve(t *testing.T) {
 	now := time.Now()
 	current := now

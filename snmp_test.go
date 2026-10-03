@@ -19,6 +19,28 @@ import (
 	"pgregory.net/rapid"
 )
 
+func TestSnmpResultEmptyCompletedRootsAfterTruncation(t *testing.T) {
+	frames := buildSnmpResultFrames(&pb.AgentJob{JobId: "empty-after-truncated", MaxResultBytes: 4096}, []snmpResultBucket{
+		{label: "1.3.6.1.2.1.2", values: map[string]string{"1.3.6.1.2.1.2.1": strings.Repeat("x", 6000)}, completed: true},
+		{label: "1.3.6.1.2.1.4.22", completed: true},
+		{label: "1.3.6.1.2.1.4.24", completed: true},
+		{label: "1.3.6.1.2.1.5", completed: false},
+	}, false)
+	if len(frames) != 2 {
+		t.Fatalf("got %d frames, want truncated frame and completed-root metadata frame", len(frames))
+	}
+	last := frames[1]
+	if len(last.OidValues) != 0 || len(last.CompletedRoots) != 2 ||
+		last.CompletedRoots[0] != "1.3.6.1.2.1.4.22" || last.CompletedRoots[1] != "1.3.6.1.2.1.4.24" {
+		t.Fatalf("metadata frame = %v, want both empty completed roots", last)
+	}
+	for i, frame := range frames {
+		if frame.Sequence != uint32(i+1) || frame.Final != (i == len(frames)-1) {
+			t.Fatalf("frame %d sequence/final = %d/%t", i, frame.Sequence, frame.Final)
+		}
+	}
+}
+
 func TestSnmpValueToString(t *testing.T) {
 	tests := []struct {
 		name string
