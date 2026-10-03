@@ -1178,6 +1178,170 @@ func TestConfigBackupJobTimeoutDuringSession(t *testing.T) {
 	}
 }
 
+func TestConfigBackupExportTimeout(t *testing.T) {
+	cases := []struct {
+		name   string
+		output string
+	}{
+		{"empty output", ""},
+		{"partial configuration", cbTestExport},
+		{"partial failure text", "no permission\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			release := make(chan struct{})
+			handler := func(ch ssh.Channel, command string) {
+				if strings.HasPrefix(command, "/export") {
+					if _, err := ch.Write([]byte(tc.output)); err != nil {
+						return
+					}
+					<-release
+					return
+				}
+				cbRouterHandler(cbTestExport)(ch, command)
+			}
+			addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
+			defer cleanup()
+			defer close(release)
+			host, port := cbAddrPort(t, addr)
+			job := cbJob(host, port)
+			job.ConfigBackup.TimeoutMs = 200
+			out := testQueue()
+			executeConfigBackupJob(context.Background(), job, out)
+			result := cbReceiveConfigBackupResult(t, out)
+			if result.ErrorCode != pb.ConfigBackupErrorCode_TIMEOUT {
+				t.Fatalf("code = %v (%q), want TIMEOUT", result.ErrorCode, result.ErrorDetail)
+			}
+		})
+	}
+}
+
+func TestConfigBackupExportStderr(t *testing.T) {
+	cases := []struct {
+		name   string
+		stderr string
+		status uint32
+		want   pb.ConfigBackupErrorCode
+	}{
+		{"permission failure after stdout", "no permission\n", 1, pb.ConfigBackupErrorCode_PERMISSION_DENIED},
+		{"failure with successful exit", "failure: export aborted\n", 0, pb.ConfigBackupErrorCode_EXPORT_FAILED},
+		{"benign diagnostic", "diagnostic: export started\n", 0, pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := func(ch ssh.Channel, command string) {
+				if strings.HasPrefix(command, "/export") {
+					if _, err := ch.Write([]byte(cbTestExport)); err != nil {
+						return
+					}
+					if _, err := ch.Stderr().Write([]byte(tc.stderr)); err != nil {
+						return
+					}
+					if _, err := ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{tc.status})); err != nil {
+						return
+					}
+					if err := ch.Close(); err != nil {
+						t.Errorf("close export channel: %v", err)
+					}
+					return
+				}
+				cbRouterHandler(cbTestExport)(ch, command)
+			}
+			addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
+			defer cleanup()
+			host, port := cbAddrPort(t, addr)
+			out := testQueue()
+			executeConfigBackupJob(context.Background(), cbJob(host, port), out)
+			result := cbReceiveConfigBackupResult(t, out)
+			if result.ErrorCode != tc.want {
+				t.Fatalf("code = %v (%q), want %v", result.ErrorCode, result.ErrorDetail, tc.want)
+			}
+			if tc.want != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK && result.ErrorDetail != strings.TrimSpace(tc.stderr) {
+				t.Fatalf("detail = %q, want stderr %q", result.ErrorDetail, tc.stderr)
+			}
+		})
+	}
+}
+
+func TestConfigBackupMetadataInvalidUTF8(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		output  string
+		mode    pb.ConfigBackupMode
+	}{
+		{"version", "system resource get version", "7.15.3\xff\n", pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE},
+		{"identity", "system identity get name", "router\xff\n", pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE},
+		{"policy", "user group get", "read;custom\xff\n", pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE},
+		{"model", "/export", "# model = router\xff\n/ip address\n", pb.ConfigBackupMode_CONFIG_BACKUP_MODE_BACKUP},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := func(ch ssh.Channel, command string) {
+				if strings.Contains(command, tc.command) {
+					if _, err := ch.Write([]byte(tc.output)); err != nil {
+						return
+					}
+					if _, err := ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0})); err != nil {
+						return
+					}
+					if err := ch.Close(); err != nil {
+						t.Errorf("close metadata channel: %v", err)
+					}
+					return
+				}
+				cbRouterHandler(cbTestExport)(ch, command)
+			}
+			addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
+			defer cleanup()
+			host, port := cbAddrPort(t, addr)
+			job := cbJob(host, port)
+			client, _, err := configBackupDial(context.Background(), job)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := client.Close(); err != nil {
+					t.Errorf("close client: %v", err)
+				}
+			}()
+			vendor := mikrotikBackupVendor{}
+			var result *pb.ConfigBackupResult
+			if tc.mode == pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE {
+				result = vendor.Probe(context.Background(), client, job.ConfigBackup, job.JobId, job.DeviceId)
+			} else {
+				result = vendor.Backup(context.Background(), client, job.ConfigBackup, job.JobId, job.DeviceId)
+			}
+			if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+				t.Fatalf("code = %v (%q), want OK", result.ErrorCode, result.ErrorDetail)
+			}
+			encoded, err := proto.Marshal(result)
+			if err != nil {
+				t.Fatalf("device metadata prevents result delivery: %v", err)
+			}
+			if !bytes.Contains(encoded, []byte("\uFFFD")) {
+				t.Fatal("metadata did not preserve the valid prefix and replace invalid UTF-8")
+			}
+			if tc.name == "model" {
+				reader, err := gzip.NewReader(bytes.NewReader(result.ConfigGzip))
+				if err != nil {
+					t.Fatal(err)
+				}
+				config, readErr := io.ReadAll(reader)
+				if err := reader.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if string(config) != tc.output {
+					t.Fatalf("archived configuration = %q, want original bytes %q", config, tc.output)
+				}
+			}
+		})
+	}
+}
+
 func TestConfigBackupGateWaitReportsTimeout(t *testing.T) {
 	// A job parked on the per-target gate must still honor its deadline: the
 	// server sweeps dispatches that never answer, so waiting silently is a
