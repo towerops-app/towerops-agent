@@ -2434,6 +2434,9 @@ func TestChkTDNSAnswerMatches(t *testing.T) {
 		{"txt exact value", "TXT", []string{"v=spf1 -all"}, "v=spf1 -all", true},
 		{"address record", "A", []string{"10.0.0.2", "10.0.0.1"}, "10.0.0.1", true},
 		{"address record with a stray dot", "A", []string{"10.0.0.1"}, "10.0.0.1.", false},
+		{"expanded IPv6 address", "AAAA", []string{"2001:db8::a"}, "2001:0db8:0000:0000:0000:0000:0000:000a", true},
+		{"IPv6 hexadecimal case", "AAAA", []string{"2001:db8::a"}, "2001:DB8::A", true},
+		{"different IPv6 address", "AAAA", []string{"2001:db8::a"}, "2001:db8::b", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2467,6 +2470,27 @@ func TestChkTDNSCheckTXTExpectedIsExact(t *testing.T) {
 	config.Expected = "v=spf1 include:example.com."
 	if status, output := executeDNSCheck(context.Background(), config, 5000); status != checkCritical {
 		t.Fatalf("status = %d (%s), want CRITICAL: a trailing dot is part of a TXT value", status, output)
+	}
+}
+
+func TestDNSCheckMalformedTXTResultRemainsDeliverable(t *testing.T) {
+	originalLookup := dnsLookupTXT
+	dnsLookupTXT = func(*net.Resolver, context.Context, string) ([]string, error) {
+		return []string{"bad\xffvalue"}, nil
+	}
+	t.Cleanup(func() { dnsLookupTXT = originalLookup })
+	result := ExecuteCheck(context.Background(), &pb.Check{
+		Id: "txt-utf8", CheckType: "dns", TimeoutMs: 1000,
+		Config: &pb.Check_Dns{Dns: &pb.DnsCheckConfig{Hostname: "example.test", RecordType: "TXT"}},
+	})
+	if result.Status != checkOK {
+		t.Fatalf("status = %d, want successful TXT lookup", result.Status)
+	}
+	if _, ok := encodeOutbound("check_result", result, result.CheckId); !ok {
+		t.Fatal("binary TXT content made the check result undeliverable")
+	}
+	if result.Output != "Resolved to: bad\uFFFDvalue" {
+		t.Fatalf("output = %q, want sanitized TXT text", result.Output)
 	}
 }
 

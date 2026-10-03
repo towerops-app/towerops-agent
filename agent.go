@@ -101,6 +101,7 @@ type writeRequest struct {
 type inFlightWrite struct {
 	result outbound
 	ack    chan error
+	ref    string
 	// spooled means the result holds a resultQueue slot the loop must
 	// release on success or requeue on failure; notices carry no slot.
 	spooled bool
@@ -111,6 +112,7 @@ type inFlightWrite struct {
 // are pruned by age rather than removed on success.
 type pendingResult struct {
 	result outbound
+	// sentAt stays zero until the writer acknowledges completion.
 	sentAt time.Time
 }
 
@@ -546,7 +548,7 @@ func (s *session) queueResultWrite(result outbound, spooled bool) (*inFlightWrit
 		}
 		return nil, fmt.Errorf("queue %s result for websocket write: timeout", result.event)
 	}
-	return &inFlightWrite{result: result, ack: ack, spooled: spooled}, nil
+	return &inFlightWrite{result: result, ack: ack, ref: ref, spooled: spooled}, nil
 }
 
 // resolveInFlight settles a completed write: spooled results free their slot
@@ -555,10 +557,15 @@ func (s *session) queueResultWrite(result outbound, spooled bool) (*inFlightWrit
 // retry never blocks while at most one write is in flight.
 func (s *session) resolveInFlight(w *inFlightWrite, err error) error {
 	if err != nil {
+		delete(s.pending, w.ref)
 		if w.spooled {
 			s.results.retry(w.result)
 		}
 		return fmt.Errorf("write %s result: %w", w.result.event, err)
+	}
+	if pending, ok := s.pending[w.ref]; ok {
+		pending.sentAt = time.Now()
+		s.pending[w.ref] = pending
 	}
 	if w.spooled {
 		s.results.ack(w.result)
@@ -596,7 +603,9 @@ func (s *session) trackPending(ref string, result outbound) {
 	if s.pending == nil {
 		s.pending = make(map[string]pendingResult)
 	}
-	s.pending[ref] = pendingResult{result: result, sentAt: time.Now()}
+	// The TTL starts after the writer finishes. Large frames can take longer
+	// than pendingReplyTTL, and the server cannot reject them until arrival.
+	s.pending[ref] = pendingResult{result: result}
 }
 
 // prunePending drops entries the server never answered. It runs on the
@@ -605,7 +614,7 @@ func (s *session) trackPending(ref string, result outbound) {
 func (s *session) prunePending() {
 	cutoff := time.Now().Add(-pendingReplyTTL)
 	for ref, p := range s.pending {
-		if p.sentAt.Before(cutoff) {
+		if !p.sentAt.IsZero() && p.sentAt.Before(cutoff) {
 			delete(s.pending, ref)
 		}
 	}
@@ -1161,17 +1170,21 @@ func recurringJob(job *pb.AgentJob) bool {
 // once if the payload is malformed or implausibly large.
 func decodeBinaryPayload(event string, raw json.RawMessage, msg proto.Message) bool {
 	var payload struct {
-		Binary string `json:"binary"`
+		Binary *string `json:"binary"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		slog.Error("decode payload", "event", event, "error", err)
 		return false
 	}
-	if len(payload.Binary) > maxEncodedJobPayloadBytes {
-		slog.Error("payload too large", "event", event, "size", len(payload.Binary), "max", maxEncodedJobPayloadBytes)
+	if payload.Binary == nil {
+		slog.Error("payload missing binary string", "event", event)
 		return false
 	}
-	bin, err := decodeBase64(payload.Binary)
+	if len(*payload.Binary) > maxEncodedJobPayloadBytes {
+		slog.Error("payload too large", "event", event, "size", len(*payload.Binary), "max", maxEncodedJobPayloadBytes)
+		return false
+	}
+	bin, err := decodeBase64(*payload.Binary)
 	if err != nil {
 		slog.Error("decode base64", "event", event, "error", err)
 		return false

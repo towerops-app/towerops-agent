@@ -215,11 +215,16 @@ func (c *mikrotikClient) writeSentence(words []string) error {
 }
 
 func (c *mikrotikClient) readResponse() (*mikrotikResponse, error) {
+	// Bound the complete reply. Renewing this deadline for every sentence
+	// lets a device retain a worker for hours by trickling !re sentences.
+	if err := c.setReadDeadline(); err != nil {
+		return nil, err
+	}
 	resp := &mikrotikResponse{}
 	totalBytes := 0
 
 	for sentenceCount := 0; sentenceCount < maxMikrotikSentences; sentenceCount++ {
-		words, err := c.readSentence()
+		words, err := c.readSentenceWords()
 		if err != nil {
 			return nil, err
 		}
@@ -244,7 +249,7 @@ func (c *mikrotikClient) readResponse() (*mikrotikResponse, error) {
 			resp.sentences = append(resp.sentences, mikrotikSentence{attributes: parseMikrotikAttrs(words[1:])})
 		case "!trap":
 			attrs := parseMikrotikAttrs(words[1:])
-			if msg, ok := attrs["message"]; ok {
+			if msg := attrs["message"]; msg != "" {
 				resp.err = msg
 			} else {
 				resp.err = "unknown error"
@@ -262,12 +267,23 @@ func (c *mikrotikClient) readResponse() (*mikrotikResponse, error) {
 	return nil, fmt.Errorf("response exceeds %d sentences", maxMikrotikSentences)
 }
 
-func (c *mikrotikClient) readSentence() ([]string, error) {
+func (c *mikrotikClient) setReadDeadline() error {
 	if tc, ok := c.conn.(net.Conn); ok {
 		if err := tc.SetReadDeadline(time.Now().Add(mikrotikReadTimeout)); err != nil {
-			return nil, fmt.Errorf("set read deadline: %w", err)
+			return fmt.Errorf("set read deadline: %w", err)
 		}
 	}
+	return nil
+}
+
+func (c *mikrotikClient) readSentence() ([]string, error) {
+	if err := c.setReadDeadline(); err != nil {
+		return nil, err
+	}
+	return c.readSentenceWords()
+}
+
+func (c *mikrotikClient) readSentenceWords() ([]string, error) {
 	words := make([]string, 0, 16)
 	totalBytes := 0
 	for len(words) < maxMikrotikWords {
@@ -374,7 +390,7 @@ func parseMikrotikAttrs(words []string) map[string]string {
 			continue
 		}
 		k, v, _ := strings.Cut(kv, "=")
-		attrs[k] = v
+		attrs[strings.ToValidUTF8(k, "\uFFFD")] = strings.ToValidUTF8(v, "\uFFFD")
 	}
 	return attrs
 }
@@ -383,7 +399,7 @@ func mikrotikError(job *pb.AgentJob, msg string, ts int64) *pb.MikrotikResult {
 	return &pb.MikrotikResult{
 		DeviceId:  job.DeviceId,
 		JobId:     job.JobId,
-		Error:     msg,
+		Error:     strings.ToValidUTF8(msg, "\uFFFD"),
 		Timestamp: ts,
 	}
 }
@@ -510,7 +526,7 @@ func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.
 		DeviceId: job.DeviceId,
 		JobId:    job.JobId,
 		Sentences: []*pb.MikrotikSentence{
-			{Attributes: map[string]string{"config": config}},
+			{Attributes: map[string]string{"config": strings.ToValidUTF8(config, "\uFFFD")}},
 		},
 		Timestamp: timestamp,
 	}, job.JobId)
