@@ -400,7 +400,7 @@ func (mikrotikBackupVendor) readVersion(ctx context.Context, c *ssh.Client) (str
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(strings.ToValidUTF8(string(out), "\uFFFD")), nil
 }
 
 func (mikrotikBackupVendor) readIdentity(ctx context.Context, c *ssh.Client) (string, error) {
@@ -408,7 +408,7 @@ func (mikrotikBackupVendor) readIdentity(ctx context.Context, c *ssh.Client) (st
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(strings.ToValidUTF8(string(out), "\uFFFD")), nil
 }
 
 // routerOSScriptEscaper escapes the characters that would terminate or expand
@@ -460,7 +460,7 @@ func (v mikrotikBackupVendor) Probe(ctx context.Context, c *ssh.Client, job *pb.
 	// RouterOS renders the policy list comma-separated in newer versions and
 	// semicolon-separated in older ones; entries prefixed with ! are denied
 	// rather than granted, so they are skipped for the missing-policy check.
-	for _, p := range strings.FieldsFunc(strings.TrimSpace(string(out)), func(r rune) bool {
+	for _, p := range strings.FieldsFunc(strings.TrimSpace(strings.ToValidUTF8(string(out), "\uFFFD")), func(r rune) bool {
 		return r == ',' || r == ';'
 	}) {
 		p = strings.TrimSpace(p)
@@ -493,6 +493,15 @@ func (v mikrotikBackupVendor) Backup(ctx context.Context, c *ssh.Client, job *pb
 	if errors.Is(err, errConfigBackupTooLarge) {
 		return configBackupError(job, jobID, deviceID, pb.ConfigBackupErrorCode_TOO_LARGE,
 			fmt.Sprintf("export exceeded the %d byte limit", maxBytes))
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return configBackupError(job, jobID, deviceID, pb.ConfigBackupErrorCode_TIMEOUT, ctx.Err().Error())
+	}
+	// Stderr can report an export failure after stdout has already emitted
+	// configuration. Only explicit failure text overrides stdout validation.
+	if code := classifyExportOutput(string(stderr)); code == pb.ConfigBackupErrorCode_EXPORT_FAILED ||
+		code == pb.ConfigBackupErrorCode_PERMISSION_DENIED {
+		return configBackupError(job, jobID, deviceID, code, string(stderr))
 	}
 	combined := string(out)
 	if combined == "" {
@@ -581,7 +590,7 @@ func parseExportModel(output string) string {
 		if rest, ok := strings.CutPrefix(trimmed, "#"); ok {
 			if k, v, ok := strings.Cut(strings.TrimSpace(rest), "="); ok &&
 				strings.EqualFold(strings.TrimSpace(k), "model") {
-				return strings.TrimSpace(v)
+				return strings.TrimSpace(strings.ToValidUTF8(v, "\uFFFD"))
 			}
 		}
 	}
