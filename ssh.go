@@ -112,19 +112,39 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 	return string(output), nil
 }
 
-// routerOSSSHAlgorithms widens the client config to every algorithm x/crypto
-// implements: RouterOS 6's SSH server offers only the legacy set (ssh-rsa,
-// diffie-hellman-group14-sha1, and on older 6.x only CBC ciphers and
-// gex/group1-sha1 key exchanges), which the default list excludes. All of
-// these connections are to operator-owned network devices whose host key is
-// pinned or accepted first-use, so the wider offer cannot be downgraded
-// below what the device itself supports.
+// routerOSSSHAlgorithms widens the client config for RouterOS 6's SSH server.
+// Host keys and MACs stay unset — the defaults already include ssh-rsa,
+// ssh-dss and hmac-sha1, and setting HostKeyAlgorithms explicitly would
+// reorder x/crypto's preference list, which could make a multi-key device
+// present a different key than the fingerprint a PROBE already recorded.
+//
+// KEX order matters: the defaults come first, then the insecure algorithms
+// only ROS 6 offers (group1-sha1, gex-sha1), then the rest of the supported
+// set (dh16-sha512, gex-sha256) last. SSH picks the first client-listed
+// algorithm the server accepts, and a RouterOS 6 with strong-crypto=no
+// answers group exchange with a 1024-bit prime that x/crypto rejects — the
+// GEX forms must sit behind every fixed group the device might offer.
 func routerOSSSHAlgorithms(c *ssh.ClientConfig) {
+	var defaults ssh.Config
+	defaults.SetDefaults()
 	supported, insecure := ssh.SupportedAlgorithms(), ssh.InsecureAlgorithms()
-	c.KeyExchanges = append(supported.KeyExchanges, insecure.KeyExchanges...)
-	c.Ciphers = append(supported.Ciphers, insecure.Ciphers...)
-	c.MACs = append(supported.MACs, insecure.MACs...)
-	c.HostKeyAlgorithms = append(supported.HostKeys, insecure.HostKeys...)
+	c.KeyExchanges = mergeAlgorithms(defaults.KeyExchanges, insecure.KeyExchanges, supported.KeyExchanges)
+	c.Ciphers = mergeAlgorithms(defaults.Ciphers, insecure.Ciphers)
+}
+
+// mergeAlgorithms concatenates algorithm lists in order, dropping repeats.
+func mergeAlgorithms(lists ...[]string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, list := range lists {
+		for _, algo := range list {
+			if !seen[algo] {
+				seen[algo] = true
+				out = append(out, algo)
+			}
+		}
+	}
+	return out
 }
 
 // hostKeyAlgorithmsFor maps a pinned key type to the signature algorithms

@@ -883,14 +883,19 @@ func TestSSHBackupPinsStoredHostKeyAlgorithm(t *testing.T) {
 		return chkTOrigSSHDial(ctx, network, addr, config)
 	}
 
-	// First connect trusts on first use; nothing pinned yet, so the config
-	// offers the full RouterOS set (supported + insecure algorithms).
+	// First connect trusts on first use; nothing pinned yet. HostKeyAlgorithms
+	// stays unset so x/crypto's default preference order applies — the widened
+	// set only appends missing KEX/ciphers (routerOSSSHAlgorithms).
 	if _, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass"); err != nil {
 		t.Fatalf("first connect failed: %v", err)
 	}
-	wantHostKeys := append(ssh.SupportedAlgorithms().HostKeys, ssh.InsecureAlgorithms().HostKeys...)
-	if !slices.Equal(captured.HostKeyAlgorithms, wantHostKeys) {
-		t.Fatalf("first-use HostKeyAlgorithms = %v, want %v", captured.HostKeyAlgorithms, wantHostKeys)
+	if len(captured.HostKeyAlgorithms) != 0 {
+		t.Fatalf("first-use HostKeyAlgorithms = %v, want unset", captured.HostKeyAlgorithms)
+	}
+	var defaults ssh.Config
+	defaults.SetDefaults()
+	if want := mergeAlgorithms(defaults.KeyExchanges, ssh.InsecureAlgorithms().KeyExchanges, ssh.SupportedAlgorithms().KeyExchanges); !slices.Equal(captured.KeyExchanges, want) {
+		t.Fatalf("first-use KeyExchanges = %v, want %v", captured.KeyExchanges, want)
 	}
 
 	// Second connect offers only the pinned key type.
@@ -913,8 +918,8 @@ func TestSSHBackupPinsStoredHostKeyAlgorithm(t *testing.T) {
 	if _, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", uint16(deadPort), "admin", "pass"); err == nil {
 		t.Fatal("dial to a closed port should fail")
 	}
-	if !slices.Equal(captured.HostKeyAlgorithms, wantHostKeys) {
-		t.Fatalf("unpinned HostKeyAlgorithms = %v, want %v", captured.HostKeyAlgorithms, wantHostKeys)
+	if len(captured.HostKeyAlgorithms) != 0 {
+		t.Fatalf("unpinned HostKeyAlgorithms = %v, want unset", captured.HostKeyAlgorithms)
 	}
 }
 
