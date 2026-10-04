@@ -230,6 +230,8 @@ func TestExecPingTimeoutArgument(t *testing.T) {
 		{name: "darwin uses milliseconds", goos: "darwin", timeoutMs: 5000, want: 5000},
 		{name: "darwin clamps to one millisecond", goos: "darwin", timeoutMs: 0, want: 1},
 		{name: "linux uses seconds", goos: "linux", timeoutMs: 5000, want: 5},
+		{name: "linux preserves fractional second", goos: "linux", timeoutMs: 1500, want: 2},
+		{name: "linux rounds just above whole second", goos: "linux", timeoutMs: 5001, want: 6},
 		{name: "linux clamps to one second", goos: "linux", timeoutMs: 999, want: 1},
 	}
 

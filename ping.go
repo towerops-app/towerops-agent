@@ -564,7 +564,9 @@ func pingTimeoutArg(timeoutMs int) int {
 	if pingGOOS == "darwin" {
 		return max(1, timeoutMs)
 	}
-	return max(1, timeoutMs/1000)
+	// Whole-second ping implementations must wait through the fractional
+	// second rather than declaring a device down before its timeout expires.
+	return (max(1, timeoutMs)-1)/1000 + 1
 }
 
 // parsePingTime extracts the response time in milliseconds from ping output.
