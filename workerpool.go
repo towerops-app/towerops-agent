@@ -76,7 +76,7 @@ func (p *workerPool) submitMode(ctx context.Context, fn func(), wait bool) bool 
 	if p.closed {
 		return false
 	}
-	if !wait && ctx.Err() != nil {
+	if ctx.Err() != nil {
 		return false
 	}
 	// Count the task before it can reach a worker so busy never dips to
