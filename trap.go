@@ -254,11 +254,12 @@ func trapToProto(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) *pb.SnmpTrap {
 		trap.TrapOid = v1TrapOID(trap.Enterprise, packet.GenericTrap, packet.SpecificTrap)
 	}
 
+	truncated := false
 	for _, pdu := range packet.Variables {
 		switch pdu.Name {
 		case oidSysUpTime:
 			// v1 carries uptime in the PDU header instead, and that value wins.
-			if trap.UptimeTicks == 0 {
+			if packet.PDUType != gosnmp.Trap && trap.UptimeTicks == 0 {
 				trap.UptimeTicks = uptimeTicks(pdu)
 			}
 			continue
@@ -269,10 +270,14 @@ func trapToProto(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) *pb.SnmpTrap {
 			continue
 		}
 		if len(trap.Varbinds) >= maxTrapVarbinds {
-			slog.Warn("truncating trap varbinds", "source", trap.SourceIp, "limit", maxTrapVarbinds)
-			break
+			// Keep scanning for metadata even after the forwarded map is full.
+			truncated = true
+			continue
 		}
 		trap.Varbinds[trimOID(pdu.Name)] = snmpValueToString(pdu)
+	}
+	if truncated {
+		slog.Warn("truncating trap varbinds", "source", trap.SourceIp, "limit", maxTrapVarbinds)
 	}
 
 	return trap
