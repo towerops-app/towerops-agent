@@ -396,6 +396,10 @@ func quotedEchoIDSeq(data []byte, isIPv4 bool) (id, seq int, dst net.IP, ok bool
 // a keyed waiter; the matching reply, an ICMP error quoting the request, the
 // context, or the timeout ends the wait.
 func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, timeoutMs int) (float64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("icmp ping: %w", err)
+	}
+
 	var msgType icmp.Type
 	if isIPv4 {
 		msgType = ipv4.ICMPTypeEcho
@@ -544,7 +548,7 @@ func execPing(parent context.Context, ip string, timeoutMs int) (float64, error)
 
 	output, err := pingCommandOutput(ctx, pingCmd, "-c", "1", "-W", strconv.Itoa(timeoutArg), ip)
 	if err != nil {
-		return 0, fmt.Errorf("ping failed: %s", strings.TrimSpace(string(output)))
+		return 0, fmt.Errorf("ping failed: %s: %w", strings.TrimSpace(string(output)), errors.Join(err, ctx.Err()))
 	}
 
 	return parsePingTime(string(output))
