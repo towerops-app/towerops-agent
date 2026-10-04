@@ -374,6 +374,24 @@ func TestReadLength(t *testing.T) {
 	}
 }
 
+func TestReadLengthRejectsReservedControlBytes(t *testing.T) {
+	for control := 0xf8; control <= 0xff; control++ {
+		t.Run(fmt.Sprintf("%02x", control), func(t *testing.T) {
+			// These trailing bytes would be consumed as a length by the old
+			// parser. A control byte must fail before interpreting any of them.
+			buf := bytes.NewBuffer([]byte{byte(control), 0, 0, 0, 5})
+			client := &mikrotikClient{conn: &nopCloser{readWriter: buf}}
+			_, err := client.readLength()
+			if err == nil || !strings.Contains(err.Error(), "control byte") {
+				t.Fatalf("readLength error = %v, want unsupported control byte", err)
+			}
+			if buf.Len() != 4 {
+				t.Fatalf("remaining bytes = %d, want 4", buf.Len())
+			}
+		})
+	}
+}
+
 func TestReadWord(t *testing.T) {
 	t.Run("normal word", func(t *testing.T) {
 		word := "!done"
