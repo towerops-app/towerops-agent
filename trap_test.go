@@ -301,6 +301,43 @@ func TestTrapToProtoTruncatesVarbinds(t *testing.T) {
 	}
 }
 
+func TestTrapToProtoPreservesMetadataAfterTruncation(t *testing.T) {
+	vars := make([]gosnmp.SnmpPDU, 0, maxTrapVarbinds+4)
+	for i := range maxTrapVarbinds + 2 {
+		vars = append(vars, gosnmp.SnmpPDU{
+			Name:  fmt.Sprintf(".1.3.6.1.4.1.99.1.%d", i),
+			Type:  gosnmp.Integer,
+			Value: i,
+		})
+	}
+	vars = append(vars,
+		gosnmp.SnmpPDU{Name: oidSysUpTime, Type: gosnmp.TimeTicks, Value: uint32(987654)},
+		gosnmp.SnmpPDU{Name: oidSnmpTrapOID, Type: gosnmp.ObjectIdentifier, Value: ".1.3.6.1.6.3.1.1.5.4"},
+	)
+	trap := trapToProto(&gosnmp.SnmpPacket{
+		Version: gosnmp.Version2c, PDUType: gosnmp.SNMPv2Trap, Variables: vars,
+	}, &net.UDPAddr{IP: net.ParseIP("192.0.2.30")})
+	if trap.UptimeTicks != 987654 || trap.TrapOid != "1.3.6.1.6.3.1.1.5.4" {
+		t.Errorf("trap metadata = %d/%q, want 987654/linkDown", trap.UptimeTicks, trap.TrapOid)
+	}
+	if len(trap.Varbinds) != maxTrapVarbinds {
+		t.Errorf("len(Varbinds) = %d, want %d", len(trap.Varbinds), maxTrapVarbinds)
+	}
+}
+
+func TestTrapToProtoPreservesZeroV1HeaderUptime(t *testing.T) {
+	trap := trapToProto(&gosnmp.SnmpPacket{
+		Version: gosnmp.Version1, PDUType: gosnmp.Trap,
+		SnmpTrap: gosnmp.SnmpTrap{Timestamp: 0, GenericTrap: 0},
+		Variables: []gosnmp.SnmpPDU{
+			{Name: oidSysUpTime, Type: gosnmp.TimeTicks, Value: uint32(999)},
+		},
+	}, &net.UDPAddr{IP: net.ParseIP("192.0.2.30")})
+	if trap.UptimeTicks != 0 {
+		t.Errorf("UptimeTicks = %d, want 0 from the SNMPv1 header", trap.UptimeTicks)
+	}
+}
+
 func TestTrapToProtoTrimsOIDs(t *testing.T) {
 	tests := []struct {
 		input string
