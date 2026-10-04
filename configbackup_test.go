@@ -1222,10 +1222,12 @@ func TestConfigBackupExportStderr(t *testing.T) {
 		stderr string
 		status uint32
 		want   pb.ConfigBackupErrorCode
+		detail string
 	}{
-		{"permission failure after stdout", "no permission\n", 1, pb.ConfigBackupErrorCode_PERMISSION_DENIED},
-		{"failure with successful exit", "failure: export aborted\n", 0, pb.ConfigBackupErrorCode_EXPORT_FAILED},
-		{"benign diagnostic", "diagnostic: export started\n", 0, pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK},
+		{"permission failure after stdout", "no permission\n", 1, pb.ConfigBackupErrorCode_PERMISSION_DENIED, "no permission"},
+		{"failure with successful exit", "failure: export aborted\n", 0, pb.ConfigBackupErrorCode_EXPORT_FAILED, "failure: export aborted"},
+		{"failure after diagnostic", "diagnostic: export started\nfailure: export aborted\n", 0, pb.ConfigBackupErrorCode_EXPORT_FAILED, "failure: export aborted"},
+		{"benign diagnostic", "diagnostic: export started\n", 0, pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1256,10 +1258,68 @@ func TestConfigBackupExportStderr(t *testing.T) {
 			if result.ErrorCode != tc.want {
 				t.Fatalf("code = %v (%q), want %v", result.ErrorCode, result.ErrorDetail, tc.want)
 			}
-			if tc.want != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK && result.ErrorDetail != strings.TrimSpace(tc.stderr) {
-				t.Fatalf("detail = %q, want stderr %q", result.ErrorDetail, tc.stderr)
+			if result.ErrorDetail != tc.detail {
+				t.Fatalf("detail = %q, want %q", result.ErrorDetail, tc.detail)
 			}
 		})
+	}
+}
+
+func TestConfigBackupExportFailureLines(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		output string
+		want   pb.ConfigBackupErrorCode
+	}{
+		{"failure after config", cbTestExport + "failure: export aborted\n", pb.ConfigBackupErrorCode_EXPORT_FAILED},
+		{"permission after header", "# RouterOS 7.15.3\n  no permission\n", pb.ConfigBackupErrorCode_PERMISSION_DENIED},
+		{"failure in comment", "# identity = failure: uplink\n/ip address\n", pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK},
+		{"failure in config value", "/system identity\nset name=\"no permission\"\n", pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyExportOutput(tc.output); got != tc.want {
+				t.Fatalf("code = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestConfigBackupProbeDeviceFailures(t *testing.T) {
+	for _, command := range []string{"system resource get version", "system identity get name", "user group get"} {
+		for _, stream := range []string{"stdout", "stderr"} {
+			t.Run(command+"/"+stream, func(t *testing.T) {
+				handler := func(ch ssh.Channel, cmd string) {
+					if !strings.Contains(cmd, command) {
+						cbRouterHandler(cbTestExport)(ch, cmd)
+						return
+					}
+					var writer io.Writer = ch
+					if stream == "stderr" {
+						writer = ch.Stderr()
+					}
+					if _, err := io.WriteString(writer, "failure: not enough permissions\n"); err != nil {
+						return
+					}
+					if _, err := ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0})); err != nil {
+						return
+					}
+					if err := ch.Close(); err != nil {
+						t.Errorf("close metadata channel: %v", err)
+					}
+				}
+				addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
+				defer cleanup()
+				host, port := cbAddrPort(t, addr)
+				job := cbJob(host, port)
+				job.ConfigBackup.Mode = pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE
+				out := testQueue()
+				executeConfigBackupJob(context.Background(), job, out)
+				result := cbReceiveConfigBackupResult(t, out)
+				if result.ErrorCode != pb.ConfigBackupErrorCode_PERMISSION_DENIED {
+					t.Fatalf("code = %v (%q), want PERMISSION_DENIED", result.ErrorCode, result.ErrorDetail)
+				}
+			})
+		}
 	}
 }
 

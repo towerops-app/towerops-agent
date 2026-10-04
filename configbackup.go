@@ -396,7 +396,7 @@ func mikrotikExportCommand(major int, includeSecrets bool) string {
 }
 
 func (mikrotikBackupVendor) readVersion(ctx context.Context, c *ssh.Client) (string, error) {
-	out, _, err := runConfigBackupSession(ctx, c, ":put [/system resource get version]", configBackupMetaMaxBytes)
+	out, err := runConfigBackupMetadata(ctx, c, ":put [/system resource get version]")
 	if err != nil {
 		return "", err
 	}
@@ -404,7 +404,7 @@ func (mikrotikBackupVendor) readVersion(ctx context.Context, c *ssh.Client) (str
 }
 
 func (mikrotikBackupVendor) readIdentity(ctx context.Context, c *ssh.Client) (string, error) {
-	out, _, err := runConfigBackupSession(ctx, c, ":put [/system identity get name]", configBackupMetaMaxBytes)
+	out, err := runConfigBackupMetadata(ctx, c, ":put [/system identity get name]")
 	if err != nil {
 		return "", err
 	}
@@ -453,7 +453,7 @@ func (v mikrotikBackupVendor) Probe(ctx context.Context, c *ssh.Client, job *pb.
 			"username cannot be embedded in a RouterOS script")
 	}
 	policyCmd := fmt.Sprintf(":put [/user group get [/user get [find name=\"%s\"] group] policy]", safeUser)
-	out, _, err := runConfigBackupSession(ctx, c, policyCmd, configBackupMetaMaxBytes)
+	out, err := runConfigBackupMetadata(ctx, c, policyCmd)
 	if err != nil {
 		return configBackupError(job, jobID, deviceID, sessionErrCode(ctx, err), err.Error())
 	}
@@ -499,13 +499,15 @@ func (v mikrotikBackupVendor) Backup(ctx context.Context, c *ssh.Client, job *pb
 	}
 	// Stderr can report an export failure after stdout has already emitted
 	// configuration. Only explicit failure text overrides stdout validation.
-	if code := classifyExportOutput(string(stderr)); code == pb.ConfigBackupErrorCode_EXPORT_FAILED ||
-		code == pb.ConfigBackupErrorCode_PERMISSION_DENIED {
-		return configBackupError(job, jobID, deviceID, code, string(stderr))
+	if failure := routerOSCommandFailure(string(stderr)); failure != nil {
+		return configBackupError(job, jobID, deviceID, failure.code, failure.detail)
 	}
 	combined := string(out)
 	if combined == "" {
 		combined = string(stderr)
+	}
+	if failure := routerOSCommandFailure(combined); failure != nil {
+		return configBackupError(job, jobID, deviceID, failure.code, failure.detail)
 	}
 	if err != nil {
 		detail := combined
@@ -556,16 +558,8 @@ func classifyExportOutput(output string) pb.ConfigBackupErrorCode {
 	if strings.TrimSpace(output) == "" {
 		return pb.ConfigBackupErrorCode_EXPORT_EMPTY
 	}
-	head := output
-	if i := strings.IndexByte(head, '\n'); i >= 0 {
-		head = head[:i]
-	}
-	lower := strings.ToLower(head)
-	if strings.Contains(lower, "failure:") || strings.Contains(lower, "bad command") {
-		return pb.ConfigBackupErrorCode_EXPORT_FAILED
-	}
-	if strings.Contains(lower, "no permission") || strings.Contains(lower, "not enough permissions") {
-		return pb.ConfigBackupErrorCode_PERMISSION_DENIED
+	if failure := routerOSCommandFailure(output); failure != nil {
+		return failure.code
 	}
 	hasComment, hasSection := false, false
 	for line := range strings.Lines(output) {
@@ -581,6 +575,46 @@ func classifyExportOutput(output string) pb.ConfigBackupErrorCode {
 		return pb.ConfigBackupErrorCode_EXPORT_INCOMPLETE
 	}
 	return pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK
+}
+
+// RouterOS can report a command failure with a successful SSH exit status.
+// Only diagnostic lines qualify; comments and configuration values may
+// legitimately contain the same phrases.
+type configBackupDeviceError struct {
+	code   pb.ConfigBackupErrorCode
+	detail string
+}
+
+func (e *configBackupDeviceError) Error() string { return e.detail }
+
+func routerOSCommandFailure(output string) *configBackupDeviceError {
+	for line := range strings.Lines(output) {
+		detail := strings.TrimSpace(line)
+		lower := strings.ToLower(detail)
+		if strings.HasPrefix(lower, "failure:") || strings.HasPrefix(lower, "bad command") ||
+			strings.HasPrefix(lower, "no permission") || strings.HasPrefix(lower, "not enough permissions") {
+			code := pb.ConfigBackupErrorCode_EXPORT_FAILED
+			if strings.Contains(lower, "no permission") || strings.Contains(lower, "not enough permissions") {
+				code = pb.ConfigBackupErrorCode_PERMISSION_DENIED
+			}
+			return &configBackupDeviceError{code: code, detail: detail}
+		}
+	}
+	return nil
+}
+
+func runConfigBackupMetadata(ctx context.Context, c *ssh.Client, cmd string) ([]byte, error) {
+	out, stderr, err := runConfigBackupSession(ctx, c, cmd, configBackupMetaMaxBytes)
+	if err != nil {
+		return nil, err
+	}
+	if failure := routerOSCommandFailure(string(stderr)); failure != nil {
+		return nil, failure
+	}
+	if failure := routerOSCommandFailure(string(out)); failure != nil {
+		return nil, failure
+	}
+	return out, nil
 }
 
 // parseExportModel extracts the model from a "# model = X" header comment.
@@ -606,6 +640,10 @@ func sessionErrCode(ctx context.Context, err error) pb.ConfigBackupErrorCode {
 	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return pb.ConfigBackupErrorCode_TIMEOUT
+	}
+	var failure *configBackupDeviceError
+	if errors.As(err, &failure) {
+		return failure.code
 	}
 	return pb.ConfigBackupErrorCode_EXPORT_FAILED
 }
