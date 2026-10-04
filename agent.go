@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"net/url"
 	"os"
 	"runtime"
 	"slices"
@@ -102,6 +103,9 @@ type inFlightWrite struct {
 	result outbound
 	ack    chan error
 	ref    string
+	// A reply can arrive before the writer's acknowledgment. Delay handling
+	// it until the spool slot is released so a retry can reuse that capacity.
+	reply *channelMsg
 	// spooled means the result holds a resultQueue slot the loop must
 	// release on success or requeue on failure; notices carry no slot.
 	spooled bool
@@ -133,7 +137,6 @@ func runAgentWithScheduling(
 	traps <-chan *pb.SnmpTrap,
 	localScheduling bool,
 ) {
-	baseURL := strings.TrimRight(wsURL, "/")
 	results := newResultQueueForAgent(ctx, resultQueueSize)
 	retryDelay := initialRetryDelay
 	maxRetry := 10 * time.Second
@@ -148,7 +151,7 @@ func runAgentWithScheduling(
 		sessionStart := time.Now()
 		err := runSessionWithResultsAndScheduling(
 			ctx,
-			baseURL,
+			wsURL,
 			token,
 			traps,
 			results,
@@ -247,7 +250,10 @@ func runSessionWithResultsAndScheduling(
 	results *resultQueue,
 	localScheduling bool,
 ) error {
-	endpoint := baseURL + "/socket/agent/websocket"
+	endpoint, err := url.JoinPath(baseURL, "socket/agent/websocket")
+	if err != nil {
+		return fmt.Errorf("build websocket endpoint: %w", err)
+	}
 	slog.Info("connecting", "url", sanitizeURL(endpoint))
 
 	ws, err := wsDial(ctx, endpoint)
@@ -573,6 +579,9 @@ func (s *session) resolveInFlight(w *inFlightWrite, err error) error {
 	} else {
 		slog.Debug("sent overload notice", "event", w.result.event)
 	}
+	if w.reply != nil {
+		s.handleResultReply(*w.reply)
+	}
 	return nil
 }
 
@@ -880,7 +889,11 @@ func (s *session) loop(ctx context.Context) error {
 				continue
 			}
 			if msg.Event == "phx_reply" && (msg.Topic == s.topic || msg.Topic == "phoenix") {
-				s.handleResultReply(msg)
+				if inFlight != nil && msg.Ref != nil && *msg.Ref == inFlight.ref {
+					inFlight.reply = &msg
+				} else {
+					s.handleResultReply(msg)
+				}
 				continue
 			}
 			shouldEnd, endErr := handleMessage(s.ctx, msg, s.topic, s.pools, s.results)

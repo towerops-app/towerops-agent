@@ -332,6 +332,9 @@ func (c *mikrotikClient) readLength() (int, error) {
 		return 0, err
 	}
 	b := first[0]
+	if b >= 0xf8 {
+		return 0, fmt.Errorf("unsupported RouterOS control byte 0x%02x", b)
+	}
 
 	if b < 0x80 {
 		return int(b), nil

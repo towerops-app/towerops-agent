@@ -15,6 +15,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"runtime"
 	"strings"
@@ -1832,6 +1834,68 @@ func TestRunSessionConnectError(t *testing.T) {
 	}
 }
 
+func TestRunSessionEndpointPreservesBaseURLQuery(t *testing.T) {
+	for _, test := range []struct {
+		name, suffix, want string
+	}{
+		{"query", "?tenant=ops", "/socket/agent/websocket?tenant=ops"},
+		{"path and query", "/towerops/?tenant=ops", "/towerops/socket/agent/websocket?tenant=ops"},
+		{"escaped path", "/proxy%2Ftenant/?scope=a%2Fb", "/proxy%2Ftenant/socket/agent/websocket?scope=a%2Fb"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests := make(chan string, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests <- r.RequestURI
+				w.WriteHeader(http.StatusBadRequest)
+			}))
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			baseURL := strings.Replace(server.URL, "http://", "ws://", 1) + test.suffix
+			if err := runSession(ctx, baseURL, "token", nil); err == nil {
+				t.Fatal("expected the test server to reject the handshake")
+			}
+			select {
+			case got := <-requests:
+				if got != test.want {
+					t.Fatalf("request URI = %q, want %q", got, test.want)
+				}
+			default:
+				t.Fatal("session did not attempt a handshake")
+			}
+		})
+	}
+}
+
+func TestRunSessionRejectsMalformedBaseURL(t *testing.T) {
+	err := runSession(context.Background(), "ws://example.com/%zz", "token", nil)
+	if err == nil || !strings.Contains(err.Error(), "invalid URL escape") {
+		t.Fatalf("runSession error = %v, want invalid URL escape", err)
+	}
+}
+
+func TestRunAgentPreservesTrailingSlashInQuery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	requests := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.RequestURI
+		w.WriteHeader(http.StatusBadRequest)
+		cancel()
+	}))
+	defer server.Close()
+	baseURL := strings.Replace(server.URL, "http://", "ws://", 1) + "/towerops/?tenant=ops/"
+	runAgent(ctx, baseURL, "token", nil)
+	select {
+	case got := <-requests:
+		if want := "/towerops/socket/agent/websocket?tenant=ops/"; got != want {
+			t.Fatalf("request URI = %q, want %q", got, want)
+		}
+	default:
+		t.Fatal("agent did not attempt a handshake")
+	}
+}
+
 // join's send path must fail deterministically on a dead conn — a write to a
 // CloseNow'd conn returns net.ErrClosed every time, unlike racing a server
 // close. Pins agent.go's "send join" error return.
@@ -3413,6 +3477,35 @@ func TestSettleInFlightPrefersCompletedWrite(t *testing.T) {
 	s.settleInFlight(&inFlightWrite{result: outbound{event: "notice"}, ack: make(chan error), spooled: false})
 	if _, ok := results.takeRetry(); ok {
 		t.Fatal("notice write must not be requeued into the result spool")
+	}
+}
+
+func TestSettleInFlightRetainsEarlyRejectionAfterCompletedWrite(t *testing.T) {
+	results := newResultQueue(1)
+	if !results.enqueue(outbound{event: "result", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("failed to seed result queue")
+	}
+	result := <-results.items
+	s := &session{results: results}
+	ref := "5"
+	s.trackPending(ref, result)
+	ack := make(chan error, 1)
+	ack <- nil
+	s.settleInFlight(&inFlightWrite{
+		result: result, ack: ack, ref: ref, spooled: true,
+		reply: &channelMsg{
+			Ref:     &ref,
+			Payload: json.RawMessage(`{"status":"error","response":{"reason":"temporary failure"}}`),
+		},
+	})
+	select {
+	case retry := <-results.items:
+		if retry.attempts != 1 {
+			t.Fatalf("retry attempts = %d, want 1", retry.attempts)
+		}
+		results.ack(retry)
+	default:
+		t.Fatal("session teardown discarded an early rejection after a completed write")
 	}
 }
 
@@ -5346,6 +5439,74 @@ func TestSessionLoopServicesInboundDuringInFlightWrite(t *testing.T) {
 	if len(results.slots) != 0 {
 		t.Fatal("completed in-flight write did not release its slot")
 	}
+}
+
+func TestSessionLoopRetriesEarlyRejectionWithFullSpool(t *testing.T) {
+	results := newResultQueue(1)
+	if !results.enqueue(outbound{event: "result", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("failed to seed result queue")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	writeCh := make(chan writeRequest, 1)
+	msgCh := make(chan []byte)
+	s := &session{
+		ctx: ctx, cancel: cancel, topic: "agent:test",
+		writeCh: writeCh, msgCh: msgCh, results: results,
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.loop(context.Background()) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("session loop did not stop")
+		}
+	})
+
+	var request writeRequest
+	select {
+	case request = <-writeCh:
+	case <-time.After(time.Second):
+		t.Fatal("session did not queue the first write")
+	}
+	var frame channelMsg
+	if err := json.Unmarshal(request.data, &frame); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := json.Marshal(channelMsg{
+		Topic: s.topic, Event: "phx_reply", Ref: frame.Ref,
+		Payload: json.RawMessage(`{"status":"error","response":{"reason":"temporary failure"}}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The second unbuffered message proves the rejection has been processed
+	// before the writer's acknowledgment is delivered.
+	for _, data := range [][]byte{reply, []byte(`{"topic":"phoenix","event":"phx_reply","payload":{}}`)} {
+		select {
+		case msgCh <- data:
+		case <-time.After(time.Second):
+			t.Fatal("session did not consume inbound message")
+		}
+	}
+	request.ack <- nil
+
+	select {
+	case retry := <-writeCh:
+		var retriedFrame channelMsg
+		if err := json.Unmarshal(retry.data, &retriedFrame); err != nil {
+			t.Fatal(err)
+		}
+		if retriedFrame.Event != "result" || *retriedFrame.Ref == *frame.Ref {
+			t.Fatalf("retry frame = %v, want result with a fresh ref", retriedFrame)
+		}
+		retry.ack <- nil
+		putFrameBuffer(retry.buf)
+	case <-time.After(time.Second):
+		t.Fatal("early rejection lost its retry while the spool slot was in flight")
+	}
+	putFrameBuffer(request.buf)
 }
 
 func TestSubmitJobDispatchSaturated(t *testing.T) {
