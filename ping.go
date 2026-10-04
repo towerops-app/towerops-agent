@@ -44,6 +44,8 @@ var icmpMarshal = func(m *icmp.Message) ([]byte, error) { return m.Marshal(nil) 
 // pingSeq prevents concurrent workers from accepting one another's replies.
 var pingSeq atomic.Uint32
 
+var errPingSequenceInUse = errors.New("icmp sequence is already in use")
+
 // pingGOOS keeps platform-specific ping arguments testable on any host.
 var pingGOOS = runtime.GOOS
 
@@ -194,13 +196,16 @@ func (s *icmpSocket) readErr() error {
 	return s.err
 }
 
-// register installs a waiter under key. A waiter registered on a socket that
-// dies before the echo request is written is never fired; doICMPPing notices
-// the closed-connection write error and retries once on a fresh socket.
+// register installs a waiter under key, or returns nil if key is in use.
+// A socket can die before registration; the subsequent write fails and
+// doICMPPing retries once on a fresh socket.
 func (s *icmpSocket) register(key pingKey, dst net.IP) *pingWaiter {
-	w := &pingWaiter{dst: dst, ch: make(chan icmpReply, 1)}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.waiters[key] != nil {
+		return nil
+	}
+	w := &pingWaiter{dst: dst, ch: make(chan icmpReply, 1)}
 	s.waiters[key] = w
 	return w
 }
@@ -396,33 +401,11 @@ func quotedEchoIDSeq(data []byte, isIPv4 bool) (id, seq int, dst net.IP, ok bool
 // a keyed waiter; the matching reply, an ICMP error quoting the request, the
 // context, or the timeout ends the wait.
 func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, timeoutMs int) (float64, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, fmt.Errorf("icmp ping: %w", err)
-	}
-
 	var msgType icmp.Type
 	if isIPv4 {
 		msgType = ipv4.ICMPTypeEcho
 	} else {
 		msgType = ipv6.ICMPTypeEchoRequest
-	}
-
-	id := os.Getpid() & 0xffff
-	seq := int(pingSeq.Add(1) & 0xffff)
-
-	msg := icmp.Message{
-		Type: msgType,
-		Code: 0,
-		Body: &icmp.Echo{
-			ID:   id,
-			Seq:  seq,
-			Data: []byte("towerops"),
-		},
-	}
-
-	wb, err := icmpMarshal(&msg)
-	if err != nil {
-		return 0, fmt.Errorf("icmp marshal: %w", err)
 	}
 
 	// Destination address type depends on network
@@ -433,7 +416,29 @@ func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, tim
 		dst = &net.IPAddr{IP: ip}
 	}
 
-	waiter, start, err := sendEcho(network, seq, ip, wb, dst)
+	var waiter sentEcho
+	var start time.Time
+	var err error
+	// The 16-bit sequence counter can wrap while a slow ping is still
+	// pending. Try another sequence instead of replacing that ping's waiter.
+	for range 1 << 16 {
+		if ctx.Err() != nil {
+			return 0, fmt.Errorf("icmp ping: %w", ctx.Err())
+		}
+		seq := int(pingSeq.Add(1) & 0xffff)
+		msg := icmp.Message{
+			Type: msgType,
+			Body: &icmp.Echo{ID: os.Getpid() & 0xffff, Seq: seq, Data: []byte("towerops")},
+		}
+		wb, marshalErr := icmpMarshal(&msg)
+		if marshalErr != nil {
+			return 0, fmt.Errorf("icmp marshal: %w", marshalErr)
+		}
+		waiter, start, err = sendEcho(network, seq, ip, wb, dst)
+		if !errors.Is(err, errPingSequenceInUse) {
+			break
+		}
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -476,6 +481,9 @@ func sendEcho(network string, seq int, ip net.IP, wb []byte, dst net.Addr) (sent
 		}
 		key := pingKey{id: sock.replyID, seq: seq}
 		w := sock.register(key, ip)
+		if w == nil {
+			return sentEcho{}, time.Time{}, errPingSequenceInUse
+		}
 		start := time.Now()
 		_, err = sock.conn.WriteTo(wb, dst)
 		if err == nil {

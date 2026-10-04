@@ -160,6 +160,11 @@ func executeConfigBackupJobCtx(sessionCtx, jobCtx context.Context, job *pb.Agent
 	}
 	if err != nil {
 		code, detail := classifyConfigBackupError(err, job)
+		// net.Dialer reports both dial and parent deadlines as dial timeouts.
+		// An exhausted whole-job budget must keep its TIMEOUT classification.
+		if errors.Is(jobCtx.Err(), context.DeadlineExceeded) {
+			code = pb.ConfigBackupErrorCode_TIMEOUT
+		}
 		result := &pb.ConfigBackupResult{
 			DeviceId:    job.DeviceId,
 			JobId:       job.JobId,

@@ -483,6 +483,34 @@ func TestConfigBackupContextCancel(t *testing.T) {
 	}
 }
 
+func TestConfigBackupExpiredJobDeadlineReportsTimeout(t *testing.T) {
+	jobCtx, cancel := context.WithDeadline(context.Background(), time.Unix(0, 0))
+	defer cancel()
+	out := testQueue()
+	executeConfigBackupJobCtx(context.Background(), jobCtx, cbJob("127.0.0.1", 22), out)
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_TIMEOUT {
+		t.Fatalf("code = %v, want TIMEOUT for an expired job budget", result.ErrorCode)
+	}
+}
+
+func TestConfigBackupJobDeadlineDuringDialReportsTimeout(t *testing.T) {
+	original := sshDial
+	t.Cleanup(func() { sshDial = original })
+	jobCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	sshDial = func(ctx context.Context, _, _ string, _ *ssh.ClientConfig) (*ssh.Client, error) {
+		<-ctx.Done()
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: context.DeadlineExceeded}
+	}
+	out := testQueue()
+	executeConfigBackupJobCtx(context.Background(), jobCtx, cbJob("127.0.0.1", 22), out)
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_TIMEOUT {
+		t.Fatalf("code = %v, want TIMEOUT", result.ErrorCode)
+	}
+}
+
 func TestConfigBackupMissingPayload(t *testing.T) {
 	job := cbJob("192.0.2.1", 22)
 	job.ConfigBackup = nil
