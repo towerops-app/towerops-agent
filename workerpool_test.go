@@ -150,6 +150,33 @@ func TestWorkerPoolSubmitRespectsContext(t *testing.T) {
 	close(blocker)
 }
 
+func TestWorkerPoolSubmitWaitRejectsPreCanceledContext(t *testing.T) {
+	pool := newWorkerPool(1)
+	t.Cleanup(pool.stop)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var executed atomic.Int32
+	accepted := 0
+	// Repeat with available queue capacity: an already-ready Done channel
+	// must not race a queue send into accepting canceled work.
+	for range 64 {
+		if pool.submitWait(ctx, func() { executed.Add(1) }) {
+			accepted++
+		}
+	}
+	pool.stop()
+	if accepted != 0 {
+		t.Errorf("accepted %d pre-canceled tasks, want none", accepted)
+	}
+	if got := executed.Load(); got != 0 {
+		t.Errorf("executed %d pre-canceled tasks, want none", got)
+	}
+	if !pool.idle() {
+		t.Error("rejected canceled work retained pool capacity")
+	}
+}
+
 func TestWorkerPoolSubmitWaitStopsOnCancellation(t *testing.T) {
 	pool := newWorkerPool(1)
 	blocker := make(chan struct{})

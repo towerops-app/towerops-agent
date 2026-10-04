@@ -579,7 +579,7 @@ func TestExecuteWithArgs(t *testing.T) {
 		t.Errorf("expected command /interface/print, got: %v", receivedWords)
 	}
 
-	// Verify args formatting: ?-prefix and .-prefix get k=v, others get =k=v
+	// Query words use k=v; command attributes (including .proplist) use =k=v.
 	wordSet := make(map[string]bool)
 	for _, w := range receivedWords[1:] {
 		wordSet[w] = true
@@ -590,8 +590,8 @@ func TestExecuteWithArgs(t *testing.T) {
 	if !wordSet["?type=ether"] {
 		t.Error("expected ?type=ether in words")
 	}
-	if !wordSet[".proplist=name,type"] {
-		t.Error("expected .proplist=name,type in words")
+	if !wordSet["=.proplist=name,type"] {
+		t.Error("expected =.proplist=name,type in words")
 	}
 }
 
@@ -1559,7 +1559,7 @@ func TestExecuteEmitsArgsInSortedOrder(t *testing.T) {
 	}
 
 	// Sorted key order makes emission deterministic.
-	want := []string{"/interface/print", ".proplist=name,type", "?disabled=false", "?type=ether", "=name=ether1"}
+	want := []string{"/interface/print", "=.proplist=name,type", "?disabled=false", "?type=ether", "=name=ether1"}
 	if !slices.Equal(receivedWords, want) {
 		t.Fatalf("words = %v, want %v", receivedWords, want)
 	}
@@ -1594,9 +1594,64 @@ func TestExecuteEmitsQueryOperatorsAfterOperands(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := []string{"/interface/print", "?disabled=false", "?type=ether", "=name=ether1", "?#!=", "?#|="}
+	want := []string{"/interface/print", "?disabled=false", "?type=ether", "=name=ether1", "?#!", "?#|"}
 	if !slices.Equal(receivedWords, want) {
 		t.Fatalf("words = %v, want %v", receivedWords, want)
+	}
+}
+
+func TestExecuteRouterOSArgumentSyntax(t *testing.T) {
+	tests := []struct {
+		name string
+		args map[string]string
+		want []string
+	}{
+		{
+			name: "property selector and tag",
+			args: map[string]string{".proplist": "name,type", ".tag": "poll-1"},
+			want: []string{"/interface/print", "=.proplist=name,type", ".tag=poll-1"},
+		},
+		{
+			name: "empty property selector",
+			args: map[string]string{".proplist": ""},
+			want: []string{"/interface/print", "=.proplist="},
+		},
+		{
+			name: "query stack operations in key",
+			args: map[string]string{"?disabled": "false", "?type": "ether", "?#|!": ""},
+			want: []string{"/interface/print", "?disabled=false", "?type=ether", "?#|!"},
+		},
+		{
+			name: "query stack operations in value",
+			args: map[string]string{"?disabled": "false", "?type": "ether", "?#": "|!"},
+			want: []string{"/interface/print", "?disabled=false", "?type=ether", "?#|!"},
+		},
+		{
+			name: "query with empty comparison value",
+			args: map[string]string{"?>comment": "", "comment": "", ".tag": ""},
+			want: []string{"/interface/print", ".tag=", "?>comment=", "=comment="},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var reply, request bytes.Buffer
+			server := &mikrotikClient{conn: &nopCloser{readWriter: &reply}}
+			if err := server.writeSentence([]string{"!done"}); err != nil {
+				t.Fatal(err)
+			}
+			client := &mikrotikClient{conn: &readWriteCloser{r: &reply, w: &request}}
+			if _, err := client.execute("/interface/print", tt.args); err != nil {
+				t.Fatal(err)
+			}
+			decoder := &mikrotikClient{conn: &nopCloser{readWriter: &request}}
+			got, err := decoder.readSentence()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("RouterOS request = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

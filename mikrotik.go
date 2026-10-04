@@ -148,9 +148,14 @@ func (c *mikrotikClient) execute(command string, args map[string]string) (*mikro
 	words := []string{command}
 	for _, k := range sortedMikrotikArgKeys(args) {
 		v := args[k]
-		if strings.HasPrefix(k, "?") || strings.HasPrefix(k, ".") {
+		switch {
+		case strings.HasPrefix(k, "?#"):
+			// Stack operations are part of the query word, not a value.
+			words = append(words, k+v)
+		case strings.HasPrefix(k, "?") || k == ".tag":
 			words = append(words, k+"="+v)
-		} else {
+		default:
+			// .proplist is a command attribute; only .tag is an API attribute.
 			words = append(words, "="+k+"="+v)
 		}
 	}
