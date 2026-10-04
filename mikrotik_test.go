@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/towerops-app/towerops-agent/pb"
+	"google.golang.org/protobuf/proto"
 	"pgregory.net/rapid"
 )
 
@@ -181,6 +182,125 @@ func TestReadSentenceRejectsTooManyWords(t *testing.T) {
 	_, err := client.readSentence()
 	if err == nil || !strings.Contains(err.Error(), "exceeds 10000 words") {
 		t.Fatalf("readSentence error = %v, want word limit", err)
+	}
+}
+
+func TestMikrotikMalformedTextRemainsDeliverable(t *testing.T) {
+	for _, words := range [][]string{
+		{"!re", "=comment=bad\xfftext", "=bad\xffkey=value"},
+		{"!trap", "=message=bad\xfferror"},
+	} {
+		t.Run(words[0], func(t *testing.T) {
+			var stream bytes.Buffer
+			stream.Write(encodeSentence(words))
+			stream.Write(encodeSentence([]string{"!done"}))
+			originalDial := mikrotikDial
+			mikrotikDial = func(context.Context, string, uint32, string, string, bool) (*mikrotikClient, error) {
+				return &mikrotikClient{conn: &nopCloser{readWriter: &stream}}, nil
+			}
+			t.Cleanup(func() { mikrotikDial = originalDial })
+			out := testQueue()
+			executeMikrotikJob(context.Background(), &pb.AgentJob{
+				JobId: "utf8", MikrotikDevice: &pb.MikrotikDevice{Ip: "192.0.2.1"},
+				MikrotikCommands: []*pb.MikrotikCommand{{Command: "/interface/print"}},
+			}, out)
+			select {
+			case queued := <-out.items:
+				result := decodeQueuedResult[*pb.MikrotikResult](t, queued)
+				if words[0] == "!re" {
+					if len(result.Sentences) != 1 || result.Sentences[0].Attributes["comment"] != "bad\uFFFDtext" ||
+						result.Sentences[0].Attributes["bad\uFFFDkey"] != "value" {
+						t.Fatalf("unexpected sanitized attributes: %v", result.Sentences)
+					}
+				} else if !strings.Contains(result.Error, "bad\uFFFDerror") {
+					t.Fatalf("unexpected error text: %q", result.Error)
+				}
+			default:
+				t.Fatal("device text made the result undeliverable")
+			}
+		})
+	}
+}
+
+func TestMikrotikLegacyBackupMalformedTextRemainsDeliverable(t *testing.T) {
+	originalBackup := sshBackup
+	sshBackup = func(context.Context, string, uint16, string, string) (string, error) { return "# bad\xfftext", nil }
+	t.Cleanup(func() { sshBackup = originalBackup })
+	out := testQueue()
+	executeMikrotikJob(context.Background(), &pb.AgentJob{
+		JobId: "backup:utf8", MikrotikDevice: &pb.MikrotikDevice{Ip: "192.0.2.1"},
+	}, out)
+	select {
+	case queued := <-out.items:
+		result := decodeQueuedResult[*pb.MikrotikResult](t, queued)
+		if got := result.Sentences[0].Attributes["config"]; got != "# bad\uFFFDtext" {
+			t.Fatalf("backup = %q, want sanitized text", got)
+		}
+	default:
+		t.Fatal("legacy backup text made the result undeliverable")
+	}
+}
+
+func TestMikrotikEmptyTrapMessageIsFailure(t *testing.T) {
+	stream := bytes.NewBuffer(append(encodeSentence([]string{"!trap", "=message="}), encodeSentence([]string{"!done"})...))
+	client := &mikrotikClient{conn: &nopCloser{readWriter: stream}}
+	response, err := client.readResponse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.err == "" {
+		t.Fatal("RouterOS !trap with an empty message was treated as success")
+	}
+}
+
+func TestMikrotikMalformedErrorRemainsDeliverable(t *testing.T) {
+	if _, err := proto.Marshal(mikrotikError(&pb.AgentJob{}, "bad\xfferror", 1)); err != nil {
+		t.Fatalf("device error is not deliverable: %v", err)
+	}
+}
+
+// advancingMikrotikConn simulates each response sentence arriving 20 seconds
+// later. It honors the installed deadline without wall-clock sleeps.
+type advancingMikrotikConn struct {
+	net.Conn
+	sentences [][]byte
+	now       time.Time
+	deadline  time.Time
+	reading   *bytes.Reader
+}
+
+func (c *advancingMikrotikConn) SetReadDeadline(deadline time.Time) error {
+	c.deadline = c.now.Add(time.Until(deadline))
+	return nil
+}
+
+func (c *advancingMikrotikConn) Read(p []byte) (int, error) {
+	if c.reading == nil || c.reading.Len() == 0 {
+		if len(c.sentences) == 0 {
+			return 0, io.EOF
+		}
+		c.now = c.now.Add(20 * time.Second)
+		if !c.deadline.IsZero() && c.now.After(c.deadline) {
+			return 0, context.DeadlineExceeded
+		}
+		c.reading = bytes.NewReader(c.sentences[0])
+		c.sentences = c.sentences[1:]
+	}
+	return c.reading.Read(p)
+}
+
+func TestMikrotikResponseCannotExtendReadBudget(t *testing.T) {
+	conn := &advancingMikrotikConn{
+		now: time.Now(),
+		sentences: [][]byte{
+			encodeSentence([]string{"!re", "=name=one"}),
+			encodeSentence([]string{"!re", "=name=two"}),
+			encodeSentence([]string{"!done"}),
+		},
+	}
+	client := &mikrotikClient{conn: conn}
+	if _, err := client.readResponse(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("readResponse error = %v, want timeout within one response budget", err)
 	}
 }
 
@@ -1143,6 +1263,20 @@ func TestHmReadSentenceDeadlineError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "set read deadline") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReadResponseDeadlineError(t *testing.T) {
+	server, client := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = client.Close() })
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &mikrotikClient{conn: client}
+	_, err := c.readResponse()
+	if !errors.Is(err, io.ErrClosedPipe) || !strings.Contains(err.Error(), "set read deadline") {
+		t.Fatalf("readResponse error = %v, want wrapped read-deadline failure", err)
 	}
 }
 

@@ -195,7 +195,7 @@ func ExecuteCheck(ctx context.Context, check *pb.Check) *pb.CheckResult {
 	return &pb.CheckResult{
 		CheckId:        check.Id,
 		Status:         status,
-		Output:         output,
+		Output:         strings.ToValidUTF8(output, "\uFFFD"),
 		ResponseTimeMs: responseTimeMs,
 		Timestamp:      time.Now().Unix(),
 	}
@@ -534,9 +534,21 @@ func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs u
 // formatted "<pref> <host>" and matches either that whole string or the host
 // on its own, which is how operators usually write it.
 //
-// Only those two record types hold hostnames. A, AAAA and TXT answers are
-// compared exactly: a trailing dot is part of a TXT value, not name syntax.
+// Address records compare parsed IPs so equivalent IPv6 spellings match.
+// TXT answers compare exactly: a trailing dot is part of a TXT value.
 func dnsAnswerMatches(recordType string, results []string, expected string) bool {
+	if recordType == "A" || recordType == "AAAA" {
+		want := net.ParseIP(expected)
+		if want == nil {
+			return false
+		}
+		for _, result := range results {
+			if got := net.ParseIP(result); got != nil && got.Equal(want) {
+				return true
+			}
+		}
+		return false
+	}
 	if recordType != "CNAME" && recordType != "MX" {
 		return slices.Contains(results, expected)
 	}

@@ -640,6 +640,111 @@ func TestDecodeBinaryPayloadAcceptsServerLimit(t *testing.T) {
 	}
 }
 
+func TestMalformedInventoryPreservesScheduledAssignments(t *testing.T) {
+	for _, event := range []string{"jobs", "check_jobs"} {
+		for _, payload := range []string{`{}`, `null`, `{"binary":null}`} {
+			t.Run(event+"/"+payload, func(t *testing.T) {
+				pools := testPools(t)
+				out := testQueue()
+				group := &pools.scheduler.jobs
+				if event == "check_jobs" {
+					group = &pools.scheduler.checks
+				}
+				pools.scheduler.replace(group, []scheduleSpec{{
+					id: "keep", interval: time.Hour, payload: &pb.Check{Id: "keep"},
+					submit: func(context.Context, func()) bool { return false },
+				}})
+				ended, err := handleMessage(context.Background(), channelMsg{
+					Topic: "agent:test", Event: event, Payload: json.RawMessage(payload),
+				}, "agent:test", pools, out)
+				if ended || err != nil {
+					t.Fatalf("malformed payload ended the session: (%v, %v)", ended, err)
+				}
+				pools.scheduler.mu.Lock()
+				_, retained := (*group)["keep"]
+				pools.scheduler.mu.Unlock()
+				if !retained {
+					t.Fatal("malformed inventory removed the existing assignment")
+				}
+				select {
+				case result := <-out.items:
+					if result.event != "error" {
+						t.Fatalf("event = %q, want payload rejection", result.event)
+					}
+				default:
+					t.Fatal("malformed inventory was not reported")
+				}
+			})
+		}
+	}
+}
+
+func TestDecodeBinaryPayloadAcceptsExplicitEmptyInventory(t *testing.T) {
+	if !decodeBinaryPayload("jobs", json.RawMessage(`{"binary":""}`), &pb.AgentJobList{}) {
+		t.Fatal("explicitly encoded empty inventory was rejected")
+	}
+}
+
+func TestPendingResultSurvivesSlowWrite(t *testing.T) {
+	q := newResultQueue(4)
+	if !q.enqueue(outbound{event: "result", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("could not enqueue result")
+	}
+	s := &session{ctx: context.Background(), topic: "agent:test", results: q, writeCh: make(chan writeRequest, 1)}
+	w, err := s.queueResultWrite(<-q.items, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := <-s.writeCh
+	defer putFrameBuffer(request.buf)
+	var msg channelMsg
+	if err := json.Unmarshal(request.data, &msg); err != nil {
+		t.Fatal(err)
+	}
+
+	// Make every nonzero send timestamp expired while the writer still owns
+	// the frame. The rejection window must begin when the write completes.
+	originalTTL := pendingReplyTTL
+	pendingReplyTTL = -time.Second
+	t.Cleanup(func() { pendingReplyTTL = originalTTL })
+	s.prunePending()
+	if len(s.pending) != 1 {
+		t.Fatal("rejection tracking expired before the write completed")
+	}
+	pendingReplyTTL = originalTTL
+	if err := s.resolveInFlight(w, nil); err != nil {
+		t.Fatal(err)
+	}
+	s.prunePending()
+	s.handleResultReply(channelMsg{Ref: msg.Ref, Payload: json.RawMessage(`{"status":"error","response":{"reason":"temporary"}}`)})
+	select {
+	case retried := <-q.items:
+		if retried.attempts != 1 {
+			t.Fatalf("retry attempts = %d, want 1", retried.attempts)
+		}
+	default:
+		t.Fatal("slowly written result was not retried after rejection")
+	}
+}
+
+func TestFailedResultWriteClearsRejectionTracking(t *testing.T) {
+	s := &session{
+		ctx: context.Background(), results: testQueue(), writeCh: make(chan writeRequest, 1),
+	}
+	w, err := s.queueResultWrite(outbound{event: "result", payload: json.RawMessage(`{}`)}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := <-s.writeCh
+	defer putFrameBuffer(request.buf)
+	if err := s.resolveInFlight(w, io.ErrClosedPipe); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("write error = %v, want closed pipe", err)
+	}
+	if len(s.pending) != 0 {
+		t.Fatal("failed write retained rejection tracking for an unsent result")
+	}
+}
+
 func TestDecodeBinaryPayloadZeroesDecodedBuffer(t *testing.T) {
 	origDecode := decodeBase64
 	defer func() { decodeBase64 = origDecode }()
@@ -2205,10 +2310,16 @@ func TestRunSessionDoesNotLogFailedResultAsSent(t *testing.T) {
 	logs := agtCaptureLogs(t)
 	agtSilenceHeartbeats(t)
 
-	origDial := mikrotikDial
-	defer func() { mikrotikDial = origDial }()
-	mikrotikDial = func(context.Context, string, uint32, string, string, bool) (*mikrotikClient, error) {
-		return nil, errors.New("\xff")
+	origDial := snmpDial
+	defer func() { snmpDial = origDial }()
+	snmpDial = func(context.Context, *pb.AgentJob) (snmpQuerier, func(), error) {
+		return &mockSnmpQuerier{getFunc: func([]string) (*gosnmp.SnmpPacket, error) {
+			// Inject an invalid OID below the protocol parser to force a real
+			// protobuf failure. RouterOS error text is now sanitized safely.
+			return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{{
+				Name: "\xff", Type: gosnmp.Integer, Value: 1,
+			}}}, nil
+		}}, func() {}, nil
 	}
 
 	ln := agtListen(t)
@@ -2217,12 +2328,13 @@ func TestRunSessionDoesNotLogFailedResultAsSent(t *testing.T) {
 
 	conn, topic := agtAccept(t, ln)
 	agtSendEvent(t, conn, topic, "jobs", makeJobPayload(&pb.AgentJob{
-		JobId:          "m-invalid",
-		JobType:        pb.JobType_MIKROTIK,
-		MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", Port: 8728},
+		JobId:      "s-invalid",
+		JobType:    pb.JobType_POLL,
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+		Queries:    []*pb.SnmpQuery{{QueryType: pb.QueryType_GET, Oids: []string{oidSysDescr}}},
 	}))
 	logs.waitFor(t, "marshal protobuf")
-	if logs.has("sent mikrotik result") {
+	if logs.has("sent result") {
 		t.Fatalf("failed result was logged as sent:\n%s", logs.dump())
 	}
 
