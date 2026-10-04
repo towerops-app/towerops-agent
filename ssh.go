@@ -109,7 +109,14 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 		return "", fmt.Errorf("ssh command: %w", err)
 	}
 
-	return string(output), nil
+	if failure := routerOSCommandFailure(string(errBuf.Bytes())); failure != nil {
+		return "", fmt.Errorf("ssh command: %w", failure)
+	}
+	exportOutput := string(outBuf.Bytes())
+	if code := classifyExportOutput(exportOutput); code != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+		return "", fmt.Errorf("ssh command: %s: %s", code, strings.TrimSpace(exportOutput))
+	}
+	return exportOutput, nil
 }
 
 // routerOSSSHAlgorithms widens the client config for RouterOS 6's SSH server.
