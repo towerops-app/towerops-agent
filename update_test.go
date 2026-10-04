@@ -27,6 +27,86 @@ func forceBareBinaryUpdate(t *testing.T) {
 	t.Cleanup(func() { runningInContainer = orig })
 }
 
+type cancelUpdateReader struct {
+	reader io.Reader
+	cancel func()
+}
+
+func (r *cancelUpdateReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if errors.Is(err, io.EOF) {
+		r.cancel()
+	}
+	return n, err
+}
+
+type cancelUpdateTempFile struct {
+	updateTempFile
+	cancel func()
+}
+
+func (f *cancelUpdateTempFile) Close() error {
+	err := f.updateTempFile.Close()
+	f.cancel()
+	return err
+}
+
+func TestSelfUpdateCancellationBeforeReplacement(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	for _, stage := range []string{"download", "staging"} {
+		t.Run(stage, func(t *testing.T) {
+			origDo, origExe, origCreate, origRename := httpDo, osExecutable, osCreateTemp, osRename
+			t.Cleanup(func() {
+				httpDo, osExecutable, osCreateTemp, osRename = origDo, origExe, origCreate, origRename
+			})
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(context.Canceled)
+			cause := errors.New("update request withdrawn")
+			cancelUpdate := func() { cancel(cause) }
+			body := "replacement binary"
+			httpDo = func(req *http.Request) (*http.Response, error) {
+				var reader io.Reader = strings.NewReader(body)
+				if stage == "download" {
+					reader = &cancelUpdateReader{reader: reader, cancel: cancelUpdate}
+				}
+				return &http.Response{StatusCode: http.StatusOK, Request: req, Body: io.NopCloser(reader)}, nil
+			}
+			dir := t.TempDir()
+			exe := filepath.Join(dir, "agent")
+			if err := os.WriteFile(exe, []byte("original binary"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			osExecutable = func() (string, error) { return exe, nil }
+			osCreateTemp = func(dir, pattern string) (updateTempFile, error) {
+				file, err := os.CreateTemp(dir, pattern)
+				if err != nil {
+					return nil, err
+				}
+				if stage == "staging" {
+					return &cancelUpdateTempFile{updateTempFile: file, cancel: cancelUpdate}, nil
+				}
+				return file, nil
+			}
+			renamed := false
+			osRename = func(string, string) error {
+				renamed = true
+				return errors.New("unexpected replacement")
+			}
+			err := selfUpdateContext(ctx, "https://example.com/agent", fmt.Sprintf("%x", sha256.Sum256([]byte(body))))
+			if !errors.Is(err, cause) || renamed {
+				t.Fatalf("update error = %v, renamed = %v; want cancellation cause before replacement", err, renamed)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 || entries[0].Name() != "agent" {
+				t.Fatalf("staged update not cleaned up: %v", entries)
+			}
+		})
+	}
+}
+
 func TestDetectContainer(t *testing.T) {
 	origMarkers := containerMarkerFiles
 	origCgroup := containerCgroupPath

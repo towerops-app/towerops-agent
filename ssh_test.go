@@ -579,6 +579,70 @@ func TestExecuteMikrotikBackupWithOutput(t *testing.T) {
 	}
 }
 
+func TestLegacySSHBackupRejectsInvalidExport(t *testing.T) {
+	tests := []struct {
+		name   string
+		stdout string
+		stderr string
+		want   string
+	}{
+		{"stdout failure", "# partial config\nfailure: export interrupted\n", "", "failure: export interrupted"},
+		{"stderr failure", "# partial config", "not enough permissions (9)\n", "not enough permissions"},
+		{"empty export", "", "", "EXPORT_EMPTY"},
+		{"diagnostic only", "export interrupted\n", "", "EXPORT_INCOMPLETE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetHostKeyStore(t)
+			addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
+				defer func() { _ = ch.Close() }()
+				if _, err := io.WriteString(ch, tt.stdout); err != nil {
+					t.Errorf("write stdout: %v", err)
+					return
+				}
+				if _, err := io.WriteString(ch.Stderr(), tt.stderr); err != nil {
+					t.Errorf("write stderr: %v", err)
+					return
+				}
+				if _, err := ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0})); err != nil {
+					t.Errorf("send exit status: %v", err)
+				}
+			})
+			defer cleanup()
+			host, port := cbAddrPort(t, addr)
+			config, err := executeMikrotikBackupContext(context.Background(), host, uint16(port), "admin", "pass")
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("backup = %q, error = %v; want failure containing %q", config, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestLegacySSHBackupPreservesConfigWithFailureComments(t *testing.T) {
+	resetHostKeyStore(t)
+	want := "# failure: text in a comment\n/system identity\nset name=router\n"
+	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
+		defer func() { _ = ch.Close() }()
+		if _, err := io.WriteString(ch, want); err != nil {
+			t.Errorf("write export: %v", err)
+			return
+		}
+		if _, err := io.WriteString(ch.Stderr(), "warning: device busy\n"); err != nil {
+			t.Errorf("write stderr: %v", err)
+			return
+		}
+		if _, err := ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0})); err != nil {
+			t.Errorf("send exit status: %v", err)
+		}
+	})
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+	config, err := executeMikrotikBackupContext(context.Background(), host, uint16(port), "admin", "pass")
+	if err != nil || config != want {
+		t.Fatalf("backup = %q, error = %v; want %q", config, err, want)
+	}
+}
+
 func TestExecuteMikrotikBackupSessionError(t *testing.T) {
 	resetHostKeyStore(t)
 

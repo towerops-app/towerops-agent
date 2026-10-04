@@ -253,6 +253,11 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string
 	if err := tempFile.Close(); err != nil {
 		return fmt.Errorf("close temp: %w", err)
 	}
+	// A completed read or local file operation may succeed after cancellation.
+	// Honor the request before committing the staged binary to disk.
+	if cause := context.Cause(reqCtx); cause != nil {
+		return fmt.Errorf("update canceled before replacement: %w", cause)
+	}
 
 	// Replace current binary (atomic on same filesystem)
 	if err := osRename(tempPath, currentExe); err != nil {
