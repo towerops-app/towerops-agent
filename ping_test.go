@@ -322,6 +322,68 @@ func TestExecPingCommandResult(t *testing.T) {
 	})
 }
 
+func TestExecPingPreservesFailureCauses(t *testing.T) {
+	original := pingCommandOutput
+	t.Cleanup(func() { pingCommandOutput = original })
+	commandErr := errors.New("ping executable failed")
+	for _, cause := range []error{nil, context.Canceled, context.DeadlineExceeded} {
+		t.Run(fmt.Sprint(cause), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if cause == context.DeadlineExceeded {
+				var deadlineCancel context.CancelFunc
+				ctx, deadlineCancel = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				defer deadlineCancel()
+			}
+			pingCommandOutput = func(context.Context, string, ...string) ([]byte, error) {
+				if cause == context.Canceled {
+					cancel()
+				}
+				return []byte("100% packet loss\n"), commandErr
+			}
+			_, err := execPing(ctx, "192.0.2.1", 1000)
+			if !errors.Is(err, commandErr) {
+				t.Errorf("error = %v, want command failure cause", err)
+			}
+			if cause != nil && !errors.Is(err, cause) {
+				t.Errorf("error = %v, want context failure %v", err, cause)
+			}
+			if err == nil || !strings.Contains(err.Error(), "ping failed: 100% packet loss") {
+				t.Errorf("error = %v, want packet-loss diagnostic", err)
+			}
+		})
+	}
+}
+
+func TestDoICMPPingCanceledBeforeSend(t *testing.T) {
+	for _, network := range []string{"ip4:icmp", "udp4", "ip6:ipv6-icmp", "udp6"} {
+		t.Run(network, func(t *testing.T) {
+			conn := tpTNewFakeICMPConn()
+			networks := tpTUseFakeICMPConn(t, conn)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			isIPv4 := strings.Contains(network, "4")
+			ip := net.ParseIP("127.0.0.1")
+			if !isIPv4 {
+				ip = net.ParseIP("::1")
+			}
+			_, err := doICMPPing(ctx, ip, network, isIPv4, 1000)
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("error = %v, want cancellation", err)
+			}
+			if len(*networks) != 0 {
+				t.Errorf("canceled ping opened sockets: %v", *networks)
+			}
+			conn.mu.Lock()
+			sent := len(conn.sent)
+			conn.mu.Unlock()
+			if sent != 0 {
+				t.Errorf("canceled ping sent %d packets", sent)
+			}
+		})
+	}
+}
+
 func TestPingDeviceFallbackToExec(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows")
