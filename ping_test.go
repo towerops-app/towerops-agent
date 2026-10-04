@@ -1776,6 +1776,101 @@ func TestTpTDoICMPPingRetriesWriteOnClosedSocket(t *testing.T) {
 	}
 }
 
+func TestDoICMPPingSequenceWrapPreservesPendingPing(t *testing.T) {
+	for _, network := range []string{"ip4:icmp", "udp4"} {
+		t.Run(network, func(t *testing.T) {
+			originalSeq := pingSeq.Load()
+			t.Cleanup(func() { pingSeq.Store(originalSeq) })
+			conn := tpTNewFakeICMPConn()
+			conn.localAddr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 32123}
+			tpTUseFakeICMPConn(t, conn)
+			sock, err := sharedSocket(network)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn.replies = []func([]byte) []byte{tpTEchoReplyWithIDFor(t, true, sock.replyID)}
+			oldIP := net.ParseIP("192.0.2.1")
+			key := pingKey{id: sock.replyID, seq: 0}
+			pending := sock.register(key, oldIP)
+			defer sock.unregister(key, pending)
+			pingSeq.Store(65535) // The next request wraps to the occupied sequence 0.
+			if _, err := doICMPPing(context.Background(), net.ParseIP("127.0.0.1"), network, true, 1000); err != nil {
+				t.Fatalf("new ping failed: %v", err)
+			}
+			sock.dispatch(&icmp.Message{
+				Type: ipv4.ICMPTypeEchoReply,
+				Body: &icmp.Echo{ID: sock.replyID, Seq: 0},
+			}, oldIP)
+			select {
+			case reply := <-pending.ch:
+				if reply.err != nil {
+					t.Fatalf("pending ping failed: %v", reply.err)
+				}
+			default:
+				t.Fatal("sequence wrap overwrote the pending ping's reply waiter")
+			}
+		})
+	}
+}
+
+func TestDoICMPPingSequenceSpaceExhausted(t *testing.T) {
+	conn := tpTNewFakeICMPConn()
+	tpTUseFakeICMPConn(t, conn)
+	sock, err := sharedSocket("ip4:icmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := &pingWaiter{dst: net.ParseIP("192.0.2.1"), ch: make(chan icmpReply, 1)}
+	sock.mu.Lock()
+	for seq := range 1 << 16 {
+		sock.waiters[pingKey{id: sock.replyID, seq: seq}] = pending
+	}
+	sock.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := doICMPPing(ctx, net.ParseIP("127.0.0.1"), "ip4:icmp", true, 1000); !errors.Is(err, errPingSequenceInUse) {
+		t.Fatalf("ping error = %v, want exhausted sequence space", err)
+	}
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if len(conn.sent) != 0 {
+		t.Fatal("ping transmitted with every sequence already occupied")
+	}
+}
+
+func TestDoICMPPingMarshalFailureAfterSequenceCollision(t *testing.T) {
+	conn := tpTNewFakeICMPConn()
+	tpTUseFakeICMPConn(t, conn)
+	sock, err := sharedSocket("ip4:icmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalSeq := pingSeq.Load()
+	pingSeq.Store(65535)
+	t.Cleanup(func() { pingSeq.Store(originalSeq) })
+	key := pingKey{id: sock.replyID, seq: 0}
+	pending := sock.register(key, net.ParseIP("192.0.2.1"))
+	originalMarshal := icmpMarshal
+	t.Cleanup(func() { icmpMarshal = originalMarshal })
+	want := errors.New("marshal failed after collision")
+	calls := 0
+	icmpMarshal = func(msg *icmp.Message) ([]byte, error) {
+		calls++
+		if calls == 2 {
+			return nil, want
+		}
+		return originalMarshal(msg)
+	}
+	if _, err := doICMPPing(context.Background(), net.ParseIP("127.0.0.1"), "ip4:icmp", true, 1000); !errors.Is(err, want) {
+		t.Fatalf("ping error = %v, want marshal failure", err)
+	}
+	sock.mu.Lock()
+	defer sock.mu.Unlock()
+	if len(sock.waiters) != 1 || sock.waiters[key] != pending {
+		t.Fatal("marshal failure changed the pending ping registrations")
+	}
+}
+
 func TestTpTDoICMPPingClosedSocketRetriesOnlyOnce(t *testing.T) {
 	conn := tpTNewFakeICMPConn()
 	conn.writeErr = &net.OpError{Op: "write", Net: "ip4:icmp", Err: net.ErrClosed}

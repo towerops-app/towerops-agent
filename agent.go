@@ -1387,6 +1387,11 @@ func submitJob(
 	done func(),
 	wait bool,
 ) bool {
+	if pools.stopAccepting.Load() {
+		slog.Debug("job submission refused during self-update drain", "job_id", job.JobId)
+		done()
+		return false
+	}
 	slog.Info("starting job", "job_id", job.JobId, "type", job.JobType)
 
 	if job.JobType == pb.JobType_CONFIG_BACKUP {

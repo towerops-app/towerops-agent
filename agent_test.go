@@ -5509,6 +5509,36 @@ func TestSessionLoopRetriesEarlyRejectionWithFullSpool(t *testing.T) {
 	putFrameBuffer(request.buf)
 }
 
+func TestSubmitJobRefusesDuringSelfUpdateDrain(t *testing.T) {
+	for _, jobType := range []pb.JobType{pb.JobType_PING, pb.JobType_CONFIG_BACKUP} {
+		for _, wait := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/wait=%t", jobType, wait), func(t *testing.T) {
+				pools := &jobPools{
+					ping: newWorkerPool(1), backup: newWorkerPool(1),
+					targets: &targetGates{},
+				}
+				t.Cleanup(func() { pools.ping.stop(); pools.backup.stop() })
+				pools.stopAccepting.Store(true)
+				done := make(chan struct{}, 1)
+				accepted := submitJob(context.Background(), &pb.AgentJob{
+					JobId: "drained-job", JobType: jobType,
+				}, pools, testQueue(), func() { done <- struct{}{} }, wait)
+				if accepted {
+					t.Fatal("job was accepted after the self-update drain stopped submissions")
+				}
+				select {
+				case <-done:
+				default:
+					t.Fatal("refused job did not signal completion")
+				}
+				if !pools.idle() {
+					t.Fatal("refused job consumed worker-pool capacity")
+				}
+			})
+		}
+	}
+}
+
 func TestSubmitJobDispatchSaturated(t *testing.T) {
 	notices := make(chan outbound, 4)
 	pools := &jobPools{
