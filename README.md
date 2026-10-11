@@ -18,7 +18,11 @@ Jobs the server can dispatch:
 - **SNMP discovery** - walks a device to enumerate sensors, interfaces and neighbours
 - **SNMP credential testing** - validates a credential set against a device before you save it
 - **ICMP monitoring** - reachability and round-trip time
-- **MikroTik RouterOS** - polling over the binary API, and configuration backup over the API or SSH `/export`
+- **MikroTik RouterOS** - polling over the binary API, and configuration backup over the API or SSH `/export`.
+  Every returned row is tagged with the command that produced it in the `__command` attribute.
+  A command the device rejects is reported as a per-command failure (command and message, password
+  redacted) and the job keeps the other commands' rows; the job-level error is set only when login or
+  the connection fails, or when every command fails
 - **LLDP topology** - LLDP-MIB walks that feed link discovery
 - **Service checks** - HTTP(S), TCP, DNS and TLS-certificate-expiry checks
 

@@ -212,8 +212,8 @@ func TestMikrotikMalformedTextRemainsDeliverable(t *testing.T) {
 						result.Sentences[0].Attributes["bad\uFFFDkey"] != "value" {
 						t.Fatalf("unexpected sanitized attributes: %v", result.Sentences)
 					}
-				} else if !strings.Contains(result.Error, "bad\uFFFDerror") {
-					t.Fatalf("unexpected error text: %q", result.Error)
+				} else if len(result.CommandFailures) != 1 || result.CommandFailures[0].Message != "bad\uFFFDerror" {
+					t.Fatalf("unexpected command failures: %v", result.CommandFailures)
 				}
 			default:
 				t.Fatal("device text made the result undeliverable")
@@ -1761,5 +1761,242 @@ func TestMikrotikConnectAbortsLoginOnContextCancel(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("login ignored ctx cancellation, blocked %s", elapsed)
+	}
+}
+
+// mikrotikJobCommands returns n commands; every third is sent with Words so
+// both request paths are exercised.
+func mikrotikJobCommands(n int) []*pb.MikrotikCommand {
+	cmds := make([]*pb.MikrotikCommand, n)
+	for i := range cmds {
+		cmd := &pb.MikrotikCommand{Command: fmt.Sprintf("/test/cmd%d/print", i)}
+		if i%3 == 2 {
+			cmd.Words = []string{"?disabled=false"}
+		}
+		cmds[i] = cmd
+	}
+	return cmds
+}
+
+// runScriptedMikrotikJob runs commands against a device that replies with
+// the given byte stream, returning the result and every command sentence the
+// agent wrote (excluding /quit).
+func runScriptedMikrotikJob(t *testing.T, reply []byte, password string, cmds []*pb.MikrotikCommand) (*pb.MikrotikResult, [][]string) {
+	t.Helper()
+	var written bytes.Buffer
+	origDial := mikrotikDial
+	t.Cleanup(func() { mikrotikDial = origDial })
+	mikrotikDial = func(context.Context, string, uint32, string, string, bool) (*mikrotikClient, error) {
+		return &mikrotikClient{conn: &readWriteCloser{r: bytes.NewReader(reply), w: &written}}, nil
+	}
+	out := testQueue()
+	executeMikrotikJob(context.Background(), &pb.AgentJob{
+		JobId:            "scripted",
+		DeviceId:         "dev-1",
+		MikrotikDevice:   &pb.MikrotikDevice{Ip: "192.0.2.1", Port: 8728, Username: "admin", Password: password},
+		MikrotikCommands: cmds,
+	}, out)
+	var result *pb.MikrotikResult
+	select {
+	case queued := <-out.items:
+		result = decodeQueuedResult[*pb.MikrotikResult](t, queued)
+	default:
+		t.Fatal("no mikrotik result queued")
+	}
+	reader := &mikrotikClient{conn: &nopCloser{readWriter: &written}}
+	var sent [][]string
+	for written.Len() > 0 {
+		words, err := reader.readSentence()
+		if err != nil {
+			t.Fatalf("decode written sentence: %v", err)
+		}
+		if len(words) > 0 && words[0] != "/quit" {
+			sent = append(sent, words)
+		}
+	}
+	return result, sent
+}
+
+// okReply is a successful reply carrying one row naming the command index.
+func okReply(i int) []byte {
+	return append(
+		encodeSentence([]string{"!re", fmt.Sprintf("=index=%d", i)}),
+		encodeSentence([]string{"!done"})...,
+	)
+}
+
+func trapReply(message string) []byte {
+	return append(
+		encodeSentence([]string{"!trap", "=message=" + message}),
+		encodeSentence([]string{"!done"})...,
+	)
+}
+
+func TestMikrotikJobTagsRowsWithCommand(t *testing.T) {
+	cmds := []*pb.MikrotikCommand{
+		{Command: "/ppp/active/print"},
+		{Command: "/interface/print", Words: []string{"?running=true"}},
+		{Command: "/system/script/run"},
+	}
+	var reply bytes.Buffer
+	reply.Write(encodeSentence([]string{"!re", "=name=pppoe-a"}))
+	reply.Write(encodeSentence([]string{"!re", "=name=pppoe-b"}))
+	reply.Write(encodeSentence([]string{"!done"}))
+	reply.Write(encodeSentence([]string{"!re", "=name=ether1"}))
+	reply.Write(encodeSentence([]string{"!done"}))
+	reply.Write(encodeSentence([]string{"!done", "=ret=ok"}))
+
+	result, _ := runScriptedMikrotikJob(t, reply.Bytes(), "", cmds)
+	if result.Error != "" {
+		t.Fatalf("unexpected error: %s", result.Error)
+	}
+	want := []struct{ name, command string }{
+		{"pppoe-a", "/ppp/active/print"},
+		{"pppoe-b", "/ppp/active/print"},
+		{"ether1", "/interface/print"},
+		{"", "/system/script/run"},
+	}
+	if len(result.Sentences) != len(want) {
+		t.Fatalf("got %d sentences, want %d: %v", len(result.Sentences), len(want), result.Sentences)
+	}
+	for i, w := range want {
+		attrs := result.Sentences[i].Attributes
+		if attrs["__command"] != w.command || attrs["name"] != w.name {
+			t.Fatalf("sentence %d = %v, want name %q tagged %q", i, attrs, w.name, w.command)
+		}
+	}
+}
+
+func TestMikrotikJobContinuesPastTrappedCommand(t *testing.T) {
+	cmds := mikrotikJobCommands(8)
+	const trapped = 5
+	var reply bytes.Buffer
+	for i := range cmds {
+		if i == trapped {
+			reply.Write(trapReply("no such command prefix"))
+			continue
+		}
+		reply.Write(okReply(i))
+	}
+
+	result, sent := runScriptedMikrotikJob(t, reply.Bytes(), "", cmds)
+	if result.Error != "" {
+		t.Fatalf("job error = %q, want empty", result.Error)
+	}
+	if len(sent) != len(cmds) {
+		t.Fatalf("agent sent %d commands, want %d", len(sent), len(cmds))
+	}
+	if len(result.Sentences) != 7 {
+		t.Fatalf("got %d rows, want 7: %v", len(result.Sentences), result.Sentences)
+	}
+	for _, s := range result.Sentences {
+		i, err := strconv.Atoi(s.Attributes["index"])
+		if err != nil || i == trapped || s.Attributes["__command"] != cmds[i].Command {
+			t.Fatalf("unexpected row %v", s.Attributes)
+		}
+	}
+	if len(result.CommandFailures) != 1 {
+		t.Fatalf("got %d failures, want 1: %v", len(result.CommandFailures), result.CommandFailures)
+	}
+	failure := result.CommandFailures[0]
+	if failure.Command != cmds[trapped].Command || failure.Message != "no such command prefix" {
+		t.Fatalf("failure = %v, want %s: no such command prefix", failure, cmds[trapped].Command)
+	}
+}
+
+func TestMikrotikJobAllCommandsTrapped(t *testing.T) {
+	cmds := mikrotikJobCommands(8)
+	var reply bytes.Buffer
+	for range cmds {
+		reply.Write(trapReply("no such command prefix"))
+	}
+
+	result, sent := runScriptedMikrotikJob(t, reply.Bytes(), "", cmds)
+	if result.Error != "all 8 commands failed" {
+		t.Fatalf("job error = %q, want %q", result.Error, "all 8 commands failed")
+	}
+	if len(sent) != len(cmds) {
+		t.Fatalf("agent sent %d commands, want %d", len(sent), len(cmds))
+	}
+	if len(result.Sentences) != 0 {
+		t.Fatalf("got rows from trapped commands: %v", result.Sentences)
+	}
+	if len(result.CommandFailures) != len(cmds) {
+		t.Fatalf("got %d failures, want %d", len(result.CommandFailures), len(cmds))
+	}
+	for i, failure := range result.CommandFailures {
+		if failure.Command != cmds[i].Command || failure.Message != "no such command prefix" {
+			t.Fatalf("failure %d = %v", i, failure)
+		}
+	}
+}
+
+func TestMikrotikJobConnectionDropReturnsRowsReadSoFar(t *testing.T) {
+	cmds := mikrotikJobCommands(8)
+	var reply bytes.Buffer
+	for i := range 3 {
+		reply.Write(okReply(i))
+	}
+	// The fourth command's reply starts, then the connection closes.
+	reply.Write(encodeSentence([]string{"!re", "=index=3"}))
+
+	result, sent := runScriptedMikrotikJob(t, reply.Bytes(), "", cmds)
+	if result.Error == "" {
+		t.Fatal("broken connection left the job error empty")
+	}
+	if !strings.Contains(result.Error, cmds[3].Command) {
+		t.Fatalf("job error = %q, want it to name %s", result.Error, cmds[3].Command)
+	}
+	if len(sent) != 4 {
+		t.Fatalf("agent sent %d commands after the connection broke, want 4", len(sent))
+	}
+	if len(result.Sentences) != 3 {
+		t.Fatalf("got %d rows, want the first three commands' rows: %v", len(result.Sentences), result.Sentences)
+	}
+	for i, s := range result.Sentences {
+		if s.Attributes["index"] != strconv.Itoa(i) || s.Attributes["__command"] != cmds[i].Command {
+			t.Fatalf("row %d = %v", i, s.Attributes)
+		}
+	}
+	if len(result.CommandFailures) != 0 {
+		t.Fatalf("transport error recorded as command failure: %v", result.CommandFailures)
+	}
+}
+
+func TestMikrotikJobTrapMessageIsSanitized(t *testing.T) {
+	const password = "hunter2-secret"
+	for _, test := range []struct {
+		name, message, want string
+	}{
+		{
+			name:    "password",
+			message: "login as admin with " + password + " rejected",
+			want:    "login as admin with *** rejected",
+		},
+		{
+			name:    "first line",
+			message: "bad argument " + password + "\nsecond line " + password,
+			want:    "bad argument ***",
+		},
+		{
+			name:    "length",
+			message: strings.Repeat("x", 400),
+			want:    strings.Repeat("x", 300),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cmds := mikrotikJobCommands(2)
+			reply := append(trapReply(test.message), okReply(1)...)
+			result, _ := runScriptedMikrotikJob(t, reply, password, cmds)
+			if result.Error != "" {
+				t.Fatalf("job error = %q, want empty", result.Error)
+			}
+			if len(result.CommandFailures) != 1 {
+				t.Fatalf("got %d failures, want 1", len(result.CommandFailures))
+			}
+			if got := result.CommandFailures[0].Message; got != test.want {
+				t.Fatalf("message = %q, want %q", got, test.want)
+			}
+		})
 	}
 }

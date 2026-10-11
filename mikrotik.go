@@ -30,6 +30,11 @@ const (
 	maxMikrotikResponse  = 16 << 20 // 16 MB aggregate decoded response
 	maxMikrotikWords     = 10000
 	maxMikrotikSentences = 10000
+	// maxMikrotikFailureLen bounds a rejected command's device message.
+	maxMikrotikFailureLen = 300
+	// mikrotikCommandAttr tags each returned row with the command that
+	// produced it. RouterOS attribute names never start with "__".
+	mikrotikCommandAttr = "__command"
 )
 
 var mikrotikDial = mikrotikConnect
@@ -457,7 +462,7 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue)
 	defer stopCancel()
 
 	var allSentences []*pb.MikrotikSentence
-	var errorMessage string
+	var failures []*pb.MikrotikCommandFailure
 
 	for _, cmd := range job.MikrotikCommands {
 		slog.Debug("executing mikrotik command", "command", cmd.Command, "args", len(cmd.Args), "words", len(cmd.Words))
@@ -473,33 +478,53 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue)
 			resp, err = client.execute(cmd.Command, cmd.Args)
 		}
 		if err != nil {
-			errorMessage = fmt.Sprintf("command '%s' failed: %v", cmd.Command, err)
+			// The connection is no longer usable: end the job, but keep the
+			// rows and failures the earlier commands produced.
+			errorMessage := fmt.Sprintf("command '%s' failed: %v", cmd.Command, err)
 			slog.Error("mikrotik command failed", "device", job.DeviceId, "error", errorMessage)
-			break
+			result := mikrotikError(job, errorMessage, timestamp)
+			result.Sentences = allSentences
+			result.CommandFailures = failures
+			sendResult(ctx, out, "mikrotik_result", result, job.JobId)
+			return
 		}
 		if resp.err != "" {
-			errorMessage = fmt.Sprintf("command '%s' error: %s", cmd.Command, resp.err)
-			slog.Error("mikrotik command error", "device", job.DeviceId, "error", errorMessage)
-			break
+			// A !trap rejects only this command; the connection stays usable.
+			message := sanitizeMikrotikFailure(resp.err, dev.Password)
+			slog.Warn("mikrotik command rejected", "device", job.DeviceId, "command", cmd.Command, "error", message)
+			failures = append(failures, &pb.MikrotikCommandFailure{Command: cmd.Command, Message: message})
+			continue
 		}
 
 		for _, s := range resp.sentences {
+			s.attributes[mikrotikCommandAttr] = cmd.Command
 			allSentences = append(allSentences, &pb.MikrotikSentence{Attributes: s.attributes})
 		}
 	}
 
-	if errorMessage != "" {
-		sendResult(ctx, out, "mikrotik_result", mikrotikError(job, errorMessage, timestamp), job.JobId)
-		return
+	result := &pb.MikrotikResult{
+		DeviceId:        job.DeviceId,
+		JobId:           job.JobId,
+		Sentences:       allSentences,
+		CommandFailures: failures,
+		Timestamp:       timestamp,
 	}
+	if n := len(job.MikrotikCommands); n > 0 && len(failures) == n {
+		result.Error = fmt.Sprintf("all %d commands failed", n)
+		slog.Error("mikrotik job failed", "device", job.DeviceId, "job", job.JobId, "error", result.Error)
+	} else {
+		slog.Info("mikrotik job complete", "device", job.DeviceId, "job", job.JobId, "command_failures", len(failures))
+	}
+	sendResult(ctx, out, "mikrotik_result", result, job.JobId)
+}
 
-	slog.Info("mikrotik job complete", "device", job.DeviceId, "job", job.JobId)
-	sendResult(ctx, out, "mikrotik_result", &pb.MikrotikResult{
-		DeviceId:  job.DeviceId,
-		JobId:     job.JobId,
-		Sentences: allSentences,
-		Timestamp: timestamp,
-	}, job.JobId)
+// sanitizeMikrotikFailure reduces a device's !trap message to one bounded
+// line with the job password scrubbed, as classifyConfigBackupError does.
+func sanitizeMikrotikFailure(message, password string) string {
+	if password != "" {
+		message = strings.ReplaceAll(message, password, "***")
+	}
+	return firstLine(message, maxMikrotikFailureLen)
 }
 
 // executeMikrotikBackupViaSSH runs /export compact over SSH.
