@@ -443,10 +443,18 @@ message MikrotikResult {
   repeated MikrotikSentence sentences = 3;
   string error = 4;
   int64 timestamp = 5;
+  // One entry per command the device rejected; the other commands' rows are
+  // still in `sentences`. Agents before this field stop at the first failure.
+  repeated MikrotikCommandFailure command_failures = 6;
 }
 
 message MikrotikSentence {
   map<string, string> attributes = 1;
+}
+
+message MikrotikCommandFailure {
+  string command = 1;
+  string message = 2;
 }
 
 
