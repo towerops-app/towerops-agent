@@ -1778,6 +1778,26 @@ func mikrotikJobCommands(n int) []*pb.MikrotikCommand {
 	return cmds
 }
 
+// mikrotikServerCommands mirrors the command list the server's
+// JobBuilder.build_mikrotik_commands sends, including the .proplist word on
+// /ppp/active/print.
+func mikrotikServerCommands() []*pb.MikrotikCommand {
+	return []*pb.MikrotikCommand{
+		{Command: "/system/identity/print"},
+		{Command: "/system/resource/print"},
+		{Command: "/ip/neighbor/print"},
+		{Command: "/ip/dhcp-server/lease/print"},
+		{Command: "/ip/arp/print"},
+		{
+			Command: "/ppp/active/print",
+			Args:    map[string]string{".proplist": "name,service,caller-id,address,uptime"},
+			Words:   []string{"=.proplist=name,service,caller-id,address,uptime"},
+		},
+		{Command: "/interface/wireless/registration-table/print"},
+		{Command: "/interface/wifi/registration-table/print"},
+	}
+}
+
 // runScriptedMikrotikJob runs commands against a device that replies with
 // the given byte stream, returning the result and every command sentence the
 // agent wrote (excluding /quit).
@@ -1868,8 +1888,8 @@ func TestMikrotikJobTagsRowsWithCommand(t *testing.T) {
 }
 
 func TestMikrotikJobContinuesPastTrappedCommand(t *testing.T) {
-	cmds := mikrotikJobCommands(8)
-	const trapped = 5
+	cmds := mikrotikServerCommands()
+	const trapped = 7 // /interface/wifi/registration-table/print, absent on RouterOS v6
 	var reply bytes.Buffer
 	for i := range cmds {
 		if i == trapped {
@@ -1905,7 +1925,7 @@ func TestMikrotikJobContinuesPastTrappedCommand(t *testing.T) {
 }
 
 func TestMikrotikJobAllCommandsTrapped(t *testing.T) {
-	cmds := mikrotikJobCommands(8)
+	cmds := mikrotikServerCommands()
 	var reply bytes.Buffer
 	for range cmds {
 		reply.Write(trapReply("no such command prefix"))
@@ -1932,7 +1952,7 @@ func TestMikrotikJobAllCommandsTrapped(t *testing.T) {
 }
 
 func TestMikrotikJobConnectionDropReturnsRowsReadSoFar(t *testing.T) {
-	cmds := mikrotikJobCommands(8)
+	cmds := mikrotikServerCommands()
 	var reply bytes.Buffer
 	for i := range 3 {
 		reply.Write(okReply(i))
