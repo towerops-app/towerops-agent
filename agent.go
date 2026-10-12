@@ -773,6 +773,9 @@ func (s *session) heartbeat() *pb.AgentHeartbeat {
 		InterfaceSubnets:     subnets,
 		ReportsVantagePoint:  true,
 		SupportsConfigBackup: true,
+		// The server dispatches plan-driven backups only to agents that
+		// advertise this feature; MikroTik backups need no plan.
+		ConfigBackupFeatures: []string{"plan_v1"},
 	}
 }
 

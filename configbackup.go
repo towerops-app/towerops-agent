@@ -177,22 +177,49 @@ func executeConfigBackupJobCtx(sessionCtx, jobCtx context.Context, job *pb.Agent
 	stopCancel := context.AfterFunc(jobCtx, func() { _ = client.Close() })
 	defer stopCancel()
 
-	vendor, ok := configBackupVendors[strings.ToLower(strings.TrimSpace(cb.Vendor))]
-	if !ok {
+	var result *pb.ConfigBackupResult
+	if cb.GetPlan() != nil {
+		// A job that carries a plan runs the vendor-neutral plan engine,
+		// whatever its vendor string; the vendor table below holds only the
+		// built-in MikroTik recipe.
+		result = runPlan(jobCtx, client, cb, job.JobId, job.DeviceId)
+	} else if vendor, ok := configBackupVendors[strings.ToLower(strings.TrimSpace(cb.Vendor))]; ok {
+		if cb.Mode == pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE {
+			result = vendor.Probe(jobCtx, client, cb, job.JobId, job.DeviceId)
+		} else {
+			result = vendor.Backup(jobCtx, client, cb, job.JobId, job.DeviceId)
+		}
+	} else {
 		fail(pb.ConfigBackupErrorCode_UNSUPPORTED_VENDOR, "unsupported vendor: "+cb.Vendor)
 		return
-	}
-
-	var result *pb.ConfigBackupResult
-	if cb.Mode == pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE {
-		result = vendor.Probe(jobCtx, client, cb, job.JobId, job.DeviceId)
-	} else {
-		result = vendor.Backup(jobCtx, client, cb, job.JobId, job.DeviceId)
 	}
 	if sessionCtx.Err() != nil {
 		return
 	}
 	finish(result)
+}
+
+// configBackupAuthMethods builds the credential order for a backup login:
+// public key when the job carries a parseable private key, then the
+// password, then keyboard-interactive answering every prompt with the
+// password. An unparseable key is dropped silently — password auth covers
+// it — and a parse failure is reported in no result field.
+func configBackupAuthMethods(cb *pb.ConfigBackupJob) []ssh.AuthMethod {
+	var auth []ssh.AuthMethod
+	if key := cb.GetPrivateKey(); key != "" {
+		if signer, err := ssh.ParsePrivateKey([]byte(key)); err == nil {
+			auth = append(auth, ssh.PublicKeys(signer))
+		}
+	}
+	auth = append(auth, ssh.Password(cb.GetPassword()))
+	auth = append(auth, ssh.KeyboardInteractive(func(name, instruction string, questions []string, _ []bool) ([]string, error) {
+		answers := make([]string, len(questions))
+		for i := range answers {
+			answers[i] = cb.GetPassword()
+		}
+		return answers, nil
+	}))
+	return auth
 }
 
 // configBackupDial connects to the target and returns the client plus the
@@ -204,12 +231,12 @@ func configBackupDial(ctx context.Context, job *pb.AgentJob) (*ssh.Client, strin
 	var observed string
 	config := &ssh.ClientConfig{
 		User:            cb.Username,
-		Auth:            []ssh.AuthMethod{ssh.Password(cb.Password)},
+		Auth:            configBackupAuthMethods(cb),
 		HostKeyCallback: configBackupHostKeyCallback(expected, &observed),
 		// Timeout is intentionally unset: sshDial never calls ssh.Dial, so the
 		// field would be ignored. The context deadline below is the bound.
 	}
-	routerOSSSHAlgorithms(config)
+	legacySSHAlgorithms(config)
 	port := cb.SshPort
 	if port == 0 {
 		port = 22
@@ -279,9 +306,7 @@ func classifyConfigBackupError(err error, job *pb.AgentJob) (pb.ConfigBackupErro
 	}
 
 	detail := err.Error()
-	if pw := job.ConfigBackup.GetPassword(); pw != "" {
-		detail = strings.ReplaceAll(detail, pw, "***")
-	}
+	detail = redactConfigSecrets(detail, job.ConfigBackup)
 	return code, firstLine(detail, maxConfigBackupDetailLen)
 }
 
@@ -336,6 +361,11 @@ func runConfigBackupSession(ctx context.Context, c *ssh.Client, cmd string, maxB
 		return nil, nil, err
 	}
 	defer func() { _ = session.Close() }()
+	// A step context must be able to abort a stalled exec: closing the
+	// session unblocks Run. Plan steps derive their context from the job
+	// context, so the job deadline still wins.
+	stopAbort := context.AfterFunc(ctx, func() { _ = session.Close() })
+	defer stopAbort()
 
 	outBuf := boundedBuffer{
 		limit:      maxBytes,
@@ -359,11 +389,10 @@ func runConfigBackupSession(ctx context.Context, c *ssh.Client, cmd string, maxB
 	return outBuf.Bytes(), errBuf.Bytes(), runErr
 }
 
-// configBackupError builds a failure result, scrubbing the password.
+// configBackupError builds a failure result, scrubbing the password, the
+// enable password and any private-key line before the 300-byte cut.
 func configBackupError(job *pb.ConfigBackupJob, jobID, deviceID string, code pb.ConfigBackupErrorCode, detail string) *pb.ConfigBackupResult {
-	if job.Password != "" {
-		detail = strings.ReplaceAll(detail, job.Password, "***")
-	}
+	detail = redactConfigSecrets(detail, job)
 	detail = firstLine(detail, maxConfigBackupDetailLen)
 	return &pb.ConfigBackupResult{
 		DeviceId:    deviceID,
