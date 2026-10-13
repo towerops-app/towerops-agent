@@ -283,10 +283,9 @@ func newShellSession(c *ssh.Client, maxBytes uint64, pagers []pagerPattern) (*sh
 		return nil, err
 	}
 	s := &shellSession{session: session, pagers: pagers, filter: newShellFilter(maxBytes)}
-	if s.stdin, err = session.StdinPipe(); err != nil {
-		_ = session.Close()
-		return nil, err
-	}
+	// StdinPipe cannot fail here: the session is fresh, so Stdin is unset
+	// and nothing has started. The error is acknowledged for errcheck.
+	s.stdin, _ = session.StdinPipe()
 	session.Stdout = s.filter
 	session.Stderr = s.filter
 	if err := session.RequestPty("vt100", 100, 200, ssh.TerminalModes{

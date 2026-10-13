@@ -6,6 +6,8 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"runtime"
 	"strings"
 	"testing"
@@ -77,7 +79,8 @@ func TestShellFilter(t *testing.T) {
 		{"other control bytes dropped", []string{"a\x01b\x7fc\n"}, "abc\n"},
 		{"tab and bell kept", []string{"a\tb\x07\n"}, "a\tb\x07\n"},
 		{"csi split across writes", []string{"x\x1b[3", "1m text\n"}, "x text\n"},
-		{"osc split across writes", []string{"y\x1b]0;ti", "tle\x07z\n"}, "yz\n"},
+		{"osc ends with escape backslash", []string{"a\x1b]0;t\x1b\\b\n"}, "ab\n"},
+		{"osc split across writes ends at ESC", []string{"y\x1b]0;ti\x1b", "\\z\n"}, "yz\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -91,6 +94,23 @@ func TestShellFilter(t *testing.T) {
 				t.Fatalf("filter output = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestShellFilterLimit(t *testing.T) {
+	// The retained output is capped: once out crosses the limit it is cut
+	// back and overflow is reported. A \r\n landing right at the cap makes
+	// the newline itself the byte past the limit, leaving lineStart beyond
+	// the truncated end; the clamp keeps it in bounds.
+	f := newShellFilter(4)
+	if _, err := f.Write([]byte("abcd\r\nxyz")); err != nil {
+		t.Fatal(err)
+	}
+	if !f.overflowed() {
+		t.Fatal("overflow not reported")
+	}
+	if got := string(f.Bytes()); got != "abcd" {
+		t.Fatalf("filter output = %q, want the 4-byte prefix", got)
 	}
 }
 
@@ -130,7 +150,7 @@ func TestDevicePromptRegex(t *testing.T) {
 		})
 	}
 
-	for _, bad := range []string{"", "no terminator", "just words here", "a line\nwith a newline\n"} {
+	for _, bad := range []string{"", "no terminator", "just words here", "a line\nwith a newline\n", "-1#"} {
 		if _, err := newDevicePrompt(bad); err == nil {
 			t.Errorf("newDevicePrompt(%q) accepted a non-prompt line", bad)
 		}
@@ -526,5 +546,337 @@ func TestShellTooLarge(t *testing.T) {
 	}
 	if len(sess.filter.Bytes()) > 1024 {
 		t.Fatalf("filter retained %d bytes, want at most 1024", len(sess.filter.Bytes()))
+	}
+}
+
+// cbFailWriter is a stdin pipe stub: the failOn-th Write returns err. It
+// covers send() failure branches without a real device.
+type cbFailWriter struct {
+	calls  int
+	failOn int
+	err    error
+}
+
+func (w *cbFailWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls == w.failOn {
+		return 0, w.err
+	}
+	return len(p), nil
+}
+
+func (w *cbFailWriter) Close() error { return nil }
+
+// cbCancelWriter cancels the session context on the cancelOn-th write, so
+// the next quietRead observes a dead context deterministically.
+type cbCancelWriter struct {
+	calls    int
+	cancelOn int
+	cancel   context.CancelFunc
+}
+
+func (w *cbCancelWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls == w.cancelOn {
+		w.cancel()
+	}
+	return len(p), nil
+}
+
+func (w *cbCancelWriter) Close() error { return nil }
+
+// cbStubSession builds a shellSession without a device: stdin is the
+// supplied writer, eofC stays open and the filter starts empty.
+func cbStubSession(stdin io.WriteCloser) *shellSession {
+	return &shellSession{
+		stdin:  stdin,
+		filter: newShellFilter(0),
+		eofC:   make(chan struct{}),
+		pagers: builtinPagerPatterns(),
+	}
+}
+
+func TestShellSessionSetupErrors(t *testing.T) {
+	t.Run("closed client cannot open a session", func(t *testing.T) {
+		fake := startFakeShellServer(t, "", "sw1> ", shellScript{})
+		defer fake.cleanup()
+		client := cbShellClient(t, fake.addr)
+		if err := client.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := newShellSession(client, defaultMaxConfigBytes, nil); err == nil {
+			t.Fatal("newShellSession succeeded on a closed client")
+		}
+	})
+
+	t.Run("device refusing a PTY fails the session", func(t *testing.T) {
+		addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbExecHandler(nil, nil))
+		defer cleanup()
+		if _, err := newShellSession(cbShellClient(t, addr), defaultMaxConfigBytes, nil); err == nil {
+			t.Fatal("newShellSession succeeded without a PTY")
+		}
+	})
+
+	t.Run("device refusing a shell fails the session", func(t *testing.T) {
+		// pty-req is granted but the shell request is refused.
+		config := &ssh.ServerConfig{
+			PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+				return nil, nil
+			},
+		}
+		config.AddHostKey(cbNewSigner(t))
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func() {
+					defer func() { _ = conn.Close() }()
+					sconn, chans, reqs, err := ssh.NewServerConn(conn, config)
+					if err != nil {
+						return
+					}
+					defer func() { _ = sconn.Close() }()
+					go ssh.DiscardRequests(reqs)
+					for newChannel := range chans {
+						if newChannel.ChannelType() != "session" {
+							_ = newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
+							continue
+						}
+						_, requests, err := newChannel.Accept()
+						if err != nil {
+							continue
+						}
+						go func() {
+							for req := range requests {
+								_ = req.Reply(req.Type == "pty-req", nil)
+							}
+						}()
+					}
+				}()
+			}
+		}()
+		if _, err := newShellSession(cbShellClient(t, ln.Addr().String()), defaultMaxConfigBytes, nil); err == nil {
+			t.Fatal("newShellSession succeeded without a shell")
+		}
+	})
+}
+
+func TestShellLearnPromptFailures(t *testing.T) {
+	t.Run("deadline before the login banner", func(t *testing.T) {
+		sess := cbStubSession(&cbFailWriter{})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := sess.learnPrompt(ctx); err == nil {
+			t.Fatal("learnPrompt succeeded on a dead context")
+		}
+	})
+
+	t.Run("first newline write fails", func(t *testing.T) {
+		sess := cbStubSession(&cbFailWriter{failOn: 1, err: io.ErrClosedPipe})
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := sess.learnPrompt(ctx); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("learnPrompt error = %v, want io.ErrClosedPipe", err)
+		}
+	})
+
+	t.Run("second newline write fails", func(t *testing.T) {
+		sess := cbStubSession(&cbFailWriter{failOn: 2, err: io.ErrClosedPipe})
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := sess.learnPrompt(ctx); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("learnPrompt error = %v, want io.ErrClosedPipe", err)
+		}
+	})
+
+	t.Run("deadline during the second probe", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		sess := cbStubSession(&cbCancelWriter{cancelOn: 2, cancel: cancel})
+		if _, err := sess.learnPrompt(ctx); err == nil {
+			t.Fatal("learnPrompt succeeded after the deadline")
+		}
+	})
+
+	t.Run("silent device never shows a prompt", func(t *testing.T) {
+		sess := cbStubSession(&cbFailWriter{})
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := sess.learnPrompt(ctx); err == nil {
+			t.Fatal("learnPrompt accepted silence as a prompt")
+		}
+	})
+}
+
+func TestShellCollectFailures(t *testing.T) {
+	t.Run("command write fails", func(t *testing.T) {
+		sess := cbStubSession(&cbFailWriter{failOn: 1, err: io.ErrClosedPipe})
+		prompt, err := newDevicePrompt("sw1>")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := sess.collect(ctx, "show run", prompt); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("collect error = %v, want io.ErrClosedPipe", err)
+		}
+	})
+
+	t.Run("prompt discovered on a quiet cycle", func(t *testing.T) {
+		// Output that arrives without an arrived-signal (a copier racing
+		// the wait loop) is still picked up when the quiet timer fires.
+		sess := cbStubSession(&cbFailWriter{})
+		prompt, err := newDevicePrompt("sw1>")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			sess.filter.mu.Lock()
+			sess.filter.out = append(sess.filter.out, "hostname sw1\nsw1> "...)
+			sess.filter.mu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		got, err := sess.collect(ctx, "show run", prompt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "hostname sw1\n" {
+			t.Fatalf("collect = %q, want %q", got, "hostname sw1\n")
+		}
+	})
+}
+
+func TestShellPrivilegedFailures(t *testing.T) {
+	newPrompt := func(t *testing.T, line string) *devicePrompt {
+		t.Helper()
+		p, err := newDevicePrompt(line)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	step := &pb.ConfigBackupStep{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_PRIVILEGED, Command: "enable"}
+
+	t.Run("enable command write fails", func(t *testing.T) {
+		sess := cbStubSession(&cbFailWriter{failOn: 1, err: io.ErrClosedPipe})
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := sess.runPrivileged(ctx, step, "s3cret", newPrompt(t, "sw1>")); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("runPrivileged error = %v, want io.ErrClosedPipe", err)
+		}
+	})
+
+	t.Run("password write fails", func(t *testing.T) {
+		sess := cbStubSession(&cbFailWriter{failOn: 2, err: io.ErrClosedPipe})
+		sess.filter.mu.Lock()
+		sess.filter.out = append(sess.filter.out, "Password: "...)
+		sess.filter.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := sess.runPrivileged(ctx, step, "s3cret", newPrompt(t, "sw1>")); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("runPrivileged error = %v, want io.ErrClosedPipe", err)
+		}
+	})
+
+	t.Run("prompt shape the parser rejects", func(t *testing.T) {
+		sess := cbStubSession(&cbFailWriter{})
+		sess.filter.mu.Lock()
+		sess.filter.out = append(sess.filter.out, "-1# "...)
+		sess.filter.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := sess.runPrivileged(ctx, step, "s3cret", newPrompt(t, "sw1>")); err == nil {
+			t.Fatal("runPrivileged accepted an unparseable prompt")
+		}
+	})
+
+	t.Run("session ends during enable", func(t *testing.T) {
+		sess := cbStubSession(&cbFailWriter{})
+		close(sess.eofC)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := sess.runPrivileged(ctx, step, "s3cret", newPrompt(t, "sw1>")); !errors.Is(err, errShellClosed) {
+			t.Fatalf("runPrivileged error = %v, want errShellClosed", err)
+		}
+	})
+
+	t.Run("deadline during enable", func(t *testing.T) {
+		sess := cbStubSession(&cbFailWriter{})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := sess.runPrivileged(ctx, step, "s3cret", newPrompt(t, "sw1>")); !errors.Is(err, context.Canceled) {
+			t.Fatalf("runPrivileged error = %v, want context.Canceled", err)
+		}
+	})
+}
+
+func TestShellCloseStuckWrite(t *testing.T) {
+	// A device that never drains stdin leaves the exit write stuck: close
+	// abandons it after shellWriteDeadline instead of waiting forever.
+	fake := startFakeShellServer(t, "", "sw1> ", shellScript{})
+	defer fake.cleanup()
+	sess := cbShellSession(t, fake.addr, builtinPagerPatterns())
+	sess.stdin = &cbFailWriter{failOn: -1, err: io.ErrClosedPipe}
+	done := make(chan struct{})
+	go func() {
+		sess.close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("close hung on a stuck exit write")
+	}
+}
+
+func TestMustCompilePanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("mustCompile accepted an invalid regex")
+		}
+	}()
+	mustCompile("[unterminated")
+}
+
+func TestShellTextHelpers(t *testing.T) {
+	prompt, err := newDevicePrompt("sw1>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := stripEchoedCommand("output\n", "  \t "); got != "output\n" {
+		t.Fatalf("stripEchoedCommand with a blank command = %q", got)
+	}
+	deep := "1\n2\n3\n4\n5\n6\n7\n8\n9\necho of a\nsw1> "
+	if got := stripEchoedCommand(deep, "echo of a"); got != deep {
+		t.Fatal("stripEchoedCommand scanned past its line limit")
+	}
+	if got := stripTrailingPrompt("\n\n", prompt); got != "\n\n" {
+		t.Fatalf("stripTrailingPrompt on empty text = %q", got)
+	}
+	if got := stripTrailingPrompt("body\nrouter2> ", prompt); got != "body\nrouter2> " {
+		t.Fatal("stripTrailingPrompt removed a non-prompt line")
+	}
+	if got := lastLine("no newline here"); got != "no newline here" {
+		t.Fatalf("lastLine without a newline = %q", got)
+	}
+}
+
+func TestSincePastEnd(t *testing.T) {
+	sess := &shellSession{filter: newShellFilter(0)}
+	sess.filter.mu.Lock()
+	sess.filter.out = []byte("ab")
+	sess.filter.mu.Unlock()
+	if got := sess.since(5); got != "" {
+		t.Fatalf("since past the buffer end = %q, want \"\"", got)
 	}
 }

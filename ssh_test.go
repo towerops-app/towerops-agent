@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1226,7 +1227,7 @@ func startFakeShellServerWithConfig(
 						}
 					}
 
-					shellStarted := false
+					var shellStarted atomic.Bool
 					var lineBuf []byte
 					go func() {
 						defer func() { _ = ch.Close() }()
@@ -1234,7 +1235,7 @@ func startFakeShellServerWithConfig(
 						for {
 							n, err := ch.Read(readBuf)
 							for _, b := range readBuf[:n] {
-								if !shellStarted {
+								if !shellStarted.Load() {
 									continue
 								}
 								switch b {
@@ -1269,7 +1270,7 @@ func startFakeShellServerWithConfig(
 							_ = req.Reply(true, nil)
 						case "shell":
 							_ = req.Reply(true, nil)
-							shellStarted = true
+							shellStarted.Store(true)
 							writeFrag(ch, banner+prompt)
 						default:
 							_ = req.Reply(false, nil)
