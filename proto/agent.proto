@@ -203,6 +203,42 @@ enum ConfigBackupMode {
   CONFIG_BACKUP_MODE_PROBE = 1;
 }
 
+// How the agent reaches the device CLI for a plan-driven backup. EXEC runs
+// each command on its own "exec" request (no PTY); SHELL opens a PTY shell,
+// learns the prompt and collects each command's output until it returns.
+enum ConfigBackupTransport {
+  CONFIG_BACKUP_TRANSPORT_EXEC = 0;
+  CONFIG_BACKUP_TRANSPORT_SHELL = 1;
+}
+
+enum ConfigBackupStepKind {
+  // Run `command`, with `fallback_commands` tried in order when the output
+  // matches a permission-denied or invalid-command pattern.
+  CONFIG_BACKUP_STEP_COMMAND = 0;
+  // Send `command` (e.g. "enable", "system-view") to enter privileged mode,
+  // answering a password prompt with the job's enable password.
+  CONFIG_BACKUP_STEP_PRIVILEGED = 1;
+}
+
+message ConfigBackupStep {
+  ConfigBackupStepKind kind = 1;
+  string command = 2;                     // PRIVILEGED: "enable", "system-view", "cli", ...
+  repeated string fallback_commands = 3;
+  string section = 4;                     // "" = no header
+  bool exclude_output = 5;
+  bool ignore_failure = 6;
+}
+
+// Server-defined backup recipe. Present on jobs for every vendor except
+// MikroTik, whose recipe lives in the agent. The agent interprets the plan
+// vendor-neutrally, so adding or fixing a vendor is a server-only change.
+message ConfigBackupPlan {
+  ConfigBackupTransport transport = 1;
+  repeated ConfigBackupStep steps = 2;
+  repeated string pager_patterns = 3;     // RE2, added to the agent's built-in list
+  uint32 step_timeout_ms = 4;             // 0 = agent default (20000)
+}
+
 message ConfigBackupJob {
   string vendor = 1;                      // "mikrotik"
   ConfigBackupMode mode = 2;
@@ -214,6 +250,9 @@ message ConfigBackupJob {
   string expected_host_key_fingerprint = 8;  // SHA256:... ; empty = first use
   uint32 timeout_ms = 9;                  // 0 = agent default (120000)
   uint64 max_config_bytes = 10;           // 0 = agent default (16 MiB)
+  ConfigBackupPlan plan = 11;             // Absent on MikroTik jobs (agent recipe)
+  string enable_password = 12;            // Answered to a privileged-mode password prompt
+  string private_key = 13;                // PEM; tried before password auth
 }
 
 enum ConfigBackupErrorCode {
@@ -231,6 +270,8 @@ enum ConfigBackupErrorCode {
   AGENT_BUSY = 11;
   UNSUPPORTED_VENDOR = 12;
   INTERNAL = 13;
+  ENABLE_FAILED = 14;          // Privileged mode refused or unconfirmed
+  COMMAND_UNSUPPORTED = 15;    // Every command of a step failed as invalid
 }
 
 message ConfigBackupResult {
@@ -372,6 +413,10 @@ message AgentHeartbeat {
   // "config_backup_result". Servers fall back to the legacy MikroTik backup
   // job for agents without it.
   bool supports_config_backup = 11;
+  // Config backup capabilities the agent implements, e.g. "plan_v1" (the
+  // server-defined plan engine). The server dispatches a plan-based backup
+  // only to an agent listing it; agents without it still take MikroTik jobs.
+  repeated string config_backup_features = 12;
 }
 
 message AgentError {
