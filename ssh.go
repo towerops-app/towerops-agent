@@ -59,7 +59,7 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 		HostKeyCallback: sshHostKeyCallback(),
 	}
 
-	routerOSSSHAlgorithms(config)
+	legacySSHAlgorithms(config)
 
 	if alg := getHostKeyStore().pinnedKeyAlgorithm("ssh:" + addr); alg != "" {
 		config.HostKeyAlgorithms = hostKeyAlgorithmsFor(alg)
@@ -119,19 +119,22 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 	return exportOutput, nil
 }
 
-// routerOSSSHAlgorithms widens the client config for RouterOS 6's SSH server.
-// Host keys and MACs stay unset — the defaults already include ssh-rsa,
-// ssh-dss and hmac-sha1, and setting HostKeyAlgorithms explicitly would
-// reorder x/crypto's preference list, which could make a multi-key device
-// present a different key than the fingerprint a PROBE already recorded.
+// legacySSHAlgorithms widens the client config with the legacy algorithms
+// old devices offer. It now serves every config backup vendor, not just
+// RouterOS 6. Host keys and MACs stay unset — the defaults already include
+// ssh-rsa, ssh-dss and hmac-sha1, and setting HostKeyAlgorithms explicitly
+// would reorder x/crypto's preference list, which could make a multi-key
+// device present a different key than the fingerprint a PROBE already
+// recorded.
 //
 // KEX order matters: the defaults come first, then the insecure algorithms
-// only ROS 6 offers (group1-sha1, gex-sha1), then the rest of the supported
-// set (dh16-sha512, gex-sha256) last. SSH picks the first client-listed
-// algorithm the server accepts, and a RouterOS 6 with strong-crypto=no
-// answers group exchange with a 1024-bit prime that x/crypto rejects — the
-// GEX forms must sit behind every fixed group the device might offer.
-func routerOSSSHAlgorithms(c *ssh.ClientConfig) {
+// only old devices offer (group1-sha1, gex-sha1), then the rest of the
+// supported set (dh16-sha512, gex-sha256) last. SSH picks the first
+// client-listed algorithm the server accepts, and a RouterOS 6 with
+// strong-crypto=no answers group exchange with a 1024-bit prime that
+// x/crypto rejects — the GEX forms must sit behind every fixed group the
+// device might offer.
+func legacySSHAlgorithms(c *ssh.ClientConfig) {
 	var defaults ssh.Config
 	defaults.SetDefaults()
 	supported, insecure := ssh.SupportedAlgorithms(), ssh.InsecureAlgorithms()

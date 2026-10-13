@@ -19,6 +19,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2584,6 +2585,9 @@ func TestRunSessionSendsImmediateHeartbeat(t *testing.T) {
 	}
 	if heartbeat.UptimeSeconds < 119 {
 		t.Errorf("heartbeat uptime_seconds = %d, want process uptime near 120s", heartbeat.UptimeSeconds)
+	}
+	if !slices.Equal(heartbeat.ConfigBackupFeatures, []string{"plan_v1"}) {
+		t.Errorf("heartbeat config_backup_features = %v, want [plan_v1]", heartbeat.ConfigBackupFeatures)
 	}
 
 	agtSendEvent(t, conn, topic, "restart", json.RawMessage(`{}`))

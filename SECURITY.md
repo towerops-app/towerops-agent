@@ -71,8 +71,9 @@ pinned deployment does not pick up security fixes on its own.
 ## Scope
 
 This policy covers the agent in this repository: the Phoenix channel client,
-the SNMP, MikroTik, SSH, LLDP, and ping pollers, the self-update mechanism,
-and the published container image.
+the SNMP, MikroTik, SSH, LLDP, and ping pollers, the configuration backup
+plan engine (including its interactive shell sessions), the self-update
+mechanism, and the published container image.
 
 Issues in the Towerops web application or API belong to that project, which is
 not hosted here. Report them by either route above anyway and we will pass
@@ -90,6 +91,25 @@ rather than vulnerabilities:
   built.
 - Credentials the operator configures for polling (SNMP communities, SSH
   keys) are readable by the agent process. That is what they are for.
+
+## Configuration Backups and Interactive Shell Sessions
+
+Plan-driven configuration backups give the agent two capabilities beyond the
+MikroTik recipe:
+
+- **Interactive shell sessions.** For shell-transport plans the agent opens
+  a PTY shell on the device, learns its prompt, sends the plan's commands,
+  answers pager prompts, and closes the session with `exit`. The commands
+  come from the Towerops server's plan for that device; the agent executes
+  whatever a plan contains, exactly as it executes whatever jobs the server
+  dispatches. An agent token therefore implies the ability to run CLI
+  commands on the devices its server sends plans for.
+- **Per-job backup credentials.** A backup job may carry an enable password
+  and an OpenSSH private key alongside the login password. They authenticate
+  the backup session to the device and are held in memory for the job's
+  duration only. They are never written to disk, never logged, and are
+  redacted to `***` in any error detail a job reports, including when a
+  device echoes them back.
 
 ## How We Check Our Own Builds
 

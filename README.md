@@ -23,6 +23,13 @@ Jobs the server can dispatch:
   A command the device rejects is reported as a per-command failure (command and message, password
   redacted) and the job keeps the other commands' rows; the job-level error is set only when login or
   the connection fails, or when every command fails
+- **Configuration backup for every SSH vendor** - the server sends a backup plan
+  (a transport, an ordered command list, pager patterns and per-step timeouts)
+  and the agent executes it vendor-neutrally: each command on its own SSH exec
+  channel, or inside one interactive PTY shell where the agent learns the
+  device prompt, answers pager prompts, strips terminal escape sequences and
+  enters privileged mode with the job's enable password. MikroTik keeps its
+  built-in recipe and needs no plan
 - **LLDP topology** - LLDP-MIB walks that feed link discovery
 - **Service checks** - HTTP(S), TCP, DNS and TLS-certificate-expiry checks
 
@@ -296,7 +303,9 @@ addresses are still recorded against the organization.
   network, or pre-seed `known_hosts.json` with the device's fingerprint. A
   rejected connection logs `TOFU`; run the agent with
   `--forget-host-key <ip:port>` to drop the stored entry and re-pin a
-  legitimately reinstalled or replaced device.
+  legitimately reinstalled or replaced device. Plan-driven configuration
+  backups over SSH use the same pinning for every vendor the server sends a
+  plan for, and advertise the `plan_v1` backup feature in the heartbeat.
 - Reporting a vulnerability: [SECURITY.md](SECURITY.md).
 
 ## License

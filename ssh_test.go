@@ -17,6 +17,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -949,7 +951,7 @@ func TestSSHBackupPinsStoredHostKeyAlgorithm(t *testing.T) {
 
 	// First connect trusts on first use; nothing pinned yet. HostKeyAlgorithms
 	// stays unset so x/crypto's default preference order applies — the widened
-	// set only appends missing KEX/ciphers (routerOSSSHAlgorithms).
+	// set only appends missing KEX/ciphers (legacySSHAlgorithms).
 	if _, err := executeMikrotikBackupContext(context.Background(), "127.0.0.1", portNum, "admin", "pass"); err != nil {
 		t.Fatalf("first connect failed: %v", err)
 	}
@@ -1094,4 +1096,191 @@ func TestHostKeyAlgorithmsFor(t *testing.T) {
 			t.Errorf("hostKeyAlgorithmsFor(%q) = %v, want %v", keyType, got, want)
 		}
 	}
+}
+
+// --- Fake shell device -------------------------------------------------
+//
+// A scripted SSH server that accepts pty-req + shell, prints a banner and
+// prompt, then answers each input line from a per-test script map. Replies
+// may contain pager pauses (the pager answer is dispatched as the line "
+// "), ANSI colors, bare-\r redraws, wrapped echoes and mode-changing
+// prompts — everything the expect engine has to survive.
+
+// shellReply is one scripted response: echo overrides the echoed input
+// line (for wrapped echoes); lines are written after the echo.
+type shellReply struct {
+	echo  string
+	lines []string
+}
+
+// shellScript maps input lines to replies. The pager answer arrives as the
+// line " "; a bare newline is "".
+type shellScript map[string]shellReply
+
+// fakeShellServer is a running fake shell device plus what tests assert on.
+type fakeShellServer struct {
+	addr    string
+	cleanup func()
+
+	mu       sync.Mutex
+	received []string
+}
+
+// receivedLines snapshots every input line the device processed.
+func (f *fakeShellServer) receivedLines() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.received...)
+}
+
+// startFakeShellServer serves one shell per connection with the given
+// banner and prompt, dispatching input lines to script.
+func startFakeShellServer(t *testing.T, banner, prompt string, script shellScript) *fakeShellServer {
+	t.Helper()
+
+	config := &ssh.ServerConfig{
+		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+			return nil, nil
+		},
+	}
+	config.AddHostKey(cbNewSigner(t))
+
+	return startFakeShellServerWithConfig(t, config, banner, prompt, script)
+}
+
+// startFakeShellServerWithConfig is startFakeShellServer with a caller
+// owned ServerConfig, for auth tests.
+func startFakeShellServerWithConfig(
+	t *testing.T,
+	config *ssh.ServerConfig,
+	banner, prompt string,
+	script shellScript,
+) *fakeShellServer {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeShellServer{addr: ln.Addr().String()}
+
+	// writeFrag writes s as a terminal fragment: embedded newlines become
+	// CRLF, but the text is not terminated — exactly how devices write a
+	// prompt or the final line of a reply.
+	writeFrag := func(ch ssh.Channel, s string) {
+		_, _ = io.WriteString(ch, strings.ReplaceAll(s, "\n", "\r\n"))
+	}
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+
+				sconn, chans, reqs, err := ssh.NewServerConn(conn, config)
+				if err != nil {
+					return
+				}
+				defer func() { _ = sconn.Close() }()
+				go ssh.DiscardRequests(reqs)
+
+				for newChannel := range chans {
+					if newChannel.ChannelType() != "session" {
+						_ = newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
+						continue
+					}
+					ch, requests, err := newChannel.Accept()
+					if err != nil {
+						continue
+					}
+
+					handleLine := func(line string, echo bool) {
+						fake.mu.Lock()
+						fake.received = append(fake.received, line)
+						fake.mu.Unlock()
+						if line == "exit" {
+							_ = ch.Close()
+							return
+						}
+						reply := script[line]
+						switch {
+						case reply.echo != "":
+							writeFrag(ch, reply.echo+"\n")
+						case echo && line != "":
+							// The device echoes the command as typed; pager
+							// keystrokes are consumed, not echoed.
+							writeFrag(ch, line+"\n")
+						}
+						for i, l := range reply.lines {
+							if i < len(reply.lines)-1 {
+								writeFrag(ch, l+"\n")
+							} else {
+								writeFrag(ch, l) // last line is a fragment
+							}
+						}
+						if len(reply.lines) == 0 && (line == "" || line == " ") {
+							// Bare newline or unanswered pager: prompt only.
+							writeFrag(ch, prompt)
+						}
+					}
+
+					var shellStarted atomic.Bool
+					var lineBuf []byte
+					go func() {
+						defer func() { _ = ch.Close() }()
+						readBuf := make([]byte, 512)
+						for {
+							n, err := ch.Read(readBuf)
+							for _, b := range readBuf[:n] {
+								if !shellStarted.Load() {
+									continue
+								}
+								switch b {
+								case '\n':
+								case '\r':
+									handleLine(string(lineBuf), true)
+									lineBuf = lineBuf[:0]
+								default:
+									lineBuf = append(lineBuf, b)
+									// Single-character script keys (" ", "q",
+									// "y", …) are pager and prompt answers the
+									// device reads without a newline: dispatch
+									// them the moment they arrive. Multi-character
+									// keys wait for the terminator.
+									if len(lineBuf) == 1 {
+										if _, ok := script[string(lineBuf)]; ok {
+											handleLine(string(lineBuf), false)
+											lineBuf = lineBuf[:0]
+										}
+									}
+								}
+							}
+							if err != nil {
+								return
+							}
+						}
+					}()
+
+					for req := range requests {
+						switch req.Type {
+						case "pty-req":
+							_ = req.Reply(true, nil)
+						case "shell":
+							_ = req.Reply(true, nil)
+							shellStarted.Store(true)
+							writeFrag(ch, banner+prompt)
+						default:
+							_ = req.Reply(false, nil)
+						}
+					}
+				}
+			}()
+		}
+	}()
+
+	fake.cleanup = func() { _ = ln.Close() }
+	return fake
 }

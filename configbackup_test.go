@@ -8,15 +8,19 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -1641,4 +1645,1022 @@ func TestConfigBackupJobLegacyAlgorithms(t *testing.T) {
 	if len(result.ConfigGzip) == 0 {
 		t.Fatal("ConfigGzip empty")
 	}
+}
+
+// --- Plan engine ---------------------------------------------------------
+
+// cbPlanJob builds a plan-driven backup job; the vendor string is one the
+// agent has no built-in recipe for.
+func cbPlanJob(host string, port uint32, plan *pb.ConfigBackupPlan) *pb.AgentJob {
+	job := cbJob(host, port)
+	job.ConfigBackup.Vendor = "cisco"
+	job.ConfigBackup.Plan = plan
+	return job
+}
+
+func cbExecPlan(steps ...*pb.ConfigBackupStep) *pb.ConfigBackupPlan {
+	return &pb.ConfigBackupPlan{Transport: pb.ConfigBackupTransport_CONFIG_BACKUP_TRANSPORT_EXEC, Steps: steps}
+}
+
+func cbShellPlan(steps ...*pb.ConfigBackupStep) *pb.ConfigBackupPlan {
+	return &pb.ConfigBackupPlan{Transport: pb.ConfigBackupTransport_CONFIG_BACKUP_TRANSPORT_SHELL, Steps: steps}
+}
+
+func cbCommand(cmd string, fallbacks ...string) *pb.ConfigBackupStep {
+	return &pb.ConfigBackupStep{
+		Kind:             pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_COMMAND,
+		Command:          cmd,
+		FallbackCommands: fallbacks,
+	}
+}
+
+func cbPrivileged(cmd string) *pb.ConfigBackupStep {
+	return &pb.ConfigBackupStep{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_PRIVILEGED, Command: cmd}
+}
+
+// cbExecResponse is one command's canned exec-channel output.
+type cbExecResponse struct {
+	out    string
+	errOut string
+	exit   uint32
+}
+
+// cbExecHandler dispatches per-command exec responses; unknown commands
+// fail loudly so tests catch commands the plan engine should never send.
+func cbExecHandler(responses map[string]cbExecResponse, seen func(cmd string)) func(ch ssh.Channel, command string) {
+	return func(ch ssh.Channel, command string) {
+		if seen != nil {
+			seen(command)
+		}
+		resp, ok := responses[command]
+		if !ok {
+			resp = cbExecResponse{out: "unexpected command: " + command + "\n", exit: 1}
+		}
+		if resp.out != "" {
+			_, _ = ch.Write([]byte(resp.out))
+		}
+		if resp.errOut != "" {
+			_, _ = ch.Stderr().Write([]byte(resp.errOut))
+		}
+		_ = ch.CloseWrite()
+		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{resp.exit}))
+		_ = ch.Close()
+	}
+}
+
+func TestConfigBackupPlanRouting(t *testing.T) {
+	t.Run("plan job with an unknown vendor runs the plan", func(t *testing.T) {
+		resetHostKeyStore(t)
+		addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbExecHandler(map[string]cbExecResponse{
+			"show configuration | display set": {out: "set system host-name jr1\n"},
+		}, nil))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		job := cbPlanJob(host, port, cbExecPlan(cbCommand("show configuration | display set")))
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+			t.Fatalf("code = %v (%q), want OK", result.ErrorCode, result.ErrorDetail)
+		}
+		if text := cbGunzip(t, result.ConfigGzip); text != "set system host-name jr1\n" {
+			t.Fatalf("config = %q", text)
+		}
+	})
+
+	t.Run("mikrotik job without a plan runs the RouterOS recipe", func(t *testing.T) {
+		resetHostKeyStore(t)
+		var mu sync.Mutex
+		var commands []string
+		addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbExecHandler(map[string]cbExecResponse{
+			":put [/system resource get version]": {out: "7.15.3 (stable)\n"},
+			"/export show-sensitive":              {out: cbTestExport},
+			"/export":                             {out: cbTestExport},
+		}, func(cmd string) {
+			mu.Lock()
+			commands = append(commands, cmd)
+			mu.Unlock()
+		}))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), cbJob(host, port), out)
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+			t.Fatalf("code = %v (%q), want OK via the RouterOS recipe", result.ErrorCode, result.ErrorDetail)
+		}
+		if got := cbGunzip(t, result.ConfigGzip); got != cbTestExport {
+			t.Fatalf("config = %q, want the RouterOS export", got)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(commands) == 0 || !strings.Contains(commands[0], "system resource get version") {
+			t.Fatalf("commands = %v, want the RouterOS version probe first", commands)
+		}
+	})
+
+	t.Run("unknown vendor without a plan is rejected before any command", func(t *testing.T) {
+		resetHostKeyStore(t)
+		var execCount int32
+		addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbExecHandler(map[string]cbExecResponse{}, func(cmd string) {
+			atomic.AddInt32(&execCount, 1)
+		}))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		job := cbJob(host, port)
+		job.ConfigBackup.Vendor = "juniper"
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_UNSUPPORTED_VENDOR {
+			t.Fatalf("code = %v, want UNSUPPORTED_VENDOR", result.ErrorCode)
+		}
+		if atomic.LoadInt32(&execCount) != 0 {
+			t.Fatalf("the fake server saw %d exec requests, want 0", execCount)
+		}
+		if result.HostKeyFingerprint == "" {
+			t.Error("observed host key fingerprint not reported")
+		}
+	})
+}
+
+func cbGunzip(t *testing.T, gz []byte) string {
+	t.Helper()
+	zr, err := gzip.NewReader(bytes.NewReader(gz))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+// cbUserKeyPEM generates an Ed25519 keypair and its PEM private key.
+func cbUserKeyPEM(t *testing.T) (ssh.Signer, string) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := ssh.MarshalPrivateKey(priv, "cb test key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signer, string(pem.EncodeToMemory(block))
+}
+
+func TestConfigBackupAuthOrder(t *testing.T) {
+	plan := cbExecPlan(cbCommand("show version"))
+	showVersion := map[string]cbExecResponse{"show version": {out: "Cisco IOS 15.2\n"}}
+
+	t.Run("public key wins when the key parses", func(t *testing.T) {
+		resetHostKeyStore(t)
+		userSigner, userPEM := cbUserKeyPEM(t)
+		config := &ssh.ServerConfig{
+			PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+				if bytes.Equal(key.Marshal(), userSigner.PublicKey().Marshal()) {
+					return &ssh.Permissions{}, nil
+				}
+				return nil, fmt.Errorf("rejected")
+			},
+		}
+		config.AddHostKey(cbNewSigner(t))
+		addr, cleanup := startTestSSHServerWithConfig(t, config, cbExecHandler(showVersion, nil))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		job := cbPlanJob(host, port, plan)
+		job.ConfigBackup.PrivateKey = userPEM
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+		if result := cbReceiveConfigBackupResult(t, out); result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+			t.Fatalf("code = %v (%q), want OK", result.ErrorCode, result.ErrorDetail)
+		}
+	})
+
+	t.Run("keyboard-interactive answers the password", func(t *testing.T) {
+		resetHostKeyStore(t)
+		config := &ssh.ServerConfig{
+			KeyboardInteractiveCallback: func(c ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+				ans, err := client("auth", "", []string{"Password: "}, []bool{false})
+				if err != nil {
+					return nil, err
+				}
+				if len(ans) == 1 && ans[0] == "secret" {
+					return &ssh.Permissions{}, nil
+				}
+				return nil, fmt.Errorf("denied")
+			},
+		}
+		config.AddHostKey(cbNewSigner(t))
+		addr, cleanup := startTestSSHServerWithConfig(t, config, cbExecHandler(showVersion, nil))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), cbPlanJob(host, port, plan), out)
+		if result := cbReceiveConfigBackupResult(t, out); result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+			t.Fatalf("code = %v (%q), want OK", result.ErrorCode, result.ErrorDetail)
+		}
+	})
+
+	t.Run("unparseable private key falls back to password", func(t *testing.T) {
+		resetHostKeyStore(t)
+		addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbExecHandler(showVersion, nil))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		job := cbPlanJob(host, port, plan)
+		job.ConfigBackup.PrivateKey = "not a pem key at all"
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+		if result := cbReceiveConfigBackupResult(t, out); result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+			t.Fatalf("code = %v (%q), want OK", result.ErrorCode, result.ErrorDetail)
+		}
+	})
+
+	t.Run("rejected public key falls back to password", func(t *testing.T) {
+		resetHostKeyStore(t)
+		_, userPEM := cbUserKeyPEM(t)
+		config := &ssh.ServerConfig{
+			PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+				return nil, fmt.Errorf("rejected")
+			},
+			PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+				return &ssh.Permissions{}, nil
+			},
+		}
+		config.AddHostKey(cbNewSigner(t))
+		addr, cleanup := startTestSSHServerWithConfig(t, config, cbExecHandler(showVersion, nil))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		job := cbPlanJob(host, port, plan)
+		job.ConfigBackup.PrivateKey = userPEM
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+		if result := cbReceiveConfigBackupResult(t, out); result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+			t.Fatalf("code = %v (%q), want OK", result.ErrorCode, result.ErrorDetail)
+		}
+	})
+}
+
+func TestConfigBackupPlanConnectionRules(t *testing.T) {
+	plan := cbExecPlan(cbCommand("show version"))
+	showVersion := map[string]cbExecResponse{"show version": {out: "Cisco IOS 15.2\n"}}
+
+	t.Run("first use reports the fingerprint", func(t *testing.T) {
+		resetHostKeyStore(t)
+		signer := cbNewSigner(t)
+		addr, cleanup := startTestSSHServerWithSigner(t, signer, cbExecHandler(showVersion, nil))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), cbPlanJob(host, port, plan), out)
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+			t.Fatalf("code = %v (%q)", result.ErrorCode, result.ErrorDetail)
+		}
+		if result.HostKeyFingerprint != ssh.FingerprintSHA256(signer.PublicKey()) {
+			t.Fatalf("fingerprint = %q, want the server key", result.HostKeyFingerprint)
+		}
+	})
+
+	t.Run("mismatch rejects before any password is sent", func(t *testing.T) {
+		resetHostKeyStore(t)
+		var authAttempts int32
+		config := &ssh.ServerConfig{
+			PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+				atomic.AddInt32(&authAttempts, 1)
+				return &ssh.Permissions{}, nil
+			},
+		}
+		serverSigner := cbNewSigner(t)
+		config.AddHostKey(serverSigner)
+		addr, cleanup := startTestSSHServerWithConfig(t, config, cbExecHandler(showVersion, nil))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		job := cbPlanJob(host, port, plan)
+		job.ConfigBackup.ExpectedHostKeyFingerprint = ssh.FingerprintSHA256(cbNewSigner(t).PublicKey())
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_HOST_KEY_MISMATCH {
+			t.Fatalf("code = %v (%q), want HOST_KEY_MISMATCH", result.ErrorCode, result.ErrorDetail)
+		}
+		if result.HostKeyFingerprint != ssh.FingerprintSHA256(serverSigner.PublicKey()) {
+			t.Fatalf("fingerprint = %q, want the observed server key", result.HostKeyFingerprint)
+		}
+		if atomic.LoadInt32(&authAttempts) != 0 {
+			t.Fatalf("server saw %d auth attempts, want 0 before host key trust", authAttempts)
+		}
+	})
+
+	t.Run("legacy ciphers connect", func(t *testing.T) {
+		resetHostKeyStore(t)
+		config := &ssh.ServerConfig{
+			PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+				return nil, nil
+			},
+		}
+		config.Ciphers = []string{ssh.InsecureCipherAES128CBC}
+		config.KeyExchanges = []string{ssh.InsecureKeyExchangeDH1SHA1}
+		config.MACs = []string{ssh.HMACSHA1}
+		config.AddHostKey(cbNewSigner(t))
+		addr, cleanup := startTestSSHServerWithConfig(t, config, cbExecHandler(showVersion, nil))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), cbPlanJob(host, port, plan), out)
+		if result := cbReceiveConfigBackupResult(t, out); result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+			t.Fatalf("code = %v (%q), want OK", result.ErrorCode, result.ErrorDetail)
+		}
+	})
+}
+
+// TestConfigBackupPlanSteps runs every exec-plan scenario on both
+// transports: the failure regexes, fallbacks, exclusions and section
+// joining must behave the same over exec channels and the PTY shell.
+func TestConfigBackupPlanSteps(t *testing.T) {
+	type stepCase struct {
+		name     string
+		steps    []*pb.ConfigBackupStep
+		exec     map[string]cbExecResponse
+		script   shellScript
+		wantText string
+		wantCode pb.ConfigBackupErrorCode
+		wantGone []string // commands that must never reach the device
+	}
+	cases := []stepCase{
+		{
+			name:  "single command",
+			steps: []*pb.ConfigBackupStep{cbCommand("show configuration | display set")},
+			exec:  map[string]cbExecResponse{"show configuration | display set": {out: "set system host-name jr1\n"}},
+			script: shellScript{
+				"show configuration | display set": {lines: []string{"set system host-name jr1", "sw1> "}},
+			},
+			wantText: "set system host-name jr1\n",
+			wantCode: pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK,
+		},
+		{
+			name:  "fallback after no such file",
+			steps: []*pb.ConfigBackupStep{cbCommand("cat /tmp/running.cfg", "cat /tmp/system.cfg")},
+			exec: map[string]cbExecResponse{
+				"cat /tmp/running.cfg": {errOut: "cat: /tmp/running.cfg: No such file or directory", exit: 1},
+				"cat /tmp/system.cfg":  {out: "system config here\n"},
+			},
+			script: shellScript{
+				"cat /tmp/running.cfg": {lines: []string{"cat: /tmp/running.cfg: No such file or directory", "sw1> "}},
+				"cat /tmp/system.cfg":  {lines: []string{"system config here", "sw1> "}},
+			},
+			wantText: "system config here\n",
+			wantCode: pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK,
+		},
+		{
+			name:  "fallback after syntax error",
+			steps: []*pb.ConfigBackupStep{cbCommand("show config | page", "show config")},
+			exec: map[string]cbExecResponse{
+				"show config | page": {out: "syntax error\n", exit: 1},
+				"show config":        {out: "full config\n"},
+			},
+			script: shellScript{
+				"show config | page": {lines: []string{"syntax error", "sw1> "}},
+				"show config":        {lines: []string{"full config", "sw1> "}},
+			},
+			wantText: "full config\n",
+			wantCode: pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK,
+		},
+		{
+			name:  "every command unsupported",
+			steps: []*pb.ConfigBackupStep{cbCommand("show running-config view full", "show running-config")},
+			exec: map[string]cbExecResponse{
+				"show running-config view full": {out: "Unknown command\n", exit: 1},
+				"show running-config":           {out: "Unknown command\n", exit: 1},
+			},
+			script: shellScript{
+				"show running-config view full": {lines: []string{"Unknown command", "sw1> "}},
+				"show running-config":           {lines: []string{"Unknown command", "sw1> "}},
+			},
+			wantCode: pb.ConfigBackupErrorCode_COMMAND_UNSUPPORTED,
+		},
+		{
+			name:  "permission text fails the step",
+			steps: []*pb.ConfigBackupStep{cbCommand("show running-config")},
+			exec: map[string]cbExecResponse{
+				"show running-config": {errOut: "% Authorization failed", exit: 1},
+			},
+			script: shellScript{
+				"show running-config": {lines: []string{"Permission denied", "sw1> "}},
+			},
+			wantCode: pb.ConfigBackupErrorCode_PERMISSION_DENIED,
+		},
+		{
+			name:  "permission text falls back to a working command",
+			steps: []*pb.ConfigBackupStep{cbCommand("show running-config view full", "show running-config")},
+			exec: map[string]cbExecResponse{
+				"show running-config view full": {errOut: "Permission denied", exit: 1},
+				"show running-config":           {out: "hostname sw1\n"},
+			},
+			script: shellScript{
+				"show running-config view full": {lines: []string{"Permission denied", "sw1> "}},
+				"show running-config":           {lines: []string{"hostname sw1", "sw1> "}},
+			},
+			wantText: "hostname sw1\n",
+			wantCode: pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK,
+		},
+		{
+			name: "ignored setup failure continues",
+			steps: []*pb.ConfigBackupStep{
+				{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_COMMAND, Command: "terminal length 0", ExcludeOutput: true, IgnoreFailure: true},
+				cbCommand("show running-config"),
+			},
+			exec: map[string]cbExecResponse{
+				"terminal length 0":   {errOut: "Invalid input", exit: 1},
+				"show running-config": {out: "hostname sw1\n"},
+			},
+			script: shellScript{
+				"terminal length 0":   {lines: []string{"Invalid input", "sw1> "}},
+				"show running-config": {lines: []string{"hostname sw1", "sw1> "}},
+			},
+			wantText: "hostname sw1\n",
+			wantCode: pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK,
+		},
+		{
+			name: "excluded step contributes no output",
+			steps: []*pb.ConfigBackupStep{
+				{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_COMMAND, Command: "set terminal width 512", ExcludeOutput: true},
+				cbCommand("show running-config"),
+			},
+			exec: map[string]cbExecResponse{
+				"set terminal width 512": {out: "width set\n"},
+				"show running-config":    {out: "hostname sw1\n"},
+			},
+			script: shellScript{
+				"set terminal width 512": {lines: []string{"width set", "sw1> "}},
+				"show running-config":    {lines: []string{"hostname sw1", "sw1> "}},
+			},
+			wantText: "hostname sw1\n",
+			wantCode: pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK,
+		},
+		{
+			name: "two labelled sections join under headers",
+			steps: []*pb.ConfigBackupStep{
+				{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_COMMAND, Command: "cat /tmp/system.cfg", Section: "system.cfg"},
+				{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_COMMAND, Command: "cat /tmp/running-config", Section: "running-config"},
+			},
+			exec: map[string]cbExecResponse{
+				"cat /tmp/system.cfg":     {out: "system cfg text\n"},
+				"cat /tmp/running-config": {out: "running cfg text\n"},
+			},
+			script: shellScript{
+				"cat /tmp/system.cfg":     {lines: []string{"system cfg text", "sw1> "}},
+				"cat /tmp/running-config": {lines: []string{"running cfg text", "sw1> "}},
+			},
+			wantText: "# ---- system.cfg ----\nsystem cfg text\n# ---- running-config ----\nrunning cfg text\n",
+			wantCode: pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK,
+		},
+		{
+			name: "a failed step stops the plan",
+			steps: []*pb.ConfigBackupStep{
+				cbCommand("first ok"),
+				cbCommand("show broken"),
+				cbCommand("third step"),
+			},
+			exec: map[string]cbExecResponse{
+				"first ok":    {out: "first\n"},
+				"show broken": {out: "Unknown command\n", exit: 1},
+			},
+			script: shellScript{
+				"first ok":    {lines: []string{"first", "sw1> "}},
+				"show broken": {lines: []string{"Unknown command", "sw1> "}},
+			},
+			wantText: "first\n",
+			wantCode: pb.ConfigBackupErrorCode_COMMAND_UNSUPPORTED,
+			wantGone: []string{"third step"},
+		},
+	}
+
+	for _, transport := range []struct {
+		name string
+		kind pb.ConfigBackupTransport
+	}{
+		{"exec", pb.ConfigBackupTransport_CONFIG_BACKUP_TRANSPORT_EXEC},
+		{"shell", pb.ConfigBackupTransport_CONFIG_BACKUP_TRANSPORT_SHELL},
+	} {
+		t.Run(transport.name, func(t *testing.T) {
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					resetHostKeyStore(t)
+					plan := &pb.ConfigBackupPlan{Transport: transport.kind, Steps: tc.steps}
+					var job *pb.AgentJob
+					var received func() []string
+					if transport.kind == pb.ConfigBackupTransport_CONFIG_BACKUP_TRANSPORT_EXEC {
+						var mu sync.Mutex
+						var seen []string
+						handler := cbExecHandler(tc.exec, func(cmd string) {
+							mu.Lock()
+							seen = append(seen, cmd)
+							mu.Unlock()
+						})
+						received = func() []string {
+							mu.Lock()
+							defer mu.Unlock()
+							return append([]string(nil), seen...)
+						}
+						addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
+						defer cleanup()
+						host, port := cbAddrPort(t, addr)
+						job = cbPlanJob(host, port, plan)
+					} else {
+						fake := startFakeShellServer(t, "", "sw1> ", tc.script)
+						defer fake.cleanup()
+						host, port := cbAddrPort(t, fake.addr)
+						job = cbPlanJob(host, port, plan)
+						received = fake.receivedLines
+					}
+					out := testQueue()
+					executeConfigBackupJob(context.Background(), job, out)
+
+					result := cbReceiveConfigBackupResult(t, out)
+					if result.ErrorCode != tc.wantCode {
+						t.Fatalf("code = %v (%q), want %v", result.ErrorCode, result.ErrorDetail, tc.wantCode)
+					}
+					if tc.wantCode == pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+						if got := cbGunzip(t, result.ConfigGzip); got != tc.wantText {
+							t.Fatalf("config = %q, want %q", got, tc.wantText)
+						}
+						if result.ConfigBytes != uint64(len(tc.wantText)) {
+							t.Fatalf("config_bytes = %d, want %d", result.ConfigBytes, len(tc.wantText))
+						}
+						if !result.IncludesSecrets {
+							t.Error("includes_secrets not set")
+						}
+					}
+					for _, gone := range tc.wantGone {
+						for _, line := range received() {
+							if line == gone {
+								t.Fatalf("step %q ran after the plan should have stopped", gone)
+							}
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestConfigBackupPlanLimitsAndResult(t *testing.T) {
+	megabyte := strings.Repeat("a", (1<<20)-1) + "\n"
+
+	t.Run("two sections over the cap return TOO_LARGE", func(t *testing.T) {
+		resetHostKeyStore(t)
+		addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbExecHandler(map[string]cbExecResponse{
+			"cat /tmp/system.cfg":     {out: strings.Repeat(megabyte, 4)},
+			"cat /tmp/running-config": {out: strings.Repeat(megabyte, 4)},
+		}, nil))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		job := cbPlanJob(host, port, cbExecPlan(
+			&pb.ConfigBackupStep{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_COMMAND, Command: "cat /tmp/system.cfg", Section: "system.cfg"},
+			&pb.ConfigBackupStep{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_COMMAND, Command: "cat /tmp/running-config", Section: "running-config"},
+		))
+		job.ConfigBackup.MaxConfigBytes = 7 << 20
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_TOO_LARGE {
+			t.Fatalf("code = %v (%q), want TOO_LARGE", result.ErrorCode, result.ErrorDetail)
+		}
+		if len(result.ConfigGzip) != 0 {
+			t.Error("TOO_LARGE must not carry config output")
+		}
+	})
+
+	t.Run("section headers count toward the cap", func(t *testing.T) {
+		resetHostKeyStore(t)
+		addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbExecHandler(map[string]cbExecResponse{
+			"cat /tmp/system.cfg":     {out: strings.Repeat(megabyte, 4)},
+			"cat /tmp/running-config": {out: strings.Repeat(megabyte, 4)},
+		}, nil))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		job := cbPlanJob(host, port, cbExecPlan(
+			&pb.ConfigBackupStep{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_COMMAND, Command: "cat /tmp/system.cfg", Section: "system.cfg"},
+			&pb.ConfigBackupStep{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_COMMAND, Command: "cat /tmp/running-config", Section: "running-config"},
+		))
+		// The two outputs alone fit 8 MiB exactly; only the headers overflow.
+		job.ConfigBackup.MaxConfigBytes = 8 << 20
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_TOO_LARGE {
+			t.Fatalf("code = %v, want TOO_LARGE when headers cross the cap", result.ErrorCode)
+		}
+	})
+
+	t.Run("successful plan fills the result", func(t *testing.T) {
+		resetHostKeyStore(t)
+		signer := cbNewSigner(t)
+		addr, cleanup := startTestSSHServerWithSigner(t, signer, cbExecHandler(map[string]cbExecResponse{
+			"show running-config": {out: strings.Repeat("x", 122880)},
+		}, nil))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), cbPlanJob(host, port, cbExecPlan(cbCommand("show running-config"))), out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+			t.Fatalf("code = %v (%q)", result.ErrorCode, result.ErrorDetail)
+		}
+		if got := cbGunzip(t, result.ConfigGzip); len(got) != 122880 {
+			t.Fatalf("config length = %d, want 122880", len(got))
+		}
+		if result.ConfigBytes != 122880 {
+			t.Fatalf("config_bytes = %d, want 122880", result.ConfigBytes)
+		}
+		if !result.IncludesSecrets {
+			t.Error("includes_secrets = false, want true")
+		}
+		if result.HostKeyFingerprint != ssh.FingerprintSHA256(signer.PublicKey()) {
+			t.Errorf("fingerprint = %q, want the server key", result.HostKeyFingerprint)
+		}
+		if result.DurationMs == 0 && result.Timestamp == 0 {
+			t.Error("duration and timestamp unset")
+		}
+	})
+}
+
+func TestConfigBackupPlanRedaction(t *testing.T) {
+	_, userPEM := cbUserKeyPEM(t)
+	keyBody := "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB"
+
+	t.Run("shell echo of every secret is redacted", func(t *testing.T) {
+		resetHostKeyStore(t)
+		fake := startFakeShellServer(t, "", "sw1> ", shellScript{
+			"show run": {lines: []string{"Permission denied for logpass (en4ble) near " + keyBody, "sw1> "}},
+		})
+		defer fake.cleanup()
+		host, port := cbAddrPort(t, fake.addr)
+
+		job := cbPlanJob(host, port, cbShellPlan(cbCommand("show run")))
+		job.ConfigBackup.Password = "logpass"
+		job.ConfigBackup.EnablePassword = "en4ble"
+		job.ConfigBackup.PrivateKey = userPEM
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_PERMISSION_DENIED {
+			t.Fatalf("code = %v (%q), want PERMISSION_DENIED", result.ErrorCode, result.ErrorDetail)
+		}
+		detail := result.ErrorDetail
+		for _, secret := range []string{"logpass", "en4ble", keyBody, "PRIVATE KEY"} {
+			if strings.Contains(detail, secret) {
+				t.Errorf("error detail leaks %q: %q", secret, detail)
+			}
+		}
+		if !strings.Contains(detail, "***") {
+			t.Errorf("error detail has no redaction marker: %q", detail)
+		}
+	})
+
+	t.Run("exec output echoing secrets is redacted", func(t *testing.T) {
+		resetHostKeyStore(t)
+		addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbExecHandler(map[string]cbExecResponse{
+			"show running-config": {errOut: "% Password: refused (login logpass, key " + keyBody + ")", exit: 1},
+		}, nil))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		job := cbPlanJob(host, port, cbExecPlan(cbCommand("show running-config")))
+		job.ConfigBackup.Password = "logpass"
+		job.ConfigBackup.PrivateKey = userPEM
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_PERMISSION_DENIED {
+			t.Fatalf("code = %v (%q), want PERMISSION_DENIED", result.ErrorCode, result.ErrorDetail)
+		}
+		for _, secret := range []string{"logpass", keyBody, "PRIVATE KEY"} {
+			if strings.Contains(result.ErrorDetail, secret) {
+				t.Errorf("error detail leaks %q: %q", secret, result.ErrorDetail)
+			}
+		}
+	})
+
+	t.Run("classifier redacts enable password and key", func(t *testing.T) {
+		job := cbJob("192.0.2.1", 22)
+		job.ConfigBackup.EnablePassword = "en4ble"
+		job.ConfigBackup.PrivateKey = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + keyBody + "\n-----END OPENSSH PRIVATE KEY-----\n"
+		_, detail := classifyConfigBackupError(
+			errors.New("handshake failed after en4ble with "+keyBody), job)
+		if strings.Contains(detail, "en4ble") || strings.Contains(detail, keyBody) {
+			t.Fatalf("detail = %q, want secrets redacted", detail)
+		}
+		if !strings.Contains(detail, "***") {
+			t.Fatalf("detail = %q, want a redaction marker", detail)
+		}
+	})
+}
+
+func TestConfigBackupPlanProbe(t *testing.T) {
+	t.Run("probe with enable reports the prompt host", func(t *testing.T) {
+		resetHostKeyStore(t)
+		fake := startFakeShellServer(t, "", "edge1> ", shellScript{
+			"enable": {lines: []string{"Password: "}},
+			"s3cret": {lines: []string{"edge1# "}},
+		})
+		defer fake.cleanup()
+		host, port := cbAddrPort(t, fake.addr)
+
+		job := cbPlanJob(host, port, cbShellPlan(cbPrivileged("enable"), cbCommand("show running-config")))
+		job.ConfigBackup.Mode = pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE
+		job.ConfigBackup.EnablePassword = "s3cret"
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+			t.Fatalf("code = %v (%q), want OK", result.ErrorCode, result.ErrorDetail)
+		}
+		if result.Identity != "edge1" {
+			t.Fatalf("identity = %q, want edge1", result.Identity)
+		}
+		if len(result.ConfigGzip) != 0 {
+			t.Error("probe must not export")
+		}
+		for _, line := range fake.receivedLines() {
+			if line == "show running-config" {
+				t.Fatal("probe ran a command step")
+			}
+		}
+	})
+
+	t.Run("probe with a refused enable password", func(t *testing.T) {
+		resetHostKeyStore(t)
+		fake := startFakeShellServer(t, "", "edge1> ", shellScript{
+			"enable": {lines: []string{"Password: "}},
+			"s3cret": {lines: []string{"% Access denied", "edge1> "}},
+		})
+		defer fake.cleanup()
+		host, port := cbAddrPort(t, fake.addr)
+
+		job := cbPlanJob(host, port, cbShellPlan(cbPrivileged("enable")))
+		job.ConfigBackup.Mode = pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE
+		job.ConfigBackup.EnablePassword = "s3cret"
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_ENABLE_FAILED {
+			t.Fatalf("code = %v (%q), want ENABLE_FAILED", result.ErrorCode, result.ErrorDetail)
+		}
+	})
+
+	t.Run("exec probe connects without a prompt", func(t *testing.T) {
+		resetHostKeyStore(t)
+		addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbExecHandler(map[string]cbExecResponse{}, nil))
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		job := cbPlanJob(host, port, cbExecPlan(cbPrivileged("enable")))
+		job.ConfigBackup.Mode = pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+			t.Fatalf("code = %v (%q), want OK", result.ErrorCode, result.ErrorDetail)
+		}
+	})
+}
+
+func TestConfigBackupPlanLifecycle(t *testing.T) {
+	t.Run("job deadline wins over a longer step timeout", func(t *testing.T) {
+		resetHostKeyStore(t)
+		fake := startFakeShellServer(t, "", "sw1> ", shellScript{
+			"show stall": {lines: []string{"starting the collection"}},
+		})
+		defer fake.cleanup()
+		host, port := cbAddrPort(t, fake.addr)
+
+		plan := cbShellPlan(cbCommand("show stall"))
+		plan.StepTimeoutMs = 60_000
+		job := cbPlanJob(host, port, plan)
+
+		before := runtimeNumGoroutine()
+		jobCtx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+		defer cancel()
+		out := testQueue()
+		executeConfigBackupJobCtx(context.Background(), jobCtx, job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_TIMEOUT {
+			t.Fatalf("code = %v (%q), want TIMEOUT", result.ErrorCode, result.ErrorDetail)
+		}
+		cbWaitGoroutines(t, before)
+	})
+
+	t.Run("session end mid-collection sends no result", func(t *testing.T) {
+		resetHostKeyStore(t)
+		fake := startFakeShellServer(t, "", "sw1> ", shellScript{
+			"show stall": {lines: []string{"starting the collection"}},
+		})
+		defer fake.cleanup()
+		host, port := cbAddrPort(t, fake.addr)
+
+		plan := cbShellPlan(cbCommand("show stall"))
+		plan.StepTimeoutMs = 5_000
+		job := cbPlanJob(host, port, plan)
+
+		sessionCtx, cancel := context.WithCancel(context.Background())
+		out := testQueue()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			executeConfigBackupJobCtx(sessionCtx, context.Background(), job, out)
+		}()
+		// Wait until the device received the command, then end the session.
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			for _, line := range fake.receivedLines() {
+				if line == "show stall" {
+					goto received
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the command never reached the fake device")
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	received:
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("job did not finish after the session ended")
+		}
+		select {
+		case queued := <-out.items:
+			t.Fatalf("a result was sent after the session ended: %+v", queued)
+		case <-time.After(200 * time.Millisecond):
+		}
+	})
+
+	t.Run("device closing mid-collection reports a failure", func(t *testing.T) {
+		resetHostKeyStore(t)
+		// The fake device closes the channel on "exit": a session ending
+		// mid-collection must surface as a non-OK result, not a hang.
+		fake := startFakeShellServer(t, "", "sw1> ", shellScript{
+			"exit": {lines: []string{"goodbye"}},
+		})
+		defer fake.cleanup()
+		host, port := cbAddrPort(t, fake.addr)
+
+		job := cbPlanJob(host, port, cbShellPlan(cbCommand("exit")))
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), job, out)
+
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode == pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+			t.Fatal("a dead session produced an OK result")
+		}
+	})
+
+	t.Run("goroutines return to baseline after each job", func(t *testing.T) {
+		resetHostKeyStore(t)
+		scenarios := []struct {
+			name   string
+			script shellScript
+			plan   *pb.ConfigBackupPlan
+		}{
+			{"success", shellScript{"show run": {lines: []string{"hostname sw1", "sw1> "}}},
+				cbShellPlan(cbCommand("show run"))},
+			{"failure", shellScript{"show broken": {lines: []string{"Unknown command", "sw1> "}}},
+				cbShellPlan(cbCommand("show broken"))},
+			{"deadline", shellScript{"show stall": {lines: []string{"starting"}}},
+				cbShellPlan(cbCommand("show stall"))},
+		}
+		for _, sc := range scenarios {
+			t.Run(sc.name, func(t *testing.T) {
+				fake := startFakeShellServer(t, "", "sw1> ", sc.script)
+				defer fake.cleanup()
+				host, port := cbAddrPort(t, fake.addr)
+
+				plan := sc.plan
+				plan.StepTimeoutMs = 600
+				before := runtimeNumGoroutine()
+				out := testQueue()
+				executeConfigBackupJob(context.Background(), cbPlanJob(host, port, plan), out)
+				cbReceiveConfigBackupResult(t, out)
+				cbWaitGoroutines(t, before)
+			})
+		}
+	})
+}
+
+func runtimeNumGoroutine() int { return runtime.NumGoroutine() }
+
+// cbWaitGoroutines fails the test unless the goroutine count returns to
+// baseline within a few seconds.
+func cbWaitGoroutines(t *testing.T, before int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= before {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("goroutines did not settle: before %d, after %d", before, runtime.NumGoroutine())
+}
+
+func TestConfigBackupPlanPool(t *testing.T) {
+	t.Run("same host runs one plan job at a time", func(t *testing.T) {
+		resetHostKeyStore(t)
+		origJitter := dispatchJitterMax
+		dispatchJitterMax = 0
+		t.Cleanup(func() { dispatchJitterMax = origJitter })
+
+		var active, maxActive int32
+		handler := cbExecHandler(map[string]cbExecResponse{
+			"show version": {out: "Cisco IOS 15.2\n"},
+		}, nil)
+		addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), func(ch ssh.Channel, command string) {
+			n := atomic.AddInt32(&active, 1)
+			for {
+				old := atomic.LoadInt32(&maxActive)
+				if n <= old || atomic.CompareAndSwapInt32(&maxActive, old, n) {
+					break
+				}
+			}
+			defer atomic.AddInt32(&active, -1)
+			handler(ch, command)
+		})
+		defer cleanup()
+		host, port := cbAddrPort(t, addr)
+
+		pools := &jobPools{
+			backup:  newWorkerPool(8),
+			targets: &targetGates{},
+			notices: make(chan outbound, 8),
+		}
+		defer func() { pools.backup.stop() }()
+		out := testQueue()
+
+		plan := cbExecPlan(cbCommand("show version"))
+		for _, jobID := range []string{"job-a", "job-b"} {
+			job := cbPlanJob(host, port, plan)
+			job.JobId = jobID
+			if !submitJob(context.Background(), job, pools, out, func() {}, false) {
+				t.Fatal("submitJob rejected a fresh pool")
+			}
+		}
+		cbReceiveConfigBackupResult(t, out)
+		cbReceiveConfigBackupResult(t, out)
+		if atomic.LoadInt32(&maxActive) != 1 {
+			t.Fatalf("max concurrent plan jobs for one host = %d, want 1", maxActive)
+		}
+	})
+
+	t.Run("saturated pool rejects a plan job with AGENT_BUSY", func(t *testing.T) {
+		pool := newWorkerPool(1)
+		pool.stop()
+		pools := &jobPools{
+			backup:  pool,
+			targets: &targetGates{},
+			notices: make(chan outbound, 8),
+		}
+		out := testQueue()
+		job := cbPlanJob("192.0.2.1", 22, cbExecPlan(cbCommand("show version")))
+		if !submitJob(context.Background(), job, pools, out, func() {}, false) {
+			t.Fatal("submitJob must always accept dispatch")
+		}
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_AGENT_BUSY {
+			t.Fatalf("code = %v, want AGENT_BUSY", result.ErrorCode)
+		}
+	})
 }
