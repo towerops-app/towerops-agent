@@ -50,7 +50,7 @@ func runMain(ctx context.Context, args []string) int {
 	hostKeysFile := fs.String("host-keys-file", envOrDefault(defaultHostKeysPath, "TOWEROPS_HOST_KEYS_FILE"), "Path to the SSH and TLS trust-on-first-use store")
 	var forgetHostKeys stringListFlag
 	fs.Var(&forgetHostKeys, "forget-host-key", "Remove the stored SSH/TLS trust-on-first-use entry for ip:port and exit (repeatable; a running agent picks up the removal without a restart)")
-	legacyScheduling := fs.Bool("legacy-scheduling", envBool(false, "TOWEROPS_LEGACY_SCHEDULING"), "Disable local recurring scheduling and request legacy server pushes")
+	legacyScheduling := fs.Bool("legacy-scheduling", envBool(false, "TOWEROPS_LEGACY_SCHEDULING"), "Run refreshed inventories once (rollback servers with periodic pushes only)")
 	snmpRate := fs.Uint("snmp-rate", envUint(defaultSNMPPDURate, "TOWEROPS_SNMP_RATE"), "Maximum SNMP request packets per second process-wide (0 disables)")
 	showHelp := fs.Bool("help", false, "Show this help message and exit")
 	fs.BoolVar(showHelp, "h", false, "Show this help message and exit (shorthand)")

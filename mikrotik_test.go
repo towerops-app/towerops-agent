@@ -645,8 +645,7 @@ func TestMikrotikCloseDoesNotWaitForResponse(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		_ = conn.Close()
-		<-done
-		t.Fatal("close waited for a /quit response")
+		t.Fatalf("close waited for a /quit response (close error: %v)", <-done)
 	}
 
 	select {

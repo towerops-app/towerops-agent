@@ -81,20 +81,28 @@ Do not open a pull request or issue for a vulnerability. See
 
 ## Development
 
-The repository ships a Nix dev shell with Go 1.27 selected explicitly and the
-linter and protobuf compiler supplied by nixpkgs-unstable. With
-[direnv](https://direnv.net/) the environment loads on
-`cd`; otherwise:
+The repository ships a locked Nix dev shell using the Go 1.27 release line.
+With [direnv](https://direnv.net/) the environment loads on `cd`; otherwise:
 
 ```bash
 nix develop
 ```
 
-Using the shell matters more than it looks: only the Go version is selected
-explicitly via `pkgs.go_1_27`. `golangci-lint` and `protoc-gen-go` follow the
-flake's unpinned nixpkgs-unstable input, so CI's explicit linter version must be
-kept in sync by hand. A mismatched `golangci-lint` will refuse to lint a module
-targeting a newer Go than it was built with.
+The Go minimum is 1.27.2. `flake.lock` pins package inputs; narrow stable-release
+overrides keep the linter, Git and gopls current while nixpkgs packaging catches
+up. Refresh the lock and review those overrides together rather than assuming
+an input update supplies the latest upstream tools. CI's explicit
+golangci-lint version must match the supported compiler and shell.
+
+| Tool | Selected stable release |
+|------|-------------------------|
+| Go | 1.27.2 |
+| golangci-lint | 2.15.0 |
+| protobuf compiler | 36.2 |
+| protoc-gen-go / Go protobuf runtime | 1.36.12 |
+| Git | 2.56.0 |
+| gopls | 0.24.0 |
+| Delve | 1.27.2 |
 
 ```bash
 make test     # go test -race -count=1 ./...
@@ -108,6 +116,23 @@ make proto    # regenerate pb/ after editing proto/agent.proto
 output is committed. Never hand-edit `pb/agent.pb.go`: the `go_package` option
 is embedded in the serialized descriptor as a length-prefixed string, so
 editing the path by hand leaves a stale length and panics at init.
+
+The canonical wire contract is `towerops-web/priv/proto/agent.proto`. Change
+that schema and the server's hand-written codecs first, mirror everything
+from `syntax = "proto3";` onward here, then regenerate with `make proto`.
+The sibling server's `.forgejo/scripts/check-agent-proto-sync.sh` checks the
+schema bodies. Cross-language fixtures in `testdata/` and the server's
+`test/fixtures/proto/` check actual message semantics; their producer source
+values are recorded in `proto_interop_test.go` and the server's
+`test/towerops/proto/interop_test.exs`. Binding regeneration does not regenerate
+those fixtures.
+
+After upgrades, run the quality gates and exercise the binary against the
+actual Phoenix agent endpoint with disposable credentials. Cover complete
+and empty inventories, reconnect, probes and backups; a schema match or a
+codec's own round trip is not interoperability proof. Release notifications
+require both bearer authentication and a timestamped HMAC over the exact
+body; do not disable the server verifier to accommodate CI.
 
 Run `make vet lint test` before pushing; CI runs the same checks and a build.
 

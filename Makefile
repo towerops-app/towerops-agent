@@ -6,7 +6,8 @@ proto:
 	protoc --go_out=. --go_opt=module=github.com/towerops-app/towerops-agent proto/agent.proto
 
 test:
-	go test -race -v -count=1 -timeout 60s ./...
+	# Match CI's Go-default suite timeout; normal race runs exceed one minute.
+	go test -race -v -count=1 ./...
 
 test-fast:
 	go test -count=1 -timeout 60s ./...

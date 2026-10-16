@@ -2871,11 +2871,11 @@ type SnmpResult struct {
 	// covers only the roots in completed_roots. The server reconciles only the
 	// completed stages and leaves stored rows for the rest authoritative.
 	Partial bool `protobuf:"varint,6,opt,name=partial,proto3" json:"partial,omitempty"`
-	// Walk roots whose buckets are carried by this frame and whose walks
-	// finished. On a split result each frame names only its own roots — the
-	// consumer unions completed_roots across frames sharing job_id. A root
-	// absent from the union was never walked or ended early; its rows in
-	// oid_values are best-effort and must not drive reconciliation.
+	// Finished walk roots. A bucket split by the per-frame entry cap claims its
+	// root only on the last piece. Consumers union these claims only after all
+	// numbered frames arrive; a missing frame clears every completion claim.
+	// Roots absent from the completed union are best-effort and must not drive
+	// reconciliation. truncated_roots further limits authoritative coverage.
 	CompletedRoots []string `protobuf:"bytes,7,rep,name=completed_roots,json=completedRoots,proto3" json:"completed_roots,omitempty"`
 	// 1-based frame number when a result is split across several SnmpResult
 	// messages sharing job_id; 0 when the result is a single frame.
@@ -3025,8 +3025,8 @@ type AgentHeartbeat struct {
 	// heartbeat from an old agent.
 	ReportsVantagePoint bool `protobuf:"varint,10,opt,name=reports_vantage_point,json=reportsVantagePoint,proto3" json:"reports_vantage_point,omitempty"`
 	// True when the agent implements JobType CONFIG_BACKUP and sends results on
-	// "config_backup_result". Servers fall back to the legacy MikroTik backup
-	// job for agents without it.
+	// "config_backup_result". Retained for historical peers; the current server
+	// does not produce legacy MikroTik backup jobs when this flag is absent.
 	SupportsConfigBackup bool `protobuf:"varint,11,opt,name=supports_config_backup,json=supportsConfigBackup,proto3" json:"supports_config_backup,omitempty"`
 	// Config backup capabilities the agent implements, e.g. "plan_v1" (the
 	// server-defined plan engine). The server dispatches a plan-based backup

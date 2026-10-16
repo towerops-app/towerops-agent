@@ -5031,7 +5031,9 @@ func TestSessionLoopDispatchesResultReply(t *testing.T) {
 		t.Fatal("session loop did not requeue the rejected result")
 	}
 	cancel()
-	<-done
+	if err := <-done; !errors.Is(err, errSessionCancelled) {
+		t.Fatalf("session loop returned %v after session cancellation", err)
+	}
 }
 
 // A "Message too large" rejection is deterministic — re-sending the same
@@ -5462,7 +5464,10 @@ func TestSessionLoopRetriesEarlyRejectionWithFullSpool(t *testing.T) {
 	t.Cleanup(func() {
 		cancel()
 		select {
-		case <-done:
+		case err := <-done:
+			if !errors.Is(err, errSessionCancelled) {
+				t.Errorf("session loop returned %v after session cancellation", err)
+			}
 		case <-time.After(time.Second):
 			t.Error("session loop did not stop")
 		}
