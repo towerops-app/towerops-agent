@@ -41,6 +41,111 @@ func TestSnmpResultEmptyCompletedRootsAfterTruncation(t *testing.T) {
 	}
 }
 
+func TestSnmpResultEntryLimit(t *testing.T) {
+	for _, count := range []int{50_000, 50_001, 100_001} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			values := make(map[string]string, count)
+			for i := range count {
+				values["1.3.6.1.2.1.2."+strconv.Itoa(i)] = strconv.Itoa(i)
+			}
+			frames := buildSnmpResultFrames(&pb.AgentJob{
+				JobId: "entry-limit", DeviceId: "dev-1",
+			}, []snmpResultBucket{{label: "1.3.6.1.2.1.2", values: values, completed: true}}, false)
+			wantFrames := (count + 49_999) / 50_000
+			if len(frames) != wantFrames {
+				t.Fatalf("got %d frames, want %d for %d entries", len(frames), wantFrames, count)
+			}
+			seen := make(map[string]string, count)
+			for i, frame := range frames {
+				wantEntries := min(50_000, count-i*50_000)
+				if len(frame.OidValues) != wantEntries {
+					t.Fatalf("frame %d has %d entries, want %d", i, len(frame.OidValues), wantEntries)
+				}
+				wantSequence := uint32(0)
+				if wantFrames > 1 {
+					wantSequence = uint32(i + 1)
+				}
+				if frame.Sequence != wantSequence || frame.Final != (i == len(frames)-1) {
+					t.Fatalf("frame %d sequence/final = %d/%t", i, frame.Sequence, frame.Final)
+				}
+				if len(frame.TruncatedRoots) != 0 || frame.Partial {
+					t.Fatalf("entry splitting truncated the result: %v", frame)
+				}
+				wantRoots := 0
+				if frame.Final {
+					wantRoots = 1
+				}
+				if len(frame.CompletedRoots) != wantRoots {
+					t.Fatalf("frame %d completed roots = %v", i, frame.CompletedRoots)
+				}
+				for oid, value := range frame.OidValues {
+					if _, exists := seen[oid]; exists {
+						t.Fatalf("OID %s appears in multiple frames", oid)
+					}
+					seen[oid] = value
+				}
+			}
+			for oid, want := range values {
+				if got, exists := seen[oid]; !exists || got != want {
+					t.Fatalf("OID %s = %q/%t, want %q", oid, got, exists, want)
+				}
+			}
+		})
+	}
+}
+
+func TestSnmpResultEntryLimitAcrossBuckets(t *testing.T) {
+	first := make(map[string]string, 30_000)
+	second := make(map[string]string, 30_000)
+	for i := range 30_000 {
+		first["1.3.6.1.2.1.2."+strconv.Itoa(i)] = "first"
+		second["1.3.6.1.2.1.4."+strconv.Itoa(i)] = "second"
+	}
+	frames := buildSnmpResultFrames(&pb.AgentJob{JobId: "bucket-limit"}, []snmpResultBucket{
+		{label: "1.3.6.1.2.1.2", values: first, completed: true},
+		{label: "1.3.6.1.2.1.4", values: second, completed: true},
+	}, false)
+	if len(frames) != 2 {
+		t.Fatalf("got %d frames, want two receiver-acceptable buckets", len(frames))
+	}
+	for i, frame := range frames {
+		if len(frame.OidValues) != 30_000 || len(frame.CompletedRoots) != 1 {
+			t.Fatalf("frame %d entries/roots = %d/%v", i, len(frame.OidValues), frame.CompletedRoots)
+		}
+		want := "1.3.6.1.2.1.2"
+		if i == 1 {
+			want = "1.3.6.1.2.1.4"
+		}
+		if frame.CompletedRoots[0] != want {
+			t.Fatalf("frame %d root = %q, want %q", i, frame.CompletedRoots[0], want)
+		}
+	}
+}
+
+func TestSnmpResultByteTruncationRespectsEntryLimit(t *testing.T) {
+	values := make(map[string]string, 100_001)
+	value := strings.Repeat("x", 64)
+	for i := range 100_001 {
+		values["1.3.6.1.2.1.2."+strconv.Itoa(i)] = value
+	}
+	frames := buildSnmpResultFrames(&pb.AgentJob{JobId: "truncated-entry-limit"},
+		[]snmpResultBucket{{label: "1.3.6.1.2.1.2", values: values, completed: true}}, false)
+	if len(frames) != 1 {
+		t.Fatalf("got %d frames, want one explicitly truncated bucket", len(frames))
+	}
+	frame := frames[0]
+	if len(frame.OidValues) != 50_000 || !frame.Final ||
+		len(frame.TruncatedRoots) != 1 || frame.TruncatedRoots[0] != "1.3.6.1.2.1.2" {
+		t.Fatalf("truncated frame entries/final/roots = %d/%t/%v",
+			len(frame.OidValues), frame.Final, frame.TruncatedRoots)
+	}
+	for oid, got := range frame.OidValues {
+		if want, exists := values[oid]; !exists || got != want {
+			t.Fatalf("retained OID %s = %q, not an original reading", oid, got)
+		}
+	}
+}
+
 func TestSnmpValueToString(t *testing.T) {
 	tests := []struct {
 		name string

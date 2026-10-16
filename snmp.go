@@ -232,6 +232,9 @@ func emptySnmpResult(job *pb.AgentJob) *pb.SnmpResult {
 // so the default stays under it.
 const defaultMaxResultBytes = 8 << 20
 
+// maxResultOIDValues matches the server decoder's per-frame map limit.
+const maxResultOIDValues = 50_000
+
 // maxResultPayloadHeadroom covers the channelMsg JSON envelope around the
 // base64 payload and the frame metadata fields (completed_roots, sequence,
 // flags) that oidEntrySize does not account for.
@@ -252,11 +255,9 @@ type snmpResultBucket struct {
 const getBucketTruncatedLabel = "<get-batch>"
 
 // buildSnmpResultFrames packs the collected buckets into SnmpResult frames
-// whose base64 payload stays under the job's max_result_bytes. A result that
-// fits ships as one frame with sequence 0; a larger one splits along bucket
-// boundaries into frames numbered from 1, the last marked final. A single
-// bucket that cannot fit one frame is truncated to what fits and named in
-// truncated_roots.
+// whose base64 payload stays under the job's max_result_bytes and whose maps
+// stay within the server's entry limit. Large entry counts split losslessly;
+// buckets exceeding the byte budget retain explicit truncation semantics.
 func buildSnmpResultFrames(
 	job *pb.AgentJob,
 	buckets []snmpResultBucket,
@@ -306,18 +307,29 @@ func buildSnmpResultFrames(
 			bucketSize += oidEntrySize(k, v)
 		}
 		if bucketSize <= maxDecoded {
-			// Whole bucket fits a frame; start a new one when it does not
-			// fit alongside what is already packed.
-			if frameSize+bucketSize > maxDecoded && frameSize > 0 {
+			// Keep a whole bucket together when possible. A bucket exceeding
+			// the entry cap spans frames, claiming its root only on the tail.
+			if (frameSize+bucketSize > maxDecoded ||
+				len(frame.OidValues)+len(bucket.values) > maxResultOIDValues) && frameSize > 0 {
 				flush()
 			}
-			for k, v := range bucket.values {
-				frame.OidValues[k] = v
+			if len(bucket.values) > maxResultOIDValues {
+				for k, v := range bucket.values {
+					if len(frame.OidValues) == maxResultOIDValues {
+						flush()
+					}
+					frame.OidValues[k] = v
+					frameSize += oidEntrySize(k, v)
+				}
+			} else {
+				for k, v := range bucket.values {
+					frame.OidValues[k] = v
+				}
+				frameSize += bucketSize
 			}
 			if bucket.completed && bucket.label != "" {
 				frameRoots = append(frameRoots, bucket.label)
 			}
-			frameSize += bucketSize
 			continue
 		}
 		// The bucket alone exceeds a frame: pack only the entries that fit
@@ -335,7 +347,7 @@ func buildSnmpResultFrames(
 		dropped := 0
 		for k, v := range bucket.values {
 			entry := oidEntrySize(k, v)
-			if frameSize+entry > maxDecoded {
+			if frameSize+entry > maxDecoded || len(frame.OidValues) == maxResultOIDValues {
 				dropped++
 				continue
 			}

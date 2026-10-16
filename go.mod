@@ -1,6 +1,6 @@
 module github.com/towerops-app/towerops-agent
 
-go 1.27.0
+go 1.27.2
 
 require (
 	github.com/coder/websocket v1.8.15
@@ -12,3 +12,7 @@ require (
 )
 
 require golang.org/x/sys v0.49.0 // indirect
+
+// The modern protobuf module still lists this unused legacy graph dependency.
+// Exclude it rather than adding a package import solely to retain an upgrade.
+exclude github.com/golang/protobuf v1.5.0

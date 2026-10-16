@@ -62,7 +62,7 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13.2
+          version: v2.15.0
 
       - name: Test with full statement coverage
         run: |
@@ -332,6 +332,13 @@ jobs:
             echo "AGENT_WEBHOOK_SECRET is not set; skipping release notification."
             exit 0
           fi
+          timestamp=$(date +%s)
+          signature=$(node -e '
+            const { createHmac } = require("node:crypto");
+            process.stdout.write(createHmac("sha256", process.env.WEBHOOK_SECRET)
+              .update(process.argv[1] + ".").digest("hex"));
+          ' "$timestamp")
           curl -sf -X POST \
             -H "Authorization: Bearer $WEBHOOK_SECRET" \
+            -H "x-agent-webhook-signature: t=$timestamp,v1=$signature" \
             https://towerops.net/api/v1/webhooks/agent-release

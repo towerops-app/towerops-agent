@@ -96,7 +96,7 @@ Flags override their corresponding environment variables.
 | `TOWEROPS_TRAP_BIND` | `--trap-bind` | Local address for the trap listener. Use `::` to receive traps from IPv6-only devices. | `0.0.0.0` |
 | `TOWEROPS_TRAP_PORT` | `--trap-port` | UDP port for the trap listener | `162` |
 | `TOWEROPS_TRAP_COMMUNITY` | `--trap-community` | Only accept traps carrying this community string. Unset accepts any community. | unset |
-| `TOWEROPS_LEGACY_SCHEDULING` | `--legacy-scheduling` | Disable local recurring scheduling and advertise `schedules_jobs: false`, restoring server-driven refreshes during a rollback. | `false` |
+| `TOWEROPS_LEGACY_SCHEDULING` | `--legacy-scheduling` | Run refreshed inventories once and advertise `schedules_jobs: false`. Only for rollback servers that still send periodic inventories; it does not restore refreshes on the current server. | `false` |
 
 The legacy unprefixed variables `LOG_LEVEL`, `LOG_FORMAT`, `TRAP_ENABLED`,
 `TRAP_PORT` and `TRAP_COMMUNITY` remain accepted when the corresponding
@@ -156,22 +156,30 @@ Towerops server ──WebSocket/TLS──▶ agent ──▶ SNMP / ICMP / SSH /
 
 ### Scheduler rollout compatibility
 
-Deploy the server first. Retire its legacy 60-second list re-push only when both
-sides meet these minimum versions:
+Deploy the server codec and split-result reassembly changes before this agent.
+The current server sends inventories on join and changes, not on a legacy
+60-second refresh. Compatibility depends on the wire behavior below, not the
+Towerops application version alone.
 
-| Component | Minimum version | Required wire behavior |
-|-----------|-----------------|------------------------|
-| Towerops server | 0.2.0 | Populates each recurring `AgentJob.interval_seconds` and pushes complete, including empty, job and check lists after assignment changes. |
-| Towerops agent | 1.5.0 | Retains recurring lists, schedules jobs and checks locally, and advertises `AgentHeartbeat.schedules_jobs`. |
+| Component | Required behavior |
+|-----------|-------------------|
+| Towerops server | Populates recurring `AgentJob.interval_seconds`, pushes complete job/check inventories including empty lists, and clears completion claims when split-result frames are missing. |
+| Towerops agent | Schedules recurring work locally (`schedules_jobs`, available since 1.5.0), respects server result limits and advertises `plan_v1` for plan-driven backups. |
 
-Server 0.1.x does not populate per-job intervals or push an empty list after the
-last assignment is removed. Use `--legacy-scheduling` only as a rollback escape
-hatch with such a server: the agent advertises `schedules_jobs: false` and runs
-each refreshed list once instead of retaining it. Repeated unchanged lists in
-local scheduling mode do not reset timers or trigger an extra run.
+Use `--legacy-scheduling` only with an older rollback server that still
+periodically pushes work. The flag runs each received list once; it cannot
+restore a removed server refresh loop. Unchanged inventories in normal local
+scheduling mode do not reset timers or trigger extra execution.
 
 Messages are Protocol Buffers ([`proto/agent.proto`](proto/agent.proto))
 carried inside the Phoenix channel envelope.
+
+SNMP frames carry at most 50,000 OID entries and normally at most 8 MiB of
+base64 payload. Entry-count splits preserve every value, including when one
+walk root spans multiple frames. Only a complete numbered frame set can
+claim authoritative roots; incomplete sets retain measurements as partial
+without reconciling away stored rows. A bucket exceeding the byte budget
+remains explicitly marked in `truncated_roots`.
 
 ### Resilience details
 
@@ -239,8 +247,8 @@ reconnects immediately.
 
 ## Building from source
 
-Requires Go 1.27 or later. A Nix dev shell with the pinned toolchain, linter
-and protobuf compiler is included - see [CONTRIBUTING.md](CONTRIBUTING.md).
+Requires Go 1.27.2 or later. The locked Nix dev shell includes the compiler,
+linter and protobuf tools — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
 make build          # or: go build -o towerops-agent .
@@ -269,10 +277,12 @@ certificate, or hardware swap all look like a MITM to the TOFU store. When the
 change is expected, remove the stale pin with `--forget-host-key <ip:port>`
 (repeatable; see [Configuration](#configuration)) so the next job can re-pin.
 
-**ICMP checks failing.** Standard Docker already grants `NET_RAW`, and the
-image binary carries `cap_net_raw+ep`. Under a hardened runtime that drops the
-capability, grant `NET_RAW` if its policy permits; otherwise the agent tries
-unprivileged UDP ping and `ping(8)` after raw sockets fail.
+**ICMP checks or container startup failing.** Standard Docker already grants
+`NET_RAW`; rootless Podman needs `--cap-add NET_RAW`. The published binary
+carries `NET_RAW` and `NET_BIND_SERVICE` file capabilities, which its runtime
+bounding set must permit. Otherwise execution can fail with `Operation not
+permitted` before the agent reaches its fallback paths. Once running, ICMP
+tries a raw socket, then unprivileged UDP, then `ping(8)`.
 
 **Traps not arriving.** Confirm `TOWEROPS_TRAP_ENABLED=true` and that UDP 162 is
 published and not blocked. Run with `TOWEROPS_LOG_LEVEL=debug`: every accepted

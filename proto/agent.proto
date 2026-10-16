@@ -366,11 +366,11 @@ message SnmpResult {
   // covers only the roots in completed_roots. The server reconciles only the
   // completed stages and leaves stored rows for the rest authoritative.
   bool partial = 6;
-  // Walk roots whose buckets are carried by this frame and whose walks
-  // finished. On a split result each frame names only its own roots — the
-  // consumer unions completed_roots across frames sharing job_id. A root
-  // absent from the union was never walked or ended early; its rows in
-  // oid_values are best-effort and must not drive reconciliation.
+  // Finished walk roots. A bucket split by the per-frame entry cap claims its
+  // root only on the last piece. Consumers union these claims only after all
+  // numbered frames arrive; a missing frame clears every completion claim.
+  // Roots absent from the completed union are best-effort and must not drive
+  // reconciliation. truncated_roots further limits authoritative coverage.
   repeated string completed_roots = 7;
   // 1-based frame number when a result is split across several SnmpResult
   // messages sharing job_id; 0 when the result is a single frame.
@@ -410,8 +410,8 @@ message AgentHeartbeat {
   // heartbeat from an old agent.
   bool reports_vantage_point = 10;
   // True when the agent implements JobType CONFIG_BACKUP and sends results on
-  // "config_backup_result". Servers fall back to the legacy MikroTik backup
-  // job for agents without it.
+  // "config_backup_result". Retained for historical peers; the current server
+  // does not produce legacy MikroTik backup jobs when this flag is absent.
   bool supports_config_backup = 11;
   // Config backup capabilities the agent implements, e.g. "plan_v1" (the
   // server-defined plan engine). The server dispatches a plan-based backup
