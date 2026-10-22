@@ -45,6 +45,7 @@ func TestSnmpGetIntoIndexedNoSuchNameRecovery(t *testing.T) {
 		oids []string
 		bad  []string
 	}{
+		{name: "empty_batch"},
 		{name: "54_one_bad", oids: large, bad: []string{large[4]}},
 		{name: "54_ten_bad", oids: large, bad: slices.Clone(large[4:14])},
 		{name: "first_bad", oids: large[:4], bad: []string{large[0]}},
