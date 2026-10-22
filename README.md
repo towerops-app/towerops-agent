@@ -183,13 +183,35 @@ remains explicitly marked in `truncated_roots`.
 
 ### Resilience details
 
-- SNMPv1 `noSuchName` and `tooBig` responses recursively halve a GET batch,
-  recovering every individually valid OID instead of discarding the whole
-  response.
+- SNMPv1 `noSuchName` with a valid one-based error index records only that
+  instance as absent, then retries the remaining instances without changing
+  the job's OID list. Each recovery removes an instance, so work is bounded.
+  `tooBig` and missing/out-of-range indexes retain recursive bisection.
+  A singleton `tooBig` is an error, not an absent reading; timeouts remain
+  missing measurements rather than absent-value markers.
 - ICMP tries a raw socket, then an unprivileged UDP socket, then `ping(8)`.
 - Standalone self-updates compare SHA-256 digests in constant time, atomically
   replace the binary, and re-exec the process. Container deployments refuse
   self-update because their binary comes from the image.
+
+### Diagnosing SNMP poll failures
+
+GET failure notices identify the actual failed recovery sub-batch, not just
+the original larger batch: elapsed request time, count, first/last canonical
+instance, then the full instance list. The concise summary precedes the full
+list because server history can truncate long messages. WALK failures identify
+the canonical root and elapsed walk time. Structured failure logs include the
+job id, device and operation. Communities, SNMPv3 secrets and complete job
+payloads are not logged by this attribution path.
+
+Correlate those diagnostics with the deployed agent version and UTC time.
+Successful sibling requests still produce results; failed walks never claim
+completed roots. A later successful poll does not erase server-side history.
+An absent OID can also be outside a credential's view; absence alone is not
+proof of an unsupported MIB. Reducing unsupported-OID recovery work does not
+establish that unrelated packet loss, slow device responses or credential
+failures are fixed. No retry, deadline, protocol or packet-rate default changes
+are part of this recovery behavior.
 
 ## SNMP trap listener
 
