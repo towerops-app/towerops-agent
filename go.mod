@@ -4,7 +4,7 @@ go 1.27.2
 
 require (
 	github.com/coder/websocket v1.8.15
-	github.com/gosnmp/gosnmp v1.45.0
+	github.com/gosnmp/gosnmp v1.46.0
 	golang.org/x/crypto v0.58.0
 	golang.org/x/net v0.61.0
 	google.golang.org/protobuf v1.36.12
