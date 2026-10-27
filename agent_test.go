@@ -169,6 +169,62 @@ func decodeQueuedResult[T proto.Message](t *testing.T, result outbound) T {
 	return msg
 }
 
+func TestEncodeOutboundSnmpResultBytes(t *testing.T) {
+	// Exercise both sides of the size varint's 127/128 and 16383/16384
+	// boundaries, including frames whose size field pushes them over one.
+	for _, length := range []int{0, 116, 117, 118, 119, 120, 121, 122, 123, 124, 16368, 16369, 16370, 16371, 16372, 16373, 16374, 16375} {
+		t.Run(fmt.Sprint(length), func(t *testing.T) {
+			msg := &pb.SnmpResult{
+				JobId: strings.Repeat("j", length), JobType: pb.JobType_POLL,
+				DurationMs: 17, Final: true, ResultBytes: 1<<32 - 1,
+			}
+			for range 2 {
+				encoded, ok := encodeOutbound("result", msg, msg.JobId)
+				if !ok {
+					t.Fatal("could not encode SNMP result")
+				}
+				var envelope struct {
+					Binary string `json:"binary"`
+				}
+				if err := json.Unmarshal(encoded.payload, &envelope); err != nil {
+					t.Fatal(err)
+				}
+				bin, err := base64.StdEncoding.DecodeString(envelope.Binary)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var got pb.SnmpResult
+				if err := proto.Unmarshal(bin, &got); err != nil {
+					t.Fatal(err)
+				}
+				if got.ResultBytes != uint32(len(bin)) || got.ResultBytes != msg.ResultBytes {
+					t.Fatalf("reported bytes = %d (source %d), actual protobuf = %d",
+						got.ResultBytes, msg.ResultBytes, len(bin))
+				}
+				if got.JobId != msg.JobId || got.DurationMs != 17 || !got.Final || got.JobType != pb.JobType_POLL {
+					t.Fatalf("measurement metadata changed during encoding: %v", &got)
+				}
+				if len(envelope.Binary) <= len(bin) || len(encoded.payload) <= len(envelope.Binary) {
+					t.Fatal("fixture does not distinguish protobuf size from base64 and JSON size")
+				}
+			}
+		})
+	}
+}
+
+func TestSnmpResultLegacyCostFields(t *testing.T) {
+	// An old POLL frame with only device_id (1) and job_type (2) has no
+	// measurements. Decoding must not manufacture a zero-cost observation.
+	bin := []byte{0x0a, 0x05, 'd', 'e', 'v', '-', '1', 0x10, 0x01}
+	var got pb.SnmpResult
+	if err := proto.Unmarshal(bin, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.DeviceId != "dev-1" || got.JobType != pb.JobType_POLL || got.DurationMs != 0 || got.ResultBytes != 0 {
+		t.Fatalf("legacy result = %v", &got)
+	}
+}
+
 // makeJobPayload creates a base64-encoded protobuf job list payload.
 func makeJobPayload(jobs ...*pb.AgentJob) json.RawMessage {
 	list := &pb.AgentJobList{Jobs: jobs}

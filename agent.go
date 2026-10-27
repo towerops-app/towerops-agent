@@ -1620,6 +1620,22 @@ func nextBackoff(current, maxDelay time.Duration) time.Duration {
 }
 
 func encodeOutbound(event string, msg proto.Message, jobID string) (outbound, bool) {
+	if result, ok := msg.(*pb.SnmpResult); ok && result != nil {
+		// Field 13 includes its own tag and varint in the reported size.
+		// Walk the payload once, solve that small fixed point, then marshal
+		// only once; base64 and the channel envelope are not protobuf bytes.
+		result.ResultBytes = 0
+		baseSize := proto.Size(result)
+		size := baseSize + 2
+		for {
+			next := baseSize + 1 + varintLen(size)
+			if next == size {
+				break
+			}
+			size = next
+		}
+		result.ResultBytes = uint32(size)
+	}
 	bin, err := proto.Marshal(msg)
 	if err != nil {
 		slog.Error("marshal protobuf", "job_id", jobID, "event", event, "error", err)

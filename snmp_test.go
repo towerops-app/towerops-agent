@@ -19,6 +19,132 @@ import (
 	"pgregory.net/rapid"
 )
 
+func TestSnmpResultFrameDurations(t *testing.T) {
+	t.Run("split operation apportions rather than repeats cost", func(t *testing.T) {
+		values := make(map[string]string, 100_000)
+		for i := range 100_000 {
+			values["1.3.6.1.2.1.2."+strconv.Itoa(i)] = "value"
+		}
+		frames := buildSnmpResultFrames(&pb.AgentJob{JobType: pb.JobType_POLL},
+			[]snmpResultBucket{{label: "1.3.6.1.2.1.2", values: values, completed: true, duration: 120 * time.Millisecond}}, false)
+		if len(frames) != 2 {
+			t.Fatalf("got %d frames, want two pieces of one operation", len(frames))
+		}
+		var total uint32
+		for i, frame := range frames {
+			if frame.DurationMs != 60 {
+				t.Fatalf("frame %d duration = %d, want half the operation's 120ms", i, frame.DurationMs)
+			}
+			total += frame.DurationMs
+		}
+		if total != 120 {
+			t.Fatalf("merged duration = %d, want 120ms", total)
+		}
+	})
+
+	t.Run("uneven operation pieces preserve the remainder", func(t *testing.T) {
+		values := make(map[string]string, 50_001)
+		for i := range 50_001 {
+			values["1.3.6.1.2.1.2."+strconv.Itoa(i)] = "value"
+		}
+		frames := buildSnmpResultFrames(&pb.AgentJob{JobType: pb.JobType_POLL},
+			[]snmpResultBucket{{values: values, duration: 50_001 * time.Millisecond}}, false)
+		if len(frames) != 2 || frames[0].DurationMs != 50_000 || frames[1].DurationMs != 1 {
+			t.Fatalf("uneven frame durations = %v, want 50000ms plus 1ms", frames)
+		}
+	})
+
+	t.Run("truncation retains failed empty operation cost", func(t *testing.T) {
+		frames := buildSnmpResultFrames(&pb.AgentJob{JobType: pb.JobType_POLL, MaxResultBytes: 4096},
+			[]snmpResultBucket{
+				{label: "1.3.6.1.2.1.2", values: map[string]string{"1.3.6.1.2.1.2.1": strings.Repeat("x", 6000)},
+					completed: true, duration: 30 * time.Millisecond},
+				{label: "1.3.6.1.2.1.4", duration: 20 * time.Millisecond},
+			}, false)
+		if len(frames) != 1 || frames[0].DurationMs != 50 {
+			t.Fatalf("frames = %v, want one truncated result with all 50ms of work", frames)
+		}
+	})
+
+	t.Run("unmeasured buckets stay unset", func(t *testing.T) {
+		frames := buildSnmpResultFrames(&pb.AgentJob{}, nil, false)
+		if len(frames) != 1 || frames[0].DurationMs != 0 {
+			t.Fatalf("unmeasured frames = %v", frames)
+		}
+	})
+}
+
+func TestSnmpDurationMillis(t *testing.T) {
+	for _, tt := range []struct {
+		elapsed time.Duration
+		want    uint32
+	}{
+		{0, 0},
+		{-time.Millisecond, 0},
+		{time.Nanosecond, 1},
+		{999 * time.Microsecond, 1},
+		{12 * time.Millisecond, 12},
+		{time.Duration(1<<32) * time.Millisecond, 1<<32 - 1},
+	} {
+		if got := snmpDurationMillis(tt.elapsed); got != tt.want {
+			t.Errorf("snmpDurationMillis(%s) = %d, want %d", tt.elapsed, got, tt.want)
+		}
+	}
+}
+
+func TestExecuteSnmpJobEmitsFrameCosts(t *testing.T) {
+	orig := snmpDial
+	t.Cleanup(func() { snmpDial = orig })
+	value := strings.Repeat("x", 6000)
+	var requestTime time.Duration
+	mock := &mockSnmpQuerier{
+		getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+			start := time.Now()
+			time.Sleep(5 * time.Millisecond)
+			requestTime += time.Since(start)
+			return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{{
+				Name: oids[0], Type: gosnmp.Integer, Value: 1,
+			}}}, nil
+		},
+		bulkWalkFunc: func(root string) ([]gosnmp.SnmpPDU, error) {
+			start := time.Now()
+			time.Sleep(15 * time.Millisecond)
+			requestTime += time.Since(start)
+			return []gosnmp.SnmpPDU{{Name: root + ".1", Type: gosnmp.OctetString, Value: []byte(value)}}, nil
+		},
+	}
+	snmpDial = func(context.Context, *pb.AgentJob) (snmpQuerier, func(), error) {
+		return mock, func() {}, nil
+	}
+	out := newResultQueue(8)
+	start := time.Now()
+	executeSnmpJob(context.Background(), &pb.AgentJob{
+		JobId: "cost", DeviceId: "dev-1", JobType: pb.JobType_POLL,
+		MaxResultBytes: 16 * 1024, SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+		Queries: []*pb.SnmpQuery{
+			{QueryType: pb.QueryType_GET, Oids: []string{"1.3.6.1.2.1.1.3.0"}},
+			{QueryType: pb.QueryType_WALK, Oids: []string{"1.3.6.1.2.1.2", "1.3.6.1.2.1.4"}},
+		},
+	}, out)
+	elapsed := time.Since(start)
+	if len(out.items) != 2 {
+		t.Fatalf("got %d results, want two independently measured frames", len(out.items))
+	}
+	first := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	second := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	if first.DurationMs < 20 || second.DurationMs < 15 {
+		t.Fatalf("GET plus first WALK / second WALK durations = %d/%d", first.DurationMs, second.DurationMs)
+	}
+	total := int64(first.DurationMs) + int64(second.DurationMs)
+	if total < requestTime.Milliseconds()-1 || total > elapsed.Milliseconds()+2 {
+		t.Fatalf("merged duration = %dms, SNMP requests = %s, executor = %s", total, requestTime, elapsed)
+	}
+	if first.ResultBytes == 0 || second.ResultBytes == 0 ||
+		first.Sequence != 1 || second.Sequence != 2 || first.Final || !second.Final {
+		t.Fatalf("cost frames lost size or split semantics: %v / %v", first, second)
+	}
+}
+
 func TestSnmpResultEmptyCompletedRootsAfterTruncation(t *testing.T) {
 	frames := buildSnmpResultFrames(&pb.AgentJob{JobId: "empty-after-truncated", MaxResultBytes: 4096}, []snmpResultBucket{
 		{label: "1.3.6.1.2.1.2", values: map[string]string{"1.3.6.1.2.1.2.1": strings.Repeat("x", 6000)}, completed: true},
@@ -2208,6 +2334,67 @@ func TestPropSnwIntegerRoundtrip(t *testing.T) {
 			t.Fatalf("int round-trip: got %d, want %d", backN, n)
 		}
 	})
+}
+
+func TestExecuteSnmpJobOperationCancellationBeforeContext(t *testing.T) {
+	for _, queryType := range []pb.QueryType{pb.QueryType_GET, pb.QueryType_WALK} {
+		for _, terminal := range []error{context.DeadlineExceeded, context.Canceled} {
+			t.Run(queryType.String()+"/"+terminal.Error(), func(t *testing.T) {
+				orig := snmpDial
+				t.Cleanup(func() { snmpDial = orig })
+				const firstOID = "1.3.6.1.2.1.1.3.0"
+				const failedOID = "1.3.6.1.2.1.2"
+				calls := 0
+				mock := &mockSnmpQuerier{
+					getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+						calls++
+						if oids[0] == firstOID {
+							return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{{
+								Name: firstOID, Type: gosnmp.Integer, Value: 123,
+							}}}, nil
+						}
+						return nil, fmt.Errorf("request stopped: %w", terminal)
+					},
+					bulkWalkFunc: func(root string) ([]gosnmp.SnmpPDU, error) {
+						calls++
+						return []gosnmp.SnmpPDU{{
+							Name: root + ".1", Type: gosnmp.Integer, Value: 456,
+						}}, fmt.Errorf("walk stopped: %w", terminal)
+					},
+				}
+				snmpDial = func(context.Context, *pb.AgentJob) (snmpQuerier, func(), error) {
+					return mock, func() {}, nil
+				}
+				out := newResultQueue(8)
+				// gosnmp can return DeadlineExceeded from the socket deadline
+				// before the context timer fires. Keep Err nil deterministically.
+				ctx := context.Background()
+				executeSnmpJob(ctx, &pb.AgentJob{
+					JobId: "operation-cancelled", JobType: pb.JobType_POLL,
+					SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+					Queries: []*pb.SnmpQuery{
+						{QueryType: pb.QueryType_GET, Oids: []string{firstOID}},
+						{QueryType: queryType, Oids: []string{failedOID}},
+						{QueryType: pb.QueryType_GET, Oids: []string{"1.3.6.1.2.1.99"}},
+					},
+				}, out)
+				if calls != 2 || ctx.Err() != nil {
+					t.Fatalf("requests = %d, context error = %v; want two requests before context cancellation", calls, ctx.Err())
+				}
+				if len(out.items) != 1 {
+					t.Fatalf("queued %d messages, want the partial result without a query-failure notice", len(out.items))
+				}
+				result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+				if !result.Partial || !result.Final || len(result.CompletedRoots) != 0 ||
+					result.OidValues[firstOID] != "123" || result.DurationMs == 0 {
+					t.Fatalf("cancelled operation lost partial-result semantics or prior work: %v", result)
+				}
+				if queryType == pb.QueryType_WALK && result.OidValues[failedOID+".1"] != "456" {
+					t.Fatalf("interrupted walk observations were dropped: %v", result)
+				}
+			})
+		}
+	}
 }
 
 // TestExecuteSnmpJobDeadline runs a job against a UDP socket that never

@@ -136,9 +136,18 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 					cancelled = true
 					break
 				}
+				start := time.Now()
 				absent, err := snmpGetInto(conn, dev, batch, getValues)
+				buckets[0].duration += time.Since(start)
 				absentOIDs += absent
-				if err != nil && ctx.Err() == nil {
+				if err != nil {
+					// A transport may observe the deadline before the context's
+					// timer publishes Err. The operation's wrapped error is
+					// authoritative too; do not start another request.
+					if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+						cancelled = true
+						break
+					}
 					slog.Warn("snmp get failed", "job_id", job.JobId, "device", dev.Ip, "operation", "GET", "error", err)
 					queryErrors = append(queryErrors, fmt.Sprintf("GET: %v", err))
 				}
@@ -170,9 +179,11 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 					}
 					values[canonicalOID(v.Name)] = snmpValueToString(v)
 				}
-				buckets = append(buckets, snmpResultBucket{label: root, values: values, completed: err == nil})
+				buckets = append(buckets, snmpResultBucket{
+					label: root, values: values, completed: err == nil, duration: time.Since(start),
+				})
 				if err != nil {
-					if ctx.Err() != nil {
+					if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 						cancelled = true
 						break
 					}
@@ -211,7 +222,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 		frame.DiscoveryPhase = job.DiscoveryPhase
 		sendResult(out.agentCtx, out, "result", frame, job.JobId)
 	}
-	if len(queryErrors) > 0 && ctx.Err() == nil {
+	if len(queryErrors) > 0 && !cancelled && ctx.Err() == nil {
 		sendResult(out.agentCtx, out, "error", &pb.AgentError{
 			DeviceId:  job.DeviceId,
 			JobId:     job.JobId,
@@ -266,11 +277,13 @@ const maxResultPayloadHeadroom = 4096
 // snmpResultBucket groups the OID values collected under one walk root. The
 // empty label is the shared GET bucket. completed marks roots whose walk
 // finished — a failed walk still ships its best-effort bucket but must not
-// claim the root.
+// claim the root. duration includes the requests and value conversion, and is
+// apportioned by entry count if one operation spans several frames.
 type snmpResultBucket struct {
 	label     string
 	values    map[string]string
 	completed bool
+	duration  time.Duration
 }
 
 // getBucketTruncatedLabel names the shared GET bucket in truncated_roots:
@@ -312,15 +325,18 @@ func buildSnmpResultFrames(
 	var truncated []string
 	frame := newFrame()
 	frameSize := int64(0)
+	frameDuration := time.Duration(0)
 	// frameRoots names the completed walk roots packed into the current
 	// frame — the server unions them across arrived frames, so a lost frame
 	// cannot claim a root whose bucket never arrived.
 	var frameRoots []string
 	flush := func() {
 		frame.CompletedRoots = frameRoots
+		frame.DurationMs = snmpDurationMillis(frameDuration)
 		frames = append(frames, frame)
 		frame = newFrame()
 		frameSize = 0
+		frameDuration = 0
 		frameRoots = nil
 	}
 
@@ -337,14 +353,28 @@ func buildSnmpResultFrames(
 				flush()
 			}
 			if len(bucket.values) > maxResultOIDValues {
+				remainingValues := len(bucket.values)
+				remainingDuration := bucket.duration
+				pieceValues := 0
 				for k, v := range bucket.values {
 					if len(frame.OidValues) == maxResultOIDValues {
+						// Attribute only this piece of the walk, retaining the
+						// remainder for later frames without copying the payload.
+						pieceDuration := remainingDuration/time.Duration(remainingValues)*time.Duration(pieceValues) +
+							remainingDuration%time.Duration(remainingValues)*time.Duration(pieceValues)/time.Duration(remainingValues)
+						frameDuration += pieceDuration
+						remainingDuration -= pieceDuration
+						remainingValues -= pieceValues
+						pieceValues = 0
 						flush()
 					}
 					frame.OidValues[k] = v
 					frameSize += oidEntrySize(k, v)
+					pieceValues++
 				}
+				frameDuration += remainingDuration
 			} else {
+				frameDuration += bucket.duration
 				for k, v := range bucket.values {
 					frame.OidValues[k] = v
 				}
@@ -367,6 +397,7 @@ func buildSnmpResultFrames(
 		if frameSize > 0 {
 			flush()
 		}
+		frameDuration += bucket.duration
 		dropped := 0
 		for k, v := range bucket.values {
 			entry := oidEntrySize(k, v)
@@ -388,6 +419,11 @@ func buildSnmpResultFrames(
 	}
 	if frameSize > 0 || len(frameRoots) > 0 || len(frames) == 0 {
 		flush()
+	} else if frameDuration > 0 {
+		// Empty failed roots have no frame of their own, but their request
+		// time still belongs to the last result of this job.
+		last := frames[len(frames)-1]
+		last.DurationMs = snmpDurationMillis(time.Duration(last.DurationMs)*time.Millisecond + frameDuration)
 	}
 
 	if len(frames) == 1 {
@@ -404,6 +440,15 @@ func buildSnmpResultFrames(
 		f.TruncatedRoots = truncated
 	}
 	return frames
+}
+
+// snmpDurationMillis reserves zero for unmeasured work. Very fast frames still
+// report one millisecond; long-running work saturates the wire's uint32 field.
+func snmpDurationMillis(elapsed time.Duration) uint32 {
+	if elapsed <= 0 {
+		return 0
+	}
+	return uint32(min(max(elapsed.Milliseconds(), 1), int64(1<<32-1)))
 }
 
 // oidEntrySize returns the encoded size of one oid_values map entry: a
