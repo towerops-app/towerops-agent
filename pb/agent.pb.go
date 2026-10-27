@@ -2890,8 +2890,18 @@ type SnmpResult struct {
 	// Echo of AgentJob.discovery_phase for DISCOVER results; UNSPECIFIED for
 	// other job types and for agents built before the field existed.
 	DiscoveryPhase DiscoveryPhase `protobuf:"varint,11,opt,name=discovery_phase,json=discoveryPhase,proto3,enum=towerops.agent.DiscoveryPhase" json:"discovery_phase,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Wall time spent producing this frame's SNMP data, in milliseconds,
+	// excluding scheduler, result-queue and encoding time. When one SNMP
+	// operation is split across frames, its time is apportioned across those
+	// frames rather than repeated. Positive per-frame times round up to 1 ms.
+	// The server sums frames into the job total. 0 means "not measured" (an
+	// agent built before the field existed), never "the poll took no time".
+	DurationMs uint32 `protobuf:"varint,12,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	// Wire bytes of this frame's encoded result message. The frame merge sums
+	// it the same way; 0 means "not measured".
+	ResultBytes   uint32 `protobuf:"varint,13,opt,name=result_bytes,json=resultBytes,proto3" json:"result_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SnmpResult) Reset() {
@@ -2999,6 +3009,20 @@ func (x *SnmpResult) GetDiscoveryPhase() DiscoveryPhase {
 		return x.DiscoveryPhase
 	}
 	return DiscoveryPhase_DISCOVERY_PHASE_UNSPECIFIED
+}
+
+func (x *SnmpResult) GetDurationMs() uint32 {
+	if x != nil {
+		return x.DurationMs
+	}
+	return 0
+}
+
+func (x *SnmpResult) GetResultBytes() uint32 {
+	if x != nil {
+		return x.ResultBytes
+	}
+	return 0
 }
 
 type AgentHeartbeat struct {
@@ -4167,7 +4191,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\tSnmpQuery\x128\n" +
 	"\n" +
 	"query_type\x18\x01 \x01(\x0e2\x19.towerops.agent.QueryTypeR\tqueryType\x12\x12\n" +
-	"\x04oids\x18\x02 \x03(\tR\x04oids\"\x81\x04\n" +
+	"\x04oids\x18\x02 \x03(\tR\x04oids\"\xc5\x04\n" +
 	"\n" +
 	"SnmpResult\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x122\n" +
@@ -4182,7 +4206,10 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x05final\x18\t \x01(\bR\x05final\x12'\n" +
 	"\x0ftruncated_roots\x18\n" +
 	" \x03(\tR\x0etruncatedRoots\x12G\n" +
-	"\x0fdiscovery_phase\x18\v \x01(\x0e2\x1e.towerops.agent.DiscoveryPhaseR\x0ediscoveryPhase\x1a<\n" +
+	"\x0fdiscovery_phase\x18\v \x01(\x0e2\x1e.towerops.agent.DiscoveryPhaseR\x0ediscoveryPhase\x12\x1f\n" +
+	"\vduration_ms\x18\f \x01(\rR\n" +
+	"durationMs\x12!\n" +
+	"\fresult_bytes\x18\r \x01(\rR\vresultBytes\x1a<\n" +
 	"\x0eOidValuesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xcf\x03\n" +

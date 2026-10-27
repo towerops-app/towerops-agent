@@ -181,7 +181,22 @@ claim authoritative roots; incomplete sets retain measurements as partial
 without reconciling away stored rows. A bucket exceeding the byte budget
 remains explicitly marked in `truncated_roots`.
 
+SNMP results also report `duration_ms` and `result_bytes` per frame. Duration
+measures GET batches (including recovery requests) and walk production, not
+scheduler wait, result-queue wait or encoding. A walk spanning entry-count
+frames has its time apportioned by entry count, not repeated on every frame;
+truncated buckets retain the cost of all their SNMP work. Positive times below
+one millisecond report 1 ms. The server sums the received frame costs, so
+per-frame millisecond rounding can affect very short split jobs.
+`result_bytes` is the exact encoded protobuf frame length, including its own
+size field, before base64 or JSON wrapping. Older messages leave both fields
+at zero, meaning unmeasured rather than free work.
+
 ### Resilience details
+
+SNMP deadline/cancellation errors stop further requests and preserve collected
+data as a partial result, even when a socket deadline reports the interruption
+before the job context's timer publishes its cancellation.
 
 - SNMPv1 `noSuchName` with a valid one-based error index records only that
   instance as absent, then retries the remaining instances without changing

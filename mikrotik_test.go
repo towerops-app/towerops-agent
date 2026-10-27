@@ -1727,12 +1727,17 @@ func TestMikrotikConnectAbortsLoginOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Accept and never reply so the login read stalls; ctx cancellation must
-	// close the conn and unblock it.
+	// Wait until the login request arrives before cancelling. Cancelling
+	// immediately on accept races DialContext and may never exercise a
+	// stalled login at all.
 	accepted := make(chan net.Conn, 1)
+	loginRead := make(chan error, 1)
 	go func() {
 		if conn, err := ln.Accept(); err == nil {
 			accepted <- conn
+			server := &mikrotikClient{conn: conn}
+			_, readErr := server.readSentence()
+			loginRead <- readErr
 			cancel()
 		}
 	}()
@@ -1757,6 +1762,9 @@ func TestMikrotikConnectAbortsLoginOnContextCancel(t *testing.T) {
 	_, err = mikrotikConnect(ctx, host, uint32(port), "admin", "pw", false)
 	if err == nil {
 		t.Fatal("expected login error after context cancellation")
+	}
+	if readErr := <-loginRead; readErr != nil {
+		t.Fatalf("login request did not reach the server: %v", readErr)
 	}
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("login ignored ctx cancellation, blocked %s", elapsed)

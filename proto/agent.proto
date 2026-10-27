@@ -385,6 +385,16 @@ message SnmpResult {
   // Echo of AgentJob.discovery_phase for DISCOVER results; UNSPECIFIED for
   // other job types and for agents built before the field existed.
   DiscoveryPhase discovery_phase = 11;
+  // Wall time spent producing this frame's SNMP data, in milliseconds,
+  // excluding scheduler, result-queue and encoding time. When one SNMP
+  // operation is split across frames, its time is apportioned across those
+  // frames rather than repeated. Positive per-frame times round up to 1 ms.
+  // The server sums frames into the job total. 0 means "not measured" (an
+  // agent built before the field existed), never "the poll took no time".
+  uint32 duration_ms = 12;
+  // Wire bytes of this frame's encoded result message. The frame merge sums
+  // it the same way; 0 means "not measured".
+  uint32 result_bytes = 13;
 }
 
 message AgentHeartbeat {
