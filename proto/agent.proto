@@ -1,10 +1,10 @@
 // Copyright (C) 2026 Graham McIntire
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The canonical wire contract is maintained in the TowerOps server at
-// priv/proto/agent.proto. Everything from `syntax = "proto3";` down must stay
-// byte-for-byte identical to that copy; change the server schema and
-// hand-written codec first, then mirror them here.
+// The canonical wire contract is maintained in the Towerops server at
+// priv/proto/agent.proto. Keep this file byte-for-byte identical to that copy;
+// change the server schema and hand-written codec first, then mirror them here.
+
 syntax = "proto3";
 
 package towerops.agent;
@@ -106,6 +106,9 @@ message MonitoringCheck {
   string status = 2; // "success" or "failure"
   double response_time_ms = 3; // Optional - only present on success
   int64 timestamp = 4; // Unix timestamp in seconds
+  // Optional, agents before 2026-11 leave it unset: percent of the job's
+  // probes that got no reply (0-100). Absent means "not measured", not 0.
+  double packet_loss_percent = 5;
 }
 
 // Service Checks (HTTP/TCP/DNS)

@@ -39,9 +39,9 @@ func TestExecutePingJob(t *testing.T) {
 	t.Run("success uses configured timeout", func(t *testing.T) {
 		origPing := doPing
 		defer func() { doPing = origPing }()
-		var gotTimeoutMs int
+		var gotTimeoutMs []int
 		doPing = func(_ context.Context, ip string, timeoutMs int) (float64, error) {
-			gotTimeoutMs = timeoutMs
+			gotTimeoutMs = append(gotTimeoutMs, timeoutMs)
 			return 3.14, nil
 		}
 
@@ -63,17 +63,27 @@ func TestExecutePingJob(t *testing.T) {
 		if result.DeviceId != "dev-1" {
 			t.Errorf("device id: got %q, want %q", result.DeviceId, "dev-1")
 		}
-		if gotTimeoutMs != 1_234 {
-			t.Errorf("timeout: got %dms, want 1234ms", gotTimeoutMs)
+		if result.PacketLossPercent != 0 {
+			t.Errorf("packet loss: got %v, want 0", result.PacketLossPercent)
+		}
+		// The job's timeout budgets the whole round; each of the three
+		// probes gets an equal share so all timeouts end inside it.
+		if len(gotTimeoutMs) != pingProbeCount {
+			t.Fatalf("probe count: got %d, want %d", len(gotTimeoutMs), pingProbeCount)
+		}
+		for i, tm := range gotTimeoutMs {
+			if tm != 1_234/pingProbeCount {
+				t.Errorf("probe %d timeout: got %dms, want %dms", i, tm, 1_234/pingProbeCount)
+			}
 		}
 	})
 
 	t.Run("failure uses default timeout for legacy jobs", func(t *testing.T) {
 		origPing := doPing
 		defer func() { doPing = origPing }()
-		var gotTimeoutMs int
+		var gotTimeoutMs []int
 		doPing = func(_ context.Context, ip string, timeoutMs int) (float64, error) {
-			gotTimeoutMs = timeoutMs
+			gotTimeoutMs = append(gotTimeoutMs, timeoutMs)
 			return 0, fmt.Errorf("request timeout")
 		}
 
@@ -88,8 +98,47 @@ func TestExecutePingJob(t *testing.T) {
 		if result.Status != "failure" {
 			t.Errorf("status: got %q, want %q", result.Status, "failure")
 		}
-		if gotTimeoutMs != defaultPingTimeoutMs {
-			t.Errorf("timeout: got %dms, want default %dms", gotTimeoutMs, defaultPingTimeoutMs)
+		if result.PacketLossPercent != 100 {
+			t.Errorf("packet loss: got %v, want 100 for a dead target", result.PacketLossPercent)
+		}
+		if len(gotTimeoutMs) != pingProbeCount {
+			t.Fatalf("probe count: got %d, want %d", len(gotTimeoutMs), pingProbeCount)
+		}
+		for i, tm := range gotTimeoutMs {
+			if tm != defaultPingTimeoutMs/pingProbeCount {
+				t.Errorf("probe %d timeout: got %dms, want %dms",
+					i, tm, defaultPingTimeoutMs/pingProbeCount)
+			}
+		}
+	})
+
+	t.Run("partial loss still reports success with the share that answered", func(t *testing.T) {
+		origPing := doPing
+		defer func() { doPing = origPing }()
+		calls := 0
+		doPing = func(_ context.Context, ip string, _ int) (float64, error) {
+			calls++
+			if calls == 2 {
+				return 0, fmt.Errorf("request timeout")
+			}
+			return 4.4, nil
+		}
+
+		out := newResultQueue(1)
+		executePingJob(context.Background(), &pb.AgentJob{
+			JobId:      "p3",
+			DeviceId:   "dev-3",
+			SnmpDevice: &pb.SnmpDevice{Ip: "192.168.1.2"},
+		}, out)
+
+		result := sshTReceiveMonitoringResult(t, out)
+		if result.Status != "success" {
+			t.Errorf("status: got %q, want %q (a reply is a reply)", result.Status, "success")
+		}
+		wantLoss := float64(pingProbeCount-2) * 100.0 / float64(pingProbeCount)
+		if result.PacketLossPercent != wantLoss {
+			t.Errorf("packet loss: got %v, want %v (1 of %d probes lost)",
+				result.PacketLossPercent, wantLoss, pingProbeCount)
 		}
 	})
 }
