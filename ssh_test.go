@@ -78,6 +78,34 @@ func TestExecutePingJob(t *testing.T) {
 		}
 	})
 
+	t.Run("small timeout keeps each probe at least 1ms", func(t *testing.T) {
+		origPing := doPing
+		defer func() { doPing = origPing }()
+		var gotTimeoutMs []int
+		doPing = func(_ context.Context, _ string, timeoutMs int) (float64, error) {
+			gotTimeoutMs = append(gotTimeoutMs, timeoutMs)
+			return 3.14, nil
+		}
+
+		out := newResultQueue(1)
+		executePingJob(context.Background(), &pb.AgentJob{
+			JobId:         "p-small-timeout",
+			DeviceId:      "dev-small-timeout",
+			SnmpDevice:    &pb.SnmpDevice{Ip: "10.0.0.2"},
+			PingTimeoutMs: 2,
+		}, out)
+		sshTReceiveMonitoringResult(t, out)
+
+		if len(gotTimeoutMs) != pingProbeCount {
+			t.Fatalf("probe count: got %d, want %d", len(gotTimeoutMs), pingProbeCount)
+		}
+		for i, timeoutMs := range gotTimeoutMs {
+			if timeoutMs != 1 {
+				t.Errorf("probe %d timeout: got %dms, want 1ms", i, timeoutMs)
+			}
+		}
+	})
+
 	t.Run("failure uses default timeout for legacy jobs", func(t *testing.T) {
 		origPing := doPing
 		defer func() { doPing = origPing }()
