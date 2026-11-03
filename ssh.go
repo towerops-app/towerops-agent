@@ -174,6 +174,14 @@ func hostKeyAlgorithmsFor(keyType string) []string {
 
 const defaultPingTimeoutMs = 5000
 
+// pingProbeCount is how many echo requests one ping job sends. One probe
+// cannot express loss at all (it is either 0 or 100, and the status field
+// already says which), so the job sends three and reports the share that
+// got no reply on monitoring_check's packet_loss_percent. Three is the
+// smallest count that distinguishes "dropping some packets" from
+// "answering" and "dead" without tripling the job's wall time.
+const pingProbeCount = 3
+
 // executePingJob pings a device and sends a monitoring check result.
 func executePingJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	dev := job.SnmpDevice
@@ -194,26 +202,50 @@ func executePingJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	if timeoutMs <= 0 {
 		timeoutMs = defaultPingTimeoutMs
 	}
-	responseTime, err := doPing(ctx, dev.Ip, timeoutMs)
+	// The job's timeout budgets the whole round; each probe gets a share so
+	// three timeouts still end inside the deadline the scheduler planned.
+	probeTimeoutMs := timeoutMs / pingProbeCount
+	if probeTimeoutMs <= 0 {
+		probeTimeoutMs = 1
+	}
 
-	if err != nil {
-		slog.Warn("device down", "device", job.DeviceId, "error", err)
+	var firstRTT float64
+	replies := 0
+	var lastErr error
+	for range pingProbeCount {
+		rtt, err := doPing(ctx, dev.Ip, probeTimeoutMs)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if replies == 0 {
+			firstRTT = rtt
+		}
+		replies++
+	}
+	lossPercent := float64(pingProbeCount-replies) * 100.0 / float64(pingProbeCount)
+
+	if replies == 0 {
+		slog.Warn("device down", "device", job.DeviceId, "error", lastErr)
 		result := &pb.MonitoringCheck{
-			DeviceId:  job.DeviceId,
-			Status:    "failure",
-			Timestamp: timestamp,
+			DeviceId:          job.DeviceId,
+			Status:            "failure",
+			Timestamp:         timestamp,
+			PacketLossPercent: lossPercent,
 		}
 		slog.Info("ping job complete", "device", job.DeviceId, "status", result.Status)
 		sendResult(ctx, out, "monitoring_check", result, job.JobId)
 		return
 	}
 
-	slog.Debug("device up", "device", job.DeviceId, "response_time_ms", responseTime)
+	slog.Debug("device up", "device", job.DeviceId, "response_time_ms", firstRTT,
+		"replies", replies, "probes", pingProbeCount)
 	result := &pb.MonitoringCheck{
-		DeviceId:       job.DeviceId,
-		Status:         "success",
-		ResponseTimeMs: responseTime,
-		Timestamp:      timestamp,
+		DeviceId:          job.DeviceId,
+		Status:            "success",
+		ResponseTimeMs:    firstRTT,
+		Timestamp:         timestamp,
+		PacketLossPercent: lossPercent,
 	}
 	slog.Info("ping job complete", "device", job.DeviceId, "status", result.Status)
 	sendResult(ctx, out, "monitoring_check", result, job.JobId)

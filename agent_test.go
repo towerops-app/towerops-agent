@@ -4243,14 +4243,19 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 		var releaseOnce sync.Once
 		defer releaseOnce.Do(func() { close(release) })
 		firstStarted := make(chan struct{})
-		secondStarted := make(chan struct{})
+		// One ping job now calls doPing three times (pingProbeCount), so
+		// "a second job started" has to be a separate signal from a later
+		// probe of the same job: first call parks until release, every
+		// later call counts, and only a call arriving while probe one is
+		// still parked would mean a second job broke the gate.
+		secondStarted := make(chan struct{}, 8)
 		var calls atomic.Int32
 		doPing = func(_ context.Context, ip string, _ int) (float64, error) {
 			if calls.Add(1) == 1 {
 				close(firstStarted)
 				<-release
 			} else {
-				close(secondStarted)
+				secondStarted <- struct{}{}
 			}
 			return 1, nil
 		}
@@ -4350,8 +4355,10 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 				},
 			}, func() {}, nil
 		}
+		var pingOnce sync.Once
 		doPing = func(_ context.Context, ip string, _ int) (float64, error) {
-			defer close(pingDone)
+			// Three probes per job now; only the first completion reports.
+			defer pingOnce.Do(func() { close(pingDone) })
 			return 1, nil
 		}
 
@@ -4739,7 +4746,9 @@ func TestSequentialJobsOnSameTargetBothRun(t *testing.T) {
 	t.Cleanup(func() { dispatchJitterMax = origJitter })
 	origPing := doPing
 	defer func() { doPing = origPing }()
-	ran := make(chan string, 2)
+	// One ping job probes the target three times (pingProbeCount), so the
+	// channel needs room for every probe of both sequential jobs.
+	ran := make(chan string, 8)
 	doPing = func(_ context.Context, ip string, _ int) (float64, error) {
 		ran <- ip
 		return 1, nil
@@ -4783,14 +4792,26 @@ func TestDifferentKindsOnSameTargetRunConcurrently(t *testing.T) {
 	// backup for the same device: it must not block on the ping's gate.
 	pingStarted := make(chan struct{})
 	pingRelease := make(chan struct{})
+	pingDone := make(chan struct{})
+	pingSubmitted := false
 	origPing := doPing
-	defer func() { doPing = origPing }()
+	var startOnce sync.Once
 	doPing = func(_ context.Context, _ string, _ int) (float64, error) {
-		close(pingStarted)
+		// Only the first of the job's three probes parks; the others run
+		// after the test releases the gate.
+		startOnce.Do(func() { close(pingStarted) })
 		<-pingRelease
 		return 1, nil
 	}
-	defer close(pingRelease)
+	// Drain the ping before restoring the global stub. The job may still call
+	// doPing for its remaining probes after the release.
+	defer func() {
+		close(pingRelease)
+		if pingSubmitted {
+			<-pingDone
+		}
+		doPing = origPing
+	}()
 
 	pools.backup = newWorkerPool(1)
 	t.Cleanup(pools.backup.stop)
@@ -4799,7 +4820,8 @@ func TestDifferentKindsOnSameTargetRunConcurrently(t *testing.T) {
 		JobId:      "conc-ping",
 		JobType:    pb.JobType_PING,
 		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.10"},
-	}, pools, testQueue(), func() {}, false)
+	}, pools, testQueue(), func() { close(pingDone) }, false)
+	pingSubmitted = true
 	select {
 
 	case <-pingStarted:
