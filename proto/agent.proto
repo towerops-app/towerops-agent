@@ -438,6 +438,17 @@ message AgentHeartbeat {
   string update_target_version = 13;
   string update_error = 14;
   int64 update_attempted_at = 15;
+  // Trap listener telemetry (issue #2754). `traps_enabled` means the agent
+  // was started to forward traps; `trap_listener_state` is "listening",
+  // "rebinding" or "failed" (the initial bind failed and the agent runs
+  // without the listener). proto3 cannot tell "agent predates this field"
+  // from "traps off", so absent means old build, the server only treats a
+  // heartbeat that explicitly carries traps_enabled=true and a non-
+  // listening state as a dead listener. `traps_dropped` is the cumulative
+  // queue-full drop count since process start.
+  bool traps_enabled = 16;
+  string trap_listener_state = 17;
+  uint64 traps_dropped = 18;
 }
 
 message AgentError {

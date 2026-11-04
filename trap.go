@@ -45,6 +45,37 @@ const (
 // itself slow the reader down and make the loss worse.
 var trapDropLogInterval = time.Minute
 
+// Process-wide trap listener telemetry for the heartbeat (issue 2754). The
+// session does not know the listener exists, so the state lives here: one
+// listener per process makes a package singleton honest.
+var (
+	// trapsReportingEnabled distinguishes "agent never asked to forward
+	// traps" from "traps enabled, listener state follows". proto3 cannot
+	// send "absent", so the server reads enabled=true as the only signal
+	// that trap_listener_state means anything.
+	trapsReportingEnabled atomic.Bool
+	// trapListenerState is "listening", "rebinding" or "failed" (the
+	// initial bind failed). atomic.Value so the heartbeat goroutine reads
+	// it without racing the serve loop's transitions.
+	trapListenerState atomic.Value
+	// trapDroppedTotal is the cumulative queue-full drop count, summed
+	// across rebinds, which is what the heartbeat reports.
+	trapDroppedTotal atomic.Uint64
+)
+
+func setTrapListenerState(state string) {
+	trapListenerState.Store(state)
+}
+
+func trapListenerStateString() string {
+	if v := trapListenerState.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
 // trapListener receives SNMP traps on a UDP port and converts them to protobuf.
 //
 // The listener outlives any single WebSocket session: devices send traps
@@ -93,9 +124,11 @@ func startTrapListener(bindAddr string, port uint16, community string) (*trapLis
 
 	select {
 	case <-t.ready:
+		setTrapListenerState("listening")
 		slog.Info("snmp trap listener started", "bind_address", bindAddr, "port", port, "community_filter", community != "")
 		return t, nil
 	case err := <-errCh:
+		setTrapListenerState("failed")
 		t.Close()
 		return nil, fmt.Errorf("bind trap port %d: %w", port, err)
 	}
@@ -126,6 +159,7 @@ func (t *trapListener) serve(listener *gosnmp.TrapListener, done chan struct{}, 
 			return
 		default:
 		}
+		setTrapListenerState("rebinding")
 		slog.Error("snmp trap listener stopped unexpectedly; rebinding", "error", err, "port", t.port)
 
 		timer := time.NewTimer(time.Second)
@@ -153,6 +187,7 @@ func (t *trapListener) serve(listener *gosnmp.TrapListener, done chan struct{}, 
 		go func(currentReady <-chan struct{}) {
 			select {
 			case <-currentReady:
+				setTrapListenerState("listening")
 				slog.Info("snmp trap listener rebound", "port", t.port)
 			case <-t.closed:
 			}
@@ -213,6 +248,7 @@ func (t *trapListener) handle(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) {
 	case t.traps <- trap:
 		slog.Debug("received snmp trap", "source", trap.SourceIp, "trap_oid", trap.TrapOid, "varbinds", len(trap.Varbinds))
 	default:
+		trapDroppedTotal.Add(1)
 		t.reportDrop(t.dropped.Add(1))
 	}
 }

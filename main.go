@@ -136,17 +136,21 @@ func runMain(ctx context.Context, args []string) int {
 	// whenever they like, including while the agent is reconnecting.
 	var traps <-chan *pb.SnmpTrap
 	if *trapEnabled {
+		trapsReportingEnabled.Store(true)
 		if *trapPort == 0 || *trapPort > 65535 {
 			fmt.Fprintf(os.Stderr, "error: --trap-port must be 1-65535, got %d\n", *trapPort)
 			return 1
 		}
 		listener, err := startTrapListener(*trapBind, uint16(*trapPort), *trapCommunity)
 		if err != nil {
-			slog.Error("trap listener", "error", err)
-			return 1
+			// Report "failed" on the heartbeat instead of dying: a trap
+			// enabled agent that refuses to start is the same invisible
+			// outage the listener telemetry exists to surface (issue 2754).
+			slog.Error("trap listener failed to bind; running without trap forwarding", "error", err)
+		} else {
+			defer listener.Close()
+			traps = listener.Traps()
 		}
-		defer listener.Close()
-		traps = listener.Traps()
 	}
 	// Apply the configured process-wide SNMP packet ceiling before any
 	// session can dial a device.

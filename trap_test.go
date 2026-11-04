@@ -608,6 +608,92 @@ func TestTrapListenerRejectsWrongCommunityOnTheWire(t *testing.T) {
 	}
 }
 
+func TestTrapListenerTelemetry(t *testing.T) {
+	// The heartbeat reads package-level state because the session never
+	// touches the listener (issue 2754). These transitions are what the
+	// server pages on, so the reporting path itself is the contract.
+
+	t.Run("reports listening after a successful bind", func(t *testing.T) {
+		port := freeUDPPort(t)
+		l, err := startTrapListener("127.0.0.1", port, "public")
+		if err != nil {
+			t.Skipf("cannot bind trap port %d: %v", port, err)
+		}
+		defer l.Close()
+
+		if got := trapListenerStateString(); got != "listening" {
+			t.Errorf("trapListenerState = %q, want listening", got)
+		}
+	})
+
+	t.Run("reports rebinding while the serve loop retries", func(t *testing.T) {
+		port := freeUDPPort(t)
+		l, err := startTrapListener("127.0.0.1", port, "public")
+		if err != nil {
+			t.Skipf("cannot bind trap port %d: %v", port, err)
+		}
+		defer l.Close()
+
+		l.mu.Lock()
+		original := l.listener
+		l.mu.Unlock()
+		original.Close()
+
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) && trapListenerStateString() != "rebinding" {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := trapListenerStateString(); got != "rebinding" {
+			t.Fatalf("trapListenerState = %q, want rebinding after an unexpected stop", got)
+		}
+
+		deadline = time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) && trapListenerStateString() != "listening" {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := trapListenerStateString(); got != "listening" {
+			t.Fatalf("trapListenerState = %q, want listening after the rebind lands", got)
+		}
+	})
+
+	t.Run("a failed initial bind reports failed", func(t *testing.T) {
+		// Squatting the port first is the only deterministic way to make
+		// the bind itself fail.
+		squatter, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+		if err != nil {
+			t.Skipf("cannot bind a squat port: %v", err)
+		}
+		defer func() { _ = squatter.Close() }()
+
+		port := uint16(squatter.LocalAddr().(*net.UDPAddr).Port)
+		if _, err := startTrapListener("127.0.0.1", port, "public"); err == nil {
+			t.Fatal("startTrapListener on an occupied port succeeded")
+		}
+		if got := trapListenerStateString(); got != "failed" {
+			t.Errorf("trapListenerState = %q, want failed", got)
+		}
+	})
+
+	t.Run("drops accumulate into the process total", func(t *testing.T) {
+		before := trapDroppedTotal.Load()
+		l := &trapListener{traps: make(chan *pb.SnmpTrap, 1)}
+		packet := &gosnmp.SnmpPacket{
+			Version: gosnmp.Version2c,
+			PDUType: gosnmp.SNMPv2Trap,
+			Variables: []gosnmp.SnmpPDU{
+				{Name: oidSnmpTrapOID, Type: gosnmp.ObjectIdentifier, Value: ".1.3.6.1.6.3.1.1.5.1"},
+			},
+		}
+		addr := &net.UDPAddr{IP: net.ParseIP("192.0.2.40"), Port: 5000}
+		l.handle(packet, addr)
+		l.handle(packet, addr)
+		l.handle(packet, addr)
+		if got := trapDroppedTotal.Load(); got != before+2 {
+			t.Errorf("trapDroppedTotal = %d, want %d", got, before+2)
+		}
+	})
+}
+
 // --- tpT: listener lifecycle and property coverage -------------------------
 
 // tpTLogWatcher signals a channel once a given number of records whose message
