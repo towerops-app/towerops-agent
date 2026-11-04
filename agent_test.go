@@ -1818,6 +1818,53 @@ func TestRunSessionDeliversPreviouslyBufferedResult(t *testing.T) {
 		t.Fatal("delivered result remained reserved in the reconnect buffer")
 	}
 }
+// Cancelling the agent context with a result still spooled must flush it over
+// the live socket before the session ends: the shutdown path shares the
+// self-update drain instead of abandoning the spool (issue #2757).
+func TestRunSessionFlushDrainsQueuedResultOnCancel(t *testing.T) {
+	results := newResultQueue(1)
+	result, ok := encodeOutbound("error", &pb.AgentError{
+		DeviceId:  "device-1",
+		JobId:     "job-queued",
+		Message:   "completed before shutdown",
+		Timestamp: 1,
+	}, "job-queued")
+	if !ok || !results.enqueue(result) {
+		t.Fatal("could not prepare queued result")
+	}
+
+	ln := agtListen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runSessionWithResults(ctx, agtURL(ln), "token", nil, results)
+	}()
+
+	conn, _ := agtAccept(t, ln)
+	frames := agtReadFrames(conn)
+
+	cancel()
+
+	frame := agtWaitEvent(t, frames, "error")
+	var got pb.AgentError
+	agtDecodeBinary(t, frame.Payload, &got)
+	if got.JobId != "job-queued" {
+		t.Fatalf("flushed result = %+v, want job-queued", &got)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runSessionWithResults error = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not exit after the shutdown flush")
+	}
+	if n := len(results.slots); n != 0 {
+		t.Fatalf("flushed result kept %d slot tokens reserved", n)
+	}
+}
+
 
 func TestRunSessionRestartDoesNotWaitForServerClose(t *testing.T) {
 	srv := newFakeWSServer(t)
