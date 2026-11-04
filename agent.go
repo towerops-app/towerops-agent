@@ -785,6 +785,11 @@ func (s *session) heartbeat() *pb.AgentHeartbeat {
 		// The server dispatches plan-driven backups only to agents that
 		// advertise this feature; MikroTik backups need no plan.
 		ConfigBackupFeatures: []string{"plan_v1"},
+		// Trap listener telemetry (issue 2754): the heartbeat is the only
+		// channel the listener's health can reach the server through.
+		TrapsEnabled:      trapsReportingEnabled.Load(),
+		TrapListenerState: trapListenerStateString(),
+		TrapsDropped:      trapDroppedTotal.Load(),
 	}
 	// The outcome of the last self-update attempt rides every heartbeat so
 	// the fleet page shows what an update did, not just what it was told.

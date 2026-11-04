@@ -707,15 +707,38 @@ func TestCliTRunMainTrapListenerBindFailure(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 	port := conn.LocalAddr().(*net.UDPAddr).Port
 
-	code := runMain(context.Background(), []string{
-		"--api-url=wss://example.com",
-		"--token=test-token",
-		"--trap-enabled",
-		"--trap-port=" + strconv.Itoa(port),
-		cliTHostKeysFlag(t),
-	})
-	if code != 1 {
-		t.Fatalf("exit = %d, want 1 when trap port is already bound", code)
+	// Issue 2754: a failed trap bind no longer kills the agent - the outage
+	// is reported to the server over the polling channel, which is the only
+	// route that can surface it. The agent keeps running, marks the
+	// listener "failed" for the next heartbeat, and would rebind on a
+	// later drop.
+	setTrapListenerState("")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() {
+		done <- runMain(ctx, []string{
+			"--api-url=wss://127.0.0.1:1",
+			"--token=test-token",
+			"--trap-enabled",
+			"--trap-port=" + strconv.Itoa(port),
+			cliTHostKeysFlag(t),
+		})
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for trapListenerStateString() != "failed" {
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatalf("trap listener state = %q, want %q after bind failure", trapListenerStateString(), "failed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	if code := <-done; code != 0 {
+		t.Fatalf("exit = %d, want 0: agent must survive a trap bind failure", code)
 	}
 }
 

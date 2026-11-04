@@ -3073,8 +3073,19 @@ type AgentHeartbeat struct {
 	UpdateTargetVersion string `protobuf:"bytes,13,opt,name=update_target_version,json=updateTargetVersion,proto3" json:"update_target_version,omitempty"`
 	UpdateError         string `protobuf:"bytes,14,opt,name=update_error,json=updateError,proto3" json:"update_error,omitempty"`
 	UpdateAttemptedAt   int64  `protobuf:"varint,15,opt,name=update_attempted_at,json=updateAttemptedAt,proto3" json:"update_attempted_at,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Trap listener telemetry (issue #2754). `traps_enabled` means the agent
+	// was started to forward traps; `trap_listener_state` is "listening",
+	// "rebinding" or "failed" (the initial bind failed and the agent runs
+	// without the listener). proto3 cannot tell "agent predates this field"
+	// from "traps off", so absent means old build, the server only treats a
+	// heartbeat that explicitly carries traps_enabled=true and a non-
+	// listening state as a dead listener. `traps_dropped` is the cumulative
+	// queue-full drop count since process start.
+	TrapsEnabled      bool   `protobuf:"varint,16,opt,name=traps_enabled,json=trapsEnabled,proto3" json:"traps_enabled,omitempty"`
+	TrapListenerState string `protobuf:"bytes,17,opt,name=trap_listener_state,json=trapListenerState,proto3" json:"trap_listener_state,omitempty"`
+	TrapsDropped      uint64 `protobuf:"varint,18,opt,name=traps_dropped,json=trapsDropped,proto3" json:"traps_dropped,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *AgentHeartbeat) Reset() {
@@ -3208,6 +3219,27 @@ func (x *AgentHeartbeat) GetUpdateError() string {
 func (x *AgentHeartbeat) GetUpdateAttemptedAt() int64 {
 	if x != nil {
 		return x.UpdateAttemptedAt
+	}
+	return 0
+}
+
+func (x *AgentHeartbeat) GetTrapsEnabled() bool {
+	if x != nil {
+		return x.TrapsEnabled
+	}
+	return false
+}
+
+func (x *AgentHeartbeat) GetTrapListenerState() string {
+	if x != nil {
+		return x.TrapListenerState
+	}
+	return ""
+}
+
+func (x *AgentHeartbeat) GetTrapsDropped() uint64 {
+	if x != nil {
+		return x.TrapsDropped
 	}
 	return 0
 }
@@ -4251,7 +4283,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\fresult_bytes\x18\r \x01(\rR\vresultBytes\x1a<\n" +
 	"\x0eOidValuesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xd6\x04\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xd0\x05\n" +
 	"\x0eAgentHeartbeat\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x1a\n" +
 	"\bhostname\x18\x02 \x01(\tR\bhostname\x12%\n" +
@@ -4269,7 +4301,10 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x16config_backup_features\x18\f \x03(\tR\x14configBackupFeatures\x122\n" +
 	"\x15update_target_version\x18\r \x01(\tR\x13updateTargetVersion\x12!\n" +
 	"\fupdate_error\x18\x0e \x01(\tR\vupdateError\x12.\n" +
-	"\x13update_attempted_at\x18\x0f \x01(\x03R\x11updateAttemptedAt\"x\n" +
+	"\x13update_attempted_at\x18\x0f \x01(\x03R\x11updateAttemptedAt\x12#\n" +
+	"\rtraps_enabled\x18\x10 \x01(\bR\ftrapsEnabled\x12.\n" +
+	"\x13trap_listener_state\x18\x11 \x01(\tR\x11trapListenerState\x12#\n" +
+	"\rtraps_dropped\x18\x12 \x01(\x04R\ftrapsDropped\"x\n" +
 	"\n" +
 	"AgentError\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12\x15\n" +
