@@ -395,7 +395,7 @@ func TestHandleMessage(t *testing.T) {
 		var calledURL string
 		var updateCtx context.Context
 		var calls atomic.Int32
-		doSelfUpdate = func(ctx context.Context, url, checksum string) error {
+		doSelfUpdate = func(ctx context.Context, url, checksum, version string) error {
 			defer close(finished)
 			updateCtx = ctx
 			calledURL = url
@@ -452,7 +452,7 @@ func TestHandleMessage(t *testing.T) {
 		defer func() { doSelfUpdate = origUpdate }()
 
 		called := false
-		doSelfUpdate = func(_ context.Context, url, checksum string) error {
+		doSelfUpdate = func(_ context.Context, url, checksum, version string) error {
 			called = true
 			return nil
 		}
@@ -474,7 +474,7 @@ func TestHandleMessage(t *testing.T) {
 		updateInProgress.Store(false)
 
 		called := make(chan struct{})
-		doSelfUpdate = func(_ context.Context, url, checksum string) error {
+		doSelfUpdate = func(_ context.Context, url, checksum, version string) error {
 			close(called)
 			return fmt.Errorf("download failed")
 		}
@@ -493,7 +493,7 @@ func TestHandleMessage(t *testing.T) {
 		defer func() { doSelfUpdate = origUpdate }()
 
 		called := false
-		doSelfUpdate = func(_ context.Context, url, checksum string) error {
+		doSelfUpdate = func(_ context.Context, url, checksum, version string) error {
 			called = true
 			return nil
 		}

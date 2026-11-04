@@ -6,6 +6,9 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"debug/elf"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +22,43 @@ import (
 
 	"pgregory.net/rapid"
 )
+
+// elfUpdateBody returns the smallest download selfUpdateContext's staged-
+// binary check accepts on this host: an ELF64 executable header. machine
+// sets the ELF architecture field.
+func elfUpdateBody(machine elf.Machine) []byte {
+	body := make([]byte, 64)
+	copy(body, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+	binary.LittleEndian.PutUint16(body[16:], uint16(elf.ET_EXEC))
+	binary.LittleEndian.PutUint16(body[18:], uint16(machine))
+	binary.LittleEndian.PutUint32(body[20:], 1)
+	binary.LittleEndian.PutUint16(body[52:], 64)
+	binary.LittleEndian.PutUint16(body[54:], 56)
+	binary.LittleEndian.PutUint16(body[58:], 64)
+	return body
+}
+
+// elfUpdateBodyForHost builds a payload matching this test host's arch, the
+// only arch validateStagedBinary accepts.
+func elfUpdateBodyForHost() []byte {
+	machine, ok := elfMachineForGOARCH()
+	if !ok {
+		// A host with no ELF mapping accepts any ELF executable.
+		return elfUpdateBody(elf.EM_X86_64)
+	}
+	return elfUpdateBody(machine)
+}
+
+// stageExecutable writes the running binary osExecutable is stubbed to
+// point at: the update path now renames it aside, so it must exist.
+func stageExecutable(t *testing.T) string {
+	t.Helper()
+	exe := filepath.Join(t.TempDir(), "test-agent")
+	if err := os.WriteFile(exe, []byte("previous binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	return exe
+}
 
 func forceBareBinaryUpdate(t *testing.T) {
 	t.Helper()
@@ -92,7 +132,7 @@ func TestSelfUpdateCancellationBeforeReplacement(t *testing.T) {
 				renamed = true
 				return errors.New("unexpected replacement")
 			}
-			err := selfUpdateContext(ctx, "https://example.com/agent", fmt.Sprintf("%x", sha256.Sum256([]byte(body))))
+			err := selfUpdateContext(ctx, "https://example.com/agent", fmt.Sprintf("%x", sha256.Sum256([]byte(body))), "1.2.3")
 			if !errors.Is(err, cause) || renamed {
 				t.Fatalf("update error = %v, renamed = %v; want cancellation cause before replacement", err, renamed)
 			}
@@ -236,7 +276,7 @@ func TestSelfUpdateRejectsContainerBeforeDownload(t *testing.T) {
 	}
 
 	const want = "self-update unsupported in this deployment: the agent runs in a container image; update by pulling a new image"
-	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64))
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64), "1.2.3")
 	if err == nil || err.Error() != want {
 		t.Fatalf("selfUpdate error = %v, want %q", err, want)
 	}
@@ -259,7 +299,7 @@ func TestSelfUpdateRejectsMalformedChecksumBeforeDownload(t *testing.T) {
 		return nil, errors.New("unexpected download")
 	}
 
-	err := selfUpdateContext(context.Background(), "https://example.com/agent", "not-a-checksum")
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", "not-a-checksum", "1.2.3")
 	if err == nil || err.Error() != "checksum must be exactly 64 hexadecimal characters" {
 		t.Fatalf("selfUpdate error = %v, want malformed checksum rejection", err)
 	}
@@ -270,7 +310,7 @@ func TestSelfUpdateRejectsMalformedChecksumBeforeDownload(t *testing.T) {
 
 func TestSelfUpdateRejectsHTTP(t *testing.T) {
 	forceBareBinaryUpdate(t)
-	err := selfUpdateContext(context.Background(), "http://example.com/agent", "abc123")
+	err := selfUpdateContext(context.Background(), "http://example.com/agent", "abc123", "1.2.3")
 	if err == nil {
 		t.Error("expected error for HTTP URL")
 	}
@@ -295,7 +335,7 @@ func TestSelfUpdateRejectsRedirectToHTTP(t *testing.T) {
 		}, nil
 	}
 
-	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64))
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64), "1.2.3")
 	if err == nil || !strings.Contains(err.Error(), "after redirects") {
 		t.Fatalf("selfUpdate error = %v, want HTTPS redirect rejection", err)
 	}
@@ -303,7 +343,7 @@ func TestSelfUpdateRejectsRedirectToHTTP(t *testing.T) {
 
 func TestSelfUpdateRequiresChecksum(t *testing.T) {
 	forceBareBinaryUpdate(t)
-	err := selfUpdateContext(context.Background(), "https://example.com/agent", "")
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", "", "1.2.3")
 	if err == nil {
 		t.Error("expected error for empty checksum")
 	}
@@ -314,7 +354,7 @@ func TestSelfUpdateRequiresChecksum(t *testing.T) {
 
 func TestSelfUpdateBadURL(t *testing.T) {
 	forceBareBinaryUpdate(t)
-	err := selfUpdateContext(context.Background(), "https://127.0.0.1:1/nonexistent", strings.Repeat("0", 64))
+	err := selfUpdateContext(context.Background(), "https://127.0.0.1:1/nonexistent", strings.Repeat("0", 64), "1.2.3")
 	if err == nil {
 		t.Error("expected error for unreachable URL")
 	}
@@ -331,7 +371,7 @@ func TestSelfUpdateChecksumMismatch(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), "0000000000000000000000000000000000000000000000000000000000000000")
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), "0000000000000000000000000000000000000000000000000000000000000000", "1.2.3")
 	if err == nil {
 		t.Error("expected checksum mismatch error")
 	}
@@ -348,7 +388,7 @@ func TestSelfUpdate404(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL)+"/missing", strings.Repeat("0", 64))
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL)+"/missing", strings.Repeat("0", 64), "1.2.3")
 	if err == nil {
 		t.Error("expected error for 404 response")
 	}
@@ -375,7 +415,7 @@ func TestSelfUpdateReadBodyError(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), strings.Repeat("0", 64))
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), strings.Repeat("0", 64), "1.2.3")
 	// This may or may not error depending on io.ReadAll behavior with truncated body
 	// but we exercise the code path
 	_ = err
@@ -401,7 +441,7 @@ func TestSelfUpdateOsExecutableError(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum, "1.2.3")
 	if err == nil {
 		t.Error("expected os.Executable error")
 	}
@@ -435,7 +475,7 @@ func TestSelfUpdateCreateTempError(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum, "1.2.3")
 	if err == nil {
 		t.Error("expected create temp error")
 	}
@@ -458,7 +498,7 @@ func TestSelfUpdateRenameError(t *testing.T) {
 		return fmt.Errorf("permission denied")
 	}
 
-	body := []byte("binary data")
+	body := elfUpdateBodyForHost()
 	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -470,18 +510,20 @@ func TestSelfUpdateRenameError(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum, "1.2.3")
 	if err == nil {
 		t.Error("expected rename error")
 	}
-	if !strings.Contains(err.Error(), "rename") {
-		t.Errorf("expected 'rename' in error, got: %v", err)
+	// The first rename moves the running binary aside; a replacement
+	// failure surfaces through it now.
+	if !strings.Contains(err.Error(), "backup current binary") {
+		t.Errorf("expected 'backup current binary' in error, got: %v", err)
 	}
 }
 
 func TestSelfUpdateChecksumMatch(t *testing.T) {
 	forceBareBinaryUpdate(t)
-	body := []byte("test binary content")
+	body := elfUpdateBodyForHost()
 	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -506,7 +548,7 @@ func TestSelfUpdateChecksumMatch(t *testing.T) {
 	osExecutable = func() (string, error) { return filepath.Join(dir, "test-agent"), nil }
 	osRename = func(string, string) error { return fmt.Errorf("stop before replacing binary") }
 
-	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum, "1.2.3")
 	if err == nil {
 		t.Fatal("expected error (rename is stubbed out)")
 	}
@@ -527,16 +569,28 @@ func TestSelfUpdateFilePermissions(t *testing.T) {
 		osExecutable = origExe
 		osRename = origRename
 	}()
-	dir := t.TempDir()
-	osExecutable = func() (string, error) { return filepath.Join(dir, "test-agent"), nil }
+	exePath := stageExecutable(t)
+	osExecutable = func() (string, error) { return exePath, nil }
 
-	var capturedPath string
+	// The staged file is what the chmod lands on: it is the second rename's
+	// source (backup is first, staged->exe is second). It is deleted by
+	// cleanup on return, so capture its mode from inside the stub.
+	var capturedPerm os.FileMode
+	renames := 0
 	osRename = func(oldpath, newpath string) error {
-		capturedPath = oldpath
-		return fmt.Errorf("stop here") // stop before re-exec
+		renames++
+		if renames == 2 {
+			info, statErr := os.Stat(oldpath)
+			if statErr != nil {
+				t.Fatalf("staged file missing: %v", statErr)
+			}
+			capturedPerm = info.Mode().Perm()
+			return fmt.Errorf("stop here") // stop before re-exec
+		}
+		return os.Rename(oldpath, newpath)
 	}
 
-	body := []byte("binary data")
+	body := elfUpdateBodyForHost()
 	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -548,15 +602,13 @@ func TestSelfUpdateFilePermissions(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	_ = selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
+	_ = selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum, "1.2.3")
 
-	if capturedPath != "" {
-		info, err := os.Stat(capturedPath)
-		if err == nil {
-			if info.Mode().Perm() != 0700 {
-				t.Errorf("expected file permissions 0700, got %o", info.Mode().Perm())
-			}
-		}
+	if renames < 2 {
+		t.Fatalf("expected the staged binary rename, got %d rename calls", renames)
+	}
+	if capturedPerm != 0700 {
+		t.Errorf("expected file permissions 0700, got %o", capturedPerm)
 	}
 }
 
@@ -578,7 +630,7 @@ func TestSelfUpdateTooLarge(t *testing.T) {
 	defer func() { httpDo = origDo }()
 	httpDo = srv.Client().Do
 
-	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum, "1.2.3")
 	if err == nil {
 		t.Error("expected error for oversized download")
 	}
@@ -634,7 +686,7 @@ func TestSanitizeArgs(t *testing.T) {
 
 func TestSelfUpdateInvalidURL(t *testing.T) {
 	forceBareBinaryUpdate(t)
-	err := selfUpdateContext(context.Background(), "://\x7f", "abc123")
+	err := selfUpdateContext(context.Background(), "://\x7f", "abc123", "1.2.3")
 	if err == nil {
 		t.Error("expected error for invalid URL")
 	}
@@ -645,7 +697,7 @@ func TestSelfUpdateInvalidURL(t *testing.T) {
 
 func TestSelfUpdateFullHappyPath(t *testing.T) {
 	forceBareBinaryUpdate(t)
-	body := []byte("test binary content for full path")
+	body := elfUpdateBodyForHost()
 	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -665,8 +717,7 @@ func TestSelfUpdateFullHappyPath(t *testing.T) {
 	}()
 	httpDo = srv.Client().Do
 
-	dir := t.TempDir()
-	exePath := filepath.Join(dir, "test-agent")
+	exePath := stageExecutable(t)
 	osExecutable = func() (string, error) { return exePath, nil }
 	osRename = func(oldpath, newpath string) error {
 		return os.Rename(oldpath, newpath) // real rename within temp dir
@@ -675,7 +726,7 @@ func TestSelfUpdateFullHappyPath(t *testing.T) {
 		return nil // success - don't actually re-exec
 	}
 
-	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum, "1.2.3")
 	if err != nil {
 		t.Errorf("expected nil error on full happy path, got: %v", err)
 	}
@@ -683,7 +734,7 @@ func TestSelfUpdateFullHappyPath(t *testing.T) {
 
 func TestSelfUpdateDrainsSpoolBeforeExec(t *testing.T) {
 	forceBareBinaryUpdate(t)
-	body := []byte("binary payload for drain test")
+	body := elfUpdateBodyForHost()
 	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -704,8 +755,7 @@ func TestSelfUpdateDrainsSpoolBeforeExec(t *testing.T) {
 	}()
 	httpDo = srv.Client().Do
 
-	dir := t.TempDir()
-	exePath := filepath.Join(dir, "test-agent")
+	exePath := stageExecutable(t)
 	osExecutable = func() (string, error) { return exePath, nil }
 	osRename = os.Rename
 
@@ -726,7 +776,7 @@ func TestSelfUpdateDrainsSpoolBeforeExec(t *testing.T) {
 		return nil
 	}
 
-	if err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum); err != nil {
+	if err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum, "1.2.3"); err != nil {
 		t.Fatalf("selfUpdateContext: %v", err)
 	}
 	if !drainCalled {
@@ -742,7 +792,7 @@ func TestSelfUpdateDrainsSpoolBeforeExec(t *testing.T) {
 
 func TestSelfUpdateExecsWhenDrainStalls(t *testing.T) {
 	forceBareBinaryUpdate(t)
-	body := []byte("binary payload for stalled drain test")
+	body := elfUpdateBodyForHost()
 	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -766,8 +816,7 @@ func TestSelfUpdateExecsWhenDrainStalls(t *testing.T) {
 	httpDo = srv.Client().Do
 	spoolDrainTimeout = 20 * time.Millisecond
 
-	dir := t.TempDir()
-	exePath := filepath.Join(dir, "test-agent")
+	exePath := stageExecutable(t)
 	osExecutable = func() (string, error) { return exePath, nil }
 	osRename = os.Rename
 
@@ -783,7 +832,7 @@ func TestSelfUpdateExecsWhenDrainStalls(t *testing.T) {
 		return nil
 	}
 
-	if err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum); err != nil {
+	if err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum, "1.2.3"); err != nil {
 		t.Fatalf("selfUpdateContext: %v", err)
 	}
 	if !execCalled {
@@ -825,7 +874,7 @@ func TestSelfUpdateWriteError(t *testing.T) {
 		return f, nil
 	}
 
-	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum)
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum, "1.2.3")
 	if err == nil {
 		t.Error("expected write error")
 	}
@@ -846,7 +895,7 @@ func TestSelfUpdateResponseHeaderTimeout(t *testing.T) {
 	}
 	selfUpdateTimeout = 10 * time.Millisecond
 
-	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64))
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64), "1.2.3")
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
@@ -890,7 +939,7 @@ func TestSelfUpdateHeaderTimeoutClosesLateResponseBody(t *testing.T) {
 		return nil, errors.New("unexpected temp file")
 	}
 
-	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64))
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64), "1.2.3")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v, want context.DeadlineExceeded", err)
 	}
@@ -921,7 +970,7 @@ func TestSelfUpdateDownloadErrorReportsCancellationCause(t *testing.T) {
 		return nil, errors.New("unexpected temp file")
 	}
 
-	err := selfUpdateContext(ctx, "https://example.com/agent", strings.Repeat("0", 64))
+	err := selfUpdateContext(ctx, "https://example.com/agent", strings.Repeat("0", 64), "1.2.3")
 	if !errors.Is(err, cause) {
 		t.Fatalf("got %v, want cancellation cause %v", err, cause)
 	}
@@ -932,7 +981,7 @@ func TestSelfUpdateDownloadErrorReportsCancellationCause(t *testing.T) {
 
 func TestSelfUpdateSlowProgressingDownloadCompletes(t *testing.T) {
 	forceBareBinaryUpdate(t)
-	body := []byte("slow but steadily progressing update")
+	body := elfUpdateBodyForHost()
 	checksum := fmt.Sprintf("%x", sha256.Sum256(body))
 
 	origDo := httpDo
@@ -986,13 +1035,12 @@ func TestSelfUpdateSlowProgressingDownloadCompletes(t *testing.T) {
 	selfUpdateTimeout = 50 * time.Millisecond
 	selfUpdateIdleTimeout = 500 * time.Millisecond
 
-	dir := t.TempDir()
-	exePath := filepath.Join(dir, "test-agent")
+	exePath := stageExecutable(t)
 	osExecutable = func() (string, error) { return exePath, nil }
 	osRename = os.Rename
 	syscallExec = func(string, []string, []string) error { return nil }
 
-	if err := selfUpdateContext(context.Background(), "https://example.com/agent", checksum); err != nil {
+	if err := selfUpdateContext(context.Background(), "https://example.com/agent", checksum, "1.2.3"); err != nil {
 		t.Fatalf("slow progressing update failed: %v", err)
 	}
 }
@@ -1025,7 +1073,7 @@ func TestSelfUpdateStalledBodyTimesOut(t *testing.T) {
 	selfUpdateTimeout = 500 * time.Millisecond
 	selfUpdateIdleTimeout = 25 * time.Millisecond
 
-	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), strings.Repeat("0", 64))
+	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), strings.Repeat("0", 64), "1.2.3")
 	if err == nil {
 		t.Fatal("expected stalled download body to time out")
 	}
@@ -1111,7 +1159,7 @@ func TestCliTSelfUpdateBuildRequestError(t *testing.T) {
 		return nil, nil
 	}
 
-	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64))
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("0", 64), "1.2.3")
 	if err == nil || !strings.Contains(err.Error(), "build request: unsupported protocol scheme") {
 		t.Fatalf("selfUpdate error = %v, want build request failure", err)
 	}
@@ -1164,7 +1212,7 @@ func TestCliTSelfUpdateTempFileFailures(t *testing.T) {
 				return nil
 			}
 
-			err := selfUpdateContext(context.Background(), downloadURL, checksum)
+			err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3")
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("selfUpdate error = %v, want %q", err, tt.want)
 			}
@@ -1186,7 +1234,7 @@ func TestCliTSelfUpdateTempFileFailures(t *testing.T) {
 
 func TestCliTSelfUpdateSyncDirectoryError(t *testing.T) {
 	forceBareBinaryUpdate(t)
-	body := []byte("payload for directory sync failure")
+	body := elfUpdateBodyForHost()
 	downloadURL, checksum := cliTUpdateServer(t, body)
 
 	origExe := osExecutable
@@ -1212,7 +1260,7 @@ func TestCliTSelfUpdateSyncDirectoryError(t *testing.T) {
 		return nil
 	}
 
-	err := selfUpdateContext(context.Background(), downloadURL, checksum)
+	err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3")
 	if err == nil || !strings.Contains(err.Error(), "sync executable directory") {
 		t.Fatalf("selfUpdate error = %v, want directory sync failure", err)
 	}
@@ -1283,4 +1331,293 @@ func TestPropCliSanitizeArgs(t *testing.T) {
 			}
 		}
 	})
+}
+
+// updateTestServer serves body over TLS and returns the server, download
+// URL and matching checksum.
+func updateTestServer(t *testing.T, body []byte) (*httptest.Server, string, string) {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, rewriteToHTTPS(srv.URL), fmt.Sprintf("%x", sha256.Sum256(body))
+}
+
+// stubUpdateIO replaces the filesystem/HTTP/exec seams the update path
+// touches and restores them on cleanup.
+func stubUpdateIO(t *testing.T, srv *httptest.Server, exePath string) {
+	t.Helper()
+	origDo, origExe, origRename, origExec := httpDo, osExecutable, osRename, syscallExec
+	t.Cleanup(func() {
+		httpDo, osExecutable, osRename, syscallExec = origDo, origExe, origRename, origExec
+	})
+	httpDo = srv.Client().Do
+	osExecutable = func() (string, error) { return exePath, nil }
+	osRename = os.Rename
+	syscallExec = func(string, []string, []string) error { return nil }
+}
+
+func TestSelfUpdateRejectsNonExecutable(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	body := []byte("this is plainly not an ELF binary")
+	srv, downloadURL, checksum := updateTestServer(t, body)
+
+	exePath := stageExecutable(t)
+	origExe, origRename := osExecutable, osRename
+	defer func() { osExecutable, osRename = origExe, origRename }()
+	osExecutable = func() (string, error) { return exePath, nil }
+	origDo := httpDo
+	defer func() { httpDo = origDo }()
+	httpDo = srv.Client().Do
+
+	renamed := false
+	osRename = func(string, string) error {
+		renamed = true
+		return nil
+	}
+
+	err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3")
+	if err == nil || !strings.Contains(err.Error(), "not an executable binary") {
+		t.Fatalf("selfUpdate error = %v, want staged-binary rejection", err)
+	}
+	if renamed {
+		t.Error("running binary was touched for a payload that cannot execute")
+	}
+}
+
+func TestSelfUpdateRejectsWrongArch(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	host, ok := elfMachineForGOARCH()
+	if !ok {
+		t.Skip("test host has no ELF mapping; wrong-arch cannot be constructed")
+	}
+	wrong := elf.EM_X86_64
+	if host == elf.EM_X86_64 {
+		wrong = elf.EM_AARCH64
+	}
+	body := elfUpdateBody(wrong)
+	srv, downloadURL, checksum := updateTestServer(t, body)
+
+	exePath := stageExecutable(t)
+	origDo, origExe, origRename := httpDo, osExecutable, osRename
+	defer func() { httpDo, osExecutable, osRename = origDo, origExe, origRename }()
+	httpDo = srv.Client().Do
+	osExecutable = func() (string, error) { return exePath, nil }
+
+	renamed := false
+	osRename = func(string, string) error {
+		renamed = true
+		return nil
+	}
+
+	err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3")
+	if err == nil || !strings.Contains(err.Error(), "this agent runs") {
+		t.Fatalf("selfUpdate error = %v, want wrong-arch rejection", err)
+	}
+	if renamed {
+		t.Error("running binary was touched for a wrong-arch payload")
+	}
+	// The rejection must leave the running binary's bytes alone.
+	content, _ := os.ReadFile(exePath)
+	if string(content) != "previous binary" {
+		t.Errorf("running binary was modified: %q", content)
+	}
+}
+
+func TestSelfUpdateExecFailureRestoresPrev(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	body := elfUpdateBodyForHost()
+	srv, downloadURL, checksum := updateTestServer(t, body)
+
+	exePath := stageExecutable(t)
+	stubUpdateIO(t, srv, exePath)
+
+	syscallExec = func(string, []string, []string) error {
+		return errors.New("exec format error")
+	}
+
+	err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3")
+	if err == nil || !strings.Contains(err.Error(), "re-exec updated binary") {
+		t.Fatalf("selfUpdate error = %v, want re-exec failure", err)
+	}
+	content, readErr := os.ReadFile(exePath)
+	if readErr != nil || string(content) != "previous binary" {
+		t.Errorf("previous binary not restored: content %q, err %v", content, readErr)
+	}
+	if _, statErr := os.Stat(exePath + ".update-pending"); !os.IsNotExist(statErr) {
+		t.Error("update-pending marker survived an exec failure")
+	}
+}
+
+func TestSelfUpdateHappyPathKeepsPrevAndMarker(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	body := elfUpdateBodyForHost()
+	srv, downloadURL, checksum := updateTestServer(t, body)
+
+	exePath := stageExecutable(t)
+	stubUpdateIO(t, srv, exePath)
+
+	if err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3"); err != nil {
+		t.Fatalf("selfUpdateContext: %v", err)
+	}
+	prev, err := os.ReadFile(exePath + ".prev")
+	if err != nil || string(prev) != "previous binary" {
+		t.Fatalf("backup binary missing or wrong: %q, err %v", prev, err)
+	}
+	marker, err := os.ReadFile(exePath + ".update-pending")
+	if err != nil {
+		t.Fatal("update-pending marker missing after replacement")
+	}
+	if !strings.Contains(string(marker), "1.2.3") {
+		t.Errorf("marker does not carry the target version: %s", marker)
+	}
+}
+
+func TestCheckPendingUpdateArmsWatchdog(t *testing.T) {
+	origExe, origTimeout := osExecutable, updateJoinTimeout
+	defer func() {
+		osExecutable = origExe
+		updateJoinTimeout = origTimeout
+		if timer := updateWatchdog.Swap(nil); timer != nil {
+			timer.Stop()
+		}
+		armedUpdate.Store(nil)
+	}()
+	exePath := stageExecutable(t)
+	osExecutable = func() (string, error) { return exePath, nil }
+	if err := os.WriteFile(exePath+".update-pending", mustJSON(pendingUpdate{Version: "1.2.3"}), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := checkPendingUpdate()
+	if p == nil || p.Attempts != 1 {
+		t.Fatalf("checkPendingUpdate = %+v, want one recorded attempt", p)
+	}
+	if armedUpdate.Load() == nil || updateWatchdog.Load() == nil {
+		t.Fatal("watchdog was not armed for the pending update")
+	}
+	// The attempt counter must persist for the crash-loop bound.
+	data, _ := os.ReadFile(exePath + ".update-pending")
+	var stored pendingUpdate
+	if err := json.Unmarshal(data, &stored); err != nil || stored.Attempts != 1 {
+		t.Fatalf("marker attempts = %+v, err %v; want 1", stored, err)
+	}
+}
+
+func TestWatchdogRollbackRestoresPrev(t *testing.T) {
+	origExe, origTimeout := osExecutable, updateJoinTimeout
+	defer func() {
+		osExecutable = origExe
+		updateJoinTimeout = origTimeout
+		armedUpdate.Store(nil)
+	}()
+	exePath := stageExecutable(t)
+	// The unproven build sits at the exe path; its predecessor is the backup.
+	if err := os.WriteFile(exePath, []byte("unproven binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exePath+".prev", []byte("previous binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exePath+".update-pending", mustJSON(pendingUpdate{Version: "1.2.3"}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	osExecutable = func() (string, error) { return exePath, nil }
+
+	exited := make(chan int, 1)
+	origExit := osExit
+	defer func() { osExit = origExit }()
+	osExit = func(code int) { exited <- code }
+	updateJoinTimeout = 10 * time.Millisecond
+
+	_ = checkPendingUpdate()
+	select {
+	case code := <-exited:
+		if code != 1 {
+			t.Errorf("osExit code = %d, want 1", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog never fired")
+	}
+	content, err := os.ReadFile(exePath)
+	if err != nil || string(content) != "previous binary" {
+		t.Errorf("rollback did not restore previous binary: %q, err %v", content, err)
+	}
+	if _, err := os.Stat(exePath + ".update-pending"); !os.IsNotExist(err) {
+		t.Error("update-pending marker survived the rollback")
+	}
+	res := readUpdateResult()
+	if res == nil || res.Error == "" || res.TargetVersion != "1.2.3" {
+		t.Errorf("failure not recorded for the heartbeat: %+v", res)
+	}
+}
+
+func TestCheckPendingUpdateCrashLoopRollsBack(t *testing.T) {
+	origExe := osExecutable
+	defer func() {
+		osExecutable = origExe
+		armedUpdate.Store(nil)
+	}()
+	exePath := stageExecutable(t)
+	if err := os.WriteFile(exePath, []byte("unproven binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exePath+".prev", []byte("previous binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		exePath+".update-pending",
+		mustJSON(pendingUpdate{Version: "1.2.3", Attempts: maxUpdateBootAttempts}),
+		0600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	osExecutable = func() (string, error) { return exePath, nil }
+
+	exited := make(chan int, 1)
+	origExit := osExit
+	defer func() { osExit = origExit }()
+	osExit = func(code int) { exited <- code }
+
+	_ = checkPendingUpdate()
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("crash-loop bound did not exit")
+	}
+	content, err := os.ReadFile(exePath)
+	if err != nil || string(content) != "previous binary" {
+		t.Errorf("crash-loop rollback did not restore previous binary: %q, err %v", content, err)
+	}
+}
+
+func TestUpdateJoinedClearsPending(t *testing.T) {
+	origExe := osExecutable
+	defer func() {
+		osExecutable = origExe
+		armedUpdate.Store(nil)
+		if timer := updateWatchdog.Swap(nil); timer != nil {
+			timer.Stop()
+		}
+	}()
+	exePath := stageExecutable(t)
+	osExecutable = func() (string, error) { return exePath, nil }
+	if err := os.WriteFile(exePath+".update-pending", mustJSON(pendingUpdate{Version: "1.2.3"}), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := checkPendingUpdate()
+	if p == nil {
+		t.Fatal("pending update was not armed")
+	}
+	updateJoined()
+
+	if _, err := os.Stat(exePath + ".update-pending"); !os.IsNotExist(err) {
+		t.Error("update-pending marker survived a joined session")
+	}
+	res := readUpdateResult()
+	if res == nil || res.Error != "" || res.TargetVersion != "1.2.3" {
+		t.Errorf("success not recorded for the heartbeat: %+v", res)
+	}
 }

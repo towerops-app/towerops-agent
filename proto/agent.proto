@@ -430,6 +430,14 @@ message AgentHeartbeat {
   // server-defined plan engine). The server dispatches a plan-based backup
   // only to an agent listing it; agents without it still take MikroTik jobs.
   repeated string config_backup_features = 12;
+  // Outcome of the last self-update attempt. All three are absent ("", 0)
+  // until the agent has applied one update since the reporting build shipped;
+  // a successful update clears update_error. The server records them so the
+  // fleet page can show what an update actually did instead of only what it
+  // was told to do (issue #2736).
+  string update_target_version = 13;
+  string update_error = 14;
+  int64 update_attempted_at = 15;
 }
 
 message AgentError {
