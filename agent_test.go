@@ -3454,6 +3454,94 @@ func TestSessionLoopRetainsRetryWhenWriterQueueStalls(t *testing.T) {
 	}
 }
 
+// Issue 2757: a process shutdown used to exit with the whole spool still
+// in memory. The session loop now drains through the same budget the
+// self-update path uses, so a queued result is written before the loop
+// returns.
+func TestSessionLoopFlushesQueuedResultsOnShutdown(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	results := newResultQueue(4)
+	want := outbound{event: "result", payload: json.RawMessage(`{"check":"flushed"}`)}
+	if !results.enqueue(want) {
+		t.Fatal("failed to seed result queue")
+	}
+
+	writeCh := make(chan writeRequest, 4)
+	pools := &jobPools{
+		snmp:     newWorkerPool(1),
+		mikrotik: newWorkerPool(1),
+		ping:     newWorkerPool(1),
+		checks:   newWorkerPool(1),
+		backup:   newWorkerPool(1),
+		targets:  &targetGates{},
+	}
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     cancel,
+		writeCh:    writeCh,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		notices:    make(chan outbound, 1),
+		results:    results,
+		pools:      pools,
+		scheduler:  newRecurringScheduler(sessionCtx, realScheduleClock{}),
+	}
+	s.refCounter.Store(1)
+	// The drain records the session globally; leave no entry behind for the
+	// next test's abortDrainedSession to pick up.
+	t.Cleanup(func() { drainedSession.CompareAndSwap(s, nil) })
+
+	done := make(chan error, 1)
+	go func() { done <- s.loop(parent) }()
+
+	// Ack every frame the writer queues so the drain can observe an empty
+	// spool; record the first result frame for the payload assertion.
+	sent := make(chan writeRequest, 1)
+	go func() {
+		for req := range writeCh {
+			if req.ack != nil {
+				req.ack <- nil
+			}
+			select {
+			case sent <- req:
+			default:
+			}
+		}
+	}()
+
+	cancelParent()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("session loop error = %v, want graceful shutdown", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("session loop did not exit within the shutdown budget")
+	}
+
+	select {
+	case req := <-sent:
+		if !strings.Contains(string(req.data), "flushed") {
+			t.Fatalf("written frame = %q, want the queued result payload", req.data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no result frame reached the writer before shutdown")
+	}
+
+	if !pools.stopAccepting.Load() {
+		t.Fatal("shutdown drain did not stop new work intake")
+	}
+	if len(results.items) != 0 {
+		t.Fatalf("spool still holds %d results after the drain", len(results.items))
+	}
+}
+
 func TestQueueResultWriteReportsWriterFailure(t *testing.T) {
 	sessionCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
