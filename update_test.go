@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -41,7 +42,7 @@ func elfUpdateBody(machine elf.Machine) []byte {
 // elfUpdateBodyForHost builds a payload matching this test host's arch, the
 // only arch validateStagedBinary accepts.
 func elfUpdateBodyForHost() []byte {
-	machine, ok := elfMachineForGOARCH()
+	machine, ok := elfMachineForGOARCH(runtime.GOARCH)
 	if !ok {
 		// A host with no ELF mapping accepts any ELF executable.
 		return elfUpdateBody(elf.EM_X86_64)
@@ -1388,7 +1389,7 @@ func TestSelfUpdateRejectsNonExecutable(t *testing.T) {
 
 func TestSelfUpdateRejectsWrongArch(t *testing.T) {
 	forceBareBinaryUpdate(t)
-	host, ok := elfMachineForGOARCH()
+	host, ok := elfMachineForGOARCH(runtime.GOARCH)
 	if !ok {
 		t.Skip("test host has no ELF mapping; wrong-arch cannot be constructed")
 	}
@@ -1619,5 +1620,356 @@ func TestUpdateJoinedClearsPending(t *testing.T) {
 	res := readUpdateResult()
 	if res == nil || res.Error != "" || res.TargetVersion != "1.2.3" {
 		t.Errorf("success not recorded for the heartbeat: %+v", res)
+	}
+}
+
+// TestUpdatePathHelpersError covers the executable-resolution failure shared
+// by the marker and result path helpers and the readers built on them.
+func TestUpdatePathHelpersError(t *testing.T) {
+	origExe := osExecutable
+	defer func() { osExecutable = origExe }()
+	osExecutable = func() (string, error) { return "", errors.New("no executable") }
+
+	if path, err := pendingUpdatePath(); err == nil || path != "" {
+		t.Errorf("pendingUpdatePath = %q, %v; want an error", path, err)
+	}
+	if path, err := updateResultPath(); err == nil || path != "" {
+		t.Errorf("updateResultPath = %q, %v; want an error", path, err)
+	}
+	if res := readUpdateResult(); res != nil {
+		t.Errorf("readUpdateResult = %+v without a resolvable path, want nil", res)
+	}
+	writeUpdateResult(updateResult{TargetVersion: "1.2.3", Error: "boom"}) // must not panic
+}
+
+// TestReadUpdateResultMissingAndCorrupt covers the outcome-file states that
+// must read as "never attempted" instead of surfacing an error.
+func TestReadUpdateResultMissingAndCorrupt(t *testing.T) {
+	origExe := osExecutable
+	defer func() { osExecutable = origExe }()
+	exePath := stageExecutable(t)
+	osExecutable = func() (string, error) { return exePath, nil }
+
+	if res := readUpdateResult(); res != nil {
+		t.Errorf("readUpdateResult on missing file = %+v, want nil", res)
+	}
+	if err := os.WriteFile(exePath+".update-result", []byte("{not json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if res := readUpdateResult(); res != nil {
+		t.Errorf("readUpdateResult on corrupt file = %+v, want nil", res)
+	}
+}
+
+// TestWriteUpdateResultErrorPaths covers the logged-only failure modes of the
+// outcome writer: unresolvable path, encode failure, unwritable path.
+func TestWriteUpdateResultErrorPaths(t *testing.T) {
+	origExe, origResultPath, origMarshal := osExecutable, updateResultPath, jsonMarshal
+	defer func() { osExecutable, updateResultPath, jsonMarshal = origExe, origResultPath, origMarshal }()
+
+	osExecutable = func() (string, error) { return "", errors.New("no executable") }
+	writeUpdateResult(updateResult{TargetVersion: "1.2.3", Error: "boom"}) // must not panic
+
+	exePath := stageExecutable(t)
+	osExecutable = func() (string, error) { return exePath, nil }
+	jsonMarshal = func(any) ([]byte, error) { return nil, errors.New("encode failed") }
+	writeUpdateResult(updateResult{TargetVersion: "1.2.3"})
+	if _, err := os.Stat(exePath + ".update-result"); !os.IsNotExist(err) {
+		t.Error("outcome file written despite an encode failure")
+	}
+
+	jsonMarshal = json.Marshal
+	updateResultPath = func() (string, error) {
+		return filepath.Join(exePath, "missing-dir", "agent.update-result"), nil
+	}
+	writeUpdateResult(updateResult{TargetVersion: "1.2.3"}) // must not panic
+}
+
+// TestCheckPendingUpdateUnresolvableExecutable covers the startup guard's
+// behavior when the executable path cannot be resolved: stay out of the way.
+func TestCheckPendingUpdateUnresolvableExecutable(t *testing.T) {
+	origExe := osExecutable
+	defer func() { osExecutable = origExe }()
+	osExecutable = func() (string, error) { return "", errors.New("no executable") }
+	if p := checkPendingUpdate(); p != nil {
+		t.Errorf("checkPendingUpdate = %+v, want nil without a resolvable executable", p)
+	}
+}
+
+// TestCheckPendingUpdateCorruptMarker covers an unreadable marker: it must be
+// removed and never arm the watchdog.
+func TestCheckPendingUpdateCorruptMarker(t *testing.T) {
+	origExe := osExecutable
+	defer func() {
+		osExecutable = origExe
+		armedUpdate.Store(nil)
+	}()
+	exePath := stageExecutable(t)
+	osExecutable = func() (string, error) { return exePath, nil }
+	if err := os.WriteFile(exePath+".update-pending", []byte("{not json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if p := checkPendingUpdate(); p != nil {
+		t.Errorf("checkPendingUpdate = %+v, want nil for a corrupt marker", p)
+	}
+	if _, err := os.Stat(exePath + ".update-pending"); !os.IsNotExist(err) {
+		t.Error("corrupt marker was not removed")
+	}
+	if armedUpdate.Load() != nil {
+		t.Error("watchdog armed for a corrupt marker")
+	}
+}
+
+// TestCheckPendingUpdateArmsWhenMarkerRewriteFails covers a read-only marker:
+// the attempt count cannot persist, but the boot must still be guarded.
+func TestCheckPendingUpdateArmsWhenMarkerRewriteFails(t *testing.T) {
+	origExe := osExecutable
+	defer func() {
+		osExecutable = origExe
+		if timer := updateWatchdog.Swap(nil); timer != nil {
+			timer.Stop()
+		}
+		armedUpdate.Store(nil)
+	}()
+	exePath := stageExecutable(t)
+	osExecutable = func() (string, error) { return exePath, nil }
+	marker := exePath + ".update-pending"
+	if err := os.WriteFile(marker, mustJSON(pendingUpdate{Version: "1.2.3"}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(marker, 0400); err != nil {
+		t.Fatal(err)
+	}
+
+	p := checkPendingUpdate()
+	if p == nil || p.Attempts != 1 {
+		t.Fatalf("checkPendingUpdate = %+v, want one recorded attempt", p)
+	}
+	if updateWatchdog.Load() == nil {
+		t.Error("watchdog not armed despite the marker rewrite failure")
+	}
+}
+
+// TestRollbackUpdateWithoutExecutable covers a rollback that cannot resolve
+// the executable path: nothing may be touched.
+func TestRollbackUpdateWithoutExecutable(t *testing.T) {
+	origExe := osExecutable
+	defer func() { osExecutable = origExe }()
+	exePath := stageExecutable(t)
+	osExecutable = func() (string, error) { return "", errors.New("no executable") }
+	if err := os.WriteFile(exePath+".update-pending", mustJSON(pendingUpdate{Version: "1.2.3"}), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	rollbackUpdate("executable unresolvable")
+	if _, err := os.Stat(exePath + ".update-pending"); err != nil {
+		t.Errorf("pending marker disturbed by a rollback without an executable: %v", err)
+	}
+}
+
+// TestRollbackUpdateRestoreFailure covers the rename failure inside a
+// rollback: the failure and the failed restore both reach the outcome file.
+func TestRollbackUpdateRestoreFailure(t *testing.T) {
+	origExe, origRename := osExecutable, osRename
+	defer func() {
+		osExecutable, osRename = origExe, origRename
+		armedUpdate.Store(nil)
+	}()
+	exePath := stageExecutable(t)
+	if err := os.WriteFile(exePath, []byte("unproven binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exePath+".prev", []byte("previous binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exePath+".update-pending", mustJSON(pendingUpdate{Version: "1.2.3"}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	osExecutable = func() (string, error) { return exePath, nil }
+	osRename = func(string, string) error { return errors.New("device busy") }
+
+	rollbackUpdate("watchdog fired")
+	res := readUpdateResult()
+	if res == nil || res.TargetVersion != "1.2.3" || !strings.Contains(res.Error, "rollback failed") {
+		t.Errorf("rollback failure not recorded: %+v", res)
+	}
+}
+
+// TestRollbackUpdateSyncFailure covers a failed post-restore fsync: the
+// restore still stands and the outcome records only the original reason.
+func TestRollbackUpdateSyncFailure(t *testing.T) {
+	origExe, origSync := osExecutable, syncDirectory
+	defer func() {
+		osExecutable, syncDirectory = origExe, origSync
+		armedUpdate.Store(nil)
+	}()
+	exePath := stageExecutable(t)
+	if err := os.WriteFile(exePath, []byte("unproven binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exePath+".prev", []byte("previous binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	osExecutable = func() (string, error) { return exePath, nil }
+	syncDirectory = func(string) error { return errors.New("sync failed") }
+
+	rollbackUpdate("did not join")
+	content, err := os.ReadFile(exePath)
+	if err != nil || string(content) != "previous binary" {
+		t.Errorf("fsync failure disturbed the restore: %q, err %v", content, err)
+	}
+	res := readUpdateResult()
+	if res == nil || res.Error != "did not join" {
+		t.Errorf("outcome = %+v, want the original reason only", res)
+	}
+}
+
+// TestValidateStagedBinaryRejectsNonExecutableELF covers a well-formed ELF
+// whose type is neither executable nor shared object (e.g. a relocatable).
+func TestValidateStagedBinaryRejectsNonExecutableELF(t *testing.T) {
+	body := elfUpdateBodyForHost()
+	binary.LittleEndian.PutUint16(body[16:], uint16(elf.ET_REL))
+	path := filepath.Join(t.TempDir(), "staged")
+	if err := os.WriteFile(path, body, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	err := validateStagedBinary(path, runtime.GOARCH)
+	if err == nil || !strings.Contains(err.Error(), "not an executable binary") {
+		t.Fatalf("validateStagedBinary = %v, want an ELF-type rejection", err)
+	}
+}
+
+// TestValidateStagedBinaryArchetable covers the GOARCH to ELF machine table,
+// the unmapped-GOARCH acceptance, and a machine mismatch.
+func TestValidateStagedBinaryArchetable(t *testing.T) {
+	for _, tc := range []struct {
+		goarch  string
+		machine elf.Machine
+		mapped  bool
+	}{
+		{"amd64", elf.EM_X86_64, true},
+		{"386", elf.EM_386, true},
+		{"arm64", elf.EM_AARCH64, true},
+		{"arm", elf.EM_ARM, true},
+		{"riscv64", elf.EM_RISCV, true},
+		{"s390x", elf.EM_NONE, false},
+	} {
+		machine, mapped := elfMachineForGOARCH(tc.goarch)
+		if machine != tc.machine || mapped != tc.mapped {
+			t.Errorf("elfMachineForGOARCH(%q) = %s, %v; want %s, %v", tc.goarch, machine, mapped, tc.machine, tc.mapped)
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "staged")
+	if err := os.WriteFile(path, elfUpdateBody(elf.EM_X86_64), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStagedBinary(path, "s390x"); err != nil {
+		t.Errorf("validateStagedBinary with an unmapped GOARCH = %v, want nil", err)
+	}
+	err := validateStagedBinary(path, "arm64")
+	if err == nil || !strings.Contains(err.Error(), "this agent runs") {
+		t.Fatalf("validateStagedBinary = %v, want a machine mismatch", err)
+	}
+}
+
+// TestMustJSONUnmarshalable covers the defensive nil return for values the
+// encoding package rejects.
+func TestMustJSONUnmarshalable(t *testing.T) {
+	if got := mustJSON(make(chan int)); got != nil {
+		t.Errorf("mustJSON = %v, want nil for an unmarshalable value", got)
+	}
+}
+
+// TestSelfUpdateMarkerPathFallback covers the marker-path helper failing
+// mid-update: the marker must still land beside the executable.
+func TestSelfUpdateMarkerPathFallback(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	body := elfUpdateBodyForHost()
+	srv, downloadURL, checksum := updateTestServer(t, body)
+	exePath := stageExecutable(t)
+	stubUpdateIO(t, srv, exePath)
+
+	origPending := pendingUpdatePath
+	defer func() { pendingUpdatePath = origPending }()
+	pendingUpdatePath = func() (string, error) { return "", errors.New("no marker path") }
+
+	if err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3"); err != nil {
+		t.Fatalf("selfUpdateContext: %v", err)
+	}
+	marker, err := os.ReadFile(exePath + ".update-pending")
+	if err != nil || !strings.Contains(string(marker), "1.2.3") {
+		t.Errorf("marker missing from the fallback path: %q, err %v", marker, err)
+	}
+}
+
+// TestSelfUpdateStagedRenameFailureRestoresPrev covers the staged build
+// failing to land and the restore failing with it.
+func TestSelfUpdateStagedRenameFailureRestoresPrev(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	body := elfUpdateBodyForHost()
+	srv, downloadURL, checksum := updateTestServer(t, body)
+	exePath := stageExecutable(t)
+	stubUpdateIO(t, srv, exePath)
+
+	osRename = func(oldpath, newpath string) error {
+		// Fail every rename that puts something new at the exe path:
+		// the staged build and the attempted restore. The backup (old
+		// exe moving aside) still succeeds.
+		if oldpath != exePath && newpath == exePath {
+			return errors.New("device busy")
+		}
+		return os.Rename(oldpath, newpath)
+	}
+
+	err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3")
+	if err == nil || !strings.Contains(err.Error(), "and restore failed") {
+		t.Fatalf("selfUpdate error = %v, want a combined rename failure", err)
+	}
+	// Both renames failed: the exe path is empty and the running build sits
+	// untouched at the backup path for the operator to restore.
+	if _, statErr := os.Stat(exePath); !os.IsNotExist(statErr) {
+		t.Errorf("something was left at the exe path: %v", statErr)
+	}
+	prev, readErr := os.ReadFile(exePath + ".prev")
+	if readErr != nil || string(prev) != "previous binary" {
+		t.Errorf("backup binary missing or wrong: %q, err %v", prev, readErr)
+	}
+}
+
+// TestSelfUpdateExecFailureRestoreFailure covers a re-exec failure whose
+// restore rename also fails: the error surfaces and the marker is dropped so
+// the next boot is not treated as unproven.
+func TestSelfUpdateExecFailureRestoreFailure(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	body := elfUpdateBodyForHost()
+	srv, downloadURL, checksum := updateTestServer(t, body)
+	exePath := stageExecutable(t)
+	stubUpdateIO(t, srv, exePath)
+
+	calls := 0
+	osRename = func(oldpath, newpath string) error {
+		calls++
+		if calls == 3 { // backup, staged replacement, then the failed restore
+			return errors.New("device busy")
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	syscallExec = func(string, []string, []string) error {
+		return errors.New("exec format error")
+	}
+
+	err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3")
+	if err == nil || !strings.Contains(err.Error(), "re-exec updated binary") {
+		t.Fatalf("selfUpdate error = %v, want a re-exec failure", err)
+	}
+	content, readErr := os.ReadFile(exePath)
+	if readErr != nil || string(content) != string(body) {
+		t.Errorf("staged binary not in place after the failed restore: err %v", readErr)
+	}
+	if _, statErr := os.Stat(exePath + ".update-pending"); !os.IsNotExist(statErr) {
+		t.Error("update-pending marker survived an exec failure with a failed restore")
 	}
 }

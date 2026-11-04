@@ -52,6 +52,9 @@ var syscallExec = syscall.Exec
 // osExit is a var so tests can intercept the rollback path's exit.
 var osExit = os.Exit
 
+// jsonMarshal is a seam so tests can fail the update result encode.
+var jsonMarshal = json.Marshal
+
 // updateJoinTimeout bounds how long a freshly replaced binary may run without
 // joining its channel before the startup guard restores the previous build.
 // Reaching the guard at all means the binary booted; staying offline past the
@@ -127,7 +130,7 @@ func writeUpdateResult(res updateResult) {
 		slog.Warn("cannot resolve update result path", "error", err)
 		return
 	}
-	data, err := json.Marshal(res)
+	data, err := jsonMarshal(res)
 	if err != nil {
 		slog.Warn("cannot encode update result", "error", err)
 		return
@@ -270,7 +273,7 @@ func rollbackUpdate(reason string) {
 // must fail before the running binary is touched, not after (issue #2736).
 // Builds whose GOARCH has no ELF mapping (darwin test hosts run the binary
 // fine; the check matters for linux releases) skip the arch check only.
-func validateStagedBinary(path string) error {
+func validateStagedBinary(path, goarch string) error {
 	f, err := elfOpen(path)
 	if err != nil {
 		return fmt.Errorf("staged update is not an executable binary: %w", err)
@@ -279,7 +282,7 @@ func validateStagedBinary(path string) error {
 	if f.Type != elf.ET_EXEC && f.Type != elf.ET_DYN {
 		return fmt.Errorf("staged update is not an executable binary (ELF type %s)", f.Type)
 	}
-	want, ok := elfMachineForGOARCH()
+	want, ok := elfMachineForGOARCH(goarch)
 	if !ok {
 		return nil
 	}
@@ -291,8 +294,8 @@ func validateStagedBinary(path string) error {
 
 var elfOpen = elf.Open
 
-func elfMachineForGOARCH() (elf.Machine, bool) {
-	switch runtime.GOARCH {
+func elfMachineForGOARCH(goarch string) (elf.Machine, bool) {
+	switch goarch {
 	case "amd64":
 		return elf.EM_X86_64, true
 	case "386":
@@ -535,7 +538,7 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum, versi
 
 	// A wrong-architecture or non-executable download must be refused here,
 	// while the running binary is still untouched.
-	if err := validateStagedBinary(tempPath); err != nil {
+	if err := validateStagedBinary(tempPath, runtime.GOARCH); err != nil {
 		return fmt.Errorf("rejecting staged update: %w", err)
 	}
 
