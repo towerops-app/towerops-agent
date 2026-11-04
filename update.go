@@ -7,7 +7,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"debug/elf"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,7 +49,276 @@ var httpDo = func(req *http.Request) (*http.Response, error) {
 }
 var syscallExec = syscall.Exec
 
-// drainResultSpool bounds how long the update path waits for the result spool
+// osExit is a var so tests can intercept the rollback path's exit.
+var osExit = os.Exit
+
+// jsonMarshal is a seam so tests can fail the update result encode.
+var jsonMarshal = json.Marshal
+
+// updateJoinTimeout bounds how long a freshly replaced binary may run without
+// joining its channel before the startup guard restores the previous build.
+// Reaching the guard at all means the binary booted; staying offline past the
+// window is treated as a failed update, not a flaky link, because the agent
+// still cannot do its job (issue #2736).
+var updateJoinTimeout = 120 * time.Second
+
+// maxUpdateBootAttempts bounds the crash-loop case: a build that dies before
+// arming the watchdog still increments its own attempt counter at startup, so
+// repeated crashes converge on a rollback instead of restarting forever.
+const maxUpdateBootAttempts = 3
+
+// pendingUpdate is the marker file written beside the binary before re-exec.
+// It survives the exec, so the next boot knows it is running an unproven build.
+type pendingUpdate struct {
+	Version  string `json:"version"`
+	Attempts int    `json:"attempts"`
+}
+
+// updateResult is the outcome file the heartbeat reports to the server. It
+// lives next to the binary so the re-execd process, or the process that ran
+// before a failed exec, both find it at the same path.
+type updateResult struct {
+	TargetVersion string `json:"target_version"`
+	Error         string `json:"error"`
+	AttemptedAt   int64  `json:"attempted_at"`
+}
+
+var updateAttemptedAtUnix = time.Now
+
+// pendingUpdatePath locates the marker beside the executable. The path is a
+// var so tests can point it at a temp dir without an osExecutable stub.
+var pendingUpdatePath = func() (string, error) {
+	exe, err := osExecutable()
+	if err != nil {
+		return "", err
+	}
+	return exe + ".update-pending", nil
+}
+
+var updateResultPath = func() (string, error) {
+	exe, err := osExecutable()
+	if err != nil {
+		return "", err
+	}
+	return exe + ".update-result", nil
+}
+
+// readUpdateResult returns the last recorded outcome, or nil when the agent
+// has never completed an update attempt since this build shipped.
+func readUpdateResult() *updateResult {
+	path, err := updateResultPath()
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	res := &updateResult{}
+	if err := json.Unmarshal(data, res); err != nil {
+		return nil
+	}
+	return res
+}
+
+// writeUpdateResult persists an outcome so heartbeat reports survive re-exec.
+// Failure is logged, not propagated: reporting must never break the update
+// path or the reconnect loop it runs inside.
+func writeUpdateResult(res updateResult) {
+	path, err := updateResultPath()
+	if err != nil {
+		slog.Warn("cannot resolve update result path", "error", err)
+		return
+	}
+	data, err := jsonMarshal(res)
+	if err != nil {
+		slog.Warn("cannot encode update result", "error", err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		slog.Warn("cannot write update result", "path", path, "error", err)
+	}
+}
+
+// recordUpdateFailure stamps a failed attempt. The agent reports it on the
+// next heartbeat; a box that cannot reach the server at all keeps the file
+// until it can.
+func recordUpdateFailure(version string, err error) {
+	writeUpdateResult(updateResult{
+		TargetVersion: version,
+		Error:         err.Error(),
+		AttemptedAt:   updateAttemptedAtUnix().Unix(),
+	})
+}
+
+// recordUpdateSuccess clears the failure state: the last attempt applied, so
+// the result carries an empty error and the server resets its offer budget.
+func recordUpdateSuccess(version string, attemptedAt int64) {
+	writeUpdateResult(updateResult{
+		TargetVersion: version,
+		Error:         "",
+		AttemptedAt:   attemptedAt,
+	})
+}
+
+// updateWatchdog is the running-join timer for an unproven build. Exactly one
+// pending update can be armed at a time.
+var updateWatchdog atomic.Pointer[time.Timer]
+
+// armedUpdate is the unproven build the watchdog guards, read back by
+// updateJoined when a session proves it.
+var armedUpdate atomic.Pointer[pendingUpdate]
+
+// checkPendingUpdate runs at startup. With no marker it is a no-op. With a
+// marker it counts this boot as an attempt of the unproven build: past the
+// crash-loop bound it restores the previous binary immediately, otherwise it
+// arms the watchdog that rolls back if no session joins in time. It returns
+// the pending record so the caller can finish cleanup on a successful join.
+func checkPendingUpdate() *pendingUpdate {
+	path, err := pendingUpdatePath()
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	p := &pendingUpdate{}
+	if err := json.Unmarshal(data, p); err != nil {
+		slog.Warn("removing unreadable update marker", "path", path, "error", err)
+		_ = os.Remove(path)
+		return nil
+	}
+
+	p.Attempts++
+	if p.Attempts > maxUpdateBootAttempts {
+		slog.Error("updated binary crashed before joining repeatedly; restoring previous build",
+			"version", p.Version, "attempts", p.Attempts)
+		rollbackUpdate(fmt.Sprintf("updated binary failed to join within %d boots", maxUpdateBootAttempts))
+		osExit(1)
+		return nil
+	}
+
+	if err := os.WriteFile(path, mustJSON(p), 0600); err != nil {
+		slog.Warn("cannot update attempt count in update marker", "path", path, "error", err)
+	}
+
+	timer := time.AfterFunc(updateJoinTimeout, func() {
+		slog.Error("updated binary did not join its channel; restoring previous build",
+			"version", p.Version, "timeout", updateJoinTimeout)
+		rollbackUpdate(fmt.Sprintf("updated binary did not join its channel within %s", updateJoinTimeout))
+		osExit(1)
+	})
+	updateWatchdog.Store(timer)
+	armedUpdate.Store(p)
+	return p
+}
+
+// updateJoined clears the pending state once a session join proves the new
+// build works: the watchdog is stopped, the marker removed, and success
+// recorded for the heartbeat. With nothing armed it is a no-op.
+func updateJoined() {
+	p := armedUpdate.Swap(nil)
+	if p == nil {
+		return
+	}
+	if timer := updateWatchdog.Swap(nil); timer != nil {
+		timer.Stop()
+	}
+	if path, err := pendingUpdatePath(); err == nil {
+		_ = os.Remove(path)
+	}
+	recordUpdateSuccess(p.Version, updateAttemptedAtUnix().Unix())
+	slog.Info("self-update verified: session joined", "version", p.Version)
+}
+
+// rollbackUpdate restores the previous binary over the unproven one and
+// records the failure so the heartbeat that eventually runs reports it.
+// The marker is removed regardless: whatever happens next boot must not be
+// treated as still-unproven.
+func rollbackUpdate(reason string) {
+	exe, err := osExecutable()
+	if err != nil {
+		slog.Error("cannot resolve executable for update rollback", "error", err)
+		return
+	}
+	prev := exe + ".prev"
+	path, perr := pendingUpdatePath()
+	var pending pendingUpdate
+	if perr == nil {
+		if data, rerr := os.ReadFile(path); rerr == nil {
+			_ = json.Unmarshal(data, &pending)
+		}
+		_ = os.Remove(path)
+	}
+	if timer := updateWatchdog.Swap(nil); timer != nil {
+		timer.Stop()
+	}
+	armedUpdate.Store(nil)
+	if err := osRename(prev, exe); err != nil {
+		slog.Error("update rollback failed: cannot restore previous binary",
+			"prev", prev, "error", err)
+		recordUpdateFailure(pending.Version, fmt.Errorf("%s; rollback failed: %w", reason, err))
+		return
+	}
+	if err := syncDirectory(filepath.Dir(exe)); err != nil {
+		slog.Warn("fsync after update rollback failed", "error", err)
+	}
+	slog.Warn("restored previous agent binary after failed update", "reason", reason)
+	recordUpdateFailure(pending.Version, errors.New(reason))
+}
+
+// validateStagedBinary rejects a staged download that cannot execute here:
+// anything that is not a real ELF executable for this machine's architecture
+// must fail before the running binary is touched, not after (issue #2736).
+// Builds whose GOARCH has no ELF mapping (darwin test hosts run the binary
+// fine; the check matters for linux releases) skip the arch check only.
+func validateStagedBinary(path, goarch string) error {
+	f, err := elfOpen(path)
+	if err != nil {
+		return fmt.Errorf("staged update is not an executable binary: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	if f.Type != elf.ET_EXEC && f.Type != elf.ET_DYN {
+		return fmt.Errorf("staged update is not an executable binary (ELF type %s)", f.Type)
+	}
+	want, ok := elfMachineForGOARCH(goarch)
+	if !ok {
+		return nil
+	}
+	if f.Machine != want {
+		return fmt.Errorf("staged update is for %s, this agent runs %s", f.Machine, want)
+	}
+	return nil
+}
+
+var elfOpen = elf.Open
+
+func elfMachineForGOARCH(goarch string) (elf.Machine, bool) {
+	switch goarch {
+	case "amd64":
+		return elf.EM_X86_64, true
+	case "386":
+		return elf.EM_386, true
+	case "arm64":
+		return elf.EM_AARCH64, true
+	case "arm":
+		return elf.EM_ARM, true
+	case "riscv64":
+		return elf.EM_RISCV, true
+	default:
+		return elf.EM_NONE, false
+	}
+}
+
+func mustJSON(v any) []byte {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
 // to flush before re-exec. It holds a func(ctx context.Context) bool reporting
 // whether the spool emptied in time; the agent/session layer registers it once
 // a resultQueue exists. No hook means nothing is drained — exec proceeds
@@ -145,9 +417,14 @@ func (r *updateIdleReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// selfUpdateContext downloads a new binary, verifies its checksum, replaces
-// the current binary, and re-execs while honoring caller cancellation.
-func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string) error {
+// selfUpdateContext downloads a new binary, verifies its checksum and that it
+// is an executable for this machine, replaces the current binary, and
+// re-execs while honoring caller cancellation. The running binary is first
+// moved aside as <exe>.prev and an update-pending marker is written before
+// exec, so a build that never joins its channel is rolled back on startup
+// rather than left crash-looping (issue #2736). version is the release the
+// server targeted; it labels the reported outcome.
+func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum, version string) error {
 	if runningInContainer() {
 		return errSelfUpdateInContainer
 	}
@@ -259,11 +536,39 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string
 		return fmt.Errorf("update canceled before replacement: %w", cause)
 	}
 
-	// Replace current binary (atomic on same filesystem)
+	// A wrong-architecture or non-executable download must be refused here,
+	// while the running binary is still untouched.
+	if err := validateStagedBinary(tempPath, runtime.GOARCH); err != nil {
+		return fmt.Errorf("rejecting staged update: %w", err)
+	}
+
+	// Keep the running build restorable: move it aside, put the staged build
+	// in place, and mark the update pending so the next boot knows the binary
+	// under the executable path is unproven. An exec that fails below leaves
+	// everything it changed reversible from this same process.
+	prevExe := currentExe + ".prev"
+	if err := osRename(currentExe, prevExe); err != nil {
+		return fmt.Errorf("backup current binary: %w", err)
+	}
 	if err := osRename(tempPath, currentExe); err != nil {
-		return fmt.Errorf("rename: %w", err)
+		// The staged build failed to land; put the running one back.
+		if restoreErr := osRename(prevExe, currentExe); restoreErr != nil {
+			return fmt.Errorf("rename new binary: %w (and restore failed: %v)", err, restoreErr)
+		}
+		return fmt.Errorf("rename new binary: %w", err)
 	}
 	slog.Warn("replaced binary does not inherit file capabilities granted with setcap", "path", currentExe)
+
+	markerPath, err := pendingUpdatePath()
+	if err != nil {
+		markerPath = currentExe + ".update-pending"
+	}
+	marker := pendingUpdate{Version: version, Attempts: 0}
+	if err := os.WriteFile(markerPath, mustJSON(marker), 0600); err != nil {
+		slog.Warn("cannot write update-pending marker; a bad build cannot self-recover",
+			"path", markerPath, "error", err)
+	}
+
 	if err := syncDirectory(filepath.Dir(currentExe)); err != nil {
 		return fmt.Errorf("sync executable directory: %w", err)
 	}
@@ -283,7 +588,23 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum string
 
 	// Re-exec with same arguments
 	slog.Info("re-executing", "args", sanitizeArgs(os.Args))
-	return syscallExec(currentExe, os.Args, os.Environ())
+	execErr := syscallExec(currentExe, os.Args, os.Environ())
+	if execErr == nil {
+		// A real syscall.Exec never returns; a nil return means the caller
+		// stubbed it and the process is considered replaced.
+		return nil
+	}
+
+	// Only an exec failure reaches here: the staged build never ran, so this
+	// process is still the working one. Restore the previous binary, drop the
+	// marker it would trip over next boot, and surface the error.
+	slog.Error("re-exec of updated binary failed; restoring previous build",
+		"path", currentExe, "error", execErr)
+	if restoreErr := osRename(prevExe, currentExe); restoreErr != nil {
+		slog.Error("restore of previous binary failed", "error", restoreErr)
+	}
+	_ = os.Remove(markerPath)
+	return fmt.Errorf("re-exec updated binary: %w", execErr)
 }
 
 // syncDirectory is a var so tests can fail the post-rename fsync.

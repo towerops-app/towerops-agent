@@ -3065,8 +3065,16 @@ type AgentHeartbeat struct {
 	// server-defined plan engine). The server dispatches a plan-based backup
 	// only to an agent listing it; agents without it still take MikroTik jobs.
 	ConfigBackupFeatures []string `protobuf:"bytes,12,rep,name=config_backup_features,json=configBackupFeatures,proto3" json:"config_backup_features,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Outcome of the last self-update attempt. All three are absent ("", 0)
+	// until the agent has applied one update since the reporting build shipped;
+	// a successful update clears update_error. The server records them so the
+	// fleet page can show what an update actually did instead of only what it
+	// was told to do (issue #2736).
+	UpdateTargetVersion string `protobuf:"bytes,13,opt,name=update_target_version,json=updateTargetVersion,proto3" json:"update_target_version,omitempty"`
+	UpdateError         string `protobuf:"bytes,14,opt,name=update_error,json=updateError,proto3" json:"update_error,omitempty"`
+	UpdateAttemptedAt   int64  `protobuf:"varint,15,opt,name=update_attempted_at,json=updateAttemptedAt,proto3" json:"update_attempted_at,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *AgentHeartbeat) Reset() {
@@ -3181,6 +3189,27 @@ func (x *AgentHeartbeat) GetConfigBackupFeatures() []string {
 		return x.ConfigBackupFeatures
 	}
 	return nil
+}
+
+func (x *AgentHeartbeat) GetUpdateTargetVersion() string {
+	if x != nil {
+		return x.UpdateTargetVersion
+	}
+	return ""
+}
+
+func (x *AgentHeartbeat) GetUpdateError() string {
+	if x != nil {
+		return x.UpdateError
+	}
+	return ""
+}
+
+func (x *AgentHeartbeat) GetUpdateAttemptedAt() int64 {
+	if x != nil {
+		return x.UpdateAttemptedAt
+	}
+	return 0
 }
 
 type AgentError struct {
@@ -4222,7 +4251,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\fresult_bytes\x18\r \x01(\rR\vresultBytes\x1a<\n" +
 	"\x0eOidValuesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xcf\x03\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xd6\x04\n" +
 	"\x0eAgentHeartbeat\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x1a\n" +
 	"\bhostname\x18\x02 \x01(\tR\bhostname\x12%\n" +
@@ -4237,7 +4266,10 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x15reports_vantage_point\x18\n" +
 	" \x01(\bR\x13reportsVantagePoint\x124\n" +
 	"\x16supports_config_backup\x18\v \x01(\bR\x14supportsConfigBackup\x124\n" +
-	"\x16config_backup_features\x18\f \x03(\tR\x14configBackupFeatures\"x\n" +
+	"\x16config_backup_features\x18\f \x03(\tR\x14configBackupFeatures\x122\n" +
+	"\x15update_target_version\x18\r \x01(\tR\x13updateTargetVersion\x12!\n" +
+	"\fupdate_error\x18\x0e \x01(\tR\vupdateError\x12.\n" +
+	"\x13update_attempted_at\x18\x0f \x01(\x03R\x11updateAttemptedAt\"x\n" +
 	"\n" +
 	"AgentError\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12\x15\n" +

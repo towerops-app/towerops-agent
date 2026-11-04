@@ -137,6 +137,11 @@ func runAgentWithScheduling(
 	traps <-chan *pb.SnmpTrap,
 	localScheduling bool,
 ) {
+	// If this process booted into an unproven self-update, arm the startup
+	// guard before anything else runs: a build that cannot reach its channel
+	// gets its predecessor restored instead of crash-looping (issue #2736).
+	_ = checkPendingUpdate()
+
 	results := newResultQueueForAgent(ctx, resultQueueSize)
 	retryDelay := initialRetryDelay
 	maxRetry := 10 * time.Second
@@ -302,6 +307,10 @@ func runSessionWithResultsAndScheduling(
 	if err := s.join(token); err != nil {
 		return err
 	}
+
+	// A session joined: any pending self-update is proven. Clear the marker
+	// and stop the rollback watchdog before work starts.
+	updateJoined()
 
 	// Worker pools are created only now: 220 goroutines started before the
 	// join would be abandoned by every early return above, and a revoked token
@@ -761,7 +770,7 @@ func (s *session) heartbeat() *pb.AgentHeartbeat {
 		localScheduling = s.pools.localScheduling
 	}
 	localIPs, subnets := localVantagePoint()
-	return &pb.AgentHeartbeat{
+	hb := &pb.AgentHeartbeat{
 		Version:              version,
 		UptimeSeconds:        uint64(time.Since(processStart).Seconds()),
 		Arch:                 runtime.GOARCH,
@@ -777,6 +786,14 @@ func (s *session) heartbeat() *pb.AgentHeartbeat {
 		// advertise this feature; MikroTik backups need no plan.
 		ConfigBackupFeatures: []string{"plan_v1"},
 	}
+	// The outcome of the last self-update attempt rides every heartbeat so
+	// the fleet page shows what an update did, not just what it was told.
+	if res := readUpdateResult(); res != nil {
+		hb.UpdateTargetVersion = res.TargetVersion
+		hb.UpdateError = res.Error
+		hb.UpdateAttemptedAt = res.AttemptedAt
+	}
+	return hb
 }
 
 // localVantagePoint enumerates the host's non-loopback interface addresses so
@@ -1129,6 +1146,7 @@ func handleMessage(
 		var payload struct {
 			URL      string `json:"url"`
 			Checksum string `json:"checksum"`
+			Version  string `json:"version"`
 		}
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil || payload.URL == "" || payload.Checksum == "" {
 			slog.Error("invalid update payload")
@@ -1139,11 +1157,12 @@ func handleMessage(
 			return false, nil
 		}
 		updateCtx := context.WithoutCancel(ctx)
-		slog.Info("update requested", "url", sanitizeURL(payload.URL))
+		slog.Info("update requested", "url", sanitizeURL(payload.URL), "version", payload.Version)
 		go func() {
 			defer updateInProgress.Store(false)
-			if err := doSelfUpdate(updateCtx, payload.URL, payload.Checksum); err != nil {
+			if err := doSelfUpdate(updateCtx, payload.URL, payload.Checksum, payload.Version); err != nil {
 				slog.Error("self-update failed", "error", err)
+				recordUpdateFailure(payload.Version, err)
 			}
 			abortDrainedSession()
 		}()
