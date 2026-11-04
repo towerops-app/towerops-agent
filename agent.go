@@ -278,7 +278,11 @@ func runSessionWithResultsAndScheduling(
 		slog.Error("resolve hostname", "error", err)
 	}
 
-	sessionCtx, sessionCancel := context.WithCancel(ctx)
+	// Detached from ctx on purpose (issue 2757): the parent's cancel is the
+	// shutdown signal, and the loop answers it by draining the spool, which
+	// needs the socket readers and writers this context governs to stay
+	// alive until the flush finishes or the budget runs out.
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	s := &session{
 		ws:              ws,
 		topic:           "agent:" + agentID,
@@ -676,6 +680,38 @@ func (s *session) drainResults(ctx context.Context) bool {
 	return true
 }
 
+// drainForShutdown runs the update drain behind a bounded budget on the
+// process-shutdown path (issue 2757): SIGTERM with a non-empty spool used
+// to exit with every queued result still in memory, a hole in each
+// device's history exactly when the operator was watching for the change
+// they just made. It reuses drainResults rather than duplicating the
+// empty-wait, so self-update and shutdown share the one implementation,
+// and it closes `done` whether the flush finished or the budget expired so
+// the session loop exits either way. The count of results still queued
+// when the budget ran out is logged once, so a restart that lost data
+// says so.
+func (s *session) drainForShutdown(done chan<- struct{}) {
+	defer close(done)
+
+	if s.pools == nil || s.scheduler == nil || s.results == nil {
+		return
+	}
+
+	queued := len(s.results.items)
+	ctx, cancel := context.WithTimeout(context.Background(), poolShutdownTimeout)
+	defer cancel()
+
+	if s.drainResults(ctx) {
+		slog.Info("shutdown drain flushed queued results", "flushed", queued)
+		return
+	}
+
+	lost := len(s.results.items)
+	if lost > 0 {
+		slog.Warn("shutdown drain timed out, results lost", "lost", lost, "timeout", poolShutdownTimeout)
+	}
+}
+
 // abortDrainedSession ends the session a self-update drain stopped, if any.
 // It runs whenever the update returns: a successful exec never does, so a
 // return means the process — and the drained, job-refusing session — lives
@@ -852,6 +888,15 @@ func (s *session) loop(ctx context.Context) error {
 	// responsive to inbound messages, traps and heartbeats during the write.
 	var inFlight *inFlightWrite
 
+	// Shutdown asks for the same drain the self-update path gets (issue
+	// 2757): the goroutine waits for pools to idle and the spool to empty
+	// while this loop keeps delivering results, then exits the session with
+	// nothing queued instead of abandoning up to 512 finished results.
+	// `ctxDone` is set to nil after the first signal so a busy select does
+	// not re-enter while the flush is in progress.
+	ctxDone := ctx.Done()
+	var drainDone chan struct{}
+
 	for {
 		if inFlight == nil {
 			if result, ok := s.results.takeRetry(); ok {
@@ -877,11 +922,16 @@ func (s *session) loop(ctx context.Context) error {
 		}
 
 		select {
-		case <-ctx.Done():
-			slog.Info("shutdown signal, closing connection")
+		case <-ctxDone:
+			slog.Info("shutdown signal, draining queued results before exit")
+			ctxDone = nil
+			drainDone = make(chan struct{})
+			go s.drainForShutdown(drainDone)
+			continue
+
+		case <-drainDone:
 			s.settleInFlight(inFlight)
 			return nil
-
 		case <-s.ctx.Done():
 			s.settleInFlight(inFlight)
 			return s.sessionErr()
