@@ -204,10 +204,15 @@ type session struct {
 	traps           <-chan *pb.SnmpTrap
 	localScheduling bool
 
-	// ctx is cancelled as soon as either I/O goroutine fails, so blocked pool
-	// submits unblock immediately instead of waiting for workers to finish.
-	ctx    context.Context
-	cancel context.CancelFunc
+	// ctx is the session I/O context. It is detached from the agent context so
+	// a process shutdown can keep writing spooled results while the session
+	// drains; cancel — via stop — is what actually ends it. jobCtx tracks the
+	// agent context: jobs and scheduled work die on shutdown while the spool
+	// flushes around them.
+	ctx       context.Context
+	cancel    context.CancelFunc
+	jobCtx    context.Context
+	jobCancel context.CancelFunc
 
 	writeCh    chan writeRequest
 	msgCh      chan []byte
@@ -278,11 +283,13 @@ func runSessionWithResultsAndScheduling(
 		slog.Error("resolve hostname", "error", err)
 	}
 
-	// Detached from ctx on purpose (issue 2757): the parent's cancel is the
-	// shutdown signal, and the loop answers it by draining the spool, which
-	// needs the socket readers and writers this context governs to stay
-	// alive until the flush finishes or the budget runs out.
-	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	// The session context is detached from the agent context: on process
+	// shutdown the loop must keep writing spooled results while it drains,
+	// which a dead I/O context cannot do. Jobs, checks and scheduled work get
+	// jobCtx — still bound to the agent context — so in-flight work is
+	// cancelled while the spool flushes around it.
+	sessionCtx, sessionCancel := context.WithCancel(context.WithoutCancel(ctx))
+	jobCtx, jobCancel := context.WithCancel(ctx)
 	s := &session{
 		ws:              ws,
 		topic:           "agent:" + agentID,
@@ -291,6 +298,8 @@ func runSessionWithResultsAndScheduling(
 		localScheduling: localScheduling,
 		ctx:             sessionCtx,
 		cancel:          sessionCancel,
+		jobCtx:          jobCtx,
+		jobCancel:       jobCancel,
 		writeCh:         make(chan writeRequest, 256),
 		msgCh:           make(chan []byte, 100),
 		errCh:           make(chan error, 1),
@@ -332,7 +341,7 @@ func runSessionWithResultsAndScheduling(
 	}
 	s.results = results
 	s.notices = notices
-	s.scheduler = newRecurringScheduler(s.ctx, realScheduleClock{})
+	s.scheduler = newRecurringScheduler(s.jobCtx, realScheduleClock{})
 	s.pools.scheduler = s.scheduler
 
 	// Let the self-update path flush the spool before it re-execs. The hook is
@@ -405,6 +414,9 @@ func (s *session) fail(ch chan<- error, err error) {
 // first, then worker pools and the scheduler, then both I/O goroutines.
 func (s *session) stop() {
 	s.cancel()
+	if s.jobCancel != nil {
+		s.jobCancel()
+	}
 	_ = s.ws.Close()
 
 	if s.scheduler != nil {
@@ -876,6 +888,11 @@ func localVantagePoint() (localIPs, subnets []string) {
 
 // loop is the session event loop. ctx is the agent-wide context; the session's
 // own context signals connection failure.
+//
+// When ctx is cancelled the loop switches to draining instead of returning:
+// drainResults — the same wait the self-update path uses — runs against the
+// spool while the loop keeps delivering its contents, so a restart flushes
+// queued results within poolShutdownTimeout instead of dropping them.
 func (s *session) loop(ctx context.Context) error {
 	heartbeatTicker := time.NewTicker(heartbeatInterval)
 	defer heartbeatTicker.Stop()
@@ -971,7 +988,7 @@ func (s *session) loop(ctx context.Context) error {
 				}
 				continue
 			}
-			shouldEnd, endErr := handleMessage(s.ctx, msg, s.topic, s.pools, s.results)
+			shouldEnd, endErr := handleMessage(s.jobCtx, msg, s.topic, s.pools, s.results)
 			if shouldEnd {
 				s.settleInFlight(inFlight)
 				return endErr

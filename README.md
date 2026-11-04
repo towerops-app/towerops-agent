@@ -50,6 +50,9 @@ Operational properties:
   reconnecting
 - **Reconnect result buffering** - up to 512 completed job results remain in
   memory across temporary WebSocket disconnects and are retried after reconnect
+- **Graceful shutdown flush** - on SIGTERM or SIGINT the agent stops accepting
+  work, cancels in-flight jobs and drains the buffered results over the live
+  socket within a five-second budget; anything it could not deliver is logged
 
 ## Quick start
 
