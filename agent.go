@@ -1141,10 +1141,13 @@ func handleMessage(
 	case "jobs":
 		if pools.stopAccepting.Load() {
 			slog.Info("dropping jobs frame during self-update drain")
+			pools.rejectInventory(msg.Event)
+			reportPayloadRejection(ctx, out, msg.Event)
 			return false, nil
 		}
 		var jobList pb.AgentJobList
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &jobList) {
+			pools.rejectInventory(msg.Event)
 			reportPayloadRejection(ctx, out, msg.Event)
 			return false, nil
 		}
@@ -1165,6 +1168,7 @@ func handleMessage(
 		// or explicitly empty inventory arrives.
 		if len(recurring) > 0 || len(jobList.Jobs) == 0 {
 			pools.scheduler.replaceJobs(recurring, pools, out)
+			pools.applyInventoryRevision(jobList.Revision)
 		}
 		for _, job := range oneShot {
 			slog.Info("received one-shot job", "job_id", job.JobId, "type", job.JobType)
@@ -1191,10 +1195,13 @@ func handleMessage(
 	case "check_jobs":
 		if pools.stopAccepting.Load() {
 			slog.Info("dropping check_jobs frame during self-update drain")
+			pools.rejectInventory(msg.Event)
+			reportPayloadRejection(ctx, out, msg.Event)
 			return false, nil
 		}
 		var checkList pb.CheckList
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &checkList) {
+			pools.rejectInventory(msg.Event)
 			reportPayloadRejection(ctx, out, msg.Event)
 			return false, nil
 		}
@@ -1209,6 +1216,7 @@ func handleMessage(
 		}
 		slog.Info("received recurring checks", "count", len(checkList.Checks))
 		pools.scheduler.replaceChecks(checkList.Checks, pools, out)
+		pools.applyInventoryRevision(checkList.Revision)
 
 	case "restart":
 		slog.Info("restart requested by server")
@@ -1415,6 +1423,14 @@ type jobPools struct {
 	// new job and check submissions while the spool flushes. In-flight work
 	// keeps running so its results can still reach the spool.
 	stopAccepting atomic.Bool
+
+	// Inventory reconciliation state (issue #2755): the newest authoritative
+	// inventory revision the agent applied and the name of the last
+	// inventory frame it refused. Both ride the heartbeat so the server can
+	// re-push a schedule that never landed instead of paging overdue on
+	// every device the missed frame covered.
+	appliedRevision   atomic.Uint64
+	rejectedInventory atomic.Value // string; "" means nothing outstanding
 }
 
 // idle reports whether every pool has finished all admitted work.
