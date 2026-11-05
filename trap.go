@@ -55,25 +55,58 @@ var (
 	// that trap_listener_state means anything.
 	trapsReportingEnabled atomic.Bool
 	// trapListenerState is "listening", "rebinding" or "failed" (the
-	// initial bind failed). atomic.Value so the heartbeat goroutine reads
-	// it without racing the serve loop's transitions.
-	trapListenerState atomic.Value
+	// initial bind failed). atomic.Int32 so the heartbeat goroutine reads
+	// it without racing the serve loop's transitions — and so a terminal
+	// "failed" can never be CAS-overwritten with "rebinding" by a serve
+	// loop racing the startup error path (issue 2754 flake).
+	trapListenerState atomic.Int32
 	// trapDroppedTotal is the cumulative queue-full drop count, summed
 	// across rebinds, which is what the heartbeat reports.
 	trapDroppedTotal atomic.Uint64
 )
 
+const (
+	trapStateUnset int32 = iota
+	trapStateListening
+	trapStateRebinding
+	trapStateFailed
+)
+
 func setTrapListenerState(state string) {
-	trapListenerState.Store(state)
+	switch state {
+	case "listening":
+		trapListenerState.Store(trapStateListening)
+	case "failed":
+		trapListenerState.Store(trapStateFailed)
+	default:
+		trapListenerState.Store(trapStateUnset)
+	}
 }
 
 func trapListenerStateString() string {
-	if v := trapListenerState.Load(); v != nil {
-		if s, ok := v.(string); ok {
-			return s
-		}
+	switch trapListenerState.Load() {
+	case trapStateListening:
+		return "listening"
+	case trapStateRebinding:
+		return "rebinding"
+	case trapStateFailed:
+		return "failed"
 	}
 	return ""
+}
+
+// beginTrapRebind moves the reported listener state to "rebinding", unless
+// a failed startup bind already marked the listener terminal. A serve loop
+// can race startTrapListener's error path — its Listen call returned before
+// the close that would have stopped it — and without the CAS its "rebinding"
+// would overwrite the "failed" the heartbeat must report (issue 2754 flake).
+func beginTrapRebind() {
+	for {
+		state := trapListenerState.Load()
+		if state == trapStateFailed || trapListenerState.CompareAndSwap(state, trapStateRebinding) {
+			return
+		}
+	}
 }
 
 // trapListener receives SNMP traps on a UDP port and converts them to protobuf.
@@ -159,7 +192,11 @@ func (t *trapListener) serve(listener *gosnmp.TrapListener, done chan struct{}, 
 			return
 		default:
 		}
-		setTrapListenerState("rebinding")
+		// A failed startup bind is terminal, not rebindable: startTrapListener
+		// records "failed" and closes the listener, but this loop can race the
+		// close and reach the rebind anyway. beginTrapRebind's CAS never
+		// overwrites "failed" (issue 2754 flake).
+		beginTrapRebind()
 		slog.Error("snmp trap listener stopped unexpectedly; rebinding", "error", err, "port", t.port)
 
 		timer := time.NewTimer(time.Second)
