@@ -839,6 +839,16 @@ func (s *session) heartbeat() *pb.AgentHeartbeat {
 		TrapListenerState: trapListenerStateString(),
 		TrapsDropped:      trapDroppedTotal.Load(),
 	}
+
+	// Inventory reconciliation (issue #2755): the newest pushed inventory
+	// revision the agent applied and the last frame it refused. The server
+	// re-pushes when applied_revision trails what it sent.
+	if s.pools != nil {
+		hb.AppliedRevision = s.pools.appliedRevision.Load()
+		if rejected, ok := s.pools.rejectedInventory.Load().(string); ok {
+			hb.InventoryRejected = rejected
+		}
+	}
 	// The outcome of the last self-update attempt rides every heartbeat so
 	// the fleet page shows what an update did, not just what it was told.
 	if res := readUpdateResult(); res != nil {
@@ -1141,10 +1151,14 @@ func handleMessage(
 	case "jobs":
 		if pools.stopAccepting.Load() {
 			slog.Info("dropping jobs frame during self-update drain")
+			pools.rejectInventory(msg.Event)
+			reportInventoryRejection(ctx, out, msg.Event,
+				"Refused "+msg.Event+" inventory during self-update drain")
 			return false, nil
 		}
 		var jobList pb.AgentJobList
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &jobList) {
+			pools.rejectInventory(msg.Event)
 			reportPayloadRejection(ctx, out, msg.Event)
 			return false, nil
 		}
@@ -1165,6 +1179,7 @@ func handleMessage(
 		// or explicitly empty inventory arrives.
 		if len(recurring) > 0 || len(jobList.Jobs) == 0 {
 			pools.scheduler.replaceJobs(recurring, pools, out)
+			pools.applyInventoryRevision(jobList.Revision)
 		}
 		for _, job := range oneShot {
 			slog.Info("received one-shot job", "job_id", job.JobId, "type", job.JobType)
@@ -1191,10 +1206,14 @@ func handleMessage(
 	case "check_jobs":
 		if pools.stopAccepting.Load() {
 			slog.Info("dropping check_jobs frame during self-update drain")
+			pools.rejectInventory(msg.Event)
+			reportInventoryRejection(ctx, out, msg.Event,
+				"Refused "+msg.Event+" inventory during self-update drain")
 			return false, nil
 		}
 		var checkList pb.CheckList
 		if !decodeBinaryPayload(msg.Event, msg.Payload, &checkList) {
+			pools.rejectInventory(msg.Event)
 			reportPayloadRejection(ctx, out, msg.Event)
 			return false, nil
 		}
@@ -1209,6 +1228,7 @@ func handleMessage(
 		}
 		slog.Info("received recurring checks", "count", len(checkList.Checks))
 		pools.scheduler.replaceChecks(checkList.Checks, pools, out)
+		pools.applyInventoryRevision(checkList.Revision)
 
 	case "restart":
 		slog.Info("restart requested by server")
@@ -1245,10 +1265,26 @@ func handleMessage(
 	return false, nil
 }
 
+// reportPayloadRejection sends a bounded error notice for a frame whose
+// protobuf payload failed to decode (issue #2755). `inventory_rejection`
+// marks the refusal as a schedule rejection — an authoritative "jobs" or
+// "check_jobs" frame the agent could not accept — so the server records it
+// and the applied-revision lag stays attributable to a cause instead of a
+// silent drop.
 func reportPayloadRejection(ctx context.Context, out *resultQueue, event string) {
+	reportInventoryRejection(ctx, out, event, "Rejected malformed or oversized "+event+" payload")
+}
+
+// reportInventoryRejection reports a refused inventory frame — an
+// authoritative "jobs" or "check_jobs" push the agent could not accept,
+// either because the self-update drain stopped submissions or because its
+// payload failed to decode. The frame name rides both the error notice
+// and the heartbeat so the server can re-push the schedule.
+func reportInventoryRejection(ctx context.Context, out *resultQueue, event, message string) {
 	sendResult(ctx, out, "error", &pb.AgentError{
-		Message:   "Rejected malformed or oversized " + event + " payload",
-		Timestamp: time.Now().Unix(),
+		Message:            message,
+		Timestamp:          time.Now().Unix(),
+		InventoryRejection: event,
 	}, "")
 }
 func splitRecurringJobs(jobs []*pb.AgentJob) (recurring, oneShot []*pb.AgentJob) {
@@ -1415,6 +1451,14 @@ type jobPools struct {
 	// new job and check submissions while the spool flushes. In-flight work
 	// keeps running so its results can still reach the spool.
 	stopAccepting atomic.Bool
+
+	// Inventory reconciliation state (issue #2755): the newest authoritative
+	// inventory revision the agent applied and the name of the last
+	// inventory frame it refused. Both ride the heartbeat so the server can
+	// re-push a schedule that never landed instead of paging overdue on
+	// every device the missed frame covered.
+	appliedRevision   atomic.Uint64
+	rejectedInventory atomic.Value // string; "" means nothing outstanding
 }
 
 // idle reports whether every pool has finished all admitted work.
@@ -1461,6 +1505,41 @@ func (p *jobPools) stop(timeout time.Duration) []string {
 		}
 	}
 	return nil
+}
+
+// applyInventoryRevision records the newest authoritative inventory revision
+// the agent accepted (issue #2755). The revision stream is monotonic per
+// connection, so a replayed or reordered frame can only move the stamp
+// forward; a successful apply also clears the refused-frame marker the
+// heartbeat reports.
+func (p *jobPools) applyInventoryRevision(revision uint64) {
+	if revision == 0 {
+		return
+	}
+	for {
+		current := p.appliedRevision.Load()
+		if revision <= current {
+			break
+		}
+		if p.appliedRevision.CompareAndSwap(current, revision) {
+			break
+		}
+	}
+	if rejected, ok := p.rejectedInventory.Load().(string); ok && rejected != "" {
+		p.rejectedInventory.Store("")
+	}
+}
+
+// rejectInventory marks an authoritative inventory frame ("jobs" or
+// "check_jobs") as refused: it arrived during the self-update drain or its
+// payload failed to decode. The next heartbeat reports the name so the
+// server records the refusal instead of silently re-pushing on a schedule
+// it believes landed (issue #2755).
+func (p *jobPools) rejectInventory(event string) {
+	if event == "" {
+		return
+	}
+	p.rejectedInventory.Store(event)
 }
 
 // dispatchJob routes a one-shot job to the appropriate worker pool.

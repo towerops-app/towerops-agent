@@ -739,6 +739,126 @@ func TestMalformedInventoryPreservesScheduledAssignments(t *testing.T) {
 	}
 }
 
+// Issue #2755: the agent stamps the newest applied inventory revision and
+// the last refused frame onto its heartbeat so the server can re-push a
+// schedule that never landed instead of paging overdue per device.
+func TestInventoryRevisionTracking(t *testing.T) {
+	t.Run("applied revision is monotonic and clears the refused marker", func(t *testing.T) {
+		pools := testPools(t)
+
+		pools.applyInventoryRevision(3)
+		pools.applyInventoryRevision(1) // replayed frame cannot regress the stamp
+		if got := pools.appliedRevision.Load(); got != 3 {
+			t.Fatalf("appliedRevision = %d, want 3", got)
+		}
+
+		pools.rejectInventory("jobs")
+		pools.applyInventoryRevision(4)
+		if got, _ := pools.rejectedInventory.Load().(string); got != "" {
+			t.Fatalf("rejectedInventory = %q after a successful apply", got)
+		}
+	})
+
+	t.Run("jobs frame applies its revision and the heartbeat echoes it", func(t *testing.T) {
+		pools := testPools(t)
+		out := testQueue()
+
+		list := &pb.AgentJobList{Revision: 7}
+		bin, _ := proto.Marshal(list)
+		payload, _ := json.Marshal(map[string]string{
+			"binary": base64.StdEncoding.EncodeToString(bin),
+		})
+		_, _ = handleMessage(context.Background(), channelMsg{
+			Topic: "agent:test", Event: "jobs", Payload: payload,
+		}, "agent:test", pools, out)
+
+		if got := pools.appliedRevision.Load(); got != 7 {
+			t.Fatalf("appliedRevision = %d, want 7", got)
+		}
+
+		s := &session{pools: pools, ws: &wsConn{}, hostname: "test-agent"}
+		hb := s.heartbeat()
+		if hb.AppliedRevision != 7 {
+			t.Fatalf("heartbeat applied_revision = %d, want 7", hb.AppliedRevision)
+		}
+		if hb.InventoryRejected != "" {
+			t.Fatalf("heartbeat inventory_rejected = %q, want empty", hb.InventoryRejected)
+		}
+	})
+
+	t.Run("a jobs frame dropped during the self-update drain reports the refusal", func(t *testing.T) {
+		pools := testPools(t)
+		pools.stopAccepting.Store(true)
+		out := testQueue()
+
+		list := &pb.AgentJobList{Revision: 9}
+		bin, _ := proto.Marshal(list)
+		payload, _ := json.Marshal(map[string]string{
+			"binary": base64.StdEncoding.EncodeToString(bin),
+		})
+		_, _ = handleMessage(context.Background(), channelMsg{
+			Topic: "agent:test", Event: "jobs", Payload: payload,
+		}, "agent:test", pools, out)
+
+		if got := pools.appliedRevision.Load(); got != 0 {
+			t.Fatalf("dropped inventory applied revision %d", got)
+		}
+		if got, _ := pools.rejectedInventory.Load().(string); got != "jobs" {
+			t.Fatalf("rejectedInventory = %q, want jobs", got)
+		}
+
+		s := &session{pools: pools, ws: &wsConn{}, hostname: "test-agent"}
+		if got := s.heartbeat().InventoryRejected; got != "jobs" {
+			t.Fatalf("heartbeat inventory_rejected = %q, want jobs", got)
+		}
+
+		select {
+		case result := <-out.items:
+			out.ack(result)
+			if result.event != "error" {
+				t.Fatalf("event = %q, want the refusal notice", result.event)
+			}
+			var notice pb.AgentError
+			agtDecodeBinary(t, result.payload, &notice)
+			if notice.InventoryRejection != "jobs" {
+				t.Fatalf("inventory_rejection = %q, want jobs", notice.InventoryRejection)
+			}
+		default:
+			t.Fatal("dropped inventory sent no refusal notice")
+		}
+	})
+
+	t.Run("a malformed inventory is reported and marked refused", func(t *testing.T) {
+		pools := testPools(t)
+		out := testQueue()
+
+		_, _ = handleMessage(context.Background(), channelMsg{
+			Topic: "agent:test", Event: "check_jobs", Payload: json.RawMessage(`{}`),
+		}, "agent:test", pools, out)
+
+		if got, _ := pools.rejectedInventory.Load().(string); got != "check_jobs" {
+			t.Fatalf("rejectedInventory = %q, want check_jobs", got)
+		}
+		select {
+		case result := <-out.items:
+			if result.event != "error" {
+				t.Fatalf("event = %q, want payload rejection", result.event)
+			}
+		default:
+			t.Fatal("malformed inventory was not reported")
+		}
+	})
+
+	t.Run("an empty event name is not recorded as a refusal", func(t *testing.T) {
+		pools := testPools(t)
+
+		pools.rejectInventory("")
+		if got, ok := pools.rejectedInventory.Load().(string); ok && got != "" {
+			t.Fatalf("rejectedInventory = %q after an unnamed refusal, want unset", got)
+		}
+	})
+}
+
 func TestDecodeBinaryPayloadAcceptsExplicitEmptyInventory(t *testing.T) {
 	if !decodeBinaryPayload("jobs", json.RawMessage(`{"binary":""}`), &pb.AgentJobList{}) {
 		t.Fatal("explicitly encoded empty inventory was rejected")
@@ -1818,6 +1938,7 @@ func TestRunSessionDeliversPreviouslyBufferedResult(t *testing.T) {
 		t.Fatal("delivered result remained reserved in the reconnect buffer")
 	}
 }
+
 // Cancelling the agent context with a result still spooled must flush it over
 // the live socket before the session ends: the shutdown path shares the
 // self-update drain instead of abandoning the spool (issue #2757).
@@ -1864,7 +1985,6 @@ func TestRunSessionFlushDrainsQueuedResultOnCancel(t *testing.T) {
 		t.Fatalf("flushed result kept %d slot tokens reserved", n)
 	}
 }
-
 
 func TestRunSessionRestartDoesNotWaitForServerClose(t *testing.T) {
 	srv := newFakeWSServer(t)
