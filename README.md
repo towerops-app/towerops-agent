@@ -49,10 +49,18 @@ Operational properties:
   of the WebSocket session and queues up to 1000 traps while the agent is
   reconnecting
 - **Reconnect result buffering** - up to 512 completed job results remain in
+<<<<<<< HEAD
   memory across temporary WebSocket disconnects and are retried after reconnect
 - **Graceful shutdown flush** - on SIGTERM or SIGINT the agent stops accepting
   work, cancels in-flight jobs and drains the buffered results over the live
   socket within a five-second budget; anything it could not deliver is logged
+=======
+  memory across temporary WebSocket disconnects and are retried after
+  reconnect. A clean shutdown (SIGTERM, `docker stop`, `systemctl restart`)
+  drains the spool the same way a self-update does: new work is refused and
+  in-flight results are written until the queue is empty or a five-second
+  budget expires, after which the log records what was flushed and dropped
+>>>>>>> c605626 (fix(agent): drain the result spool on shutdown, not just self-update (issue 2757))
 
 ## Quick start
 

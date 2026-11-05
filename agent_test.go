@@ -3753,6 +3753,26 @@ func TestDrainForShutdownTimesOutWithQueuedResults(t *testing.T) {
 	}
 }
 
+// A session that never joined has no spool: drainForShutdown returns
+// without touching drainedSession, which belongs to the self-update drain.
+func TestDrainForShutdownWithoutSpool(t *testing.T) {
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &session{ctx: sessionCtx, cancel: cancel}
+
+	done := make(chan struct{})
+	go s.drainForShutdown(done)
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("drainForShutdown did not return on a session without a spool")
+	}
+	if drainedSession.Load() != nil {
+		t.Fatal("shutdown drain marked drainedSession reserved for self-update")
+	}
+}
+
 // The reader bails through s.ctx.Done() when the session context ends
 // while a decoded frame is still waiting on a full msgCh. msgCh has no
 // buffer here so the first frame parks the select, and cancelling the
@@ -3965,6 +3985,103 @@ func TestSessionLoopSendsRetriedResultBeforeNewerResult(t *testing.T) {
 	stopAgent()
 	if err := <-done; err != nil {
 		t.Fatalf("session loop returned %v after agent shutdown", err)
+	}
+}
+
+func TestSessionLoopDrainsSpoolOnAgentShutdown(t *testing.T) {
+	results := newResultQueue(2)
+	if !results.enqueue(outbound{event: "finished", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("failed to queue result")
+	}
+
+	agentCtx, stopAgent := context.WithCancel(context.Background())
+	sessionCtx, stopSession := context.WithCancel(context.Background())
+	defer stopSession()
+	writeCh := make(chan writeRequest)
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     stopSession,
+		writeCh:    writeCh,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		results:    results,
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.loop(agentCtx) }()
+
+	// Cancel with a result still queued: the shutdown drain must keep the
+	// session delivering it instead of exiting with the spool (issue 2757).
+	stopAgent()
+
+	select {
+	case request := <-writeCh:
+		var msg channelMsg
+		if err := json.Unmarshal(request.data, &msg); err != nil {
+			t.Fatal(err)
+		}
+		if msg.Event != "finished" {
+			t.Fatalf("result event = %q, want finished", msg.Event)
+		}
+		request.ack <- nil
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued result was discarded on agent shutdown")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("session loop returned %v after shutdown drain", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session loop did not exit after the drained spool reported")
+	}
+
+	// The shutdown drain must not mark drainedSession — that marker belongs
+	// to the self-update drain, whose session abortDrainedSession ends when
+	// the re-exec does not happen. A process that is leaving anyway has no
+	// abort to run (issue 2757).
+	if drainedSession.Load() != nil {
+		t.Fatal("shutdown drain marked drainedSession reserved for self-update")
+	}
+}
+
+func TestSessionLoopShutdownDrainBoundedWhenWriteStalls(t *testing.T) {
+	origTimeout := poolShutdownTimeout
+	t.Cleanup(func() { poolShutdownTimeout = origTimeout })
+	poolShutdownTimeout = 50 * time.Millisecond
+
+	results := newResultQueue(2)
+	if !results.enqueue(outbound{event: "finished", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("failed to queue result")
+	}
+
+	agentCtx, stopAgent := context.WithCancel(context.Background())
+	sessionCtx, stopSession := context.WithCancel(context.Background())
+	defer stopSession()
+	// The writer accepts the frame but never acks it, so the slot stays held
+	// and the spool can never report empty; the loop must still exit when the
+	// drain budget expires.
+	writeCh := make(chan writeRequest, 1)
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     stopSession,
+		writeCh:    writeCh,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		results:    results,
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.loop(agentCtx) }()
+
+	stopAgent()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("session loop returned %v after shutdown drain timeout", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session loop outlived the shutdown drain budget")
 	}
 }
 

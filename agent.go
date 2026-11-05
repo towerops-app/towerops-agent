@@ -668,21 +668,28 @@ func (s *session) prunePending() {
 // abortDrainedSession if the re-exec does not happen.
 func (s *session) drainResults(ctx context.Context) bool {
 	drainedSession.Store(s)
-	s.scheduler.cancelAll()
-	s.pools.stopAccepting.Store(true)
+	return s.drainSpool(ctx)
+}
+
+// drainSpool refuses new work and waits out every queued result. The caller
+// supplies a bounded context; the session loop must still be running, since
+// it is what delivers results during the wait. Self-update calls it through
+// drainResults, which also records the session for abortDrainedSession; the
+// shutdown drain calls it directly because the process is leaving anyway.
+func (s *session) drainSpool(ctx context.Context) bool {
+	if s.scheduler != nil {
+		s.scheduler.cancelAll()
+	}
+	if s.pools != nil {
+		s.pools.stopAccepting.Store(true)
+	}
 
 	// Pools are checked before the spool: a job sends its result before its
 	// task returns, so once every pool is idle its result is already queued
 	// and the spool check below covers it.
-	drained := func() bool {
-		return s.pools.idle() &&
-			len(s.results.items) == 0 &&
-			len(s.results.slots) == 0 &&
-			len(s.results.reservedSlots) == 0
-	}
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
-	for !drained() {
+	for !s.resultsDrained() {
 		select {
 		case <-ctx.Done():
 			return false
@@ -692,20 +699,34 @@ func (s *session) drainResults(ctx context.Context) bool {
 	return true
 }
 
-// drainForShutdown runs the update drain behind a bounded budget on the
+// resultsDrained reports whether in-flight work has all finished and every
+// queued result was written to the socket and acked. Pools are checked before
+// the spool: a job sends its result before its task returns, so once every
+// pool is idle its result is already queued. Shared by the self-update drain
+// and the shutdown drain, which differ only in who waits for it (issue 2757).
+func (s *session) resultsDrained() bool {
+	poolsIdle := s.pools == nil || s.pools.idle()
+	return poolsIdle &&
+		len(s.results.items) == 0 &&
+		len(s.results.slots) == 0 &&
+		len(s.results.reservedSlots) == 0
+}
+
+// drainForShutdown runs the spool drain behind a bounded budget on the
 // process-shutdown path (issue 2757): SIGTERM with a non-empty spool used
 // to exit with every queued result still in memory, a hole in each
 // device's history exactly when the operator was watching for the change
-// they just made. It reuses drainResults rather than duplicating the
-// empty-wait, so self-update and shutdown share the one implementation,
-// and it closes `done` whether the flush finished or the budget expired so
-// the session loop exits either way. The count of results still queued
-// when the budget ran out is logged once, so a restart that lost data
-// says so.
+// they just made. It calls drainSpool directly — not drainResults — so the
+// process exit never records the session in drainedSession: that marker is
+// reserved for the self-update drain, whose session abortDrainedSession
+// ends if the re-exec does not happen. It closes `done` whether the flush
+// finished or the budget expired so the session loop exits either way. The
+// count of results still queued when the budget ran out is logged once, so
+// a restart that lost data says so.
 func (s *session) drainForShutdown(done chan<- struct{}) {
 	defer close(done)
 
-	if s.pools == nil || s.scheduler == nil || s.results == nil {
+	if s.results == nil {
 		return
 	}
 
@@ -713,7 +734,7 @@ func (s *session) drainForShutdown(done chan<- struct{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), poolShutdownTimeout)
 	defer cancel()
 
-	if s.drainResults(ctx) {
+	if s.drainSpool(ctx) {
 		slog.Info("shutdown drain flushed queued results", "flushed", queued)
 		return
 	}
