@@ -1888,8 +1888,13 @@ func (x *CheckResult) GetTimestamp() int64 {
 }
 
 type CheckList struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Checks        []*Check               `protobuf:"bytes,1,rep,name=checks,proto3" json:"checks,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Checks []*Check               `protobuf:"bytes,1,rep,name=checks,proto3" json:"checks,omitempty"`
+	// Monotonic revision of this authoritative service-check inventory, per
+	// agent connection. The agent echoes the newest revision it applied on its
+	// heartbeat so the server can re-push an inventory that never landed
+	// (issue #2755). Zero means the server predates revisions.
+	Revision      uint64 `protobuf:"varint,2,opt,name=revision,proto3" json:"revision,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1929,6 +1934,13 @@ func (x *CheckList) GetChecks() []*Check {
 		return x.Checks
 	}
 	return nil
+}
+
+func (x *CheckList) GetRevision() uint64 {
+	if x != nil {
+		return x.Revision
+	}
+	return 0
 }
 
 // Heartbeat metadata
@@ -2480,8 +2492,13 @@ func (x *ConfigBackupResult) GetTimestamp() int64 {
 }
 
 type AgentJobList struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Jobs          []*AgentJob            `protobuf:"bytes,1,rep,name=jobs,proto3" json:"jobs,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Jobs  []*AgentJob            `protobuf:"bytes,1,rep,name=jobs,proto3" json:"jobs,omitempty"`
+	// Monotonic revision of this authoritative job inventory, per agent
+	// connection. The agent echoes the newest revision it applied on its
+	// heartbeat so the server can re-push an inventory that never landed
+	// (issue #2755). Zero means the server predates revisions.
+	Revision      uint64 `protobuf:"varint,2,opt,name=revision,proto3" json:"revision,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2521,6 +2538,13 @@ func (x *AgentJobList) GetJobs() []*AgentJob {
 		return x.Jobs
 	}
 	return nil
+}
+
+func (x *AgentJobList) GetRevision() uint64 {
+	if x != nil {
+		return x.Revision
+	}
+	return 0
 }
 
 type AgentJob struct {
@@ -3084,6 +3108,16 @@ type AgentHeartbeat struct {
 	TrapsEnabled      bool   `protobuf:"varint,16,opt,name=traps_enabled,json=trapsEnabled,proto3" json:"traps_enabled,omitempty"`
 	TrapListenerState string `protobuf:"bytes,17,opt,name=trap_listener_state,json=trapListenerState,proto3" json:"trap_listener_state,omitempty"`
 	TrapsDropped      uint64 `protobuf:"varint,18,opt,name=traps_dropped,json=trapsDropped,proto3" json:"traps_dropped,omitempty"`
+	// Newest authoritative inventory revision the agent applied (issue #2755).
+	// Jobs and check_jobs share the per-connection revision stream, so one
+	// value covers both. Zero means nothing applied yet or an agent build that
+	// predates revisions; the server re-pushes when this trails the revision
+	// it last sent.
+	AppliedRevision uint64 `protobuf:"varint,19,opt,name=applied_revision,json=appliedRevision,proto3" json:"applied_revision,omitempty"`
+	// Name of the last inventory frame the agent refused ("jobs" or
+	// "check_jobs"), reported until an inventory applies successfully. Empty
+	// means nothing refused or an agent build that predates the field.
+	InventoryRejected string `protobuf:"bytes,20,opt,name=inventory_rejected,json=inventoryRejected,proto3" json:"inventory_rejected,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -3244,14 +3278,33 @@ func (x *AgentHeartbeat) GetTrapsDropped() uint64 {
 	return 0
 }
 
+func (x *AgentHeartbeat) GetAppliedRevision() uint64 {
+	if x != nil {
+		return x.AppliedRevision
+	}
+	return 0
+}
+
+func (x *AgentHeartbeat) GetInventoryRejected() string {
+	if x != nil {
+		return x.InventoryRejected
+	}
+	return ""
+}
+
 type AgentError struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	DeviceId      string                 `protobuf:"bytes,1,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
-	JobId         string                 `protobuf:"bytes,2,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	Message       string                 `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
-	Timestamp     int64                  `protobuf:"varint,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	DeviceId  string                 `protobuf:"bytes,1,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
+	JobId     string                 `protobuf:"bytes,2,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Message   string                 `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
+	Timestamp int64                  `protobuf:"varint,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// Name of the inventory frame this error refuses ("jobs", "check_jobs",
+	// "discovery_job"); empty on ordinary job failures (issue #2755). The
+	// server records it so a refused schedule is visible on the agent page
+	// instead of only in the agent's log.
+	InventoryRejection string `protobuf:"bytes,5,opt,name=inventory_rejection,json=inventoryRejection,proto3" json:"inventory_rejection,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *AgentError) Reset() {
@@ -3310,6 +3363,13 @@ func (x *AgentError) GetTimestamp() int64 {
 		return x.Timestamp
 	}
 	return 0
+}
+
+func (x *AgentError) GetInventoryRejection() string {
+	if x != nil {
+		return x.InventoryRejection
+	}
+	return ""
 }
 
 type CredentialTestResult struct {
@@ -4164,9 +4224,10 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x06status\x18\x02 \x01(\rR\x06status\x12\x16\n" +
 	"\x06output\x18\x03 \x01(\tR\x06output\x12(\n" +
 	"\x10response_time_ms\x18\x04 \x01(\x01R\x0eresponseTimeMs\x12\x1c\n" +
-	"\ttimestamp\x18\x05 \x01(\x03R\ttimestamp\":\n" +
+	"\ttimestamp\x18\x05 \x01(\x03R\ttimestamp\"V\n" +
 	"\tCheckList\x12-\n" +
-	"\x06checks\x18\x01 \x03(\v2\x15.towerops.agent.CheckR\x06checks\"p\n" +
+	"\x06checks\x18\x01 \x03(\v2\x15.towerops.agent.CheckR\x06checks\x12\x1a\n" +
+	"\brevision\x18\x02 \x01(\x04R\brevision\"p\n" +
 	"\x11HeartbeatMetadata\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x1a\n" +
 	"\bhostname\x18\x02 \x01(\tR\bhostname\x12%\n" +
@@ -4221,9 +4282,10 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x10includes_secrets\x18\f \x01(\bR\x0fincludesSecrets\x12\x1f\n" +
 	"\vduration_ms\x18\r \x01(\rR\n" +
 	"durationMs\x12\x1c\n" +
-	"\ttimestamp\x18\x0e \x01(\x03R\ttimestamp\"<\n" +
+	"\ttimestamp\x18\x0e \x01(\x03R\ttimestamp\"X\n" +
 	"\fAgentJobList\x12,\n" +
-	"\x04jobs\x18\x01 \x03(\v2\x18.towerops.agent.AgentJobR\x04jobs\"\xbf\x06\n" +
+	"\x04jobs\x18\x01 \x03(\v2\x18.towerops.agent.AgentJobR\x04jobs\x12\x1a\n" +
+	"\brevision\x18\x02 \x01(\x04R\brevision\"\xbf\x06\n" +
 	"\bAgentJob\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x122\n" +
 	"\bjob_type\x18\x02 \x01(\x0e2\x17.towerops.agent.JobTypeR\ajobType\x12\x1b\n" +
@@ -4283,7 +4345,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\fresult_bytes\x18\r \x01(\rR\vresultBytes\x1a<\n" +
 	"\x0eOidValuesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xd0\x05\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xaa\x06\n" +
 	"\x0eAgentHeartbeat\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x1a\n" +
 	"\bhostname\x18\x02 \x01(\tR\bhostname\x12%\n" +
@@ -4304,13 +4366,16 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x13update_attempted_at\x18\x0f \x01(\x03R\x11updateAttemptedAt\x12#\n" +
 	"\rtraps_enabled\x18\x10 \x01(\bR\ftrapsEnabled\x12.\n" +
 	"\x13trap_listener_state\x18\x11 \x01(\tR\x11trapListenerState\x12#\n" +
-	"\rtraps_dropped\x18\x12 \x01(\x04R\ftrapsDropped\"x\n" +
+	"\rtraps_dropped\x18\x12 \x01(\x04R\ftrapsDropped\x12)\n" +
+	"\x10applied_revision\x18\x13 \x01(\x04R\x0fappliedRevision\x12-\n" +
+	"\x12inventory_rejected\x18\x14 \x01(\tR\x11inventoryRejected\"\xa9\x01\n" +
 	"\n" +
 	"AgentError\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12\x15\n" +
 	"\x06job_id\x18\x02 \x01(\tR\x05jobId\x12\x18\n" +
 	"\amessage\x18\x03 \x01(\tR\amessage\x12\x1c\n" +
-	"\ttimestamp\x18\x04 \x01(\x03R\ttimestamp\"\xfa\x01\n" +
+	"\ttimestamp\x18\x04 \x01(\x03R\ttimestamp\x12/\n" +
+	"\x13inventory_rejection\x18\x05 \x01(\tR\x12inventoryRejection\"\xfa\x01\n" +
 	"\x14CredentialTestResult\x12\x17\n" +
 	"\atest_id\x18\x01 \x01(\tR\x06testId\x12\x18\n" +
 	"\asuccess\x18\x02 \x01(\bR\asuccess\x12#\n" +

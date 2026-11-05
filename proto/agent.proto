@@ -169,6 +169,11 @@ message CheckResult {
 
 message CheckList {
   repeated Check checks = 1;
+  // Monotonic revision of this authoritative service-check inventory, per
+  // agent connection. The agent echoes the newest revision it applied on its
+  // heartbeat so the server can re-push an inventory that never landed
+  // (issue #2755). Zero means the server predates revisions.
+  uint64 revision = 2;
 }
 
 // Heartbeat metadata
@@ -312,6 +317,11 @@ enum DiscoveryPhase {
 
 message AgentJobList {
   repeated AgentJob jobs = 1;
+  // Monotonic revision of this authoritative job inventory, per agent
+  // connection. The agent echoes the newest revision it applied on its
+  // heartbeat so the server can re-push an inventory that never landed
+  // (issue #2755). Zero means the server predates revisions.
+  uint64 revision = 2;
 }
 
 message AgentJob {
@@ -449,6 +459,16 @@ message AgentHeartbeat {
   bool traps_enabled = 16;
   string trap_listener_state = 17;
   uint64 traps_dropped = 18;
+  // Newest authoritative inventory revision the agent applied (issue #2755).
+  // Jobs and check_jobs share the per-connection revision stream, so one
+  // value covers both. Zero means nothing applied yet or an agent build that
+  // predates revisions; the server re-pushes when this trails the revision
+  // it last sent.
+  uint64 applied_revision = 19;
+  // Name of the last inventory frame the agent refused ("jobs" or
+  // "check_jobs"), reported until an inventory applies successfully. Empty
+  // means nothing refused or an agent build that predates the field.
+  string inventory_rejected = 20;
 }
 
 message AgentError {
@@ -456,6 +476,11 @@ message AgentError {
   string job_id = 2;
   string message = 3;
   int64 timestamp = 4;
+  // Name of the inventory frame this error refuses ("jobs", "check_jobs",
+  // "discovery_job"); empty on ordinary job failures (issue #2755). The
+  // server records it so a refused schedule is visible on the agent page
+  // instead of only in the agent's log.
+  string inventory_rejection = 5;
 }
 
 message CredentialTestResult {
