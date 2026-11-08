@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,10 @@ import (
 )
 
 const snmpMaxOIDsPerGet = 60
+
+// snmpMaxRepetitions is the GETBULK max-repetitions the walk loop requests
+// per round trip; newSnmpConn configures the connection to the same value.
+const snmpMaxRepetitions = 25
 
 // System-group OIDs a credential probe reads to prove a candidate and feed
 // device identification.
@@ -45,13 +50,15 @@ const (
 	maxProbeAttemptRetries     = 10
 )
 
-// snmpQuerier abstracts SNMP operations for testability.
+// snmpQuerier abstracts SNMP request operations for testability. Walks are
+// never delegated to gosnmp: its walk functions return a nil error when the
+// device answers genErr, tooBig, authorizationError, resourceUnavailable or
+// an empty varbind list, so snmpWalkAll runs the GETNEXT/GETBULK loop here
+// and inspects every response's error status itself.
 type snmpQuerier interface {
 	Get(oids []string) (*gosnmp.SnmpPacket, error)
-	WalkAll(rootOid string) ([]gosnmp.SnmpPDU, error)
-	BulkWalkAll(rootOid string) ([]gosnmp.SnmpPDU, error)
-	Walk(rootOid string, walkFn gosnmp.WalkFunc) error
-	BulkWalk(rootOid string, walkFn gosnmp.WalkFunc) error
+	GetNext(oids []string) (*gosnmp.SnmpPacket, error)
+	GetBulk(oids []string, nonRepeaters uint8, maxRepetitions uint32) (*gosnmp.SnmpPacket, error)
 }
 
 // snmpDial connects to the job's SNMP device and returns a querier + close
@@ -153,7 +160,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 				}
 			}
 		case pb.QueryType_WALK:
-			// SNMPv1 doesn't support GETBULK, use GETNEXT-based WalkAll instead
+			// SNMPv1 has no GETBULK, so its walk runs on GETNEXT.
 			useV1Walk := isSnmpV1(dev.Version)
 			for _, baseOID := range q.Oids {
 				if ctx.Err() != nil {
@@ -162,17 +169,9 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 				}
 				root := canonicalOID(baseOID)
 				values := make(map[string]string)
-				var results []gosnmp.SnmpPDU
-				var elapsed time.Duration
 				start := time.Now()
-				if useV1Walk {
-					results, err = conn.WalkAll(baseOID)
-				} else {
-					results, err = conn.BulkWalkAll(baseOID)
-				}
-				if err != nil {
-					elapsed = time.Since(start)
-				}
+				results, err := snmpWalkAll(ctx, conn, baseOID, useV1Walk)
+				elapsed := time.Since(start)
 				for _, v := range results {
 					if !snmpValueUsable(v) {
 						continue
@@ -180,7 +179,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 					values[canonicalOID(v.Name)] = snmpValueToString(v)
 				}
 				buckets = append(buckets, snmpResultBucket{
-					label: root, values: values, completed: err == nil, duration: time.Since(start),
+					label: root, values: values, completed: err == nil, duration: elapsed,
 				})
 				if err != nil {
 					if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -465,6 +464,115 @@ func varintLen(v int) int {
 		n++
 	}
 	return n
+}
+
+// snmpWalkAll runs the GETNEXT (SNMPv1) or GETBULK loop in the agent and
+// collects every varbind under rootOid. Unlike gosnmp's walk functions, any
+// response error status other than NoError fails the walk — keeping the
+// varbinds collected so far — so a device answering genErr, tooBig,
+// authorizationError or resourceUnavailable never reports a root complete
+// whose rows the server would then reconcile away. The one exception is
+// SNMPv1 noSuchName: for a v1 GETNEXT walk it is how a device reports the
+// normal end of the MIB. The loop also ends cleanly when a varbind carries
+// EndOfMibView, NoSuchObject or NoSuchInstance, when one escapes the
+// subtree, or — for a root that names a leaf — after one exact GET of the
+// root, mirroring gosnmp's walk semantics.
+func snmpWalkAll(ctx context.Context, conn snmpQuerier, rootOid string, v1 bool) ([]gosnmp.SnmpPDU, error) {
+	if rootOid == "" || rootOid == "." {
+		// gosnmp's convention: an empty root walks the internet subtree.
+		rootOid = ".1.3.6.1"
+	}
+	root := "." + strings.TrimPrefix(rootOid, ".")
+
+	var results []gosnmp.SnmpPDU
+	oid := root
+	// last is the OID every subsequent answer must exceed; a device that
+	// repeats or goes backwards would loop forever otherwise.
+	last := root
+	exactGet := false
+requestLoop:
+	for {
+		if err := ctx.Err(); err != nil {
+			return results, err
+		}
+		var packet *gosnmp.SnmpPacket
+		var err error
+		if exactGet {
+			packet, err = conn.Get([]string{oid})
+		} else if v1 {
+			packet, err = conn.GetNext([]string{oid})
+		} else {
+			packet, err = conn.GetBulk([]string{oid}, 0, snmpMaxRepetitions)
+		}
+		if err != nil {
+			return results, err
+		}
+
+		switch packet.Error {
+		case gosnmp.NoError:
+		case gosnmp.NoSuchName:
+			if v1 {
+				// Normal end of the MIB for a v1 GETNEXT walk: never
+				// consume the echoed varbinds of an error response.
+				return results, nil
+			}
+			return results, fmt.Errorf("device answered %v (error index %d) for %s", packet.Error, packet.ErrorIndex, canonicalOID(oid))
+		default:
+			return results, fmt.Errorf("device answered %v (error index %d) for %s", packet.Error, packet.ErrorIndex, canonicalOID(oid))
+		}
+		if len(packet.Variables) == 0 {
+			return results, fmt.Errorf("device answered with an empty varbind list for %s", canonicalOID(oid))
+		}
+
+		for i, pdu := range packet.Variables {
+			switch pdu.Type {
+			case gosnmp.EndOfMibView, gosnmp.NoSuchObject, gosnmp.NoSuchInstance:
+				// The subtree is exhausted (or the root itself is absent):
+				// a clean end, not a failure.
+				return results, nil
+			}
+			if !strings.HasPrefix(pdu.Name, root+".") {
+				if pdu.Name == root && pdu.Type != gosnmp.NoSuchInstance {
+					// The requested root itself was answered: a leaf walk.
+					results = append(results, pdu)
+				}
+				if !exactGet && oid == root && i == 0 {
+					// The first GETNEXT/GETBULK answered beyond the root, so
+					// the root names a leaf those requests cannot discover.
+					// Fall back to one exact GET (gosnmp issues #78, #93).
+					exactGet = true
+					oid = root
+					continue requestLoop
+				}
+				return results, nil
+			}
+			if !snmpOIDLess(last, pdu.Name) {
+				return results, fmt.Errorf("device answered a non-increasing OID %s after %s", canonicalOID(pdu.Name), canonicalOID(last))
+			}
+			results = append(results, pdu)
+			last = pdu.Name
+		}
+		oid = packet.Variables[len(packet.Variables)-1].Name
+	}
+}
+
+// snmpOIDLess reports whether dotted OID a sorts strictly before b, comparing
+// arcs numerically. It guards the walk loop against devices that repeat or
+// wind back OIDs, which would otherwise never terminate.
+func snmpOIDLess(a, b string) bool {
+	as := strings.Split(strings.TrimPrefix(a, "."), ".")
+	bs := strings.Split(strings.TrimPrefix(b, "."), ".")
+	for i := range min(len(as), len(bs)) {
+		an, aerr := strconv.ParseUint(as[i], 10, 64)
+		bn, berr := strconv.ParseUint(bs[i], 10, 64)
+		if aerr != nil || berr != nil {
+			return as[i] < bs[i]
+		}
+		if an != bn {
+			return an < bn
+		}
+	}
+	return len(as) < len(bs)
 }
 
 // isSnmpV1 reports whether a device speaks SNMPv1, which has no GETBULK.
@@ -806,7 +914,7 @@ func newSnmpConn(ctx context.Context, dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error
 		Port:           uint16(port),
 		Timeout:        10 * time.Second,
 		Retries:        2,
-		MaxRepetitions: 25,
+		MaxRepetitions: snmpMaxRepetitions,
 		Context:        ctx,
 	}
 	// gosnmp invokes OnSent after every transmitted packet, including

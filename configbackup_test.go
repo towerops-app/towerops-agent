@@ -1614,6 +1614,28 @@ func TestConfigBackupJobRouterOS6NoExitStatus(t *testing.T) {
 	}
 }
 
+// TestRunConfigBackupSessionRejectsTruncatedOutputOnDeadConnection: the
+// ExitMissingError tolerance must not swallow a dropped transport. A device
+// rebooting mid-export yields the same error over a dead connection, and
+// only a keepalive answer may excuse the missing exit status.
+func TestRunConfigBackupSessionRejectsTruncatedOutputOnDeadConnection(t *testing.T) {
+	resetHostKeyStore(t)
+	addr, cleanup := startDroppingSSHServer(t, "# model = RB5009\n/ip address\n")
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	client, _, err := configBackupDial(context.Background(), cbJob(host, port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	stdout, _, err := runConfigBackupSession(context.Background(), client, "/export", defaultMaxConfigBytes)
+	if err == nil {
+		t.Fatalf("dropped connection must fail, got %d bytes of truncated output", len(stdout))
+	}
+}
+
 // TestConfigBackupJobLegacyAlgorithms serves SSH with a key exchange and
 // cipher only a very old RouterOS 6 offers (group1-sha1, aes128-cbc) — both
 // moved out of x/crypto's default client list.

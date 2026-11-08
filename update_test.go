@@ -495,6 +495,13 @@ func TestSelfUpdateRenameError(t *testing.T) {
 	}()
 	dir := t.TempDir()
 	osExecutable = func() (string, error) { return filepath.Join(dir, "test-agent"), nil }
+	// The backup is a hard link now; failing it must stop before anything
+	// at the executable path is touched.
+	origLink := osLink
+	defer func() { osLink = origLink }()
+	osLink = func(oldpath, newpath string) error {
+		return fmt.Errorf("permission denied")
+	}
 	osRename = func(oldpath, newpath string) error {
 		return fmt.Errorf("permission denied")
 	}
@@ -515,8 +522,8 @@ func TestSelfUpdateRenameError(t *testing.T) {
 	if err == nil {
 		t.Error("expected rename error")
 	}
-	// The first rename moves the running binary aside; a replacement
-	// failure surfaces through it now.
+	// The first step is linking the running binary aside; a failure there
+	// surfaces through it now.
 	if !strings.Contains(err.Error(), "backup current binary") {
 		t.Errorf("expected 'backup current binary' in error, got: %v", err)
 	}
@@ -543,10 +550,15 @@ func TestSelfUpdateChecksumMatch(t *testing.T) {
 	httpDo = srv.Client().Do
 
 	// Stage into a temp dir and stop at the rename: letting the real
-	// os.Executable/os.Rename/syscall.Exec run would overwrite and re-exec the
-	// test binary itself.
+	// os.Executable/os.Link/os.Rename/syscall.Exec run would overwrite and
+	// re-exec the test binary itself. The exe must exist because the backup
+	// links the running binary before the stubbed rename.
 	dir := t.TempDir()
-	osExecutable = func() (string, error) { return filepath.Join(dir, "test-agent"), nil }
+	exePath := filepath.Join(dir, "test-agent")
+	if err := os.WriteFile(exePath, []byte("previous binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	osExecutable = func() (string, error) { return exePath, nil }
 	osRename = func(string, string) error { return fmt.Errorf("stop before replacing binary") }
 
 	err := selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum, "1.2.3")
@@ -573,14 +585,14 @@ func TestSelfUpdateFilePermissions(t *testing.T) {
 	exePath := stageExecutable(t)
 	osExecutable = func() (string, error) { return exePath, nil }
 
-	// The staged file is what the chmod lands on: it is the second rename's
-	// source (backup is first, staged->exe is second). It is deleted by
-	// cleanup on return, so capture its mode from inside the stub.
+	// The staged file is what the chmod lands on: it is the rename's source
+	// (the backup is a hard link now). It is deleted by cleanup on return,
+	// so capture its mode from inside the stub.
 	var capturedPerm os.FileMode
 	renames := 0
 	osRename = func(oldpath, newpath string) error {
 		renames++
-		if renames == 2 {
+		if renames == 1 {
 			info, statErr := os.Stat(oldpath)
 			if statErr != nil {
 				t.Fatalf("staged file missing: %v", statErr)
@@ -605,7 +617,7 @@ func TestSelfUpdateFilePermissions(t *testing.T) {
 
 	_ = selfUpdateContext(context.Background(), rewriteToHTTPS(srv.URL), checksum, "1.2.3")
 
-	if renames < 2 {
+	if renames < 1 {
 		t.Fatalf("expected the staged binary rename, got %d rename calls", renames)
 	}
 	if capturedPerm != 0700 {
@@ -1254,6 +1266,11 @@ func TestCliTSelfUpdateSyncDirectoryError(t *testing.T) {
 	osExecutable = func() (string, error) { return filepath.Join(missingDir, "agent"), nil }
 	osCreateTemp = func(_, pattern string) (updateTempFile, error) { return os.CreateTemp(stage, pattern) }
 	osRename = func(string, string) error { return nil }
+	// The backup link is faked like the renames: neither the exe nor its
+	// directory exists in this scenario.
+	origLink := osLink
+	defer func() { osLink = origLink }()
+	osLink = func(string, string) error { return nil }
 
 	execCalled := false
 	syscallExec = func(string, []string, []string) error {
@@ -1905,9 +1922,10 @@ func TestSelfUpdateMarkerPathFallback(t *testing.T) {
 	}
 }
 
-// TestSelfUpdateStagedRenameFailureRestoresPrev covers the staged build
-// failing to land and the restore failing with it.
-func TestSelfUpdateStagedRenameFailureRestoresPrev(t *testing.T) {
+// TestSelfUpdateStagedRenameFailureKeepsRunningBuild covers the staged build
+// failing to land: the hard link keeps the running binary at the executable
+// path through the whole swap, and the backup link is cleaned up.
+func TestSelfUpdateStagedRenameFailureKeepsRunningBuild(t *testing.T) {
 	forceBareBinaryUpdate(t)
 	body := elfUpdateBodyForHost()
 	srv, downloadURL, checksum := updateTestServer(t, body)
@@ -1915,27 +1933,21 @@ func TestSelfUpdateStagedRenameFailureRestoresPrev(t *testing.T) {
 	stubUpdateIO(t, srv, exePath)
 
 	osRename = func(oldpath, newpath string) error {
-		// Fail every rename that puts something new at the exe path:
-		// the staged build and the attempted restore. The backup (old
-		// exe moving aside) still succeeds.
-		if oldpath != exePath && newpath == exePath {
-			return errors.New("device busy")
-		}
-		return os.Rename(oldpath, newpath)
+		return errors.New("device busy")
 	}
 
 	err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3")
-	if err == nil || !strings.Contains(err.Error(), "and restore failed") {
-		t.Fatalf("selfUpdate error = %v, want a combined rename failure", err)
+	if err == nil || !strings.Contains(err.Error(), "rename new binary") {
+		t.Fatalf("selfUpdate error = %v, want a staged rename failure", err)
 	}
-	// Both renames failed: the exe path is empty and the running build sits
-	// untouched at the backup path for the operator to restore.
-	if _, statErr := os.Stat(exePath); !os.IsNotExist(statErr) {
-		t.Errorf("something was left at the exe path: %v", statErr)
+	// The rename failed, so the running build is still untouched at the exe
+	// path — nothing for the operator to restore by hand.
+	content, readErr := os.ReadFile(exePath)
+	if readErr != nil || string(content) != "previous binary" {
+		t.Errorf("running binary not intact at the exe path: %q, err %v", content, readErr)
 	}
-	prev, readErr := os.ReadFile(exePath + ".prev")
-	if readErr != nil || string(prev) != "previous binary" {
-		t.Errorf("backup binary missing or wrong: %q, err %v", prev, readErr)
+	if _, statErr := os.Stat(exePath + ".prev"); !os.IsNotExist(statErr) {
+		t.Errorf("backup link survived the failed staged rename: %v", statErr)
 	}
 }
 
@@ -1952,7 +1964,7 @@ func TestSelfUpdateExecFailureRestoreFailure(t *testing.T) {
 	calls := 0
 	osRename = func(oldpath, newpath string) error {
 		calls++
-		if calls == 3 { // backup, staged replacement, then the failed restore
+		if calls == 2 { // staged replacement, then the failed restore
 			return errors.New("device busy")
 		}
 		return os.Rename(oldpath, newpath)
@@ -1971,5 +1983,207 @@ func TestSelfUpdateExecFailureRestoreFailure(t *testing.T) {
 	}
 	if _, statErr := os.Stat(exePath + ".update-pending"); !os.IsNotExist(statErr) {
 		t.Error("update-pending marker survived an exec failure with a failed restore")
+	}
+}
+
+// TestSelfUpdateSyncFailureRestoresPrev pins the directory-sync failure
+// path: the staged build is installed by then, so the previous build must
+// go back and the marker must go, exactly like an exec failure — a retry
+// must not move the unproven build to .prev.
+func TestSelfUpdateSyncFailureRestoresPrev(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	body := elfUpdateBodyForHost()
+	srv, downloadURL, checksum := updateTestServer(t, body)
+	exePath := stageExecutable(t)
+	stubUpdateIO(t, srv, exePath)
+
+	origSync := syncDirectory
+	t.Cleanup(func() { syncDirectory = origSync })
+	syncDirectory = func(string) error { return errors.New("dirsync failed") }
+
+	execCalled := false
+	syscallExec = func(string, []string, []string) error {
+		execCalled = true
+		return nil
+	}
+
+	err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3")
+	if err == nil || !strings.Contains(err.Error(), "sync executable directory") {
+		t.Fatalf("selfUpdate error = %v, want directory sync failure", err)
+	}
+	if execCalled {
+		t.Error("re-exec attempted although the directory sync failed")
+	}
+	content, readErr := os.ReadFile(exePath)
+	if readErr != nil || string(content) != "previous binary" {
+		t.Errorf("previous binary not restored after sync failure: content %q, err %v", content, readErr)
+	}
+	if _, statErr := os.Stat(exePath + ".update-pending"); !os.IsNotExist(statErr) {
+		t.Error("update-pending marker survived a sync failure")
+	}
+}
+
+// A session that lands while the watchdog timer is already firing must win
+// the armedUpdate CompareAndSwap: losing it stops the callback so a build
+// that just joined is not rolled back.
+func TestWatchdogDoesNotRollBackJoinedBuild(t *testing.T) {
+	origExe, origTimeout := osExecutable, updateJoinTimeout
+	defer func() {
+		osExecutable = origExe
+		updateJoinTimeout = origTimeout
+		if timer := updateWatchdog.Swap(nil); timer != nil {
+			timer.Stop()
+		}
+		armedUpdate.Store(nil)
+	}()
+	exePath := stageExecutable(t)
+	if err := os.WriteFile(exePath, []byte("unproven binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exePath+".prev", []byte("previous binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exePath+".update-pending", mustJSON(pendingUpdate{Version: "1.2.3"}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	osExecutable = func() (string, error) { return exePath, nil }
+
+	exited := make(chan int, 1)
+	origExit := osExit
+	defer func() { osExit = origExit }()
+	osExit = func(code int) { exited <- code }
+	updateJoinTimeout = 10 * time.Millisecond
+
+	if p := checkPendingUpdate(); p == nil {
+		t.Fatal("pending update was not armed")
+	}
+	// The join lands while the callback is in flight: updateJoined's Swap
+	// removes the arm before the callback reaches its CompareAndSwap.
+	armedUpdate.Store(nil)
+
+	select {
+	case code := <-exited:
+		t.Fatalf("watchdog rolled back a build that joined: osExit(%d)", code)
+	case <-time.After(200 * time.Millisecond):
+	}
+	content, err := os.ReadFile(exePath)
+	if err != nil || string(content) != "unproven binary" {
+		t.Errorf("joined build was rolled back: %q, err %v", content, err)
+	}
+	if res := readUpdateResult(); res != nil && res.Error != "" {
+		t.Errorf("failure recorded for a build that joined: %+v", res)
+	}
+}
+
+// beginUpdate registers exactly one update, detached from the requesting
+// session but cancellable by the shutdown hook; finish releases the slot.
+func TestBeginUpdateRegistrationAndShutdownCancel(t *testing.T) {
+	t.Cleanup(func() { currentUpdate.Store(nil) })
+	currentUpdate.Store(nil)
+
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	defer sessionCancel()
+
+	u := beginUpdate(sessionCtx)
+	if u == nil {
+		t.Fatal("beginUpdate returned nil with no update registered")
+	}
+	// The update must survive session cancellation...
+	sessionCancel()
+	if u.ctx.Err() != nil {
+		t.Fatalf("update ctx = %v, want it detached from the session", u.ctx.Err())
+	}
+	// ...but a duplicate update must be refused.
+	if again := beginUpdate(context.Background()); again != nil {
+		t.Fatal("beginUpdate handed out a second update handle")
+	}
+
+	// Shutdown cancels the registered update with its own cause.
+	cancelActiveUpdate()
+	if u.ctx.Err() == nil {
+		t.Fatal("cancelActiveUpdate did not cancel the update")
+	}
+	if cause := context.Cause(u.ctx); !errors.Is(cause, errUpdateShutdown) {
+		t.Fatalf("update cancellation cause = %v, want %v", cause, errUpdateShutdown)
+	}
+
+	// finish clears the registration so a later update can begin.
+	u.finish()
+	if got := currentUpdate.Load(); got != nil {
+		t.Fatal("finish left the update registered")
+	}
+	next := beginUpdate(context.Background())
+	if next == nil {
+		t.Fatal("beginUpdate refused a new update after finish")
+	}
+	next.finish()
+}
+
+// waitActiveUpdate returns as soon as the registered update finishes, and
+// without waiting at all when no update is running.
+func TestWaitActiveUpdateReturnsWhenUpdateFinishes(t *testing.T) {
+	t.Cleanup(func() { currentUpdate.Store(nil) })
+	currentUpdate.Store(nil)
+
+	start := time.Now()
+	waitActiveUpdate(200 * time.Millisecond)
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("waitActiveUpdate with no update waited %v", elapsed)
+	}
+
+	u := beginUpdate(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		u.finish()
+	}()
+	start = time.Now()
+	waitActiveUpdate(2 * time.Second)
+	if elapsed := time.Since(start); elapsed >= 2*time.Second {
+		t.Fatal("waitActiveUpdate timed out although the update finished")
+	}
+}
+
+// A shutdown cancellation landing between the binary swap and the re-exec
+// — exactly where SIGTERM during the drain arrives — must restore the
+// previous build instead of re-execing into the new one.
+func TestSelfUpdateShutdownBeforeExecRestoresPrev(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	body := elfUpdateBodyForHost()
+	srv, downloadURL, checksum := updateTestServer(t, body)
+	exePath := stageExecutable(t)
+	stubUpdateIO(t, srv, exePath)
+
+	// Register the update the way the session's update handler does, then
+	// cancel it from the drain hook: the shutdown hook runs while the
+	// update is between the swap and the exec.
+	u := beginUpdate(context.Background())
+	t.Cleanup(u.finish)
+
+	execCalled := false
+	syscallExec = func(string, []string, []string) error {
+		execCalled = true
+		return nil
+	}
+	drain := func(context.Context) bool {
+		cancelActiveUpdate() // SIGTERM lands during the drain
+		return true
+	}
+	origDrain := drainResultSpool.Load()
+	drainResultSpool.Store(&drain)
+	t.Cleanup(func() { drainResultSpool.Store(origDrain) })
+
+	err := selfUpdateContext(u.ctx, downloadURL, checksum, "1.2.3")
+	if err == nil || !errors.Is(err, errUpdateShutdown) {
+		t.Fatalf("selfUpdate error = %v, want the shutdown cause", err)
+	}
+	if execCalled {
+		t.Error("re-exec ran although shutdown cancelled the update")
+	}
+	content, readErr := os.ReadFile(exePath)
+	if readErr != nil || string(content) != "previous binary" {
+		t.Errorf("previous binary not restored: content %q, err %v", content, readErr)
+	}
+	if _, statErr := os.Stat(exePath + ".update-pending"); !os.IsNotExist(statErr) {
+		t.Error("update-pending marker survived the shutdown cancellation")
 	}
 }

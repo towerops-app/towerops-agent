@@ -159,10 +159,13 @@ func sharedSocket(network string) (*icmpSocket, error) {
 	}
 	// Unprivileged UDP sockets have their echo identifier rewritten to the
 	// local port, so replies come back with that identifier rather than the
-	// process id.
+	// process id. Some platforms - darwin among them - report port 0 on the
+	// fresh socket while replies carry the process id, so a zero port must
+	// not be trusted: replyID stays unknown (-1) and waiters match on
+	// sequence alone.
 	replyID := -1
 	if strings.HasPrefix(network, "udp") {
-		if localAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		if localAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && localAddr.Port != 0 {
 			replyID = localAddr.Port
 		}
 	} else {
@@ -554,7 +557,16 @@ func execPing(parent context.Context, ip string, timeoutMs int) (float64, error)
 	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutMs+1000)*time.Millisecond)
 	defer cancel()
 
-	output, err := pingCommandOutput(ctx, pingCmd, "-c", "1", "-W", strconv.Itoa(timeoutArg), ip)
+	args := []string{"-c", "1", "-W", strconv.Itoa(timeoutArg), ip}
+	if pingGOOS == "darwin" && pingCmd == "ping6" {
+		// macOS ping6's -W takes no argument - it selects old-format Node
+		// Information queries - and reads the timeout value as the host. It
+		// has no per-reply wait option, so the context deadline bounds a
+		// silent host instead.
+		args = []string{"-c", "1", ip}
+	}
+
+	output, err := pingCommandOutput(ctx, pingCmd, args...)
 	if err != nil {
 		return 0, fmt.Errorf("ping failed: %s: %w", strings.TrimSpace(string(output)), errors.Join(err, ctx.Err()))
 	}

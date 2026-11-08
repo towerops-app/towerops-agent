@@ -16,7 +16,7 @@ import (
 )
 
 func TestRateLimitedQuerierChargesOnlyTransmittedPackets(t *testing.T) {
-	for _, operation := range []string{"get", "walk", "bulk-walk"} {
+	for _, operation := range []string{"get", "next", "get-bulk"} {
 		for _, packets := range []int{0, 1, 3} {
 			t.Run(fmt.Sprintf("%s/packets=%d", operation, packets), func(t *testing.T) {
 				original := snmpPDUs
@@ -29,20 +29,22 @@ func TestRateLimitedQuerierChargesOnlyTransmittedPackets(t *testing.T) {
 						hook(nil)
 					}
 				}
+				send := func() (*gosnmp.SnmpPacket, error) {
+					transmit()
+					if packets == 0 {
+						return nil, errors.New("request never sent")
+					}
+					return &gosnmp.SnmpPacket{}, nil
+				}
 				mock := &mockSnmpQuerier{
 					getFunc: func([]string) (*gosnmp.SnmpPacket, error) {
-						transmit()
-						if packets == 0 {
-							return nil, errors.New("request never sent")
-						}
-						return &gosnmp.SnmpPacket{}, nil
+						return send()
 					},
-					walkStepFunc: func(string) ([]gosnmp.SnmpPDU, error) {
-						transmit()
-						if packets == 0 {
-							return nil, errors.New("request never sent")
-						}
-						return []gosnmp.SnmpPDU{{Name: "1.3.6.1.1"}}, nil
+					nextFunc: func([]string) (*gosnmp.SnmpPacket, error) {
+						return send()
+					},
+					getBulkFunc: func([]string, uint8, uint32) (*gosnmp.SnmpPacket, error) {
+						return send()
 					},
 				}
 				q := &rateLimitedQuerier{ctx: context.Background(), q: mock}
@@ -50,10 +52,10 @@ func TestRateLimitedQuerierChargesOnlyTransmittedPackets(t *testing.T) {
 				switch operation {
 				case "get":
 					_, err = q.Get([]string{"1.3.6.1"})
-				case "walk":
-					err = q.Walk("1.3.6.1", func(gosnmp.SnmpPDU) error { return nil })
-				case "bulk-walk":
-					err = q.BulkWalk("1.3.6.1", func(gosnmp.SnmpPDU) error { return nil })
+				case "next":
+					_, err = q.GetNext([]string{"1.3.6.1"})
+				case "get-bulk":
+					_, err = q.GetBulk([]string{"1.3.6.1"}, 0, snmpMaxRepetitions)
 				}
 				if (err != nil) != (packets == 0) {
 					t.Fatalf("operation error = %v for %d packets", err, packets)
@@ -492,11 +494,14 @@ func TestRateLimitedQuerier(t *testing.T) {
 		getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 			return &gosnmp.SnmpPacket{}, nil
 		},
-		walkFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
-			return []gosnmp.SnmpPDU{{Name: rootOid + ".1"}}, nil
+		nextFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+			return &gosnmp.SnmpPacket{}, nil
 		},
-		walkStepFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
-			return []gosnmp.SnmpPDU{{Name: rootOid + ".1"}}, nil
+		getBulkFunc: func(oids []string, nonRepeaters uint8, maxRepetitions uint32) (*gosnmp.SnmpPacket, error) {
+			if nonRepeaters != 0 || maxRepetitions != snmpMaxRepetitions {
+				t.Errorf("GetBulk parameters = (%d, %d), want (0, %d)", nonRepeaters, maxRepetitions, snmpMaxRepetitions)
+			}
+			return &gosnmp.SnmpPacket{}, nil
 		},
 	}
 	q := &rateLimitedQuerier{ctx: context.Background(), q: mock}
@@ -504,41 +509,17 @@ func TestRateLimitedQuerier(t *testing.T) {
 	if _, err := q.Get([]string{"1.3.6.1"}); err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	results, err := q.WalkAll("1.3.6.1")
-	if err != nil {
-		t.Fatalf("WalkAll: %v", err)
+	if _, err := q.GetNext([]string{"1.3.6.1"}); err != nil {
+		t.Fatalf("GetNext: %v", err)
 	}
-	// WalkAll collects PDUs through the paced Walk path, so the delegate
-	// records a Walk root rather than a WalkAll call.
-	if len(mock.walkRoots) != 1 {
-		t.Fatal("WalkAll did not delegate")
+	if len(mock.nextRequests) != 1 || mock.nextRequests[0] != "1.3.6.1" {
+		t.Fatalf("GetNext requests = %v, want [1.3.6.1]", mock.nextRequests)
 	}
-	if len(results) != 1 || results[0].Name != "1.3.6.1.1" {
-		t.Fatalf("WalkAll collected %v, want the walk's PDU", results)
+	if _, err := q.GetBulk([]string{"1.3.6.1"}, 0, snmpMaxRepetitions); err != nil {
+		t.Fatalf("GetBulk: %v", err)
 	}
-	if results, err := q.BulkWalkAll("1.3.6.1"); err != nil || len(results) != 1 {
-		t.Fatalf("BulkWalkAll = %v, %v; want one collected PDU", results, err)
-	}
-	if len(mock.bulkWalkRoots) != 1 {
-		t.Fatal("BulkWalkAll did not delegate")
-	}
-	var walked []gosnmp.SnmpPDU
-	if err := q.Walk("1.3.6.1", func(p gosnmp.SnmpPDU) error {
-		walked = append(walked, p)
-		return nil
-	}); err != nil {
-		t.Fatalf("Walk: %v", err)
-	}
-	if len(walked) != 1 {
-		t.Fatalf("Walk delivered %d PDUs, want 1", len(walked))
-	}
-	if err := q.BulkWalk("1.3.6.1", func(p gosnmp.SnmpPDU) error { return nil }); err != nil {
-		t.Fatalf("BulkWalk: %v", err)
-	}
-	// One root from BulkWalkAll routing through BulkWalk, plus the direct
-	// BulkWalk call above.
-	if len(mock.bulkWalkRoots) != 2 {
-		t.Fatal("BulkWalk did not delegate")
+	if len(mock.bulkRequests) != 1 || mock.bulkRequests[0] != "1.3.6.1" {
+		t.Fatalf("GetBulk requests = %v, want [1.3.6.1]", mock.bulkRequests)
 	}
 }
 
@@ -558,93 +539,82 @@ func TestRateLimitedQuerierCancelledContext(t *testing.T) {
 			delegated = true
 			return &gosnmp.SnmpPacket{}, nil
 		},
+		nextFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+			delegated = true
+			return &gosnmp.SnmpPacket{}, nil
+		},
+		getBulkFunc: func(oids []string, _ uint8, _ uint32) (*gosnmp.SnmpPacket, error) {
+			delegated = true
+			return &gosnmp.SnmpPacket{}, nil
+		},
 	}
 	q := &rateLimitedQuerier{ctx: ctx, q: mock}
 	_, err := q.Get([]string{"1.3.6.1"})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Get error = %v, want context.Canceled", err)
 	}
-	if _, err := q.WalkAll("1.3.6.1"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("WalkAll error = %v, want context.Canceled", err)
+	if _, err := q.GetNext([]string{"1.3.6.1"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetNext error = %v, want context.Canceled", err)
 	}
-	if _, err := q.BulkWalkAll("1.3.6.1"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("BulkWalkAll error = %v, want context.Canceled", err)
-	}
-	if err := q.Walk("1.3.6.1", func(p gosnmp.SnmpPDU) error { return nil }); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Walk error = %v, want context.Canceled", err)
-	}
-	if err := q.BulkWalk("1.3.6.1", func(p gosnmp.SnmpPDU) error { return nil }); !errors.Is(err, context.Canceled) {
-		t.Fatalf("BulkWalk error = %v, want context.Canceled", err)
+	if _, err := q.GetBulk([]string{"1.3.6.1"}, 0, snmpMaxRepetitions); !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetBulk error = %v, want context.Canceled", err)
 	}
 	if delegated {
 		t.Fatal("querier delegated to the device despite cancellation")
 	}
 }
 
-// A walk must repay the OnSent debt between requests instead of dumping
-// every GETNEXT/GETBULK back-to-back. The mock charges the bucket per PDU
-// the way gosnmp's OnSent does per packet, so five PDUs at 100/s must take
-// roughly five token intervals (50ms); without pacing it returns instantly.
-func TestRateLimitedQuerierPacesWalks(t *testing.T) {
-	t.Cleanup(func() { setSNMPPDURate(defaultSNMPPDURate) })
-	setSNMPPDURate(100) // burst of 10, then 10ms per token
+// Bug #19 regression: pacing must happen once per outgoing request, not once
+// per varbind. One GETBULK response carrying 25 varbinds costs one slot, and
+// the end-of-MIB response sleeps nothing because no request follows it. The
+// frozen clock makes refill impossible, so every reservation's debt surfaces
+// as real sleep: two requests with one charge outstanding take ~50ms at
+// 100/s, while per-varbind pacing would take twenty-six slots (~520ms).
+func TestWalkPacesOncePerRequest(t *testing.T) {
+	original := snmpPDUs
+	t.Cleanup(func() { snmpPDUs = original })
 
-	// Drop the burst so every step of the walk runs under debt.
-	snmpPDUs.mu.Lock()
-	snmpPDUs.tokens = 0
-	snmpPDUs.last = snmpPDUs.now()
-	snmpPDUs.mu.Unlock()
+	fixed := time.Now()
+	snmpPDUs = newTokenBucket(100, func() time.Time { return fixed })
+	for range 11 { // burst of 10 plus one: one charge of OnSent debt outstanding
+		snmpPDUs.charge()
+	}
 
-	const pdus = 5
+	const root = ".1.3.6.1.2.1.2"
+	const varbinds = 25
+	requests := 0
 	mock := &mockSnmpQuerier{
-		walkStepFunc: func(rootOid string) ([]gosnmp.SnmpPDU, error) {
-			out := make([]gosnmp.SnmpPDU, pdus)
-			for i := range out {
-				out[i].Name = fmt.Sprintf("%s.%d", rootOid, i+1)
+		getBulkFunc: func(oids []string, _ uint8, _ uint32) (*gosnmp.SnmpPacket, error) {
+			requests++
+			snmpPDUs.charge() // gosnmp charges OnSent per transmitted packet
+			if requests == 1 {
+				vars := make([]gosnmp.SnmpPDU, varbinds)
+				for i := range vars {
+					vars[i] = gosnmp.SnmpPDU{Name: fmt.Sprintf("%s.%d", root, i+1), Type: gosnmp.Integer, Value: i + 1}
+				}
+				return &gosnmp.SnmpPacket{Variables: vars}, nil
 			}
-			return out, nil
+			return endOfMibViewPacket(oids[0]), nil
 		},
-		onWalkPDU: func() { snmpPDUs.charge() },
 	}
 	q := &rateLimitedQuerier{ctx: context.Background(), q: mock}
 
 	start := time.Now()
-	results, err := q.WalkAll("1.3.6.1")
+	results, err := snmpWalkAll(context.Background(), q, root, false)
 	elapsed := time.Since(start)
 	if err != nil {
-		t.Fatalf("WalkAll: %v", err)
+		t.Fatalf("walk: %v", err)
 	}
-	if len(results) != pdus {
-		t.Fatalf("WalkAll collected %d PDUs, want %d", len(results), pdus)
+	if len(results) != varbinds {
+		t.Fatalf("walk collected %d varbinds, want %d", len(results), varbinds)
 	}
-	// Each paced step sleeps until the last send's token is repaid (~10ms at
-	// 100/s); unpaced sends finish in microseconds.
-	if elapsed < 40*time.Millisecond {
-		t.Fatalf("walk of %d PDUs finished in %v; the limiter did not pace the requests", pdus, elapsed)
+	if requests != 2 || len(mock.bulkRequests) != 2 {
+		t.Fatalf("walk sent %d requests (%d recorded), want 2", requests, len(mock.bulkRequests))
 	}
-}
-
-// pacedWalkFn must surface a walkFn error without touching the bucket, and a
-// cancelled ctx while repaying debt must end the walk.
-func TestPacedWalkFnErrorAndCancel(t *testing.T) {
-	t.Cleanup(func() { setSNMPPDURate(defaultSNMPPDURate) })
-
-	mock := &mockSnmpQuerier{}
-	q := &rateLimitedQuerier{ctx: context.Background(), q: mock}
-	paced := q.pacedWalkFn(func(gosnmp.SnmpPDU) error { return errors.New("walkFn failed") })
-	if err := paced(gosnmp.SnmpPDU{}); err == nil || err.Error() != "walkFn failed" {
-		t.Fatalf("pacedWalkFn = %v, want walkFn error", err)
+	if elapsed < 40*time.Millisecond || elapsed >= 300*time.Millisecond {
+		t.Fatalf("walk of %d varbinds over %d requests took %v; want two paced slots (~50ms), not per-varbind reservations (~520ms)", varbinds, requests, elapsed)
 	}
-
-	// With debt outstanding and a cancelled ctx, the wrapped fn returns the
-	// ctx error instead of nil.
-	setSNMPPDURate(1)
-	snmpPDUs.charge()
-	ctx, cancel := context.WithCancel(context.Background())
-	q.ctx = ctx
-	paced = q.pacedWalkFn(func(gosnmp.SnmpPDU) error { return nil })
-	cancel()
-	if err := paced(gosnmp.SnmpPDU{}); !errors.Is(err, context.Canceled) {
-		t.Fatalf("pacedWalkFn = %v, want context.Canceled", err)
+	if snmpPDUs.tokens != -3 {
+		t.Fatalf("tokens = %v after the walk, want -3 — one OnSent charge per transmitted packet, no reservation consumed", snmpPDUs.tokens)
 	}
 }

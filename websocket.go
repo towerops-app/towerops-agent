@@ -17,8 +17,19 @@ const (
 	wsHandshakeTimeout = 30 * time.Second
 	wsReadTimeout      = 90 * time.Second
 	wsWriteTimeout     = 30 * time.Second
-	maxMessageSize     = 16 << 20
 )
+
+// wsMaxReadOverhead bounds the JSON envelope (topic, event, ref and the
+// "binary" key) that wraps an encoded payload, on top of the payload itself.
+const wsMaxReadOverhead = 1 << 20
+
+// maxMessageSize caps inbound frames just above the largest payload the agent
+// can decode and refuse. decodeBinaryPayload rejects encoded payloads over
+// maxEncodedJobPayloadBytes with an inventory_rejection notice the server
+// needs to re-push the inventory, so the read limit must sit above that: a
+// frame killed by the read limit tears the session down before any rejection
+// can be sent, and every session would die right after joining.
+var maxMessageSize = maxEncodedJobPayloadBytes + wsMaxReadOverhead
 
 // wsMinWriteBytesPerSec is the assumed uplink floor (1 Mbps) used to scale the
 // write deadline. The fixed wsWriteTimeout alone lets an ~8MiB base64 result
@@ -53,6 +64,14 @@ func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 	defer cancel()
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// The client serves this handshake only and is never stored: a failed
+	// handshake (403/502) returns its connection to the clone's idle pool,
+	// where it would hold a socket and two goroutines for the 90s idle
+	// timeout per failed dial. Closing idle connections when the dial ends
+	// releases them; the upgraded connection of a successful handshake is
+	// handed to coder/websocket as an in-use response body, not an idle
+	// pooled connection, so this cannot disturb a live session.
+	defer transport.CloseIdleConnections()
 	dialContext := transport.DialContext
 	localAddr := make(chan string, 1)
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -77,7 +96,7 @@ func wsDial(ctx context.Context, rawURL string) (*wsConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial websocket: %w", err)
 	}
-	conn.SetReadLimit(maxMessageSize)
+	conn.SetReadLimit(int64(maxMessageSize))
 	var recordedAddr string
 	select {
 	case recordedAddr = <-localAddr:

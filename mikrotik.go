@@ -189,6 +189,18 @@ func compareMikrotikArgKeys(a, b string) int {
 }
 
 func (c *mikrotikClient) executeWords(words []string) (*mikrotikResponse, error) {
+	// A zero-length word is the end-of-sentence marker on the wire, so an
+	// empty command or an empty word would split the sentence in two and
+	// make the next command on the connection read the stale reply. Reject
+	// both before anything is written.
+	if len(words) == 0 || words[0] == "" {
+		return nil, fmt.Errorf("empty RouterOS command")
+	}
+	for i, w := range words[1:] {
+		if w == "" {
+			return nil, fmt.Errorf("empty RouterOS API word at index %d", i+1)
+		}
+	}
 	if conn, ok := c.conn.(net.Conn); ok {
 		if err := conn.SetWriteDeadline(time.Now().Add(mikrotikWriteTimeout)); err != nil {
 			return nil, fmt.Errorf("set write deadline: %w", err)

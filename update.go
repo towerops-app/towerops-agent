@@ -43,6 +43,7 @@ var osCreateTemp = func(dir, pattern string) (updateTempFile, error) {
 	return os.CreateTemp(dir, pattern)
 }
 var osRename = os.Rename
+var osLink = os.Link
 var httpNewRequest = http.NewRequestWithContext
 var httpDo = func(req *http.Request) (*http.Response, error) {
 	return http.DefaultClient.Do(req)
@@ -204,6 +205,12 @@ func checkPendingUpdate() *pendingUpdate {
 	}
 
 	timer := time.AfterFunc(updateJoinTimeout, func() {
+		// updateJoined swaps the arm away when a session joins. If that lands
+		// while this timer is already firing, losing the CompareAndSwap means
+		// the build proved itself and this rollback must not run.
+		if !armedUpdate.CompareAndSwap(p, nil) {
+			return
+		}
 		slog.Error("updated binary did not join its channel; restoring previous build",
 			"version", p.Version, "timeout", updateJoinTimeout)
 		rollbackUpdate(fmt.Sprintf("updated binary did not join its channel within %s", updateJoinTimeout))
@@ -417,6 +424,80 @@ func (r *updateIdleReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// activeUpdate tracks the one in-flight self-update. The update runs detached
+// from the session that requested it (a reconnect must not abort it), so
+// process shutdown is the only authority that may still stop it: shutdown
+// cancels the update before the binary is replaced and waits for its cleanup
+// before the process exits.
+type activeUpdate struct {
+	// ctx is the update's execution context: detached from the session,
+	// cancellable by cancelActiveUpdate.
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	done   chan struct{}
+}
+
+// currentUpdate holds the running update, or nil. It doubles as the
+// duplicate-update guard and as the handle shutdown coordinates through.
+var currentUpdate atomic.Pointer[activeUpdate]
+
+// errUpdateShutdown is the cancellation cause when the process shuts down
+// while an update is in flight. The update must stand down instead of
+// replacing the binary or re-execing: a re-exec after SIGTERM would install
+// new signal handlers and keep running until systemd sends SIGKILL.
+var errUpdateShutdown = errors.New("update canceled by shutdown")
+
+// beginUpdate registers the caller as the one in-flight self-update and
+// returns its coordination handle. It returns nil when an update is already
+// running, which the caller reports as a duplicate.
+func beginUpdate(ctx context.Context) *activeUpdate {
+	u := &activeUpdate{done: make(chan struct{})}
+	if !currentUpdate.CompareAndSwap(nil, u) {
+		return nil
+	}
+	u.ctx, u.cancel = context.WithCancelCause(context.WithoutCancel(ctx))
+	return u
+}
+
+// finish releases the handle once the update goroutine has returned.
+func (u *activeUpdate) finish() {
+	u.cancel(context.Canceled)
+	close(u.done)
+	currentUpdate.CompareAndSwap(u, nil)
+}
+
+// cancelActiveUpdate asks an in-flight self-update to stand down at its next
+// cancellation point, before the binary is replaced or re-execed. Only
+// process shutdown calls it: ordinary session cancellation must never abort
+// an update, which is why the update context is detached from the session.
+func cancelActiveUpdate() {
+	if u := currentUpdate.Load(); u != nil {
+		u.cancel(errUpdateShutdown)
+	}
+}
+
+// shutdownUpdateWait bounds how long the shutdown path waits for a cancelled
+// in-flight update to finish its restore before the process exits.
+var shutdownUpdateWait = 10 * time.Second
+
+// waitActiveUpdate waits for the in-flight self-update to return, bounded by
+// budget, so the process never exits between the binary swap and the restore
+// the shutdown cancellation triggers. With no update running there is
+// nothing to wait for.
+func waitActiveUpdate(budget time.Duration) {
+	u := currentUpdate.Load()
+	if u == nil {
+		return
+	}
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case <-u.done:
+	case <-timer.C:
+		slog.Warn("self-update still running at shutdown; proceeding without it", "waited", budget)
+	}
+}
+
 // selfUpdateContext downloads a new binary, verifies its checksum and that it
 // is an executable for this machine, replaces the current binary, and
 // re-execs while honoring caller cancellation. The running binary is first
@@ -542,19 +623,19 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum, versi
 		return fmt.Errorf("rejecting staged update: %w", err)
 	}
 
-	// Keep the running build restorable: move it aside, put the staged build
-	// in place, and mark the update pending so the next boot knows the binary
-	// under the executable path is unproven. An exec that fails below leaves
-	// everything it changed reversible from this same process.
+	// Keep the running build restorable: hard-link it to <exe>.prev, then
+	// rename the staged build over the executable in one atomic step. The
+	// link is what makes the window safe: until the rename lands, the old
+	// binary is still at the executable path, so a crash mid-swap — or a
+	// restore that fails below — can never leave nothing to run.
 	prevExe := currentExe + ".prev"
-	if err := osRename(currentExe, prevExe); err != nil {
+	if err := osLink(currentExe, prevExe); err != nil {
 		return fmt.Errorf("backup current binary: %w", err)
 	}
 	if err := osRename(tempPath, currentExe); err != nil {
-		// The staged build failed to land; put the running one back.
-		if restoreErr := osRename(prevExe, currentExe); restoreErr != nil {
-			return fmt.Errorf("rename new binary: %w (and restore failed: %v)", err, restoreErr)
-		}
+		// The staged build never landed, so the running one is still in
+		// place at the executable path; only the link needs to go.
+		_ = os.Remove(prevExe)
 		return fmt.Errorf("rename new binary: %w", err)
 	}
 	slog.Warn("replaced binary does not inherit file capabilities granted with setcap", "path", currentExe)
@@ -570,6 +651,15 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum, versi
 	}
 
 	if err := syncDirectory(filepath.Dir(currentExe)); err != nil {
+		// The new binary is installed but not proven durable on disk. Restore
+		// the previous build and drop the marker, exactly like the
+		// exec-failure path below, so a retried update does not move the
+		// unproven build to .prev and a later rollback cannot restore it.
+		slog.Error("sync of executable directory failed; restoring previous build", "error", err)
+		if restoreErr := osRename(prevExe, currentExe); restoreErr != nil {
+			return fmt.Errorf("sync executable directory: %w (and restore failed: %v)", err, restoreErr)
+		}
+		_ = os.Remove(markerPath)
 		return fmt.Errorf("sync executable directory: %w", err)
 	}
 	slog.Info("binary replaced", "path", currentExe)
@@ -584,6 +674,20 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum, versi
 		if !drained {
 			slog.Warn("self-update drain timed out; spooled results and in-flight jobs are discarded by re-exec")
 		}
+	}
+
+	// A shutdown that arrived before the swap, or during this drain, cancels
+	// the update. Standing down here restores the previous build instead of
+	// re-execing into the new one while the process is exiting: a re-exec
+	// after SIGTERM would replace the process image, install new signal
+	// handlers and keep running until systemd sends SIGKILL.
+	if cause := context.Cause(reqCtx); cause != nil {
+		slog.Warn("self-update canceled after replacement; restoring previous build", "cause", cause)
+		if restoreErr := osRename(prevExe, currentExe); restoreErr != nil {
+			slog.Error("restore of previous binary failed", "error", restoreErr)
+		}
+		_ = os.Remove(markerPath)
+		return fmt.Errorf("update canceled before re-exec: %w", cause)
 	}
 
 	// Re-exec with same arguments

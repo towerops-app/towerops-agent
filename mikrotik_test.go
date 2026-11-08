@@ -157,6 +157,30 @@ func TestEncodeLength(t *testing.T) {
 	}
 }
 
+// TestExecuteWordsRejectsEmptyCommandAndWords: a zero-length word is the
+// end-of-sentence marker on the wire, so an empty command or an empty word
+// would end the sentence early and make the next command on the connection
+// read the stale reply. Both must be rejected before anything is written.
+func TestExecuteWordsRejectsEmptyCommandAndWords(t *testing.T) {
+	var buf bytes.Buffer
+	client := &mikrotikClient{conn: &nopCloser{readWriter: &buf}}
+	for _, words := range [][]string{
+		{""},
+		{"/system/resource/print", ""},
+		{"/queue/simple/print", "=stats=", ""},
+	} {
+		if _, err := client.executeWords(words); err == nil {
+			t.Errorf("executeWords(%q) = nil error, want a rejection", words)
+		}
+	}
+	if _, err := client.execute("", nil); err == nil {
+		t.Error("execute with an empty command must be rejected")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("rejected sentences wrote %d bytes", buf.Len())
+	}
+}
+
 func TestWriteSentenceHandlesShortWrites(t *testing.T) {
 	conn := &shortWriter{}
 	client := &mikrotikClient{conn: conn}

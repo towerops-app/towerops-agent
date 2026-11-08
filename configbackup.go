@@ -377,10 +377,11 @@ func runConfigBackupSession(ctx context.Context, c *ssh.Client, cmd string, maxB
 	runErr := session.Run(cmd)
 	// RouterOS 6 closes the exec channel without an exit-status, which
 	// surfaces as *ssh.ExitMissingError with the output still delivered.
-	// Tolerate it only while the job context is live: a deadline-driven
-	// conn.Close produces the same error and must stay an error.
+	// Tolerate it only while the connection still answers a keepalive: a
+	// deadline-driven conn.Close produces the same error and must stay an
+	// error.
 	var exitMissing *ssh.ExitMissingError
-	if errors.As(runErr, &exitMissing) && ctx.Err() == nil {
+	if errors.As(runErr, &exitMissing) && sshClientAlive(c) {
 		runErr = nil
 	}
 	if outBuf.overflow {
