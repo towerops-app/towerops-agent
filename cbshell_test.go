@@ -136,6 +136,110 @@ func TestShellFilterLimit(t *testing.T) {
 	}
 }
 
+// TestShellFilterAdjustMarkers pins adjustMarkers' bookkeeping: a range a
+// cut runs through is dropped, a range ending before the cut survives.
+func TestShellFilterAdjustMarkers(t *testing.T) {
+	f := newShellFilter(0)
+	f.mu.Lock()
+	f.markers = []pagerMatch{{start: 0, end: 2}, {start: 4, end: 6}}
+	f.mu.Unlock()
+
+	f.adjustMarkers(4, 2)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.markers) != 1 || f.markers[0] != (pagerMatch{start: 0, end: 2}) {
+		t.Fatalf("markers = %v, want the pre-cut range kept and the cut range dropped", f.markers)
+	}
+}
+
+// TestShellFilterMatchPagerPrune pins the leftover-range pruning matchPager
+// runs before scanning: ranges ending at or before the floor of the current
+// collect go, later ranges stay.
+func TestShellFilterMatchPagerPrune(t *testing.T) {
+	f := newShellFilter(0)
+	if _, err := f.Write([]byte("sw1> --More--")); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.markers = []pagerMatch{{start: 0, end: 2}, {start: 4, end: 6}}
+	f.mu.Unlock()
+
+	answered := -1
+	if answer := f.matchPager(4, &answered, nil); answer != "" {
+		t.Fatalf("matchPager answered %q with no patterns", answer)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.markers) != 1 || f.markers[0] != (pagerMatch{start: 4, end: 6}) {
+		t.Fatalf("markers = %v, want the stale range pruned and the later range kept", f.markers)
+	}
+}
+
+// TestShellFilterEraseDropsMarkers covers the real path: a bare-\r line
+// erase runs adjustMarkers and drops the marker range it cut through.
+func TestShellFilterEraseDropsMarkers(t *testing.T) {
+	f := newShellFilter(0)
+	if _, err := f.Write([]byte("ab\n--More--")); err != nil {
+		t.Fatal(err)
+	}
+	answered := -1
+	if answer := f.matchPager(0, &answered, builtinPagerPatterns()); answer == "" {
+		t.Fatal("pager marker not matched")
+	}
+	f.mu.Lock()
+	recorded := len(f.markers)
+	f.mu.Unlock()
+	if recorded != 1 {
+		t.Fatalf("recorded markers = %d, want 1", recorded)
+	}
+
+	if _, err := f.Write([]byte("\r ")); err != nil { // the space lands after the erase
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.markers) != 0 {
+		t.Fatalf("markers = %v, want dropped by the line erase", f.markers)
+	}
+}
+
+// TestShellFilterSincePastEndMarkers pins sinceWithMarkers' guard for a
+// start past the buffer end: an erase can shrink the buffer below the
+// offset a caller captured.
+func TestShellFilterSincePastEndMarkers(t *testing.T) {
+	f := newShellFilter(0)
+	if _, err := f.Write([]byte("ab")); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.markers = []pagerMatch{{start: 0, end: 1}}
+	f.mu.Unlock()
+
+	text, markers := f.sinceWithMarkers(5)
+	if text != "" || markers != nil {
+		t.Fatalf("sinceWithMarkers past the end = %q %v, want \"\" nil", text, markers)
+	}
+}
+
+// TestShellFinishCollectDropsStaleMarker pins finishCollect's defensive
+// guard: a recorded range that no longer fits the collected text (an
+// unexpected shift) is skipped instead of corrupting the output.
+func TestShellFinishCollectDropsStaleMarker(t *testing.T) {
+	sess := cbStubSession(&cbFailWriter{})
+	sess.filter.mu.Lock()
+	sess.filter.out = []byte("abcdef")
+	sess.filter.markers = []pagerMatch{{start: 3, end: 99}} // end past the buffer
+	sess.filter.mu.Unlock()
+	prompt, err := newDevicePrompt("sw1>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := sess.finishCollect(3, "show run", prompt); got != "def" {
+		t.Fatalf("finishCollect = %q, want the untouched text %q", got, "def")
+	}
+}
+
 func TestDevicePromptRegex(t *testing.T) {
 	cases := []struct {
 		prompt     string

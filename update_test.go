@@ -2187,3 +2187,97 @@ func TestSelfUpdateShutdownBeforeExecRestoresPrev(t *testing.T) {
 		t.Error("update-pending marker survived the shutdown cancellation")
 	}
 }
+
+// waitActiveUpdate must give up when the cancelled update never returns:
+// shutdown proceeds instead of hanging on a stalled goroutine.
+func TestWaitActiveUpdateTimesOutWhenUpdateStalls(t *testing.T) {
+	t.Cleanup(func() { currentUpdate.Store(nil) })
+	currentUpdate.Store(nil)
+
+	u := beginUpdate(context.Background())
+	t.Cleanup(u.finish)
+
+	start := time.Now()
+	waitActiveUpdate(time.Millisecond)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waitActiveUpdate blocked %v on a stalled update", elapsed)
+	}
+}
+
+// A sync failure whose restore also fails must surface both errors: the
+// operator has to know the previous build could not be put back either.
+func TestSelfUpdateSyncFailureWithFailedRestore(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	body := elfUpdateBodyForHost()
+	srv, downloadURL, checksum := updateTestServer(t, body)
+	exePath := stageExecutable(t)
+	stubUpdateIO(t, srv, exePath)
+
+	origSync := syncDirectory
+	t.Cleanup(func() { syncDirectory = origSync })
+	syncDirectory = func(string) error { return errors.New("dirsync failed") }
+
+	// The staged build lands; only the restore of the previous build fails.
+	osRename = func(oldpath, newpath string) error {
+		if oldpath == exePath+".prev" && newpath == exePath {
+			return errors.New("device busy")
+		}
+		return os.Rename(oldpath, newpath)
+	}
+
+	err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3")
+	if err == nil || !strings.Contains(err.Error(), "sync executable directory") {
+		t.Fatalf("selfUpdate error = %v, want directory sync failure", err)
+	}
+	if !strings.Contains(err.Error(), "and restore failed") {
+		t.Errorf("error %v does not name the failed restore", err)
+	}
+}
+
+// A shutdown cancellation landing after the swap with a failing restore must
+// still report the cancellation and drop the marker: the next boot must not
+// be treated as running an unproven build.
+func TestSelfUpdateShutdownCancelWithFailedRestore(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	body := elfUpdateBodyForHost()
+	srv, downloadURL, checksum := updateTestServer(t, body)
+	exePath := stageExecutable(t)
+	stubUpdateIO(t, srv, exePath)
+
+	// Register the update the way the session's update handler does, then
+	// cancel it from the drain hook: the window between the binary swap
+	// and the re-exec that a shutdown during the drain produces.
+	u := beginUpdate(context.Background())
+	t.Cleanup(u.finish)
+
+	execCalled := false
+	syscallExec = func(string, []string, []string) error {
+		execCalled = true
+		return nil
+	}
+	// The staged build lands; only the shutdown-triggered restore fails.
+	osRename = func(oldpath, newpath string) error {
+		if oldpath == exePath+".prev" && newpath == exePath {
+			return errors.New("device busy")
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	drain := func(context.Context) bool {
+		cancelActiveUpdate() // SIGTERM lands during the drain
+		return true
+	}
+	origDrain := drainResultSpool.Load()
+	drainResultSpool.Store(&drain)
+	t.Cleanup(func() { drainResultSpool.Store(origDrain) })
+
+	err := selfUpdateContext(u.ctx, downloadURL, checksum, "1.2.3")
+	if err == nil || !strings.Contains(err.Error(), "update canceled before re-exec") {
+		t.Fatalf("selfUpdate error = %v, want the shutdown cancellation", err)
+	}
+	if execCalled {
+		t.Error("re-exec ran although shutdown cancelled the update")
+	}
+	if _, statErr := os.Stat(exePath + ".update-pending"); !os.IsNotExist(statErr) {
+		t.Error("update-pending marker survived the cancelled update")
+	}
+}

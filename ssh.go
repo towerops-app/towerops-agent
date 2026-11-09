@@ -52,11 +52,9 @@ var sshResolve = func(ctx context.Context, addr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if len(addrs) == 0 {
-		return "", fmt.Errorf("no addresses for %s", host)
-	}
 	// Unmap folds an IPv4-mapped IPv6 literal to plain IPv4, the form the
-	// handshake's remote address reports.
+	// handshake's remote address reports. A lookup cannot come back empty
+	// with a nil error: the resolver reports zero answers as errNoSuchHost.
 	return net.JoinHostPort(addrs[0].Unmap().String(), port), nil
 }
 

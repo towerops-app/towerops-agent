@@ -236,21 +236,19 @@ func (f *shellFilter) eraseLine() {
 	f.out = f.out[:f.lineStart]
 }
 
-// adjustMarkers re-points the recorded pager marker ranges after delta
-// bytes disappeared at cut: ranges wholly past the cut shift left, ranges
-// spanning it belonged to text the device erased itself and are dropped —
-// there is nothing left to strip.
+// adjustMarkers drops the recorded pager marker ranges that an erase cut
+// into. Every erase is a tail truncation — a bare \r and a backspace erase
+// the current partial line, the byte cap cuts the tail — so surviving
+// ranges are exactly those ending at or before the cut; the marker text a
+// range covered is gone either way, erased by the device or by the cap.
 func (f *shellFilter) adjustMarkers(cut, delta int) {
 	if delta <= 0 || len(f.markers) == 0 {
 		return
 	}
 	kept := f.markers[:0]
 	for _, m := range f.markers {
-		switch {
-		case m.end <= cut:
+		if m.end <= cut {
 			kept = append(kept, m)
-		case m.start >= cut+delta:
-			kept = append(kept, pagerMatch{start: m.start - delta, end: m.end - delta})
 		}
 	}
 	f.markers = kept
@@ -334,8 +332,9 @@ func (f *shellFilter) sinceWithMarkers(start int) (string, []pagerMatch) {
 // matchPager scans the last pagerWindow bytes of the buffer for the first
 // pager marker not answered yet, records its range for finishCollect and
 // returns the answer that dismisses it ("" when there is none). The scan
-// never reaches before floor — the current collect's start — so a marker
-// left in the buffer by an earlier command is not answered again.
+// never reaches before floor — the current collect's start, never negative —
+// so a marker left in the buffer by an earlier command is not answered
+// again.
 func (f *shellFilter) matchPager(floor int, answeredTo *int, pagers []pagerPattern) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -351,9 +350,6 @@ func (f *shellFilter) matchPager(floor int, answeredTo *int, pagers []pagerPatte
 	start := len(f.out) - pagerWindow
 	if start < floor {
 		start = floor
-	}
-	if start < 0 {
-		start = 0
 	}
 	window := f.out[start:]
 	bestStart, bestEnd, bestAnswer := -1, -1, ""
@@ -579,14 +575,10 @@ func (s *shellSession) finishCollect(start int, cmd string, p *devicePrompt) str
 		}
 		// A device often writes the marker line's newline only after the
 		// answer dismisses it, so it lands in the buffer past the recorded
-		// end; consume it the way the marker patterns' optional \r?\n did.
-		if to < len(text) {
-			switch {
-			case strings.HasPrefix(text[to:], "\r\n"):
-				to += 2
-			case text[to] == '\n' || text[to] == '\r':
-				to++
-			}
+		// end; consume it. (The buffer never holds \r: \r\n collapsed and a
+		// bare \r erased the line.)
+		if to < len(text) && text[to] == '\n' {
+			to++
 		}
 		text = text[:from] + text[to:]
 		cut += to - from

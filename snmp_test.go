@@ -2508,6 +2508,125 @@ func TestExecuteSnmpJobWalkErrorStatusNeverCompletes(t *testing.T) {
 	}
 }
 
+// An empty or dot root falls back to the internet subtree, mirroring
+// gosnmp's convention.
+func TestSnmpWalkAllEmptyRootWalksInternetSubtree(t *testing.T) {
+	for _, rootOid := range []string{"", "."} {
+		t.Run("root="+rootOid, func(t *testing.T) {
+			mock := &mockSnmpQuerier{
+				getBulkFunc: bulkTable(map[string]*gosnmp.SnmpPacket{
+					".1.3.6.1": {Variables: []gosnmp.SnmpPDU{
+						{Name: ".1.3.6.1.2.1.1", Type: gosnmp.Integer, Value: 1},
+					}},
+				}),
+			}
+			results, err := snmpWalkAll(context.Background(), mock, rootOid, false)
+			if err != nil {
+				t.Fatalf("walk: %v", err)
+			}
+			if len(mock.bulkRequests) == 0 || mock.bulkRequests[0] != ".1.3.6.1" {
+				t.Fatalf("first request = %v, want [.1.3.6.1]", mock.bulkRequests)
+			}
+			if len(results) != 1 || results[0].Name != ".1.3.6.1.2.1.1" {
+				t.Errorf("collected = %v, want the internet-subtree varbind", results)
+			}
+		})
+	}
+}
+
+// Non-numeric arcs fall back to a lexical comparison instead of panicking.
+func TestSnmpOIDLessNonNumericArcs(t *testing.T) {
+	if snmpOIDLess(".1.3.x", ".1.3.5") {
+		t.Error(`snmpOIDLess(".1.3.x", ".1.3.5") = true, want lexical "x" > "5"`)
+	}
+	if !snmpOIDLess(".1.3.5", ".1.3.x") {
+		t.Error(`snmpOIDLess(".1.3.5", ".1.3.x") = false, want lexical "5" < "x"`)
+	}
+}
+
+// A cancelled context stops the job at the next walk root even when the
+// root in flight completed cleanly: the per-root guard marks the run
+// cancelled without failing the finished root.
+func TestExecuteSnmpJobCancelBetweenWalkRoots(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mock := &mockSnmpQuerier{
+		getBulkFunc: func(oids []string, _ uint8, _ uint32) (*gosnmp.SnmpPacket, error) {
+			// The first root's walk still completes cleanly (end-of-MIB)
+			// although the job context ends while it is in flight.
+			cancel()
+			return endOfMibViewPacket(oids[0]), nil
+		},
+	}
+	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
+		return mock, func() {}, nil
+	}
+
+	out := newResultQueue(8)
+	executeSnmpJob(ctx, &pb.AgentJob{
+		JobId:      "between-roots",
+		DeviceId:   "dev-1",
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+		Queries: []*pb.SnmpQuery{{
+			QueryType: pb.QueryType_WALK,
+			Oids:      []string{".1.3.6.1.2.1.2.2.1", ".1.3.6.1.2.1.4.22"},
+		}},
+	}, out)
+
+	result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	if !result.Partial {
+		t.Fatal("job cancelled between walk roots did not mark its result partial")
+	}
+	if len(result.CompletedRoots) != 1 || result.CompletedRoots[0] != "1.3.6.1.2.1.2.2.1" {
+		t.Fatalf("completed_roots = %v, want [1.3.6.1.2.1.2.2.1]", result.CompletedRoots)
+	}
+	if len(mock.bulkRequests) != 1 {
+		t.Fatalf("walk issued %d requests, want 1 — the second root must be skipped", len(mock.bulkRequests))
+	}
+}
+
+// A Null varbind inside the subtree — a device quirk distinct from the v2
+// sentinel classes, which end the walk inside snmpWalkAll — reaches the
+// result filter and must be dropped rather than recorded as a value.
+func TestExecuteSnmpJobWalkDropsNullVarbinds(t *testing.T) {
+	orig := snmpDial
+	defer func() { snmpDial = orig }()
+
+	mock := &mockSnmpQuerier{
+		getBulkFunc: bulkTable(map[string]*gosnmp.SnmpPacket{
+			".1.3.6.1.2.1.2.2.1": {Variables: []gosnmp.SnmpPDU{
+				{Name: ".1.3.6.1.2.1.2.2.1.1", Type: gosnmp.Null},
+				{Name: ".1.3.6.1.2.1.2.2.1.2", Type: gosnmp.OctetString, Value: []byte("eth0")},
+			}},
+		}),
+	}
+	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
+		return mock, func() {}, nil
+	}
+
+	ch := newResultQueue(1)
+	executeSnmpJob(context.Background(), &pb.AgentJob{
+		JobId:      "walk-null",
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Version: "2c"},
+		Queries: []*pb.SnmpQuery{{
+			QueryType: pb.QueryType_WALK,
+			Oids:      []string{".1.3.6.1.2.1.2.2.1"},
+		}},
+	}, ch)
+
+	result := decodeQueuedResult[*pb.SnmpResult](t, (<-ch.items))
+	if len(result.OidValues) != 1 || result.OidValues["1.3.6.1.2.1.2.2.1.2"] != "eth0" {
+		t.Fatalf("OidValues = %v, want {1.3.6.1.2.1.2.2.1.2: eth0}", result.OidValues)
+	}
+	if len(result.CompletedRoots) != 1 {
+		t.Errorf("Null varbind walk did not claim its root: %v", result.CompletedRoots)
+	}
+}
+
 // snwTValueGen draws the Value shapes a real (or hostile) SNMP decoder can
 // place in an SnmpPDU.
 var snwTValueGen = rapid.OneOf(

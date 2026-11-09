@@ -306,20 +306,17 @@ func (r *planRunner) execStep(ctx context.Context, step *pb.ConfigBackupStep) *p
 		}
 		// A lost connection closes the exec channel, which surfaces as
 		// *ssh.ExitMissingError with only the output that arrived before
-		// the drop. RouterOS 6 ends every exec the same way while the
-		// connection stays up, so the missing exit status is acceptable
-		// only when the client is still alive — a keepalive is answered.
-		// Treating the dead-client case as success would store a partial
-		// config as a good backup.
+		// the drop. The session runner already tolerates the missing exit
+		// status of a live RouterOS 6-style channel close, so one arriving
+		// here means the client is gone; a keepalive confirms it. Passing
+		// the truncated output as a good step would store a partial config
+		// as a successful backup.
 		var exitMissing *ssh.ExitMissingError
-		if errors.As(err, &exitMissing) {
-			if !clientAlive(r.client) {
-				return &planStepFailure{
-					code:   pb.ConfigBackupErrorCode_EXPORT_FAILED,
-					detail: "ssh connection dropped while running " + cmd,
-				}
+		if errors.As(err, &exitMissing) && !clientAlive(r.client) {
+			return &planStepFailure{
+				code:   pb.ConfigBackupErrorCode_EXPORT_FAILED,
+				detail: "ssh connection dropped while running " + cmd,
 			}
-			err = nil
 		}
 		if failure := classifyStepOutput(string(stdout), string(stderr)); failure != nil {
 			lastFailure = failure
@@ -351,8 +348,8 @@ func (r *planRunner) execStep(ctx context.Context, step *pb.ConfigBackupStep) *p
 }
 
 // clientAlive reports that the client's transport still answers a keepalive
-// request. Local to the plan runner: the exec paths in ssh.go and
-// configbackup.go carry their own liveness checks.
+// request. Local to the plan runner (nil-safe); ssh.go carries the shared
+// sshClientAlive for the session runner paths.
 func clientAlive(c *ssh.Client) bool {
 	if c == nil {
 		return false

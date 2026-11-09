@@ -175,6 +175,31 @@ func TestPlanExecDroppedConnection(t *testing.T) {
 	}
 }
 
+// TestPlanExecChannelCloseWithoutExit pins the tolerated side of bug #2:
+// a device that closes the exec channel without an exit-status while the
+// connection stays up (RouterOS 6 style) keeps its output — the step
+// succeeds, and the cbplan dropped-connection gate leaves it alone.
+func TestPlanExecChannelCloseWithoutExit(t *testing.T) {
+	resetHostKeyStore(t)
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), func(ch ssh.Channel, command string) {
+		_, _ = ch.Write([]byte("set system host-name jr1\n"))
+		_ = ch.Close() // no exit-status follows: Run reports *ssh.ExitMissingError
+	})
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), cbPlanJob(host, port, cbExecPlan(cbCommand("show run"))), out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+		t.Fatalf("code = %v (%q), want OK for a channel close on a live connection", result.ErrorCode, result.ErrorDetail)
+	}
+	if got := cbGunzip(t, result.ConfigGzip); got != "set system host-name jr1\n" {
+		t.Fatalf("config = %q, want the tolerated step's output", got)
+	}
+}
+
 // TestPlanRunnerInternals covers the runner paths no device scenario
 // reaches: include() after a failure, the pager-pattern compile fallback,
 // successResult's failed and gzip-error branches, and privilegedFailure's

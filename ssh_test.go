@@ -1352,6 +1352,58 @@ func TestSSHBackupLooksUpPinByResolvedAddress(t *testing.T) {
 	}
 }
 
+// TestSSHBackupResolveFailure: a resolution failure must surface as a
+// wrapped "resolve <addr>" error and abort before any dial.
+func TestSSHBackupResolveFailure(t *testing.T) {
+	resetHostKeyStore(t)
+	origResolve := sshResolve
+	origDial := sshDial
+	defer func() {
+		sshResolve = origResolve
+		sshDial = origDial
+	}()
+	resolveErr := errors.New("dns unavailable")
+	sshResolve = func(_ context.Context, _ string) (string, error) {
+		return "", resolveErr
+	}
+	dialed := false
+	sshDial = func(context.Context, string, string, *ssh.ClientConfig) (*ssh.Client, error) {
+		dialed = true
+		return nil, errors.New("dial must not happen")
+	}
+
+	_, err := executeMikrotikBackupContext(context.Background(), "10.0.0.1", 22, "admin", "pass")
+	if !errors.Is(err, resolveErr) {
+		t.Fatalf("err = %v, want the wrapped resolve failure", err)
+	}
+	if !strings.HasPrefix(err.Error(), "resolve 10.0.0.1:22:") {
+		t.Fatalf("err = %v, want a resolve prefix naming the dial target", err)
+	}
+	if dialed {
+		t.Fatal("a failed resolution must not reach the dial")
+	}
+}
+
+// TestSSHResolveRejectsMissingPort: an address without a port is not a dial
+// target and must be rejected before any lookup.
+func TestSSHResolveRejectsMissingPort(t *testing.T) {
+	if _, err := sshResolve(context.Background(), "10.0.0.1"); err == nil {
+		t.Fatal("an address without a port must be rejected")
+	}
+}
+
+// TestSSHResolveReportsLookupFailure: a hostname (not a literal) routes
+// through the resolver's context select, so an already-canceled context —
+// like the .invalid name that never resolves — must surface as an error,
+// never as an empty result.
+func TestSSHResolveReportsLookupFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := sshResolve(ctx, "towerops-coverage.invalid:22"); err == nil {
+		t.Fatal("a failed lookup must be reported")
+	}
+}
+
 func TestHostKeyAlgorithmsFor(t *testing.T) {
 	tests := map[string][]string{
 		ssh.KeyAlgoRSA:         {ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA},
