@@ -2017,3 +2017,51 @@ func TestTpTDispatchIgnoresErrorQuotingOtherDestination(t *testing.T) {
 		})
 	}
 }
+
+// CVE-2026-84243: glibc's gettext loads message catalogs from attacker-named
+// paths when LANGUAGE selects a non-C locale. The ping fallback is the only
+// glibc-linked binary the agent execs, so its child environment must pin the
+// locale to C regardless of what the agent itself inherited.
+func TestPingChildEnvPinsCLocale(t *testing.T) {
+	env := pingChildEnv()
+	joined := strings.Join(env, "\n") + "\n"
+	for _, want := range []string{"LANG=C", "LC_ALL=C", "LANGUAGE="} {
+		if !strings.Contains(joined, want+"\n") {
+			t.Errorf("pingChildEnv missing %q: got %q", want, env)
+		}
+	}
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "LANGUAGE=") && kv != "LANGUAGE=" {
+			t.Errorf("LANGUAGE must be set empty, got %q", kv)
+		}
+	}
+}
+
+func TestPingChildEnvDefaultPathWhenUnset(t *testing.T) {
+	t.Setenv("PATH", "")
+	env := pingChildEnv()
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "PATH=") && kv != "PATH=" {
+			return
+		}
+	}
+	t.Errorf("expected a non-empty default PATH entry, got %q", env)
+}
+
+// The env built by pingChildEnv must actually become the child's environment,
+// not just exist.
+func TestPingCommandOutputUsesPingChildEnv(t *testing.T) {
+	orig := pingChildEnv
+	t.Cleanup(func() { pingChildEnv = orig })
+	pingChildEnv = func() []string {
+		return []string{"PATH=/usr/bin:/bin", "TOWEROPS_TEST_MARKER=present"}
+	}
+
+	out, err := pingCommandOutput(context.Background(), "env")
+	if err != nil {
+		t.Fatalf("running env failed: %v", err)
+	}
+	if !strings.Contains(string(out), "TOWEROPS_TEST_MARKER=present") {
+		t.Errorf("child env ignored pingChildEnv; output:\n%s", out)
+	}
+}

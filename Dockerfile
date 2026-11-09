@@ -40,6 +40,12 @@ RUN adduser -D -u 1000 towerops && \
     # setgid binary at all, which takes the ld.so AT_SECURE vulnerabilities
     # (CVE-2026-86805, CVE-2026-95818 - see .grype.yaml) off the table entirely.
     rm -f /usr/bin/unix_chkpwd
+# gettext (CVE-2026-84243, GLIBC-SA-2026-0025) only consults LANGUAGE when
+# LC_MESSAGES is not "C"/"POSIX", so pinning the locale makes an injected
+# LANGUAGE inert inside the container. Defense in depth with the agent, which
+# execs its ping(8) fallback - the only glibc-linked binary it spawns - with a
+# fixed C-locale environment (pingChildEnv in ping.go).
+ENV LANG=C LC_ALL=C LANGUAGE=
 ENV TOWEROPS_HOST_KEYS_FILE=/data/known_hosts.json
 # Without a persistent volume, container recreation resets the TOFU store and
 # defeats host-key and TLS-certificate pinning.
