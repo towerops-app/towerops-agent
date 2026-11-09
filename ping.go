@@ -56,7 +56,24 @@ var pingLookPath = exec.LookPath
 // pingCommandOutput runs the final ping(8) fallback. Tests replace it so
 // command success and failure do not depend on the host network.
 var pingCommandOutput = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = pingChildEnv()
+	return cmd.CombinedOutput()
+}
+
+// pingChildEnv is the environment given to the ping(8) fallback child. The
+// agent execs ping with a fixed minimal environment instead of inheriting its
+// own: an inherited LANGUAGE or LANG selecting a non-C locale would let
+// glibc's gettext (CVE-2026-84243) load an attacker-named message catalog
+// from disk inside the only glibc-linked binary the agent spawns. gettext
+// ignores LANGUAGE entirely when LC_MESSAGES is "C", so the traversal never
+// arms even if a hostile variable slips in.
+var pingChildEnv = func() []string {
+	path := os.Getenv("PATH")
+	if path == "" {
+		path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+	return []string{"PATH=" + path, "LANG=C", "LC_ALL=C", "LANGUAGE="}
 }
 
 // icmpPing sends a single ICMP echo request and returns the round-trip time in milliseconds.

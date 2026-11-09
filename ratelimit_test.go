@@ -118,7 +118,13 @@ func TestTokenBucketReserve(t *testing.T) {
 }
 
 func TestTokenBucketWait(t *testing.T) {
-	b := newTokenBucket(1000, nil) // 1ms per token, burst of 100
+	// A frozen clock keeps refill out of the picture: however long a loaded
+	// runner makes the burst loop below, not a single token refills, so the
+	// waits past the burst must actually sleep their real reservation
+	// (timers never fire early). With the real clock this flaked when the
+	// loop itself took over 1ms of wall time and refilled the token the
+	// assertions were waiting on.
+	b := newTokenBucket(1000, func() time.Time { return time.Unix(0, 0) }) // 1ms per token, burst of 100
 
 	// Inside the burst wait never blocks.
 	for range 100 {
