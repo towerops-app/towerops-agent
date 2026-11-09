@@ -40,6 +40,42 @@ var sshDial = func(ctx context.Context, network, addr string, config *ssh.Client
 }
 var doPing = pingDevice
 
+// sshResolve resolves a dial target to the canonical remote address form —
+// the same remote.String() the TOFU callback pins host keys under. It is a
+// var so tests can fake DNS.
+var sshResolve = func(ctx context.Context, addr string) (string, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", err
+	}
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return "", err
+	}
+	// Unmap folds an IPv4-mapped IPv6 literal to plain IPv4, the form the
+	// handshake's remote address reports. A lookup cannot come back empty
+	// with a nil error: the resolver reports zero answers as errNoSuchHost.
+	return net.JoinHostPort(addrs[0].Unmap().String(), port), nil
+}
+
+// sshClientAlive reports whether the connection still answers a keepalive
+// request. RouterOS 6 closes the exec channel without an exit status while
+// the transport stays usable; a device that dropped mid-export closes the
+// whole connection and the request fails. That is what separates a
+// RouterOS-style close that may succeed from a lost-connection close whose
+// partial output must not be stored as a good backup.
+func sshClientAlive(c *ssh.Client) bool {
+	_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
+	return err == nil
+}
+
+// redactBackupDetail mirrors configBackupError: scrub the credentials the
+// legacy SSH backup carries, then shorten device output to one 300-byte
+// line before it can reach an error field.
+func redactBackupDetail(detail, password string) string {
+	return firstLine(redactConfigSecrets(detail, &pb.ConfigBackupJob{Password: password}), maxConfigBackupDetailLen)
+}
+
 // executeMikrotikBackupContext connects via SSH and bounds the complete export,
 // including the handshake and command, so a stalled device cannot pin a worker.
 func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, username, password string) (string, error) {
@@ -47,6 +83,15 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 	defer cancel()
 
 	addr := net.JoinHostPort(ip, strconv.Itoa(int(port)))
+	// Resolve before the pin lookup: the TOFU store keys entries by the
+	// resolved remote.String() the handshake callback reports, so a
+	// hostname or non-canonical IPv6 dev.Ip would never find its pin under
+	// the raw dial string. Dialing the resolved literal keeps the dialed
+	// address identical to the resolved one even when DNS round-robins.
+	resolved, err := sshResolve(ctx, addr)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", addr, err)
+	}
 
 	// SECURITY: TOFU (Trust-On-First-Use) host key verification.
 	// On first connection the key is stored; subsequent connections reject
@@ -61,11 +106,11 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 
 	legacySSHAlgorithms(config)
 
-	if alg := getHostKeyStore().pinnedKeyAlgorithm("ssh:" + addr); alg != "" {
+	if alg := getHostKeyStore().pinnedKeyAlgorithm("ssh:" + resolved); alg != "" {
 		config.HostKeyAlgorithms = hostKeyAlgorithmsFor(alg)
 	}
 
-	conn, err := sshDial(ctx, "tcp", addr, config)
+	conn, err := sshDial(ctx, "tcp", resolved, config)
 	if err != nil {
 		return "", fmt.Errorf("ssh dial %s: %w", addr, err)
 	}
@@ -92,10 +137,11 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 	err = session.Run("/export compact")
 	// RouterOS 6 closes the exec channel without an exit-status, which
 	// surfaces as *ssh.ExitMissingError with the output still delivered.
-	// Tolerate it only while the context is live: a deadline-driven
-	// conn.Close produces the same error and must stay an error.
+	// Tolerate it only while the connection still answers a keepalive: a
+	// device that dropped mid-export closes the transport, which produces
+	// the same error and must stay an error.
 	var exitMissing *ssh.ExitMissingError
-	if errors.As(err, &exitMissing) && ctx.Err() == nil {
+	if errors.As(err, &exitMissing) && sshClientAlive(conn) {
 		err = nil
 	}
 	output := append(outBuf.Bytes(), errBuf.Bytes()...)
@@ -104,17 +150,17 @@ func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, u
 	}
 	if err != nil {
 		if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
-			return "", fmt.Errorf("ssh command: %w: %s", err, trimmed)
+			return "", fmt.Errorf("ssh command: %w: %s", err, redactBackupDetail(trimmed, password))
 		}
 		return "", fmt.Errorf("ssh command: %w", err)
 	}
 
 	if failure := routerOSCommandFailure(string(errBuf.Bytes())); failure != nil {
-		return "", fmt.Errorf("ssh command: %w", failure)
+		return "", fmt.Errorf("ssh command: %s", redactBackupDetail(failure.detail, password))
 	}
 	exportOutput := string(outBuf.Bytes())
 	if code := classifyExportOutput(exportOutput); code != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
-		return "", fmt.Errorf("ssh command: %s: %s", code, strings.TrimSpace(exportOutput))
+		return "", fmt.Errorf("ssh command: %s: %s", code, redactBackupDetail(strings.TrimSpace(exportOutput), password))
 	}
 	return exportOutput, nil
 }

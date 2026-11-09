@@ -384,11 +384,11 @@ func TestHandleMessage(t *testing.T) {
 
 	t.Run("update runs asynchronously without session cancellation", func(t *testing.T) {
 		origUpdate := doSelfUpdate
-		defer func() {
+		t.Cleanup(func() {
 			doSelfUpdate = origUpdate
-			updateInProgress.Store(false)
-		}()
-		updateInProgress.Store(false)
+			currentUpdate.Store(nil)
+		})
+		currentUpdate.Store(nil)
 
 		called := make(chan struct{})
 		release := make(chan struct{})
@@ -468,11 +468,11 @@ func TestHandleMessage(t *testing.T) {
 
 	t.Run("update error", func(t *testing.T) {
 		origUpdate := doSelfUpdate
-		defer func() {
+		t.Cleanup(func() {
 			doSelfUpdate = origUpdate
-			updateInProgress.Store(false)
-		}()
-		updateInProgress.Store(false)
+			currentUpdate.Store(nil)
+		})
+		currentUpdate.Store(nil)
 
 		called := make(chan struct{})
 		doSelfUpdate = func(_ context.Context, url, checksum, version string) error {
@@ -746,16 +746,60 @@ func TestInventoryRevisionTracking(t *testing.T) {
 	t.Run("applied revision is monotonic and clears the refused marker", func(t *testing.T) {
 		pools := testPools(t)
 
-		pools.applyInventoryRevision(3)
-		pools.applyInventoryRevision(1) // replayed frame cannot regress the stamp
+		pools.applyInventoryRevision("jobs", 3)
+		pools.applyInventoryRevision("jobs", 1) // replayed frame cannot regress the stamp
 		if got := pools.appliedRevision.Load(); got != 3 {
 			t.Fatalf("appliedRevision = %d, want 3", got)
 		}
 
 		pools.rejectInventory("jobs")
-		pools.applyInventoryRevision(4)
+		pools.applyInventoryRevision("jobs", 4)
 		if got, _ := pools.rejectedInventory.Load().(string); got != "" {
 			t.Fatalf("rejectedInventory = %q after a successful apply", got)
+		}
+	})
+
+	// Jobs and check_jobs share one revision stream: a successful apply of
+	// one type must not clear the other type's refusal or advance the stamp
+	// over it, or the server reads the refused stream as reconciled and
+	// never re-pushes it.
+	t.Run("a cross-type apply holds the stamp and keeps the refusal", func(t *testing.T) {
+		pools := testPools(t)
+
+		pools.rejectInventory("jobs")
+		pools.applyInventoryRevision("check_jobs", 6)
+		if got := pools.appliedRevision.Load(); got != 0 {
+			t.Fatalf("appliedRevision = %d while jobs was refused, want it held", got)
+		}
+		if got, _ := pools.rejectedInventory.Load().(string); got != "jobs" {
+			t.Fatalf("rejectedInventory = %q after a check_jobs apply, want jobs kept", got)
+		}
+		s := &session{pools: pools, ws: &wsConn{}, hostname: "test-agent"}
+		hb := s.heartbeat()
+		if hb.AppliedRevision != 0 {
+			t.Fatalf("heartbeat applied_revision = %d, want it held back", hb.AppliedRevision)
+		}
+		if hb.InventoryRejected != "jobs" {
+			t.Fatalf("heartbeat inventory_rejected = %q, want jobs", hb.InventoryRejected)
+		}
+
+		// The re-pushed jobs stream applies and reconciles both signals.
+		pools.applyInventoryRevision("jobs", 7)
+		if got := pools.appliedRevision.Load(); got != 7 {
+			t.Fatalf("appliedRevision = %d after the refused type applied, want 7", got)
+		}
+		if got, _ := pools.rejectedInventory.Load().(string); got != "" {
+			t.Fatalf("rejectedInventory = %q after the refused type applied, want cleared", got)
+		}
+
+		// The same hold applies in the other direction.
+		pools.rejectInventory("check_jobs")
+		pools.applyInventoryRevision("jobs", 9)
+		if got := pools.appliedRevision.Load(); got != 7 {
+			t.Fatalf("appliedRevision = %d while check_jobs was refused, want it held", got)
+		}
+		if got, _ := pools.rejectedInventory.Load().(string); got != "check_jobs" {
+			t.Fatalf("rejectedInventory = %q after a jobs apply, want check_jobs kept", got)
 		}
 	})
 
@@ -1444,6 +1488,45 @@ func TestSessionLoopReportsAbortWhileContextAlive(t *testing.T) {
 
 	if err := s.loop(context.Background()); !errors.Is(err, errSelfUpdateAborted) {
 		t.Fatalf("loop error = %v, want %v", err, errSelfUpdateAborted)
+	}
+}
+
+// sessionErr must prefer the abort and the write failure over whatever the
+// reader posted: an abort cancels the session, the reader then sees only
+// the cancellation echo, and the abort reason must not surface as
+// "read: context canceled" — that logging hid the real cause and cost the
+// aborted session its immediate reconnect.
+func TestSessionErrPrefersAbortAndWriteOverReadEcho(t *testing.T) {
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     cancel,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		abortCh:    make(chan error, 1),
+	}
+	// Exactly what an abort produces: the abort reason plus the reader's
+	// cancellation echo.
+	s.errCh <- errors.New("context canceled")
+	s.abortCh <- errSelfUpdateAborted
+	if err := s.sessionErr(); !errors.Is(err, errSelfUpdateAborted) {
+		t.Fatalf("sessionErr() = %v, want the abort over the read echo", err)
+	}
+
+	// A writer failure must keep its real cause over a stale read echo.
+	s2 := &session{
+		ctx:        sessionCtx,
+		cancel:     cancel,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		abortCh:    make(chan error, 1),
+	}
+	s2.errCh <- errors.New("context canceled")
+	s2.writeErrCh <- errors.New("broken pipe")
+	err := s2.sessionErr()
+	if err == nil || !strings.HasPrefix(err.Error(), "write:") || !strings.Contains(err.Error(), "broken pipe") {
+		t.Fatalf("sessionErr() = %v, want the write failure over the read echo", err)
 	}
 }
 
@@ -3825,6 +3908,55 @@ func TestSessionReadExitsOnContextDoneWithFullMsgCh(t *testing.T) {
 	select {
 	case err := <-s.errCh:
 		t.Fatalf("read() reported an error on graceful cancel: %v", err)
+	default:
+	}
+}
+
+// A reader error that lands after the session was cancelled by another
+// failure is only the cancellation echo: the reader must exit without
+// publishing it, so the real cause (e.g. a self-update abort) survives in
+// sessionErr instead of being shadowed by "read: context canceled".
+func TestSessionReadSkipsEchoAfterCancellation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		// Keep the peer open so the reader's first failure is the
+		// cancellation itself, not a connection error.
+		<-r.Context().Done()
+		_ = conn.CloseNow()
+	}))
+	defer srv.Close()
+
+	ws, err := wsDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"))
+	if err != nil {
+		t.Fatalf("wsDial: %v", err)
+	}
+	defer func() { _ = ws.Close() }()
+
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	s := &session{
+		ws:         ws,
+		ctx:        sessionCtx,
+		cancel:     cancel,
+		msgCh:      make(chan []byte, 1),
+		errCh:      make(chan error, 1),
+		readerDone: make(chan struct{}),
+	}
+	go s.read()
+	// An abort elsewhere (fail(abortCh)) cancels the session first; the
+	// in-flight read then fails with the cancellation echo.
+	cancel()
+
+	select {
+	case <-s.readerDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("read() did not exit after cancellation")
+	}
+	select {
+	case err := <-s.errCh:
+		t.Fatalf("read() published a cancellation echo: %v", err)
 	default:
 	}
 }

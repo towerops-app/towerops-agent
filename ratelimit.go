@@ -134,9 +134,10 @@ func (b *tokenBucket) wait(ctx context.Context) bool {
 }
 
 // waitDebt blocks until the bucket can afford one more send, or ctx is
-// cancelled. It exists to pace a sequence of requests where each send is
-// already charged by OnSent, e.g. inside a gosnmp walkFn between one response
-// and the next request.
+// cancelled. It exists to pace a sequence of requests whose sends are
+// already charged by OnSent — rateLimitedQuerier calls it before every
+// Get, GetNext and GetBulk so pacing happens outside gosnmp's request
+// deadline.
 //
 // It reserves a token like wait, so concurrent walkers (and wait callers) get
 // distinct, ordered slots instead of polling for a non-negative balance —
@@ -172,8 +173,12 @@ func snmpSentHook(b *tokenBucket) func(*gosnmp.GoSNMP) {
 }
 
 // rateLimitedQuerier waits for a send slot before each SNMP request, outside
-// gosnmp's request deadline. waitDebt returns the reservation so OnSent alone
-// charges transmitted packets, including retries; unsent requests cost nothing.
+// gosnmp's request deadline. Pacing happens once per outgoing request — a
+// 25-varbind GETBULK response costs one slot, not twenty-five — and waitDebt
+// returns the reservation so OnSent alone charges transmitted packets,
+// including retries; unsent requests cost nothing. The walk loop in snmp.go
+// drives GetNext/GetBulk through these methods, so every request of a walk
+// is paced and no sleep trails the last response.
 type rateLimitedQuerier struct {
 	ctx context.Context
 	q   snmpQuerier
@@ -186,53 +191,18 @@ func (r *rateLimitedQuerier) Get(oids []string) (*gosnmp.SnmpPacket, error) {
 	return r.q.Get(oids)
 }
 
-// pacedWalkFn wraps a gosnmp WalkFunc so the debt charged by OnSent for the
-// request just answered is repaid before gosnmp sends the next GETNEXT or
-// GETBULK. walkFn runs after each response and before the next request, so
-// the sleep never consumes gosnmp's per-request deadline — without it a walk
-// sends every packet back-to-back and the wire rate ignores the limiter.
-func (r *rateLimitedQuerier) pacedWalkFn(walkFn gosnmp.WalkFunc) gosnmp.WalkFunc {
-	return func(pdu gosnmp.SnmpPDU) error {
-		if err := walkFn(pdu); err != nil {
-			return err
-		}
-		if !snmpPDUs.waitDebt(r.ctx) {
-			return r.ctx.Err()
-		}
-		return nil
-	}
-}
-
-func (r *rateLimitedQuerier) WalkAll(rootOid string) ([]gosnmp.SnmpPDU, error) {
-	var results []gosnmp.SnmpPDU
-	err := r.Walk(rootOid, func(pdu gosnmp.SnmpPDU) error {
-		results = append(results, pdu)
-		return nil
-	})
-	return results, err
-}
-
-func (r *rateLimitedQuerier) BulkWalkAll(rootOid string) ([]gosnmp.SnmpPDU, error) {
-	var results []gosnmp.SnmpPDU
-	err := r.BulkWalk(rootOid, func(pdu gosnmp.SnmpPDU) error {
-		results = append(results, pdu)
-		return nil
-	})
-	return results, err
-}
-
-func (r *rateLimitedQuerier) Walk(rootOid string, walkFn gosnmp.WalkFunc) error {
+func (r *rateLimitedQuerier) GetNext(oids []string) (*gosnmp.SnmpPacket, error) {
 	if !snmpPDUs.waitDebt(r.ctx) {
-		return r.ctx.Err()
+		return nil, r.ctx.Err()
 	}
-	return r.q.Walk(rootOid, r.pacedWalkFn(walkFn))
+	return r.q.GetNext(oids)
 }
 
-func (r *rateLimitedQuerier) BulkWalk(rootOid string, walkFn gosnmp.WalkFunc) error {
+func (r *rateLimitedQuerier) GetBulk(oids []string, nonRepeaters uint8, maxRepetitions uint32) (*gosnmp.SnmpPacket, error) {
 	if !snmpPDUs.waitDebt(r.ctx) {
-		return r.ctx.Err()
+		return nil, r.ctx.Err()
 	}
-	return r.q.BulkWalk(rootOid, r.pacedWalkFn(walkFn))
+	return r.q.GetBulk(oids, nonRepeaters, maxRepetitions)
 }
 
 // snmpPDUs is the process-wide token bucket for outbound SNMP request packets.

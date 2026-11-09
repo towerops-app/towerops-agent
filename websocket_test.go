@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -215,5 +216,81 @@ func TestWSWriteTimeoutForScalesWithSize(t *testing.T) {
 
 	if wsWriteTimeoutFor(8<<20) <= wsWriteTimeoutFor(8<<20-1) {
 		t.Error("write timeout is not strictly increasing in size")
+	}
+}
+
+// The read limit must sit above the largest payload decodeBinaryPayload can
+// see: a frame it could still refuse must reach it, because the refusal is
+// what tells the server not to push that inventory again. A frame killed by
+// the read limit tears the session down with no rejection at all.
+func TestWSReadLimitAdmitsRefusablePayloads(t *testing.T) {
+	if maxMessageSize <= maxEncodedJobPayloadBytes {
+		t.Fatalf("maxMessageSize = %d, must sit above maxEncodedJobPayloadBytes %d",
+			maxMessageSize, maxEncodedJobPayloadBytes)
+	}
+
+	// Just above the decode cap, well below the read limit: delivered.
+	oversize := make([]byte, maxEncodedJobPayloadBytes+1024)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		_ = conn.Write(r.Context(), websocket.MessageBinary, oversize)
+	}))
+	defer srv.Close()
+
+	ws, err := wsDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"))
+	if err != nil {
+		t.Fatalf("wsDial: %v", err)
+	}
+	defer func() { _ = ws.Close() }()
+
+	data, err := ws.ReadMessage(context.Background())
+	if err != nil {
+		t.Fatalf("frame above the decode cap was killed by the read limit: %v", err)
+	}
+	if len(data) != len(oversize) {
+		t.Fatalf("delivered %d bytes, want %d", len(data), len(oversize))
+	}
+}
+
+// A failed handshake must not leave its connection parked in the discarded
+// transport's idle pool: the socket and its two goroutines would hold on
+// until the 90s idle timeout on every failed dial.
+func TestFailedHandshakeReleasesIdleConnection(t *testing.T) {
+	var active atomic.Int32
+	done := make(chan struct{})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateActive:
+			active.Add(1)
+		case http.StateClosed, http.StateHijacked, http.StateIdle:
+			if active.Add(-1) == 0 {
+				select {
+				case <-done:
+				default:
+					close(done)
+				}
+			}
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	if _, err := wsDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http")); err == nil {
+		t.Fatal("wsDial succeeded against a 403 handler")
+	}
+
+	// Without the fix the connection sits idle client-side and the server
+	// never sees it close; with the fix this returns in milliseconds.
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("failed handshake left %d server-side connections open", active.Load())
 	}
 }

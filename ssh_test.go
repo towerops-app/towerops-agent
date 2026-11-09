@@ -665,7 +665,7 @@ func TestLegacySSHBackupRejectsInvalidExport(t *testing.T) {
 		stderr string
 		want   string
 	}{
-		{"stdout failure", "# partial config\nfailure: export interrupted\n", "", "failure: export interrupted"},
+		{"stdout failure", "# partial config\nfailure: export interrupted\n", "", "EXPORT_FAILED: # partial config"},
 		{"stderr failure", "# partial config", "not enough permissions (9)\n", "not enough permissions"},
 		{"empty export", "", "", "EXPORT_EMPTY"},
 		{"diagnostic only", "export interrupted\n", "", "EXPORT_INCOMPLETE"},
@@ -1157,6 +1157,250 @@ func TestSSHBackupPinnedRSAOffersSHA2(t *testing.T) {
 	}
 	if got := globalHostKeys.pinnedKeyAlgorithm("ssh:" + addr); got != ssh.KeyAlgoRSA {
 		t.Fatalf("pinned type = %q, want %q", got, ssh.KeyAlgoRSA)
+	}
+}
+
+// startDroppingSSHServer serves one exec per connection: it writes the
+// caller's output, then drops the whole transport without an exit-status —
+// what a device rebooting mid-command looks like. session.Run surfaces
+// *ssh.ExitMissingError over a dead connection, the state the backup paths
+// must refuse to treat as success.
+func startDroppingSSHServer(t *testing.T, output string) (string, func()) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &ssh.ServerConfig{
+		PasswordCallback: func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) {
+			return nil, nil
+		},
+	}
+	config.AddHostKey(signer)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				sconn, chans, reqs, err := ssh.NewServerConn(conn, config)
+				if err != nil {
+					return
+				}
+				defer func() { _ = sconn.Close() }()
+				go ssh.DiscardRequests(reqs)
+				for newChannel := range chans {
+					ch, requests, err := newChannel.Accept()
+					if err != nil {
+						continue
+					}
+					go func() {
+						for req := range requests {
+							if req.Type == "exec" {
+								_ = req.Reply(true, nil)
+								_, _ = ch.Write([]byte(output))
+								// Drop the transport instead of closing the
+								// channel: the client sees a channel that
+								// ended without an exit status over a dead
+								// connection.
+								_ = sconn.Close()
+								return
+							}
+							_ = req.Reply(false, nil)
+						}
+					}()
+				}
+			}()
+		}
+	}()
+	return ln.Addr().String(), func() { _ = ln.Close() }
+}
+
+// TestSSHBackupRejectsTruncatedExportOnDeadConnection: a device rebooting
+// mid-/export drops the transport, which session.Run reports as
+// *ssh.ExitMissingError — the same error a healthy RouterOS 6 produces by
+// closing only the channel. The dropped connection must keep the backup
+// failed so a truncated config is never stored as a good backup.
+func TestSSHBackupRejectsTruncatedExportOnDeadConnection(t *testing.T) {
+	resetHostKeyStore(t)
+	// The output carries both a comment and a section line, so the old
+	// context-only check classified it as a complete export.
+	addr, cleanup := startDroppingSSHServer(t, "# model = RB5009\n/ip address\nadd address=10.0.0.1/24\n")
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	_, err := executeMikrotikBackupContext(context.Background(), host, uint16(port), "admin", "pass")
+	if err == nil {
+		t.Fatal("a dropped connection mid-export must fail, not store a truncated config")
+	}
+	if !strings.Contains(err.Error(), "ssh command") {
+		t.Fatalf("err = %v, want an ssh command failure", err)
+	}
+}
+
+// TestLegacySSHBackupErrorRedactsAndTruncatesOutput: device output that ends
+// up in the error — a failed command or an incomplete export — must pass
+// through the same redact-then-firstLine(300) treatment configBackupError
+// applies, so a RouterOS 6 export with secrets never reaches
+// MikrotikResult.Error.
+func TestLegacySSHBackupErrorRedactsAndTruncatesOutput(t *testing.T) {
+	const password = "h3re-be-secr3ts"
+	cases := []struct {
+		name   string
+		status uint32
+		output string
+	}{
+		{"failed command", 1, "# partial export with " + password + " " + strings.Repeat("x", 400) + "\nsecond line with " + password + "\n"},
+		{"incomplete export", 0, "mid-export fragment with " + password + "\n" + strings.Repeat("add secret=x;", 100) + "\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetHostKeyStore(t)
+			addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
+				_, _ = io.WriteString(ch, tc.output)
+				_ = ch.CloseWrite()
+				_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{tc.status}))
+				_ = ch.Close()
+			})
+			defer cleanup()
+			host, port := cbAddrPort(t, addr)
+
+			_, err := executeMikrotikBackupContext(context.Background(), host, uint16(port), "admin", password)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			msg := err.Error()
+			if strings.Contains(msg, password) {
+				t.Errorf("error leaks the job password: %q", msg)
+			}
+			if !strings.Contains(msg, "***") {
+				t.Errorf("error has no redaction marker: %q", msg)
+			}
+			if strings.Contains(msg, "\n") {
+				t.Errorf("error carries more than the first output line: %q", msg)
+			}
+			if len(msg) > 400 {
+				t.Errorf("error detail is %d bytes, want the 300-byte detail bound", len(msg))
+			}
+		})
+	}
+}
+
+// TestSSHBackupLooksUpPinByResolvedAddress: the TOFU store keys entries by
+// the resolved remote.String() the handshake callback reports. A hostname
+// dev.Ip must find its pin — a lookup by the raw dial string never matches,
+// leaving HostKeyAlgorithms unpinned so an x/crypto preference change can
+// make a dual-key device present a different key and trip a false MITM
+// error.
+func TestSSHBackupLooksUpPinByResolvedAddress(t *testing.T) {
+	resetHostKeyStore(t)
+	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) {
+		_, _ = ch.Write([]byte("# RouterOS config\n"))
+		_ = ch.CloseWrite()
+		_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+		_ = ch.Close()
+	})
+	defer cleanup()
+	_, port, _ := net.SplitHostPort(addr)
+	var portNum uint16
+	_, _ = fmt.Sscanf(port, "%d", &portNum)
+
+	origResolve := sshResolve
+	origDial := sshDial
+	defer func() {
+		sshResolve = origResolve
+		sshDial = origDial
+	}()
+	// Pretend DNS: router.example maps to the loopback test address.
+	resolved := net.JoinHostPort("127.0.0.1", port)
+	sshResolve = func(_ context.Context, _ string) (string, error) {
+		return resolved, nil
+	}
+	var captured *ssh.ClientConfig
+	var dialAddr string
+	sshDial = func(ctx context.Context, network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
+		dialAddr = addr
+		captured = config
+		return chkTOrigSSHDial(ctx, network, addr, config)
+	}
+
+	for i := range 2 {
+		if _, err := executeMikrotikBackupContext(context.Background(), "router.example", portNum, "admin", "pass"); err != nil {
+			t.Fatalf("connect %d failed: %v", i, err)
+		}
+	}
+	if dialAddr != resolved {
+		t.Fatalf("dial addr = %q, want the resolved literal %q", dialAddr, resolved)
+	}
+	if got := globalHostKeys.keys["ssh:"+resolved]; got == "" {
+		t.Fatal("first use stored no pin under the resolved address")
+	}
+	if len(captured.HostKeyAlgorithms) != 1 || captured.HostKeyAlgorithms[0] != ssh.KeyAlgoECDSA256 {
+		t.Fatalf("pinned HostKeyAlgorithms = %v, want [%s] via the resolved-address pin", captured.HostKeyAlgorithms, ssh.KeyAlgoECDSA256)
+	}
+}
+
+// TestSSHBackupResolveFailure: a resolution failure must surface as a
+// wrapped "resolve <addr>" error and abort before any dial.
+func TestSSHBackupResolveFailure(t *testing.T) {
+	resetHostKeyStore(t)
+	origResolve := sshResolve
+	origDial := sshDial
+	defer func() {
+		sshResolve = origResolve
+		sshDial = origDial
+	}()
+	resolveErr := errors.New("dns unavailable")
+	sshResolve = func(_ context.Context, _ string) (string, error) {
+		return "", resolveErr
+	}
+	dialed := false
+	sshDial = func(context.Context, string, string, *ssh.ClientConfig) (*ssh.Client, error) {
+		dialed = true
+		return nil, errors.New("dial must not happen")
+	}
+
+	_, err := executeMikrotikBackupContext(context.Background(), "10.0.0.1", 22, "admin", "pass")
+	if !errors.Is(err, resolveErr) {
+		t.Fatalf("err = %v, want the wrapped resolve failure", err)
+	}
+	if !strings.HasPrefix(err.Error(), "resolve 10.0.0.1:22:") {
+		t.Fatalf("err = %v, want a resolve prefix naming the dial target", err)
+	}
+	if dialed {
+		t.Fatal("a failed resolution must not reach the dial")
+	}
+}
+
+// TestSSHResolveRejectsMissingPort: an address without a port is not a dial
+// target and must be rejected before any lookup.
+func TestSSHResolveRejectsMissingPort(t *testing.T) {
+	if _, err := sshResolve(context.Background(), "10.0.0.1"); err == nil {
+		t.Fatal("an address without a port must be rejected")
+	}
+}
+
+// TestSSHResolveReportsLookupFailure: a hostname (not a literal) routes
+// through the resolver's context select, so an already-canceled context —
+// like the .invalid name that never resolves — must surface as an error,
+// never as an empty result.
+func TestSSHResolveReportsLookupFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := sshResolve(ctx, "towerops-coverage.invalid:22"); err == nil {
+		t.Fatal("a failed lookup must be reported")
 	}
 }
 

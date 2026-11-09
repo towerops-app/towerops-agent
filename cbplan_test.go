@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -45,6 +46,157 @@ func TestClassifyStepOutput(t *testing.T) {
 	if f := classifyStepOutput("clean output\n", "% Invalid input\n"); f == nil ||
 		f.code != pb.ConfigBackupErrorCode_COMMAND_UNSUPPORTED {
 		t.Fatalf("stderr failure missed or misclassified: %+v", f)
+	}
+}
+
+// TestClassifyStepOutputConfigText pins bug #17: the failure regexes are
+// anchored to whole-line device error forms, so config text that merely
+// contains the phrases must not classify a good backup as a failure, while
+// the decorated forms devices really print still classify.
+func TestClassifyStepOutputConfigText(t *testing.T) {
+	for _, line := range []string{
+		`message "UNAUTHORIZED ACCESS DENIED";`,
+		`set system login message "Access denied for all";`,
+		`set snmp community "authentication failed" authorization read-only`,
+		`description online 2-3`,
+		`set comment "unknown command handler installed"`,
+	} {
+		if f := classifyStepOutput(line+"\n", ""); f != nil {
+			t.Errorf("config line %q classified as %v (%+v)", line, f.code, f)
+		}
+	}
+
+	kept := []struct{ line, kind string }{
+		{"Permission denied for logpass (en4ble) near xxx", "permission"},
+		{"% Access denied", "permission"},
+		{"%% Login invalid", "permission"},
+		{"error: permission denied", "permission"},
+		{"sh: /bin/showconf: Permission denied", "permission"},
+		{"% Invalid input detected at '^' marker.", "invalid"},
+		{"cat: /tmp/running.cfg: No such file or directory", "invalid"},
+		{"bash: foo: command not found", "invalid"},
+		{"syntax error, expecting 'interface'", "invalid"},
+		{"Invalid input: 'show running-config view full'", "invalid"},
+	}
+	for _, tc := range kept {
+		f := classifyStepOutput(tc.line+"\n", "")
+		if f == nil {
+			t.Errorf("device error %q no longer classified", tc.line)
+			continue
+		}
+		if tc.kind == "permission" && f.code != pb.ConfigBackupErrorCode_PERMISSION_DENIED {
+			t.Errorf("device error %q classified %v, want PERMISSION_DENIED", tc.line, f.code)
+		}
+		if tc.kind == "invalid" && f.code != pb.ConfigBackupErrorCode_COMMAND_UNSUPPORTED {
+			t.Errorf("device error %q classified %v, want COMMAND_UNSUPPORTED", tc.line, f.code)
+		}
+	}
+}
+
+// TestClientAlive covers the liveness check behind the ExitMissingError
+// gate: a live connection answers the keepalive, a closed one does not.
+func TestClientAlive(t *testing.T) {
+	fake := startFakeShellServer(t, "", "sw1> ", shellScript{})
+	client := cbShellClient(t, fake.addr)
+	if !clientAlive(client) {
+		t.Fatal("clientAlive = false on a live connection")
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if clientAlive(client) {
+		t.Fatal("clientAlive = true on a closed connection")
+	}
+	if clientAlive(nil) {
+		t.Fatal("clientAlive(nil) = true")
+	}
+}
+
+// TestPlanExecDroppedConnection pins bug #2's cbplan.go part: an exec
+// channel that ends without an exit status because the whole connection
+// dropped must not report the truncated output as a good step — the runner
+// fails the job with EXPORT_FAILED.
+func TestPlanExecDroppedConnection(t *testing.T) {
+	resetHostKeyStore(t)
+	config := &ssh.ServerConfig{
+		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+			return nil, nil
+		},
+	}
+	config.AddHostKey(cbNewSigner(t))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				sconn, chans, reqs, err := ssh.NewServerConn(conn, config)
+				if err != nil {
+					return
+				}
+				defer func() { _ = sconn.Close() }()
+				go ssh.DiscardRequests(reqs)
+				for newChannel := range chans {
+					ch, requests, err := newChannel.Accept()
+					if err != nil {
+						continue
+					}
+					go func() {
+						for req := range requests {
+							_ = req.Reply(req.Type == "exec", nil)
+						}
+					}()
+					go func() {
+						_, _ = ch.Write([]byte("partial config output"))
+						// Let the exec reply and the partial output land
+						// first, so the connection drops mid-command — the
+						// bug's scenario — instead of before it starts.
+						time.Sleep(200 * time.Millisecond)
+						_ = sconn.Close()
+					}()
+				}
+			}()
+		}
+	}()
+
+	host, port := cbAddrPort(t, ln.Addr().String())
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), cbPlanJob(host, port, cbExecPlan(cbCommand("show run"))), out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_EXPORT_FAILED {
+		t.Fatalf("code = %v (%q), want EXPORT_FAILED for a dropped connection", result.ErrorCode, result.ErrorDetail)
+	}
+}
+
+// TestPlanExecChannelCloseWithoutExit pins the tolerated side of bug #2:
+// a device that closes the exec channel without an exit-status while the
+// connection stays up (RouterOS 6 style) keeps its output — the step
+// succeeds, and the cbplan dropped-connection gate leaves it alone.
+func TestPlanExecChannelCloseWithoutExit(t *testing.T) {
+	resetHostKeyStore(t)
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), func(ch ssh.Channel, command string) {
+		_, _ = ch.Write([]byte("set system host-name jr1\n"))
+		_ = ch.Close() // no exit-status follows: Run reports *ssh.ExitMissingError
+	})
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), cbPlanJob(host, port, cbExecPlan(cbCommand("show run"))), out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+		t.Fatalf("code = %v (%q), want OK for a channel close on a live connection", result.ErrorCode, result.ErrorDetail)
+	}
+	if got := cbGunzip(t, result.ConfigGzip); got != "set system host-name jr1\n" {
+		t.Fatalf("config = %q, want the tolerated step's output", got)
 	}
 }
 

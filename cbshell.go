@@ -130,11 +130,15 @@ func mustCompile(expr string) *regexp.Regexp {
 
 // shellFilter turns a device's terminal byte stream into plain text: CSI
 // and OSC escape sequences are stripped, control bytes other than \n, \r,
-// \t and BEL are dropped, \r\n collapses to \n, and a bare \r erases back
-// to the line start, which removes spinner and pager-erase artifacts.
-// Write is safe for concurrent use — the session's stdout and stderr
-// copiers share one filter. out holds complete lines plus the line in
-// progress; eraseLine truncates back to the start of that partial line.
+// \t, BEL and backspace are dropped, \r\n collapses to \n, a bare \r erases
+// back to the line start (spinner artifacts) and a backspace erases the
+// byte before the cursor, stopping at the line start (the way devices
+// rewrite a pager marker). Write is safe for concurrent use — the session's
+// stdout and stderr copiers share one filter. out holds complete lines plus
+// the line in progress; eraseLine truncates back to the start of that
+// partial line. markers carries the pager marker ranges answerPager
+// answered, re-pointed whenever an erase shifts the buffer so finishCollect
+// can strip exactly the answered text.
 type shellFilter struct {
 	mu        sync.Mutex
 	out       []byte
@@ -144,6 +148,14 @@ type shellFilter struct {
 	arrived   chan struct{}
 	limit     uint64 // retained-output cap; 0 = unbounded
 	overflow  bool
+
+	markers []pagerMatch
+}
+
+// pagerMatch is one answered pager marker's byte range in the filter
+// buffer, kept consistent with the buffer as erases shift it.
+type pagerMatch struct {
+	start, end int
 }
 
 func newShellFilter(limit uint64) *shellFilter {
@@ -182,6 +194,14 @@ func (f *shellFilter) Write(p []byte) (int, error) {
 			f.esc = 1
 		case b == '\t' || b == 0x07:
 			f.out = append(f.out, b)
+		case b == 0x08:
+			// A backspace erases the byte before the cursor — Cisco and HP
+			// rewrite pager markers with backspace/space runs — but never
+			// crosses the line start.
+			if len(f.out) > f.lineStart {
+				f.out = f.out[:len(f.out)-1]
+				f.adjustMarkers(len(f.out), 1)
+			}
 		case b < 0x20 || b == 0x7f:
 			// Drop other control bytes.
 		default:
@@ -189,6 +209,7 @@ func (f *shellFilter) Write(p []byte) (int, error) {
 		}
 		if f.limit > 0 && uint64(len(f.out)) > f.limit {
 			// Keep the prefix; the job fails with TOO_LARGE.
+			f.adjustMarkers(int(f.limit), len(f.out)-int(f.limit))
 			f.out = f.out[:f.limit]
 			if f.lineStart > len(f.out) {
 				f.lineStart = len(f.out)
@@ -211,7 +232,26 @@ func (f *shellFilter) lineBreak() {
 }
 
 func (f *shellFilter) eraseLine() {
+	f.adjustMarkers(f.lineStart, len(f.out)-f.lineStart)
 	f.out = f.out[:f.lineStart]
+}
+
+// adjustMarkers drops the recorded pager marker ranges that an erase cut
+// into. Every erase is a tail truncation — a bare \r and a backspace erase
+// the current partial line, the byte cap cuts the tail — so surviving
+// ranges are exactly those ending at or before the cut; the marker text a
+// range covered is gone either way, erased by the device or by the cap.
+func (f *shellFilter) adjustMarkers(cut, delta int) {
+	if delta <= 0 || len(f.markers) == 0 {
+		return
+	}
+	kept := f.markers[:0]
+	for _, m := range f.markers {
+		if m.end <= cut {
+			kept = append(kept, m)
+		}
+	}
+	f.markers = kept
 }
 
 // feedEscape consumes bytes while inside an escape sequence and returns how
@@ -253,11 +293,80 @@ func (f *shellFilter) feedEscape(p []byte) int {
 	return len(p) // the whole chunk is part of the sequence
 }
 
-// Bytes returns the filtered output.
+// Bytes returns a copy of the filtered output. Callers hold the result
+// while later Writes erase and overwrite the buffer, so handing out the
+// internal slice let a bare-\r redraw tear the text a reader was scanning.
 func (f *shellFilter) Bytes() []byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.out
+	out := make([]byte, len(f.out))
+	copy(out, f.out)
+	return out
+}
+
+// size returns the buffer's current length, without copying it.
+func (f *shellFilter) size() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.out)
+}
+
+// sinceWithMarkers returns the buffer from start together with the answered
+// pager-marker ranges inside it, under one lock so the text and the offsets
+// agree.
+func (f *shellFilter) sinceWithMarkers(start int) (string, []pagerMatch) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if start > len(f.out) {
+		return "", nil
+	}
+	var markers []pagerMatch
+	for _, m := range f.markers {
+		if m.start >= start {
+			markers = append(markers, m)
+		}
+	}
+	return string(f.out[start:]), markers
+}
+
+// matchPager scans the last pagerWindow bytes of the buffer for the first
+// pager marker not answered yet, records its range for finishCollect and
+// returns the answer that dismisses it ("" when there is none). The scan
+// never reaches before floor — the current collect's start, never negative —
+// so a marker left in the buffer by an earlier command is not answered
+// again.
+func (f *shellFilter) matchPager(floor int, answeredTo *int, pagers []pagerPattern) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Ranges left over from an earlier collect can never be stripped again.
+	kept := f.markers[:0]
+	for _, m := range f.markers {
+		if m.end > floor {
+			kept = append(kept, m)
+		}
+	}
+	f.markers = kept
+
+	start := len(f.out) - pagerWindow
+	if start < floor {
+		start = floor
+	}
+	window := f.out[start:]
+	bestStart, bestEnd, bestAnswer := -1, -1, ""
+	for _, pg := range pagers {
+		for _, loc := range pg.re.FindAllIndex(window, -1) {
+			end := start + loc[1]
+			if end > *answeredTo && (bestEnd < 0 || end < bestEnd) {
+				bestStart, bestEnd, bestAnswer = start+loc[0], end, pg.answer
+			}
+		}
+	}
+	if bestEnd < 0 {
+		return ""
+	}
+	*answeredTo = bestEnd
+	f.markers = append(f.markers, pagerMatch{start: bestStart, end: bestEnd})
+	return bestAnswer
 }
 
 // shellSession is one interactive PTY session against a device. Output is
@@ -345,7 +454,7 @@ func (s *shellSession) waitOutput(ctx context.Context, quiet time.Duration) shel
 // quietRead collects new output until it has been silent for quiet, or ctx
 // expires (then err is non-nil). It returns the text gathered during the call.
 func (s *shellSession) quietRead(ctx context.Context, quiet time.Duration) (string, error) {
-	start := len(s.filter.Bytes())
+	start := s.filter.size()
 	for {
 		switch s.waitOutput(ctx, quiet) {
 		case shellEvtData:
@@ -400,7 +509,7 @@ func (s *shellSession) learnPrompt(ctx context.Context) (*devicePrompt, error) {
 // collecting it answers pager markers (each position once) and fails when
 // the step's deadline passes without a prompt.
 func (s *shellSession) collect(ctx context.Context, cmd string, p *devicePrompt) (string, error) {
-	start := len(s.filter.Bytes())
+	start := s.filter.size()
 	if err := s.send(cmd + "\r"); err != nil {
 		return "", err
 	}
@@ -415,7 +524,7 @@ func (s *shellSession) collect(ctx context.Context, cmd string, p *devicePrompt)
 				return s.finishCollect(start, cmd, p), nil
 			}
 		case shellEvtQuiet:
-			if s.answerPager(&answeredTo) {
+			if s.answerPager(start, &answeredTo) {
 				continue
 			}
 			if s.promptReturned(start, p) {
@@ -432,27 +541,15 @@ func (s *shellSession) collect(ctx context.Context, cmd string, p *devicePrompt)
 
 // answerPager dismisses the first pager marker whose end position is past
 // everything already answered, so each marker position is answered once.
-func (s *shellSession) answerPager(answeredTo *int) bool {
-	out := s.filter.Bytes()
-	windowStart := len(out) - pagerWindow
-	if windowStart < 0 {
-		windowStart = 0
-	}
-	window := out[windowStart:]
-	bestEnd, bestAnswer := -1, ""
-	for _, pg := range s.pagers {
-		for _, loc := range pg.re.FindAllIndex(window, -1) {
-			end := windowStart + loc[1]
-			if end > *answeredTo && (bestEnd < 0 || end < bestEnd) {
-				bestEnd, bestAnswer = end, pg.answer
-			}
-		}
-	}
-	if bestEnd < 0 {
+// The filter records the match's byte range; the scan never reaches before
+// from, this collect's start, so markers left over from earlier commands
+// stay unanswered.
+func (s *shellSession) answerPager(from int, answeredTo *int) bool {
+	answer := s.filter.matchPager(from, answeredTo, s.pagers)
+	if answer == "" {
 		return false
 	}
-	*answeredTo = bestEnd
-	_ = s.send(bestAnswer)
+	_ = s.send(answer)
 	return true
 }
 
@@ -464,13 +561,30 @@ func (s *shellSession) promptReturned(start int, p *devicePrompt) bool {
 	return final != "" && p.re.MatchString(final)
 }
 
-// finishCollect post-processes one command's raw output: strip the echoed
-// command, the returning prompt and any pager markers.
+// finishCollect post-processes one command's raw output: strip the pager
+// markers answered during the collect — exactly the recorded ranges at
+// their recorded offsets, so pager-like config text is never touched —
+// then the echoed command and the returning prompt.
 func (s *shellSession) finishCollect(start int, cmd string, p *devicePrompt) string {
-	text := s.since(start)
+	text, markers := s.filter.sinceWithMarkers(start)
+	cut := 0
+	for _, m := range markers {
+		from, to := m.start-start-cut, m.end-start-cut
+		if from < 0 || from > to || to > len(text) {
+			continue // out of range can only follow an unexpected shift
+		}
+		// A device often writes the marker line's newline only after the
+		// answer dismisses it, so it lands in the buffer past the recorded
+		// end; consume it. (The buffer never holds \r: \r\n collapsed and a
+		// bare \r erased the line.)
+		if to < len(text) && text[to] == '\n' {
+			to++
+		}
+		text = text[:from] + text[to:]
+		cut += to - from
+	}
 	text = stripEchoedCommand(text, cmd)
-	text = stripTrailingPrompt(text, p)
-	return stripPagerMarkers(text, s.pagers)
+	return stripTrailingPrompt(text, p)
 }
 
 // runPrivileged performs a privileged-mode step: skip when the prompt is
@@ -484,6 +598,11 @@ func (s *shellSession) runPrivileged(ctx context.Context, step *pb.ConfigBackupS
 	if err := s.send(step.GetCommand() + "\r"); err != nil {
 		return nil, err
 	}
+	// Judge only output that arrives after each send: bytes already in the
+	// buffer are stale — slow TACACS enable auth or an RTT over the quiet
+	// window keeps the pre-send prompt or password line visible, which used
+	// to end the step as ENABLE_FAILED or "stayed unprivileged".
+	from := s.filter.size()
 	answered := 0
 	for {
 		switch s.waitOutput(ctx, shellQuiet) {
@@ -491,8 +610,11 @@ func (s *shellSession) runPrivileged(ctx context.Context, step *pb.ConfigBackupS
 			// A privileged prompt can appear without a stall; wait for the
 			// quiet window so multi-line replies settle before judging them.
 		case shellEvtQuiet:
-			final := lastNonEmptyLine(string(s.filter.Bytes()))
+			final := lastNonEmptyLine(s.since(from))
 			switch {
+			case final == "":
+				// Nothing new since the send yet: keep waiting for the
+				// device's reply instead of judging stale output.
 			case shellPasswordPromptRe.MatchString(final):
 				// A second password request means the first answer was
 				// refused — never loop feeding the enable password.
@@ -503,6 +625,7 @@ func (s *shellSession) runPrivileged(ctx context.Context, step *pb.ConfigBackupS
 				if err := s.send(enablePassword + "\r"); err != nil {
 					return nil, err
 				}
+				from = s.filter.size()
 			case shellPromptShapeRe.MatchString(final):
 				next, err := newDevicePrompt(final)
 				if err != nil {
@@ -585,14 +708,6 @@ func stripTrailingPrompt(text string, p *devicePrompt) string {
 	final := lastLine(trimmed)
 	if p.re.MatchString(final) {
 		return strings.TrimRight(strings.TrimSuffix(trimmed, final), "\n") + "\n"
-	}
-	return text
-}
-
-// stripPagerMarkers removes pager marker text the device left in the stream.
-func stripPagerMarkers(text string, pagers []pagerPattern) string {
-	for _, pg := range pagers {
-		text = pg.re.ReplaceAllString(text, "")
 	}
 	return text
 }

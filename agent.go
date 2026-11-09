@@ -53,7 +53,6 @@ var initialRetryDelay = time.Second
 var writeQueueTimeout = 5 * time.Second
 
 var agentIDCounter atomic.Uint64
-var updateInProgress atomic.Bool
 var processStart = time.Now()
 
 // resultDropLogInterval bounds repeated spool saturation logs.
@@ -366,6 +365,13 @@ func (s *session) read() {
 	for {
 		data, err := s.ws.ReadMessage(s.ctx)
 		if err != nil {
+			// fail() elsewhere (an abort, the writer) cancels the session;
+			// once that cancellation is visible this read error is only its
+			// echo. Posting it would shadow the real cause with "read:
+			// context canceled" in sessionErr and the loop select.
+			if s.ctx.Err() != nil {
+				return
+			}
 			s.fail(s.errCh, err)
 			return
 		}
@@ -391,6 +397,13 @@ func (s *session) write() {
 			putFrameBuffer(request.buf)
 		}
 		if err != nil {
+			// Same echo rule as the reader: once the session context is
+			// cancelled by another failure, this write error is only the
+			// echo and must not shadow the real cause (e.g. an abort) in
+			// sessionErr or the loop select.
+			if s.ctx.Err() != nil {
+				return
+			}
 			slog.Error("websocket write", "error", err)
 			s.fail(s.writeErrCh, err)
 			return
@@ -814,10 +827,13 @@ func (s *session) handleResultReply(msg channelMsg) {
 // sessionErr reports why the session context was cancelled. Both I/O
 // goroutines publish their error before cancelling, so a non-blocking drain
 // returns the real cause rather than whichever select case happened to win.
+// The abort and write channels are checked before errCh: a self-update
+// abort cancels the session, the reader then sees only the cancellation
+// echo, and the abort reason must not be lost to "read: context canceled".
 func (s *session) sessionErr() error {
 	select {
-	case err := <-s.errCh:
-		return fmt.Errorf("read: %w", err)
+	case err := <-s.abortCh:
+		return err
 	default:
 	}
 	select {
@@ -826,8 +842,8 @@ func (s *session) sessionErr() error {
 	default:
 	}
 	select {
-	case err := <-s.abortCh:
-		return err
+	case err := <-s.errCh:
+		return fmt.Errorf("read: %w", err)
 	default:
 	}
 	return errSessionCancelled
@@ -972,12 +988,18 @@ func (s *session) loop(ctx context.Context) error {
 		select {
 		case <-ctxDone:
 			slog.Info("shutdown signal, draining queued results before exit")
+			// An in-flight self-update must not re-exec while the process is
+			// shutting down: stand it down now, and after the drain give it
+			// a bounded window to finish the restore its cancellation
+			// triggers before the process exits.
+			cancelActiveUpdate()
 			ctxDone = nil
 			drainDone = make(chan struct{})
 			go s.drainForShutdown(drainDone)
 			continue
 
 		case <-drainDone:
+			waitActiveUpdate(shutdownUpdateWait)
 			s.settleInFlight(inFlight)
 			return nil
 		case <-s.ctx.Done():
@@ -1200,7 +1222,7 @@ func handleMessage(
 		// or explicitly empty inventory arrives.
 		if len(recurring) > 0 || len(jobList.Jobs) == 0 {
 			pools.scheduler.replaceJobs(recurring, pools, out)
-			pools.applyInventoryRevision(jobList.Revision)
+			pools.applyInventoryRevision(msg.Event, jobList.Revision)
 		}
 		for _, job := range oneShot {
 			slog.Info("received one-shot job", "job_id", job.JobId, "type", job.JobType)
@@ -1249,7 +1271,7 @@ func handleMessage(
 		}
 		slog.Info("received recurring checks", "count", len(checkList.Checks))
 		pools.scheduler.replaceChecks(checkList.Checks, pools, out)
-		pools.applyInventoryRevision(checkList.Revision)
+		pools.applyInventoryRevision(msg.Event, checkList.Revision)
 
 	case "restart":
 		slog.Info("restart requested by server")
@@ -1265,18 +1287,22 @@ func handleMessage(
 			slog.Error("invalid update payload")
 			return false, nil
 		}
-		if !updateInProgress.CompareAndSwap(false, true) {
+		// The handle registers the update so process shutdown can cancel it
+		// before the binary is replaced (see cancelActiveUpdate). Session
+		// cancellation must not reach the update, hence WithoutCancel in
+		// beginUpdate.
+		update := beginUpdate(ctx)
+		if update == nil {
 			slog.Warn("self-update already in progress, ignoring duplicate")
 			return false, nil
 		}
-		updateCtx := context.WithoutCancel(ctx)
 		slog.Info("update requested", "url", sanitizeURL(payload.URL), "version", payload.Version)
 		go func() {
-			defer updateInProgress.Store(false)
-			if err := doSelfUpdate(updateCtx, payload.URL, payload.Checksum, payload.Version); err != nil {
+			if err := doSelfUpdate(update.ctx, payload.URL, payload.Checksum, payload.Version); err != nil {
 				slog.Error("self-update failed", "error", err)
 				recordUpdateFailure(payload.Version, err)
 			}
+			update.finish()
 			abortDrainedSession()
 		}()
 
@@ -1529,12 +1555,23 @@ func (p *jobPools) stop(timeout time.Duration) []string {
 }
 
 // applyInventoryRevision records the newest authoritative inventory revision
-// the agent accepted (issue #2755). The revision stream is monotonic per
-// connection, so a replayed or reordered frame can only move the stamp
-// forward; a successful apply also clears the refused-frame marker the
-// heartbeat reports.
-func (p *jobPools) applyInventoryRevision(revision uint64) {
+// the agent accepted (issue #2755). Jobs and check_jobs share one revision
+// stream, so the stamp is monotonic per connection and a replayed or
+// reordered frame can only move it forward. The refused-frame marker is
+// cleared only when the refused frame type itself applies: otherwise a
+// successful apply of the other type would report the refused stream as
+// reconciled and the server would never re-push it. While a refusal is
+// outstanding the applied stamp is held back entirely, keeping the server's
+// re-push logic (applied_revision trailing what it sent) active.
+func (p *jobPools) applyInventoryRevision(event string, revision uint64) {
 	if revision == 0 {
+		return
+	}
+	rejected, _ := p.rejectedInventory.Load().(string)
+	if rejected != "" && rejected != event {
+		// A different frame type is still refused. Do not advance the stamp:
+		// reporting this apply as reconciliation would tell the server the
+		// refused stream landed when it never did.
 		return
 	}
 	for {
@@ -1546,7 +1583,7 @@ func (p *jobPools) applyInventoryRevision(revision uint64) {
 			break
 		}
 	}
-	if rejected, ok := p.rejectedInventory.Load().(string); ok && rejected != "" {
+	if rejected != "" {
 		p.rejectedInventory.Store("")
 	}
 }

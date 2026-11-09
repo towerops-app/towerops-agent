@@ -173,8 +173,21 @@ func TestExecuteSnmpJob_WalkFailureAttribution(t *testing.T) {
 						Name: "." + oidSysName, Type: gosnmp.OctetString, Value: []byte("retained-scalar"),
 					}}}, nil
 				},
-				walkFunc: func(string) ([]gosnmp.SnmpPDU, error) {
-					return []gosnmp.SnmpPDU{{Name: "." + root + ".1", Type: gosnmp.Integer, Value: 7}}, errors.New("walk timeout")
+				nextFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+					if oids[0] == "."+root {
+						return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{
+							{Name: "." + root + ".1", Type: gosnmp.Integer, Value: 7},
+						}}, nil
+					}
+					return nil, errors.New("walk timeout")
+				},
+				getBulkFunc: func(oids []string, _ uint8, _ uint32) (*gosnmp.SnmpPacket, error) {
+					if oids[0] == "."+root {
+						return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{
+							{Name: "." + root + ".1", Type: gosnmp.Integer, Value: 7},
+						}}, nil
+					}
+					return nil, errors.New("walk timeout")
 				},
 			}
 			result, notice, logs := runSnmpAttributionJob(t, job, mock)
@@ -185,8 +198,8 @@ func TestExecuteSnmpJob_WalkFailureAttribution(t *testing.T) {
 			if len(result.CompletedRoots) != 0 {
 				t.Errorf("failed walk claimed completed roots: %v", result.CompletedRoots)
 			}
-			if mock.walkAllCalled != (version == "1") || mock.bulkWalkCalled != (version != "1") {
-				t.Errorf("walk selection changed: walk=%t bulk=%t version=%s", mock.walkAllCalled, mock.bulkWalkCalled, version)
+			if (len(mock.nextRequests) > 0) != (version == "1") || (len(mock.bulkRequests) > 0) != (version != "1") {
+				t.Errorf("walk selection changed: next=%d bulk=%d version=%s", len(mock.nextRequests), len(mock.bulkRequests), version)
 			}
 			record := assertSnmpFailureAttribution(t, job, notice, logs, "WALK", []string{root}, nil)
 			if record.Root != root || record.Elapsed <= 0 {

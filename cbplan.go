@@ -26,33 +26,37 @@ const (
 )
 
 // permissionDeniedRes are the permission-denied phrases a command's output
-// is scanned for — the classic Unimus set: anything matching one of these
-// in the first 20 lines of a command's output is permission text, which
-// triggers the step's fallbacks and, at exhaustion, PERMISSION_DENIED.
+// is scanned for — the classic Unimus set. Every phrase is anchored to the
+// start of a line, behind the decorations real device error lines carry
+// (Cisco %/%% status markers, an "error:"/"fatal:" tag, or a short shell
+// prefix such as "sh: /bin/foo:"), because unanchored matching classified
+// config text like Juniper's `message "UNAUTHORIZED ACCESS DENIED"` as a
+// device refusal. Bounded device text may follow the phrase: real refusals
+// carry explanations ("Permission denied for logpass …").
 var permissionDeniedRes = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)permission denied`),
-	regexp.MustCompile(`(?i)access denied`),
-	regexp.MustCompile(`(?i)% authorization failed`),
-	regexp.MustCompile(`(?i)authentication failed`),
-	regexp.MustCompile(`(?i)% password:`),
-	regexp.MustCompile(`(?i)% bad secrets`),
-	regexp.MustCompile(`(?i)invalid password`),
-	regexp.MustCompile(`(?i)% login invalid`),
+	regexp.MustCompile(`(?i)^(?:%{1,2} ?|(?:error|fatal): ?|(?:[^:\s][^:]{0,62}: ?)+)?` +
+		`(?:permission denied|access denied|authorization failed|authentication failed|invalid password|login invalid|bad secrets)\b`),
+	regexp.MustCompile(`(?i)^%{1,2} ?password:`),
 }
 
 // invalidCommandRe detects device-side rejections of the command itself,
 // built from the invalid-command phrases in tmp/unimus.md section 6:
 // a qualifier (invalid, incomplete, ambiguous, unrecognized, unsupported,
 // unknown) followed by command/input/keyword, "% Invalid input", a '^'
-// error marker line, ": not found", "No such file or directory",
-// "syntax error" and "expected end of command".
-var invalidCommandRe = regexp.MustCompile(`(?i)(?:invalid|incomplete|ambiguous|unrecogni[sz]ed|unsupported|unknown)\b.{0,60}?\b(?:command|input|keyword)\b` +
-	`|% ?invalid input` +
+// error marker line, "not found", "No such file or directory",
+// "syntax error" and "expected end of command". Like permissionDeniedRes,
+// every phrase is anchored to the start of a line behind the usual device
+// error decorations, so config text merely containing the words no longer
+// classifies a step as rejected; bounded device text may follow (Cisco's
+// "detected at '^' marker.", Junos's "expecting …").
+var invalidCommandRe = regexp.MustCompile(`(?i)^(?:%{1,2} ?|(?:error|fatal): ?|(?:[^:\s][^:]{0,62}: ?)+)?` +
+	`(?:(?:invalid|incomplete|ambiguous|unrecogni[sz]ed|unsupported|unknown)\b.{0,60}?\b(?:command|input|keyword)\b` +
 	`|command (?:not found|not recognized|not supported)` +
-	`|: not found` +
 	`|no such file or directory` +
+	`|not found` +
 	`|syntax error` +
-	`|expected end of command`)
+	`|expected end of command)` +
+	`(?:.{0,80})?$`)
 
 // invalidMarkerLineRe matches a bare '^' error marker line (per-line use).
 var invalidMarkerLineRe = regexp.MustCompile(`^[ \t]*\^`)
@@ -300,6 +304,20 @@ func (r *planRunner) execStep(ctx context.Context, step *pb.ConfigBackupStep) *p
 			r.failed = true
 			return nil
 		}
+		// A lost connection closes the exec channel, which surfaces as
+		// *ssh.ExitMissingError with only the output that arrived before
+		// the drop. The session runner already tolerates the missing exit
+		// status of a live RouterOS 6-style channel close, so one arriving
+		// here means the client is gone; a keepalive confirms it. Passing
+		// the truncated output as a good step would store a partial config
+		// as a successful backup.
+		var exitMissing *ssh.ExitMissingError
+		if errors.As(err, &exitMissing) && !clientAlive(r.client) {
+			return &planStepFailure{
+				code:   pb.ConfigBackupErrorCode_EXPORT_FAILED,
+				detail: "ssh connection dropped while running " + cmd,
+			}
+		}
 		if failure := classifyStepOutput(string(stdout), string(stderr)); failure != nil {
 			lastFailure = failure
 			continue
@@ -327,6 +345,17 @@ func (r *planRunner) execStep(ctx context.Context, step *pb.ConfigBackupStep) *p
 		return nil
 	}
 	return lastFailure
+}
+
+// clientAlive reports that the client's transport still answers a keepalive
+// request. Local to the plan runner (nil-safe); ssh.go carries the shared
+// sshClientAlive for the session runner paths.
+func clientAlive(c *ssh.Client) bool {
+	if c == nil {
+		return false
+	}
+	_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
+	return err == nil
 }
 
 // runShellPlan executes a plan over one interactive PTY session.

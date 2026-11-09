@@ -245,6 +245,53 @@ func TestExecPingTimeoutArgument(t *testing.T) {
 	}
 }
 
+func TestExecPingWaitArgumentByPlatform(t *testing.T) {
+	origGOOS := pingGOOS
+	origLookPath := pingLookPath
+	origCommand := pingCommandOutput
+	t.Cleanup(func() {
+		pingGOOS = origGOOS
+		pingLookPath = origLookPath
+		pingCommandOutput = origCommand
+	})
+	pingLookPath = func(file string) (string, error) { return "/sbin/" + file, nil }
+
+	tests := []struct {
+		name     string
+		goos     string
+		ip       string
+		wantCmd  string
+		wantArgs []string
+	}{
+		{name: "darwin ipv4 keeps -W in milliseconds", goos: "darwin", ip: "127.0.0.1", wantCmd: "ping", wantArgs: []string{"-c", "1", "-W", "1500", "127.0.0.1"}},
+		{name: "darwin ipv6 omits -W so ping6 sees the host", goos: "darwin", ip: "2001:db8::1", wantCmd: "ping6", wantArgs: []string{"-c", "1", "2001:db8::1"}},
+		{name: "linux ipv4 unchanged", goos: "linux", ip: "127.0.0.1", wantCmd: "ping", wantArgs: []string{"-c", "1", "-W", "2", "127.0.0.1"}},
+		{name: "linux ipv6 unchanged", goos: "linux", ip: "2001:db8::1", wantCmd: "ping6", wantArgs: []string{"-c", "1", "-W", "2", "2001:db8::1"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pingGOOS = tt.goos
+			var gotCmd string
+			var gotArgs []string
+			pingCommandOutput = func(_ context.Context, name string, args ...string) ([]byte, error) {
+				gotCmd = name
+				gotArgs = args
+				return []byte("64 bytes from target: time=1.5 ms"), nil
+			}
+			if _, err := execPing(context.Background(), tt.ip, 1500); err != nil {
+				t.Fatalf("execPing(%s): %v", tt.ip, err)
+			}
+			if gotCmd != tt.wantCmd {
+				t.Errorf("command = %q, want %q", gotCmd, tt.wantCmd)
+			}
+			if !slices.Equal(gotArgs, tt.wantArgs) {
+				t.Errorf("args = %q, want %q", gotArgs, tt.wantArgs)
+			}
+		})
+	}
+}
+
 func TestIPv6PingCommandFallsBackToPing(t *testing.T) {
 	origLookPath := pingLookPath
 	t.Cleanup(func() { pingLookPath = origLookPath })
@@ -890,6 +937,41 @@ func TestTpTDoICMPPingUDPMatchesSequenceWhenLocalAddressIsNotUDP(t *testing.T) {
 	if got := conn.readsConsumed(); got != 1 {
 		t.Errorf("consumed %d replies, want 1 (sequence-only fallback)", got)
 	}
+}
+
+func TestTpTDoICMPPingUDPMatchesSequenceWhenPortIsZero(t *testing.T) {
+	// darwin reports port 0 for a fresh unprivileged UDP ICMP socket while
+	// replies carry the real echo id (pid & 0xffff). A zero port must leave
+	// the reply identifier unknown so the ping matches on sequence alone;
+	// trusting it as the identifier makes every reply a stranger.
+	t.Run("udp4", func(t *testing.T) {
+		conn := tpTNewFakeICMPConn(tpTEchoReplyFor(t, true, 0, 0))
+		conn.localAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+		tpTUseFakeICMPConn(t, conn)
+
+		_, err := doICMPPing(context.Background(), net.ParseIP("127.0.0.1"), "udp4", true, 1000)
+		if err != nil {
+			t.Fatalf("doICMPPing: %v", err)
+		}
+		if got := conn.readsConsumed(); got != 1 {
+			t.Errorf("consumed %d replies, want 1 (pid identifier matched on sequence alone)", got)
+		}
+	})
+
+	t.Run("udp6", func(t *testing.T) {
+		conn := tpTNewFakeICMPConn(tpTEchoReplyFor(t, false, 0, 0))
+		conn.localAddr = &net.UDPAddr{IP: net.ParseIP("::1"), Port: 0}
+		conn.peers = []net.Addr{&net.IPAddr{IP: net.ParseIP("::1")}}
+		tpTUseFakeICMPConn(t, conn)
+
+		_, err := doICMPPing(context.Background(), net.ParseIP("::1"), "udp6", false, 1000)
+		if err != nil {
+			t.Fatalf("doICMPPing: %v", err)
+		}
+		if got := conn.readsConsumed(); got != 1 {
+			t.Errorf("consumed %d replies, want 1 (pid identifier matched on sequence alone)", got)
+		}
+	})
 }
 
 func TestTpTDoICMPPingSkipsUnusableReplies(t *testing.T) {
