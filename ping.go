@@ -148,13 +148,26 @@ type icmpSocket struct {
 	err     error // terminal read error; set once, under mu
 }
 
+// icmpUnavailableRetry is how long a failed listen on a network is remembered
+// before sharedSocket tries to open it again. Overridable for tests.
+var icmpUnavailableRetry = 5 * time.Minute
+
+// icmpListenFailure is a remembered listen error for one network.
+type icmpListenFailure struct {
+	err   error
+	until time.Time
+}
+
 var sharedSockets = struct {
-	mu sync.Mutex
-	m  map[string]*icmpSocket
-}{m: make(map[string]*icmpSocket)}
+	mu          sync.Mutex
+	m           map[string]*icmpSocket
+	unavailable map[string]icmpListenFailure
+}{m: make(map[string]*icmpSocket), unavailable: make(map[string]icmpListenFailure)}
 
 // sharedSocket returns the long-lived socket for network, opening it on first
-// use and replacing it if its read loop died.
+// use and replacing it if its read loop died. A listen failure is cached for
+// icmpUnavailableRetry, so an agent without CAP_NET_RAW does not retry the
+// raw socket on every ping before falling back.
 func sharedSocket(network string) (*icmpSocket, error) {
 	sharedSockets.mu.Lock()
 	defer sharedSockets.mu.Unlock()
@@ -164,11 +177,17 @@ func sharedSocket(network string) (*icmpSocket, error) {
 		}
 		delete(sharedSockets.m, network)
 	}
+	if failure, ok := sharedSockets.unavailable[network]; ok && time.Now().Before(failure.until) {
+		return nil, failure.err
+	}
 
 	conn, err := icmpListenPacket(network, "")
 	if err != nil {
-		return nil, &errICMPUnavailable{err: fmt.Errorf("icmp listen %s: %w", network, err)}
+		unavailable := &errICMPUnavailable{err: fmt.Errorf("icmp listen %s: %w", network, err)}
+		sharedSockets.unavailable[network] = icmpListenFailure{err: unavailable, until: time.Now().Add(icmpUnavailableRetry)}
+		return nil, unavailable
 	}
+	delete(sharedSockets.unavailable, network)
 
 	proto := 1
 	if strings.HasPrefix(network, "ip6") || strings.HasPrefix(network, "udp6") {
@@ -195,10 +214,12 @@ func sharedSocket(network string) (*icmpSocket, error) {
 	return s, nil
 }
 
-// closeSharedSockets closes every shared socket and forgets them. Production
-// sockets live for the process; tests call this to reset state.
+// closeSharedSockets closes every shared socket and forgets them and any
+// cached listen failures. Production sockets live for the process; tests call
+// this to reset state.
 func closeSharedSockets() {
 	sharedSockets.mu.Lock()
+	clear(sharedSockets.unavailable)
 	socks := make([]*icmpSocket, 0, len(sharedSockets.m))
 	for network, s := range sharedSockets.m {
 		socks = append(socks, s)
