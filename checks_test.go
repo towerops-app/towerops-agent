@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -2991,5 +2992,93 @@ func TestChkTSSLCheckUsesPresentedIntermediates(t *testing.T) {
 				t.Fatalf("got output %q, want the leaf expiry date %s", output, chain.Leaf.NotAfter.Format("2006-01-02"))
 			}
 		})
+	}
+}
+
+// An empty host makes net.JoinHostPort produce ":port", which Go dials on
+// the local system, so the agent would report its own service as the
+// target's. Both checks must refuse before dialing.
+func TestTCPCheck_EmptyHostIsUnknownWithoutDialing(t *testing.T) {
+	orig := tcpDialContext
+	t.Cleanup(func() { tcpDialContext = orig })
+	tcpDialContext = func(context.Context, string, string) (net.Conn, error) {
+		t.Error("TCP check dialed with an empty host")
+		return nil, errors.New("unexpected dial")
+	}
+
+	status, output := executeTCPCheck(context.Background(), &pb.TcpCheckConfig{Port: 22}, 1000)
+	if status != checkUnknown || output != "TCP check has no host configured" {
+		t.Fatalf("status = %d, output = %q; want UNKNOWN missing-host result", status, output)
+	}
+}
+
+func TestSSLCheck_EmptyHostIsUnknownWithoutDialing(t *testing.T) {
+	orig := sslDialTLS
+	t.Cleanup(func() { sslDialTLS = orig })
+	sslDialTLS = func(context.Context, *net.Dialer, *tls.Config, string, string) (net.Conn, error) {
+		t.Error("SSL check dialed with an empty host")
+		return nil, errors.New("unexpected dial")
+	}
+
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{Port: 443}, 1000)
+	if status != checkUnknown || output != "SSL check has no host configured" {
+		t.Fatalf("status = %d, output = %q; want UNKNOWN missing-host result", status, output)
+	}
+}
+
+// Sub-millisecond checks must keep their fractional time: the proto field is
+// a double, and whole-millisecond truncation reported fast checks as 0 ms.
+func TestExecuteCheck_ResponseTimeKeepsSubMillisecondPrecision(t *testing.T) {
+	orig := tcpDialContext
+	t.Cleanup(func() { tcpDialContext = orig })
+	tcpDialContext = func(context.Context, string, string) (net.Conn, error) {
+		time.Sleep(200 * time.Microsecond)
+		client, server := net.Pipe()
+		t.Cleanup(func() { _ = server.Close() })
+		return client, nil
+	}
+
+	result := ExecuteCheck(context.Background(), &pb.Check{
+		Id:        "chk-precision",
+		CheckType: "tcp",
+		Config:    &pb.Check_Tcp{Tcp: &pb.TcpCheckConfig{Host: "192.0.2.1", Port: 80}},
+	})
+	if result.Status != checkOK {
+		t.Fatalf("status = %d, output = %q; want OK", result.Status, result.Output)
+	}
+	ms := result.ResponseTimeMs
+	if ms <= 0 || ms == math.Trunc(ms) {
+		t.Fatalf("ResponseTimeMs = %v, want a positive value with a fractional part", ms)
+	}
+}
+
+// Go keeps a caller's Host override only across relative redirects. An
+// absolute Location back to the same address must still carry the override,
+// or the follow-up request reaches the server's default virtual host.
+func TestHTTPCheck_HostOverrideSurvivesAbsoluteSameHostRedirect(t *testing.T) {
+	const virtualHost = "virtual.example.test"
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != virtualHost {
+			w.WriteHeader(http.StatusMisdirectedRequest)
+			return
+		}
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, srvURL+"/next", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+		Url:             srv.URL + "/start",
+		Headers:         map[string]string{"Host": virtualHost},
+		VerifySsl:       true,
+		FollowRedirects: true,
+	}, 5000)
+	if status != checkOK {
+		t.Fatalf("status = %d, output = %q; want OK with Host kept across redirect", status, output)
 	}
 }
