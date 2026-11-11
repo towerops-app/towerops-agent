@@ -25,7 +25,10 @@ type workerPool struct {
 	// busy counts work admitted to this pool that has not finished:
 	// coordinators in jitter or gate wait, queued tasks and running tasks.
 	// The self-update drain waits for it to reach zero.
-	busy   atomic.Int64
+	busy atomic.Int64
+	// paused refuses new submissions while admitted work finishes; set by
+	// the self-update drain, never cleared.
+	paused atomic.Bool
 	wg     sync.WaitGroup
 	once   sync.Once
 	mu     sync.RWMutex
@@ -57,20 +60,25 @@ func newWorkerPool(n int) *workerPool {
 	return p
 }
 
-// submit enqueues a task without blocking. Interactive callers use it so a
-// saturated protocol cannot stall the session event loop.
-func (p *workerPool) submit(ctx context.Context, fn func()) bool {
-	return p.submitMode(ctx, fn, false)
+// pause makes the pool refuse new submissions for good. Admitted work keeps
+// running, and dispatchGated coordinators admitted before the pause still
+// queue their job. The self-update drain pauses the pools, then waits for
+// idle.
+func (p *workerPool) pause() {
+	p.paused.Store(true)
 }
 
-// submitWait applies backpressure until a queue slot opens or ctx is
-// cancelled. Recurring schedulers have one goroutine per assignment, so
-// waiting here spreads a burst without blocking unrelated work.
-func (p *workerPool) submitWait(ctx context.Context, fn func()) bool {
-	return p.submitMode(ctx, fn, true)
-}
-
+// submitMode queues fn. With wait it applies backpressure until a queue slot
+// opens or ctx is cancelled, which recurring schedulers use since they run
+// one goroutine per assignment; without wait it fails at once on a full
+// queue, so the session event loop never stalls. A paused pool refuses.
 func (p *workerPool) submitMode(ctx context.Context, fn func(), wait bool) bool {
+	return p.admit(ctx, fn, wait, true)
+}
+
+// admit is submitMode with the pause check optional: dispatchGated skips it
+// for coordinators the pool already counts as busy.
+func (p *workerPool) admit(ctx context.Context, fn func(), wait, honorPause bool) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.closed {
@@ -82,6 +90,13 @@ func (p *workerPool) submitMode(ctx context.Context, fn func(), wait bool) bool 
 	// Count the task before it can reach a worker so busy never dips to
 	// zero between admission and completion.
 	p.busy.Add(1)
+	// The pause is read after the busy increment, and pause stores before
+	// the drain reads busy. Either the drain sees this task as busy, or
+	// this read sees the pause.
+	if honorPause && p.paused.Load() {
+		p.busy.Add(-1)
+		return false
+	}
 	task := func() {
 		defer p.busy.Add(-1)
 		fn()
@@ -161,7 +176,7 @@ func (p *workerPool) dispatchGated(
 		// The gate moves into the queued task so the worker frees it on
 		// every exit path — success, panic past the pool's recover, or the
 		// task's early cancelled-context return.
-		if !p.submitMode(submitCtx, func() { run(release) }, false) {
+		if !p.admit(submitCtx, func() { run(release) }, false, false) {
 			release()
 			fail(dispatchQueueFull)
 		}

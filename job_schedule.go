@@ -9,6 +9,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/towerops-app/towerops-agent/pb"
@@ -69,6 +70,10 @@ type recurringScheduler struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	clock  scheduleClock
+
+	// paused stops new ticks and inventory changes without cancelling
+	// running ticks; set by the self-update drain, never cleared.
+	paused atomic.Bool
 
 	mu     sync.Mutex
 	closed bool
@@ -165,7 +170,7 @@ func (s *recurringScheduler) replace(group *map[string]*scheduleEntry, specs []s
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || s.paused.Load() {
 		return
 	}
 	retiring := s.retiringChecks
@@ -298,6 +303,11 @@ func firstTickDelay(id string, interval time.Duration) time.Duration {
 // worker-pool capacity; measuring the period from dispatch keeps the
 // configured cadence instead of adding queue-wait time to every cycle.
 func (s *recurringScheduler) runOnce(ctx context.Context, spec scheduleSpec) bool {
+	// A paused scheduler starts no tick; the entry parks until cancelAll.
+	if s.paused.Load() {
+		<-ctx.Done()
+		return false
+	}
 	done := make(chan struct{})
 	timer := s.clock.NewTimer(spec.interval)
 	defer timer.Stop()
@@ -331,6 +341,14 @@ func (s *recurringScheduler) runOnce(ctx context.Context, spec scheduleSpec) boo
 		}
 	}
 	return true
+}
+
+// pause stops every entry from starting another tick and refuses inventory
+// replacement. Unlike cancelAll it leaves entry contexts live, so a tick
+// already running finishes and delivers its result. Session stop still calls
+// cancelAll to end the parked entries.
+func (s *recurringScheduler) pause() {
+	s.paused.Store(true)
 }
 
 func (s *recurringScheduler) cancelAll() {

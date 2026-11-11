@@ -117,6 +117,8 @@ type pendingResult struct {
 	result outbound
 	// sentAt stays zero until the writer acknowledges completion.
 	sentAt time.Time
+	// seq orders insertions; the count cap evicts the lowest.
+	seq uint64
 }
 
 // pendingReplyTTL expires phx_reply tracking for results the server never
@@ -124,12 +126,18 @@ type pendingResult struct {
 // otherwise accumulate for the life of the session.
 var pendingReplyTTL = 30 * time.Second
 
-// runAgent connects to the server and runs the event loop with reconnect.
-// traps may be nil when the trap listener is disabled.
-func runAgent(ctx context.Context, wsURL, token string, traps <-chan *pb.SnmpTrap) {
-	runAgentWithScheduling(ctx, wsURL, token, traps, true)
-}
+// maxPendingResults caps pending by count. Every entry holds its result's
+// payload, and a fast uplink acks far more than the spool's 512 slots within
+// one TTL; without the cap that memory sits outside the spool's bound.
+const maxPendingResults = resultQueueSize
 
+// overloadRetryDelay spaces the retry of a result the server rejected as
+// "overloaded". Its ingest queue is full, so an immediate re-send lands on
+// the same full queue and the second rejection drops the result.
+var overloadRetryDelay = 5 * time.Second
+
+// runAgentWithScheduling connects to the server and runs the event loop with
+// reconnect. traps may be nil when the trap listener is disabled.
 func runAgentWithScheduling(
 	ctx context.Context,
 	wsURL, token string,
@@ -224,7 +232,7 @@ type session struct {
 	writerDone chan struct{}
 
 	// pools and results exist only once the channel join has been accepted;
-	// see runSession.
+	// see runSessionWithResultsAndScheduling.
 	pools     *jobPools
 	scheduler *recurringScheduler
 	results   *resultQueue
@@ -235,21 +243,14 @@ type session struct {
 	// pending tracks result refs awaiting a server phx_reply so a rejected
 	// delivery (e.g. an oversized payload) can be retried instead of being
 	// acked on websocket write alone. Only the session loop touches it.
-	pending map[string]pendingResult
-}
+	// pendingSeq numbers insertions so the count cap evicts the oldest.
+	pending    map[string]pendingResult
+	pendingSeq uint64
 
-// runSession runs one WebSocket session with local recurring scheduling.
-func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.SnmpTrap) error {
-	return runSessionWithResults(ctx, baseURL, token, traps, newResultQueueForAgent(ctx, resultQueueSize))
-}
-
-func runSessionWithResults(
-	ctx context.Context,
-	baseURL, token string,
-	traps <-chan *pb.SnmpTrap,
-	results *resultQueue,
-) error {
-	return runSessionWithResultsAndScheduling(ctx, baseURL, token, traps, results, true)
+	// ackedResults counts spooled results the writer acknowledged. The
+	// shutdown drain reads it from its own goroutine to log how many
+	// results it flushed.
+	ackedResults atomic.Uint64
 }
 
 func runSessionWithResultsAndScheduling(
@@ -401,10 +402,11 @@ func (s *session) write() {
 			// cancelled by another failure, this write error is only the
 			// echo and must not shadow the real cause (e.g. an abort) in
 			// sessionErr or the loop select.
+			// runAgentWithScheduling logs the error the session returns,
+			// so the writer only publishes it.
 			if s.ctx.Err() != nil {
 				return
 			}
-			slog.Error("websocket write", "error", err)
 			s.fail(s.writeErrCh, err)
 			return
 		}
@@ -471,7 +473,7 @@ func (s *session) join(token string) error {
 	defer timer.Stop()
 	select {
 	case data := <-s.msgCh:
-		if err := validateJoinReply(data); err != nil {
+		if err := validateJoinReply(data, s.topic); err != nil {
 			return err
 		}
 		slog.Info("channel joined")
@@ -613,6 +615,7 @@ func (s *session) resolveInFlight(w *inFlightWrite, err error) error {
 	}
 	if w.spooled {
 		s.results.ack(w.result)
+		s.ackedResults.Add(1)
 		slog.Debug("sent result", "event", w.result.event)
 	} else {
 		slog.Debug("sent overload notice", "event", w.result.event)
@@ -644,15 +647,33 @@ func (s *session) settleInFlight(w *inFlightWrite) {
 
 // trackPending records a result under its message ref. Successful handle_in
 // calls produce no phx_reply, so expired entries are swept on the channel
-// heartbeat tick — not here — keeping per-send work O(1) instead of scanning
-// the whole map on every result.
+// heartbeat tick. Between sweeps the map is capped at maxPendingResults: at
+// the cap the oldest entry is evicted, which costs one map scan per insert
+// only while the cap is reached. The evicted result was sent longest ago; a
+// rejection for it arriving later is ignored like any unknown ref.
 func (s *session) trackPending(ref string, result outbound) {
 	if s.pending == nil {
 		s.pending = make(map[string]pendingResult)
 	}
+	if len(s.pending) >= maxPendingResults {
+		s.evictOldestPending()
+	}
+	s.pendingSeq++
 	// The TTL starts after the writer finishes. Large frames can take longer
 	// than pendingReplyTTL, and the server cannot reject them until arrival.
-	s.pending[ref] = pendingResult{result: result}
+	s.pending[ref] = pendingResult{result: result, seq: s.pendingSeq}
+}
+
+// evictOldestPending deletes the entry with the lowest insertion sequence.
+func (s *session) evictOldestPending() {
+	var oldestRef string
+	var oldestSeq uint64
+	for ref, p := range s.pending {
+		if oldestRef == "" || p.seq < oldestSeq {
+			oldestRef, oldestSeq = ref, p.seq
+		}
+	}
+	delete(s.pending, oldestRef)
 }
 
 // prunePending drops entries the server never answered. It runs on the
@@ -668,17 +689,20 @@ func (s *session) prunePending() {
 }
 
 // drainResults prepares the session for a self-update re-exec: the recurring
-// scheduler is stopped, new job and check submissions are refused, in-flight
-// jobs — queued, running, or still in jitter or a gate wait — are allowed to
-// finish, and the spool is flushed until every slot is free — the semaphores
-// hold a token per in-use slot — meaning every enqueued or in-flight result
-// was written to the websocket and acked. The session loop keeps delivering
+// scheduler and the worker pools are paused, so no new tick or submission
+// starts, while work already admitted keeps its live context and finishes.
+// That covers running recurring ticks and one-shot jobs that are queued,
+// running, or still in jitter or a gate wait. A recurring tick still in its
+// own jitter or gate wait has not been admitted; the paused pool refuses it.
+// The spool is then flushed until every slot is free (the semaphores hold a
+// token per in-use slot), meaning every enqueued or in-flight result was
+// written to the websocket and acked. The session loop keeps delivering
 // results concurrently; drain only gates acceptance. Returns false when the
 // caller's bounded context expires first.
 //
-// The drain cannot be undone in place — the scheduler is closed for good —
-// so the session is recorded in drainedSession and ended by
-// abortDrainedSession if the re-exec does not happen.
+// The drain cannot be undone in place, since the pause has no resume, so the
+// session is recorded in drainedSession and ended by abortDrainedSession if
+// the re-exec does not happen.
 func (s *session) drainResults(ctx context.Context) bool {
 	drainedSession.Store(s)
 	return s.drainSpool(ctx)
@@ -690,11 +714,12 @@ func (s *session) drainResults(ctx context.Context) bool {
 // drainResults, which also records the session for abortDrainedSession; the
 // shutdown drain calls it directly because the process is leaving anyway.
 func (s *session) drainSpool(ctx context.Context) bool {
-	if s.scheduler != nil {
-		s.scheduler.cancelAll()
-	}
 	if s.pools != nil {
 		s.pools.stopAccepting.Store(true)
+		s.pools.pause()
+	}
+	if s.scheduler != nil {
+		s.scheduler.pause()
 	}
 
 	// Pools are checked before the spool: a job sends its result before its
@@ -735,7 +760,8 @@ func (s *session) resultsDrained() bool {
 // ends if the re-exec does not happen. It closes `done` whether the flush
 // finished or the budget expired so the session loop exits either way. The
 // count of results still queued when the budget ran out is logged once, so
-// a restart that lost data says so.
+// a restart that lost data says so. "flushed" counts the writer acks during
+// the drain, so it includes results queued after the drain started.
 func (s *session) drainForShutdown(done chan<- struct{}) {
 	defer close(done)
 
@@ -743,18 +769,21 @@ func (s *session) drainForShutdown(done chan<- struct{}) {
 		return
 	}
 
-	queued := len(s.results.items)
+	ackedBefore := s.ackedResults.Load()
 	ctx, cancel := context.WithTimeout(context.Background(), poolShutdownTimeout)
 	defer cancel()
 
 	if s.drainSpool(ctx) {
-		slog.Info("shutdown drain flushed queued results", "flushed", queued)
+		slog.Info("shutdown drain flushed queued results", "flushed", s.ackedResults.Load()-ackedBefore)
 		return
 	}
 
 	lost := len(s.results.items)
 	if lost > 0 {
-		slog.Warn("shutdown drain timed out, results lost", "lost", lost, "timeout", poolShutdownTimeout)
+		slog.Warn("shutdown drain timed out, results lost",
+			"lost", lost,
+			"flushed", s.ackedResults.Load()-ackedBefore,
+			"timeout", poolShutdownTimeout)
 	}
 }
 
@@ -765,6 +794,14 @@ func (s *session) drainForShutdown(done chan<- struct{}) {
 func abortDrainedSession() {
 	s := drainedSession.Swap(nil)
 	if s == nil {
+		return
+	}
+	// A cancelled jobCtx means the process is shutting down (or the session
+	// already stopped). The loop is running the shutdown drain through the
+	// session I/O context; failing the session would cancel that context and
+	// abandon the flush. The shutdown drain ends the session itself.
+	if s.jobCtx != nil && s.jobCtx.Err() != nil {
+		slog.Info("self-update stood down during shutdown; the shutdown drain ends the session")
 		return
 	}
 	slog.Warn("self-update did not re-exec after draining; reconnecting to restore job intake")
@@ -806,15 +843,24 @@ func (s *session) handleResultReply(msg channelMsg) {
 	if reason == "" {
 		reason = reply.Status
 	}
-	if strings.HasPrefix(reason, "Message too large") {
-		slog.Error("server rejected oversized result, dropping",
+	// Both rejections are deterministic: "Message too large" is a size check
+	// and "Invalid message" a decode failure, so the identical bytes fail
+	// again on every retry.
+	if strings.HasPrefix(reason, "Message too large") || strings.HasPrefix(reason, "Invalid message") {
+		slog.Error("server rejected result as undeliverable, dropping",
 			"event", p.result.event, "reason", reason)
 		return
 	}
 	if p.result.attempts == 0 {
+		p.result.attempts++
+		if reason == "overloaded" {
+			slog.Warn("server overloaded, retrying result after a delay",
+				"event", p.result.event, "delay", overloadRetryDelay)
+			s.results.enqueueAfter(p.result, overloadRetryDelay)
+			return
+		}
 		slog.Warn("server rejected result, retrying once",
 			"event", p.result.event, "reason", reason)
-		p.result.attempts++
 		if !s.results.enqueue(p.result) {
 			slog.Error("result retry dropped, spool full", "event", p.result.event)
 		}
@@ -1137,13 +1183,16 @@ func newAgentID() string {
 	return fmt.Sprintf("agent-%d-%d", time.Now().UnixNano(), agentIDCounter.Add(1))
 }
 
-func validateJoinReply(data []byte) error {
+func validateJoinReply(data []byte, topic string) error {
 	var reply channelMsg
 	if err := json.Unmarshal(data, &reply); err != nil {
 		return fmt.Errorf("join reply unmarshal: %w", err)
 	}
 	if reply.Event != "phx_reply" {
 		return fmt.Errorf("expected phx_reply, got %s", reply.Event)
+	}
+	if reply.Topic != topic {
+		return fmt.Errorf("join reply for topic %q, want %q", reply.Topic, topic)
 	}
 	if reply.Ref == nil || *reply.Ref != "1" {
 		return fmt.Errorf("join reply has unexpected ref")
@@ -1181,10 +1230,9 @@ func handleMessage(
 		return false, nil
 	}
 
+	// phx_reply never reaches here: the session loop routes every reply on
+	// this topic or "phoenix" to handleResultReply.
 	switch msg.Event {
-	case "phx_reply":
-		slog.Debug("channel reply", "topic", msg.Topic)
-
 	case "phx_error", "phx_close":
 		slog.Warn("phoenix channel ended, reconnecting",
 			"event", msg.Event,
@@ -1193,10 +1241,7 @@ func handleMessage(
 
 	case "jobs":
 		if pools.stopAccepting.Load() {
-			slog.Info("dropping jobs frame during self-update drain")
-			pools.rejectInventory(msg.Event)
-			reportInventoryRejection(ctx, out, msg.Event,
-				"Refused "+msg.Event+" inventory during self-update drain")
+			refuseInventory(ctx, pools, out, msg.Event)
 			return false, nil
 		}
 		var jobList pb.AgentJobList
@@ -1231,7 +1276,7 @@ func handleMessage(
 
 	case "discovery_job", "backup_job":
 		if pools.stopAccepting.Load() {
-			slog.Info("dropping one-shot jobs during self-update drain", "event", msg.Event)
+			slog.Info("dropping one-shot jobs during "+intakeStopReason(ctx), "event", msg.Event)
 			return false, nil
 		}
 		var jobList pb.AgentJobList
@@ -1248,10 +1293,7 @@ func handleMessage(
 
 	case "check_jobs":
 		if pools.stopAccepting.Load() {
-			slog.Info("dropping check_jobs frame during self-update drain")
-			pools.rejectInventory(msg.Event)
-			reportInventoryRejection(ctx, out, msg.Event,
-				"Refused "+msg.Event+" inventory during self-update drain")
+			refuseInventory(ctx, pools, out, msg.Event)
 			return false, nil
 		}
 		var checkList pb.CheckList
@@ -1310,6 +1352,29 @@ func handleMessage(
 		slog.Debug("ignoring event", "event", msg.Event)
 	}
 	return false, nil
+}
+
+// intakeStopReason names why stopAccepting is set. The self-update drain and
+// the shutdown drain both set it; only shutdown cancels the job context.
+func intakeStopReason(ctx context.Context) string {
+	if ctx.Err() != nil {
+		return "shutdown"
+	}
+	return "self-update drain"
+}
+
+// refuseInventory handles an inventory frame that arrives after intake
+// stopped. During the self-update drain the refusal is recorded and reported
+// so the server re-pushes after the restart. During shutdown it is only
+// logged: the process is exiting and the notice could not be sent anyway.
+func refuseInventory(ctx context.Context, pools *jobPools, out *resultQueue, event string) {
+	if ctx.Err() != nil {
+		slog.Info("dropping " + event + " frame during shutdown")
+		return
+	}
+	slog.Info("dropping " + event + " frame during self-update drain")
+	pools.rejectInventory(event)
+	reportInventoryRejection(ctx, out, event, "Refused "+event+" inventory during self-update drain")
 }
 
 // reportPayloadRejection sends a bounded error notice for a frame whose
@@ -1457,6 +1522,18 @@ func (q *resultQueue) enqueue(result outbound) bool {
 	}
 }
 
+// enqueueAfter queues result once delay has passed. The timer goroutine
+// holds the payload outside the spool until then; enqueue is safe from any
+// goroutine. The spool is process-wide, so the retry still lands when the
+// session that scheduled it has ended.
+func (q *resultQueue) enqueueAfter(result outbound, delay time.Duration) {
+	time.AfterFunc(delay, func() {
+		if !q.enqueue(result) {
+			slog.Error("result retry dropped, spool full", "event", result.event)
+		}
+	})
+}
+
 func (q *resultQueue) ack(result outbound) {
 	if result.reservedSlot {
 		<-q.reservedSlots
@@ -1510,12 +1587,25 @@ type jobPools struct {
 
 // idle reports whether every pool has finished all admitted work.
 func (p *jobPools) idle() bool {
-	for _, pool := range []*workerPool{p.snmp, p.mikrotik, p.ping, p.checks, p.backup} {
+	for _, pool := range p.all() {
 		if pool != nil && !pool.idle() {
 			return false
 		}
 	}
 	return true
+}
+
+// pause stops every pool from admitting new work; see workerPool.pause.
+func (p *jobPools) pause() {
+	for _, pool := range p.all() {
+		if pool != nil {
+			pool.pause()
+		}
+	}
+}
+
+func (p *jobPools) all() []*workerPool {
+	return []*workerPool{p.snmp, p.mikrotik, p.ping, p.checks, p.backup}
 }
 
 func (p *jobPools) stop(timeout time.Duration) []string {
@@ -1659,6 +1749,7 @@ func submitJob(
 		execute = func() { executeSnmpJob(ctx, job, out) }
 	default:
 		reportUnsupportedJob(ctx, pools.notices, job)
+		done()
 		return false
 	}
 
@@ -1677,7 +1768,10 @@ func submitJob(
 		}
 		if !pool.submitMode(ctx, func() { defer release(); task(execute)() }, true) {
 			release()
-			reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
+			// A paused pool is a drain refusal, not saturation.
+			if !pool.paused.Load() {
+				reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
+			}
 			done()
 			return false
 		}
@@ -2000,7 +2094,10 @@ func submitCheck(
 		sendResult(ctx, out, "check_result", result, check.Id)
 	}, wait)
 	if !ok {
-		reportPoolRejection(ctx, pools.notices, "", check.Id, "CHECK")
+		// A paused pool is a drain refusal, not saturation.
+		if !pools.checks.paused.Load() {
+			reportPoolRejection(ctx, pools.notices, "", check.Id, "CHECK")
+		}
 		done()
 	}
 	return ok

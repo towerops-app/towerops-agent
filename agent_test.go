@@ -1299,13 +1299,12 @@ func TestRunSessionRejectsFailedJoin(t *testing.T) {
 		resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
 		_, _ = conn.Write([]byte(resp))
 
-		// Read the join message (masked WebSocket frame) - just consume it
-		frameBuf := make([]byte, 4096)
-		_, _ = conn.Read(frameBuf)
+		// Read the join message (masked WebSocket frame) for its topic
+		topic := joinFrameTopic(conn)
 
 		// Send phx_error reply as an unmasked text frame
 		reply, _ := json.Marshal(channelMsg{
-			Topic:   "agent:agent-0",
+			Topic:   topic,
 			Event:   "phx_reply",
 			Payload: json.RawMessage(`{"status":"error","response":{"reason":"invalid token"}}`),
 			Ref:     new("1"),
@@ -1551,7 +1550,7 @@ func TestValidateJoinReplyRejectsWrongRef(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := validateJoinReply(data); err == nil || !strings.Contains(err.Error(), "unexpected ref") {
+		if err := validateJoinReply(data, ""); err == nil || !strings.Contains(err.Error(), "unexpected ref") {
 			t.Fatalf("validateJoinReply() error = %v, want unexpected ref", err)
 		}
 	}
@@ -1585,7 +1584,7 @@ func TestValidateJoinReplyRejectionReason(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = validateJoinReply(data)
+			err = validateJoinReply(data, "")
 			if err == nil || err.Error() != tt.want {
 				t.Fatalf("validateJoinReply() error = %v, want %q", err, tt.want)
 			}
@@ -2382,10 +2381,9 @@ func TestRunAgentReconnectOnError(t *testing.T) {
 				// Second connection: proper session with restart (triggers restart reconnect)
 				resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
 				_, _ = conn.Write([]byte(resp))
-				frameBuf := make([]byte, 4096)
-				_, _ = conn.Read(frameBuf)
+				topic := joinFrameTopic(conn)
 				reply, _ := json.Marshal(channelMsg{
-					Topic:   "agent:agent-0",
+					Topic:   topic,
 					Event:   "phx_reply",
 					Payload: json.RawMessage(`{"status":"ok"}`),
 					Ref:     new("1"),
@@ -2393,7 +2391,7 @@ func TestRunAgentReconnectOnError(t *testing.T) {
 				_, _ = conn.Write(makeTextFrame(reply))
 				time.Sleep(20 * time.Millisecond)
 				restart, _ := json.Marshal(channelMsg{
-					Topic:   "agent:agent-0",
+					Topic:   topic,
 					Event:   "restart",
 					Payload: json.RawMessage(`{}`),
 				})
@@ -2480,11 +2478,10 @@ func TestRunAgentRestart(t *testing.T) {
 			resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
 			_, _ = conn.Write([]byte(resp))
 
-			frameBuf := make([]byte, 4096)
-			_, _ = conn.Read(frameBuf)
+			topic := joinFrameTopic(conn)
 
 			reply, _ := json.Marshal(channelMsg{
-				Topic:   "agent:agent-0",
+				Topic:   topic,
 				Event:   "phx_reply",
 				Payload: json.RawMessage(`{"status":"ok"}`),
 				Ref:     new("1"),
@@ -2495,7 +2492,7 @@ func TestRunAgentRestart(t *testing.T) {
 				// First connection: send restart event
 				time.Sleep(20 * time.Millisecond)
 				restart, _ := json.Marshal(channelMsg{
-					Topic:   "agent:agent-0",
+					Topic:   topic,
 					Event:   "restart",
 					Payload: json.RawMessage(`{}`),
 				})
@@ -3502,12 +3499,13 @@ func TestAgtRunSessionJoinReplyBadStatusPayload(t *testing.T) {
 		}
 		accept := computeAcceptKey(extractWSKey(string(buf[:n])))
 		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"))
-		if _, err := readMaskedFrame(conn); err != nil {
+		topic := joinFrameTopic(conn)
+		if topic == "" {
 			return
 		}
 		// Payload is a JSON array, so decoding it into the status struct fails.
 		reply, _ := json.Marshal(channelMsg{
-			Topic:   "agent:whatever",
+			Topic:   topic,
 			Event:   "phx_reply",
 			Payload: json.RawMessage(`[1,2,3]`),
 			Ref:     new("1"),
@@ -4582,8 +4580,10 @@ func TestAgtRunSessionReportsWriteError(t *testing.T) {
 		}
 		if strings.Contains(lastErr.Error(), "write:") {
 			t.Logf("writer error reached the session loop on attempt %d", attempt+1)
-			if !logs.has("websocket write") {
-				t.Errorf("expected a 'websocket write' report\nlogged:\n%s", logs.dump())
+			// runAgent logs the returned error; the writer must not log it
+			// a second time.
+			if logs.has("websocket write") {
+				t.Errorf("writer logged the failure runAgent already reports\nlogged:\n%s", logs.dump())
 			}
 			return
 		}
