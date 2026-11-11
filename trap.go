@@ -321,6 +321,7 @@ func trapToProto(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) *pb.SnmpTrap {
 		trap.SpecificTrap = uint32(packet.SpecificTrap) //nolint:gosec // device-supplied trap number
 		trap.UptimeTicks = uint64(packet.Timestamp)
 		trap.TrapOid = v1TrapOID(trap.Enterprise, packet.GenericTrap, packet.SpecificTrap)
+		trap.AgentAddress = v1AgentAddress(packet.AgentAddress)
 	}
 
 	truncated := false
@@ -381,6 +382,17 @@ func v1TrapOID(enterprise string, generic, specific int) string {
 		return ""
 	}
 	return oidSnmpTrapsRoot + "." + strconv.Itoa(generic+1)
+}
+
+// v1AgentAddress returns a v1 PDU's agent-addr as dotted IPv4, or "" when the
+// device left it unset or sent 0.0.0.0. A relay forwards traps from its own
+// address, so this is the only field that names the originating device.
+func v1AgentAddress(raw string) string {
+	ip := net.ParseIP(raw).To4()
+	if ip == nil || ip.IsUnspecified() {
+		return ""
+	}
+	return ip.String()
 }
 
 // uptimeTicks reads a sysUpTime binding, which devices send as TimeTicks but

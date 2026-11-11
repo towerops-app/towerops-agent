@@ -163,6 +163,96 @@ func TestTrapToProtoV1(t *testing.T) {
 	}
 }
 
+func TestTrapToProtoV1AgentAddress(t *testing.T) {
+	// A relay forwards a device's v1 trap from its own address, so source_ip
+	// names the relay and only agent-addr names the device.
+	relay := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 162}
+	tests := []struct {
+		name    string
+		version gosnmp.SnmpVersion
+		pduType gosnmp.PDUType
+		agent   string
+		want    string
+	}{
+		{"relayed v1 trap keeps the device address", gosnmp.Version1, gosnmp.Trap, "192.0.2.20", "192.0.2.20"},
+		{"v1 unspecified address is empty", gosnmp.Version1, gosnmp.Trap, "0.0.0.0", ""},
+		{"v1 missing address is empty", gosnmp.Version1, gosnmp.Trap, "", ""},
+		{"v1 non-IPv4 address is empty", gosnmp.Version1, gosnmp.Trap, "2001:db8::1", ""},
+		{"v1 garbage address is empty", gosnmp.Version1, gosnmp.Trap, "not-an-ip", ""},
+		{"v2c ignores the v1 header field", gosnmp.Version2c, gosnmp.SNMPv2Trap, "192.0.2.20", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			packet := &gosnmp.SnmpPacket{
+				Version: tt.version,
+				PDUType: tt.pduType,
+				SnmpTrap: gosnmp.SnmpTrap{
+					Enterprise:   ".1.3.6.1.4.1.9",
+					AgentAddress: tt.agent,
+					GenericTrap:  2,
+				},
+			}
+
+			trap := trapToProto(packet, relay)
+
+			if trap.AgentAddress != tt.want {
+				t.Errorf("AgentAddress = %q, want %q", trap.AgentAddress, tt.want)
+			}
+			if trap.SourceIp != "198.51.100.7" {
+				t.Errorf("SourceIp = %q, want the relay address", trap.SourceIp)
+			}
+		})
+	}
+}
+
+func TestTrapListenerReceivesV1AgentAddress(t *testing.T) {
+	port := freeUDPPort(t)
+
+	l, err := startTrapListener("127.0.0.1", port, "public")
+	if err != nil {
+		t.Skipf("cannot bind trap port %d: %v", port, err)
+	}
+	defer l.Close()
+
+	sender := &gosnmp.GoSNMP{
+		Target:    "127.0.0.1",
+		Port:      port,
+		Transport: "udp",
+		Community: "public",
+		Version:   gosnmp.Version1,
+		Timeout:   2 * time.Second,
+		MaxOids:   gosnmp.MaxOids,
+	}
+	if err := sender.Connect(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = sender.Conn.Close() }()
+
+	if _, err := sender.SendTrap(gosnmp.SnmpTrap{
+		Enterprise:   ".1.3.6.1.4.1.9",
+		AgentAddress: "192.0.2.44",
+		GenericTrap:  2,
+		Timestamp:    100,
+		Variables: []gosnmp.SnmpPDU{
+			{Name: ".1.3.6.1.2.1.2.2.1.1.3", Type: gosnmp.Integer, Value: 3},
+		},
+	}); err != nil {
+		t.Fatalf("send trap: %v", err)
+	}
+
+	select {
+	case trap := <-l.Traps():
+		if trap.AgentAddress != "192.0.2.44" {
+			t.Errorf("AgentAddress = %q, want 192.0.2.44", trap.AgentAddress)
+		}
+		if trap.SourceIp != "127.0.0.1" {
+			t.Errorf("SourceIp = %q, want 127.0.0.1", trap.SourceIp)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the v1 trap")
+	}
+}
+
 func TestV1TrapOID(t *testing.T) {
 	tests := []struct {
 		name       string
