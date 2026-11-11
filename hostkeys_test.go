@@ -894,14 +894,30 @@ func TestHostKeyStoreSavedGenCoverage(t *testing.T) {
 	})
 }
 
-func TestHostKeyStoreSaveFailsOnDirectorySync(t *testing.T) {
-	s, _ := hmTNewStore(t)
+// TestHostKeyStoreDirectorySyncFailureKeepsSavedEntry pins that a failed
+// directory fsync after a successful rename does not roll back the entry
+// the rename already put on disk. Rolling it back let the next save write a
+// snapshot without the host and re-ran TOFU on the next connection.
+func TestHostKeyStoreDirectorySyncFailureKeepsSavedEntry(t *testing.T) {
+	s, path := hmTNewStore(t)
 	orig := syncDirectory
 	t.Cleanup(func() { syncDirectory = orig })
 	syncDirectory = func(string) error { return errors.New("dir sync failed") }
 
-	if err := s.verify("ssh:192.0.2.31:22", "fp31"); err == nil {
-		t.Fatal("expected directory-sync failure to propagate")
+	if err := s.verify("ssh:192.0.2.31:22", "fp31"); err != nil {
+		t.Fatalf("first use with a failed directory sync = %v, want trusted", err)
+	}
+	if got := hmTReadStore(t, path)["ssh:192.0.2.31:22"]; got != "fp31" {
+		t.Fatalf("stored entry = %q, want fp31 on disk", got)
+	}
+	if err := s.verify("ssh:192.0.2.32:22", "fp32"); err != nil {
+		t.Fatalf("second first use: %v", err)
+	}
+	if got := hmTReadStore(t, path)["ssh:192.0.2.31:22"]; got != "fp31" {
+		t.Fatalf("a later save dropped the first host: %q", got)
+	}
+	if err := s.verify("ssh:192.0.2.31:22", "other"); err == nil {
+		t.Fatal("a changed key was trusted again: the entry was rolled back")
 	}
 }
 

@@ -1232,6 +1232,7 @@ func TestConfigBackupExportTimeout(t *testing.T) {
 				}
 				cbRouterHandler(cbTestExport)(ch, command)
 			}
+			resetHostKeyStore(t)
 			addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
 			defer cleanup()
 			defer close(release)
@@ -1281,6 +1282,7 @@ func TestConfigBackupExportStderr(t *testing.T) {
 				}
 				cbRouterHandler(cbTestExport)(ch, command)
 			}
+			resetHostKeyStore(t)
 			addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
 			defer cleanup()
 			host, port := cbAddrPort(t, addr)
@@ -1339,6 +1341,7 @@ func TestConfigBackupProbeDeviceFailures(t *testing.T) {
 						t.Errorf("close metadata channel: %v", err)
 					}
 				}
+				resetHostKeyStore(t)
 				addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
 				defer cleanup()
 				host, port := cbAddrPort(t, addr)
@@ -1384,6 +1387,7 @@ func TestConfigBackupMetadataInvalidUTF8(t *testing.T) {
 				}
 				cbRouterHandler(cbTestExport)(ch, command)
 			}
+			resetHostKeyStore(t)
 			addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), handler)
 			defer cleanup()
 			host, port := cbAddrPort(t, addr)
@@ -2513,16 +2517,22 @@ func TestConfigBackupPlanLifecycle(t *testing.T) {
 		defer fake.cleanup()
 		host, port := cbAddrPort(t, fake.addr)
 
+		// The step deadline is far past the wait below, so only the session
+		// end can finish the job. submitJob derives jobCtx from the session
+		// context; a jobCtx unrelated to it left the job running until its
+		// 5 s step deadline, which raced the 5 s wait under load.
 		plan := cbShellPlan(cbCommand("show stall"))
-		plan.StepTimeoutMs = 5_000
+		plan.StepTimeoutMs = 60_000
 		job := cbPlanJob(host, port, plan)
 
 		sessionCtx, cancel := context.WithCancel(context.Background())
+		jobCtx, jobCancel := context.WithTimeout(sessionCtx, configBackupTimeout(job))
+		defer jobCancel()
 		out := testQueue()
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			executeConfigBackupJobCtx(sessionCtx, context.Background(), job, out)
+			executeConfigBackupJobCtx(sessionCtx, jobCtx, job, out)
 		}()
 		// Wait until the device received the command, then end the session.
 		deadline := time.Now().Add(3 * time.Second)
@@ -2541,7 +2551,7 @@ func TestConfigBackupPlanLifecycle(t *testing.T) {
 		cancel()
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatal("job did not finish after the session ended")
 		}
 		select {
@@ -2685,4 +2695,307 @@ func TestConfigBackupPlanPool(t *testing.T) {
 			t.Fatalf("code = %v, want AGENT_BUSY", result.ErrorCode)
 		}
 	})
+}
+
+// TestConfigBackupHostKeyWithoutExpectedUsesTOFU pins that a job carrying
+// no expected fingerprint is checked against the agent's TOFU store, the
+// way the legacy /export path is, instead of trusting any key.
+func TestConfigBackupHostKeyWithoutExpectedUsesTOFU(t *testing.T) {
+	resetHostKeyStore(t)
+	remote := &net.TCPAddr{IP: net.IPv4(192, 0, 2, 7), Port: 22}
+	first, second := hmTSSHPublicKey(t), hmTSSHPublicKey(t)
+
+	var observed string
+	callback := configBackupHostKeyCallback("", &observed)
+	if err := callback("192.0.2.7:22", remote, first); err != nil {
+		t.Fatalf("first use rejected: %v", err)
+	}
+	if err := callback("192.0.2.7:22", remote, first); err != nil {
+		t.Fatalf("pinned key rejected: %v", err)
+	}
+	err := callback("192.0.2.7:22", remote, second)
+	if !errors.Is(err, errConfigBackupHostKeyMismatch) {
+		t.Fatalf("changed key = %v, want a host key mismatch", err)
+	}
+	if observed != ssh.FingerprintSHA256(second) {
+		t.Fatalf("observed = %q, want the presented key's fingerprint", observed)
+	}
+	job := cbJob("192.0.2.7", 22)
+	if code, _ := classifyConfigBackupError(fmt.Errorf("ssh: handshake failed: %w", err), job); code != pb.ConfigBackupErrorCode_HOST_KEY_MISMATCH {
+		t.Fatalf("classified %v, want HOST_KEY_MISMATCH", code)
+	}
+
+	// A store that cannot vouch for the key, or no store at all, fails
+	// closed without claiming a mismatch.
+	for _, store := range []*hostKeyStore{{loadErr: errors.New("store unreadable")}, nil} {
+		globalHostKeys = store
+		err = callback("192.0.2.7:22", remote, first)
+		if err == nil || errors.Is(err, errConfigBackupHostKeyMismatch) {
+			t.Fatalf("broken store = %v, want a non-mismatch error", err)
+		}
+	}
+}
+
+// TestConfigBackupEmptyHostRejected pins that a job without a host fails
+// before dialing: net.Dial routes ":22" to the agent's own sshd.
+func TestConfigBackupEmptyHostRejected(t *testing.T) {
+	origDial := sshDial
+	t.Cleanup(func() { sshDial = origDial })
+	dialed := false
+	sshDial = func(context.Context, string, string, *ssh.ClientConfig) (*ssh.Client, error) {
+		dialed = true
+		return nil, errors.New("mock dial")
+	}
+	for _, host := range []string{"", "  "} {
+		out := testQueue()
+		executeConfigBackupJob(context.Background(), cbJob(host, 22), out)
+		result := cbReceiveConfigBackupResult(t, out)
+		if result.ErrorCode != pb.ConfigBackupErrorCode_INTERNAL {
+			t.Fatalf("host %q: code = %v (%q), want INTERNAL", host, result.ErrorCode, result.ErrorDetail)
+		}
+	}
+	if dialed {
+		t.Fatal("a job without a host was dialed")
+	}
+}
+
+// TestConfigBackupKeyboardInteractiveAnswers pins that keyboard-interactive
+// sends the password only to password questions. A verification-code
+// question fails the login instead of receiving the password.
+func TestConfigBackupKeyboardInteractiveAnswers(t *testing.T) {
+	challenge := configBackupKeyboardInteractive("secret")
+	for _, questions := range [][]string{
+		{"Password: "},
+		{"backup@sw1's password:"},
+		{"Password for backup: "},
+		{},
+	} {
+		answers, err := challenge("", "", questions, nil)
+		if err != nil {
+			t.Fatalf("questions %q: %v", questions, err)
+		}
+		if len(answers) != len(questions) {
+			t.Fatalf("questions %q: %d answers", questions, len(answers))
+		}
+		for _, a := range answers {
+			if a != "secret" {
+				t.Fatalf("questions %q: answer %q, want the password", questions, a)
+			}
+		}
+	}
+	_, err := challenge("", "", []string{"Password: ", "Verification code: "}, nil)
+	if !errors.Is(err, errUnansweredKeyboardQuestion) {
+		t.Fatalf("verification code question = %v, want errUnansweredKeyboardQuestion", err)
+	}
+	job := cbJob("192.0.2.1", 22)
+	if code, _ := classifyConfigBackupError(fmt.Errorf("ssh: handshake failed: %w", err), job); code != pb.ConfigBackupErrorCode_AUTH_FAILED {
+		t.Fatalf("classified %v, want AUTH_FAILED", code)
+	}
+}
+
+// TestConfigBackupKeyboardInteractiveOTPLogin drives the refusal end to
+// end: a device asking for a password and a verification code never gets
+// the password as the code, and the job reports AUTH_FAILED.
+func TestConfigBackupKeyboardInteractiveOTPLogin(t *testing.T) {
+	resetHostKeyStore(t)
+	var mu sync.Mutex
+	var received []string
+	config := &ssh.ServerConfig{
+		KeyboardInteractiveCallback: func(c ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+			ans, err := client("auth", "", []string{"Password: ", "Verification code: "}, []bool{false, true})
+			mu.Lock()
+			received = append(received, ans...)
+			mu.Unlock()
+			if err != nil {
+				return nil, err
+			}
+			return &ssh.Permissions{}, nil
+		},
+	}
+	config.AddHostKey(cbNewSigner(t))
+	addr, cleanup := startTestSSHServerWithConfig(t, config, cbExecHandler(nil, nil))
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), cbPlanJob(host, port, cbExecPlan(cbCommand("show version"))), out)
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_AUTH_FAILED {
+		t.Fatalf("code = %v (%q), want AUTH_FAILED", result.ErrorCode, result.ErrorDetail)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 0 {
+		t.Fatalf("device received answers %q, want none", received)
+	}
+}
+
+// TestConfigBackupUnusableKeyNamedInAuthFailure pins that an unparseable
+// private key shows up in the AUTH_FAILED detail instead of vanishing.
+func TestConfigBackupUnusableKeyNamedInAuthFailure(t *testing.T) {
+	resetHostKeyStore(t)
+	config := &ssh.ServerConfig{
+		PublicKeyCallback: func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
+			return nil, errors.New("rejected")
+		},
+	}
+	config.AddHostKey(cbNewSigner(t))
+	addr, cleanup := startTestSSHServerWithConfig(t, config, cbExecHandler(nil, nil))
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	job := cbPlanJob(host, port, cbExecPlan(cbCommand("show version")))
+	job.ConfigBackup.PrivateKey = "not a pem key at all"
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), job, out)
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_AUTH_FAILED {
+		t.Fatalf("code = %v (%q), want AUTH_FAILED", result.ErrorCode, result.ErrorDetail)
+	}
+	if !strings.Contains(result.ErrorDetail, "private key unusable") {
+		t.Fatalf("detail = %q, want the key parse failure named", result.ErrorDetail)
+	}
+}
+
+// TestConfigBackupIdentityFailureKeepsBackup pins that a failed identity
+// read after a good export still stores the backup, with no identity.
+func TestConfigBackupIdentityFailureKeepsBackup(t *testing.T) {
+	resetHostKeyStore(t)
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbFailOnHandler("system identity get name"))
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), cbJob(host, port), out)
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+		t.Fatalf("code = %v (%q), want OK", result.ErrorCode, result.ErrorDetail)
+	}
+	if result.Identity != "" {
+		t.Fatalf("identity = %q, want empty", result.Identity)
+	}
+}
+
+// cbStallConn is a server-side conn that stops processing input once
+// stalled: data it reads afterwards is dropped and the next Read blocks
+// until Close. It models a device that ignores CHANNEL_CLOSE and global
+// requests.
+type cbStallConn struct {
+	net.Conn
+	stalled atomic.Bool
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func (c *cbStallConn) Read(p []byte) (int, error) {
+	if c.stalled.Load() {
+		<-c.closed
+		return 0, io.EOF
+	}
+	n, err := c.Conn.Read(p)
+	if c.stalled.Load() {
+		<-c.closed
+		return 0, io.EOF
+	}
+	return n, err
+}
+
+func (c *cbStallConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+// cbStartStallServer accepts one SSH connection; an exec request writes
+// "partial" and then stalls the connection. Before any exec, stallNow
+// stalls it directly.
+func cbStartStallServer(t *testing.T) (client *ssh.Client, stallNow func()) {
+	t.Helper()
+	config := &ssh.ServerConfig{NoClientAuth: true}
+	config.AddHostKey(cbNewSigner(t))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	connC := make(chan *cbStallConn, 1)
+	go func() {
+		raw, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		conn := &cbStallConn{Conn: raw, closed: make(chan struct{})}
+		connC <- conn
+		_, chans, reqs, err := ssh.NewServerConn(conn, config)
+		if err != nil {
+			return
+		}
+		go ssh.DiscardRequests(reqs)
+		for newChannel := range chans {
+			ch, requests, err := newChannel.Accept()
+			if err != nil {
+				continue
+			}
+			go func() {
+				for req := range requests {
+					_ = req.Reply(req.Type == "exec", nil)
+					if req.Type == "exec" {
+						_, _ = ch.Write([]byte("partial"))
+						conn.stalled.Store(true)
+					}
+				}
+			}()
+		}
+	}()
+	client = cbShellClient(t, ln.Addr().String())
+	conn := <-connC
+	t.Cleanup(func() { _ = conn.Close() })
+	return client, func() { conn.stalled.Store(true) }
+}
+
+// TestRunConfigBackupSessionStepDeadlineIgnoredClose pins that a step
+// deadline ends the session even when the device never answers
+// CHANNEL_CLOSE: after a grace period the connection is closed, instead of
+// Run holding the worker until the job deadline.
+func TestRunConfigBackupSessionStepDeadlineIgnoredClose(t *testing.T) {
+	origGrace, origKeepalive := configBackupCloseGrace, sshKeepaliveTimeout
+	t.Cleanup(func() { configBackupCloseGrace, sshKeepaliveTimeout = origGrace, origKeepalive })
+	configBackupCloseGrace, sshKeepaliveTimeout = 200*time.Millisecond, 200*time.Millisecond
+
+	client, _ := cbStartStallServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := runConfigBackupSession(ctx, client, "show run", defaultMaxConfigBytes)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("aborted session reported success")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session ignored the step deadline")
+	}
+}
+
+// TestSSHClientAliveBounded pins that the keepalive probe gives up on a
+// device that never answers global requests.
+func TestSSHClientAliveBounded(t *testing.T) {
+	orig := sshKeepaliveTimeout
+	t.Cleanup(func() { sshKeepaliveTimeout = orig })
+	sshKeepaliveTimeout = 200 * time.Millisecond
+
+	client, stallNow := cbStartStallServer(t)
+	stallNow()
+	done := make(chan bool, 1)
+	go func() { done <- sshClientAlive(client) }()
+	select {
+	case alive := <-done:
+		if alive {
+			t.Fatal("sshClientAlive = true for a device that never answered")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sshClientAlive blocked on an unanswered keepalive")
+	}
 }
