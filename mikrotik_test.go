@@ -358,6 +358,15 @@ func TestParseMikrotikAttrs(t *testing.T) {
 }
 
 // encodeSentence encodes a list of words into RouterOS binary format.
+// readSentence reads one sentence under a fresh read deadline. Tests use it
+// to play the device side and to decode what the agent wrote.
+func (c *mikrotikClient) readSentence() ([]string, error) {
+	if err := c.setReadDeadline(); err != nil {
+		return nil, err
+	}
+	return c.readSentenceWords()
+}
+
 func encodeSentence(words []string) []byte {
 	var buf []byte
 	for _, w := range words {
@@ -1838,7 +1847,8 @@ func runScriptedMikrotikJob(t *testing.T, reply []byte, password string, cmds []
 	origDial := mikrotikDial
 	t.Cleanup(func() { mikrotikDial = origDial })
 	mikrotikDial = func(context.Context, string, uint32, string, string, bool) (*mikrotikClient, error) {
-		return &mikrotikClient{conn: &readWriteCloser{r: bytes.NewReader(reply), w: &written}}, nil
+		// mikrotikConnect stores the login password so device text is scrubbed.
+		return &mikrotikClient{conn: &readWriteCloser{r: bytes.NewReader(reply), w: &written}, password: password}, nil
 	}
 	out := testQueue()
 	executeMikrotikJob(context.Background(), &pb.AgentJob{
@@ -2049,5 +2059,234 @@ func TestMikrotikJobTrapMessageIsSanitized(t *testing.T) {
 				t.Fatalf("message = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+// mikrotikTestListener starts a one-connection RouterOS server that runs
+// serve and returns the port to dial.
+func mikrotikTestListener(t *testing.T, serve func(sc *mikrotikClient)) uint32 {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		serve(&mikrotikClient{conn: conn})
+	}()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	n, err := strconv.ParseUint(port, 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return uint32(n)
+}
+
+func TestMikrotikLoginTrapIsSanitized(t *testing.T) {
+	const password = "hunter2-secret"
+	message := "bad login " + password + strings.Repeat("x", 1000)
+	port := mikrotikTestListener(t, func(sc *mikrotikClient) {
+		_, _ = sc.readSentence()
+		_ = sc.writeSentence([]string{"!trap", "=message=" + message + "\nline two"})
+		_ = sc.writeSentence([]string{"!done"})
+	})
+	_, err := mikrotikConnect(context.Background(), "127.0.0.1", port, "admin", password, false)
+	if err == nil {
+		t.Fatal("login trap accepted")
+	}
+	if want := "auth failed: " + sanitizeMikrotikFailure(message, password); err.Error() != want {
+		t.Fatalf("error = %q (%d bytes), want %q", err, len(err.Error()), want)
+	}
+}
+
+func TestMikrotikLoginFatalIsSanitized(t *testing.T) {
+	const password = "hunter2-secret"
+	port := mikrotikTestListener(t, func(sc *mikrotikClient) {
+		_, _ = sc.readSentence()
+		_ = sc.writeSentence([]string{"!fatal", "=message=" + password + strings.Repeat("y", 1000)})
+	})
+	_, err := mikrotikConnect(context.Background(), "127.0.0.1", port, "admin", password, false)
+	if err == nil {
+		t.Fatal("login fatal accepted")
+	}
+	if strings.Contains(err.Error(), password) || len(err.Error()) > len("auth: fatal: ")+maxMikrotikFailureLen {
+		t.Fatalf("error = %q (%d bytes), want scrubbed and bounded", err, len(err.Error()))
+	}
+}
+
+func TestMikrotikJobFatalMessageIsSanitized(t *testing.T) {
+	const password = "hunter2-secret"
+	cmds := mikrotikJobCommands(2)
+	reply := append(okReply(0),
+		encodeSentence([]string{"!fatal", "=message=closing " + password + strings.Repeat("z", 5000)})...)
+	result, _ := runScriptedMikrotikJob(t, reply, password, cmds)
+	if strings.Contains(result.Error, password) || !strings.Contains(result.Error, "closing ***") {
+		t.Fatalf("job error = %q, want password scrubbed", result.Error)
+	}
+	if limit := len("command '' failed: fatal: ") + len(cmds[1].Command) + maxMikrotikFailureLen; len(result.Error) > limit {
+		t.Fatalf("job error is %d bytes, want at most %d", len(result.Error), limit)
+	}
+	if len(result.Sentences) != 1 {
+		t.Fatalf("got %d rows, want the first command's row", len(result.Sentences))
+	}
+}
+
+func TestMikrotikTrapWithEmptyFirstLineIsFailure(t *testing.T) {
+	stream := bytes.NewBuffer(append(encodeSentence([]string{"!trap", "=message=\nsecond line"}), encodeSentence([]string{"!done"})...))
+	client := &mikrotikClient{conn: &nopCloser{readWriter: stream}}
+	response, err := client.readResponse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.err != "unknown error" {
+		t.Fatalf("trap error = %q, want unknown error", response.err)
+	}
+}
+
+// overCapReply is a complete reply with one more row than readResponse keeps.
+func overCapReply() []byte {
+	var reply bytes.Buffer
+	for i := range maxMikrotikSentences + 1 {
+		reply.Write(encodeSentence([]string{"!re", fmt.Sprintf("=index=%d", i)}))
+	}
+	reply.Write(encodeSentence([]string{"!done"}))
+	return reply.Bytes()
+}
+
+func TestMikrotikOversizedReplyFailsOnlyItsCommand(t *testing.T) {
+	cmds := mikrotikJobCommands(2)
+	reply := append(overCapReply(), okReply(1)...)
+	result, sent := runScriptedMikrotikJob(t, reply, "", cmds)
+	if result.Error != "" {
+		t.Fatalf("job error = %q, want later commands to run", result.Error)
+	}
+	if len(sent) != 2 {
+		t.Fatalf("agent sent %d commands, want 2", len(sent))
+	}
+	want := fmt.Sprintf("response exceeds %d sentences", maxMikrotikSentences)
+	if len(result.CommandFailures) != 1 || result.CommandFailures[0].Command != cmds[0].Command ||
+		result.CommandFailures[0].Message != want {
+		t.Fatalf("failures = %v, want %q for %s", result.CommandFailures, want, cmds[0].Command)
+	}
+	if len(result.Sentences) != 1 || result.Sentences[0].Attributes["index"] != "1" {
+		t.Fatalf("rows = %v, want only the second command's row", result.Sentences)
+	}
+}
+
+func TestMikrotikOversizedReplyDrainStopsOnFatal(t *testing.T) {
+	stream := overCapReply()
+	stream = stream[:len(stream)-len(encodeSentence([]string{"!done"}))]
+	stream = append(stream, encodeSentence([]string{"!fatal", "=message=session closed"})...)
+	client := &mikrotikClient{conn: &nopCloser{readWriter: bytes.NewBuffer(stream)}}
+	_, err := client.readResponse()
+	if err == nil || err.Error() != "fatal: session closed" {
+		t.Fatalf("readResponse error = %v, want the device's fatal message", err)
+	}
+}
+
+func TestMikrotikReplyOverByteBudgetLeavesConnectionUsable(t *testing.T) {
+	const word = 9 << 20
+	var readers []io.Reader
+	for range 2 {
+		readers = append(readers, bytes.NewReader(append(encodeLength(len("!re")), "!re"...)))
+		readers = append(readers, hmTFillerWord(word)...)
+		readers = append(readers, bytes.NewReader([]byte{0}))
+	}
+	readers = append(readers, bytes.NewReader(encodeSentence([]string{"!done"})), bytes.NewReader(okReply(7)))
+	c := &mikrotikClient{conn: &hmTReadConn{r: io.MultiReader(readers...)}}
+
+	first, err := c.readResponse()
+	if err != nil {
+		t.Fatalf("over-budget reply: %v", err)
+	}
+	if want := fmt.Sprintf("response exceeds %d bytes", maxMikrotikResponse); first.err != want || len(first.sentences) != 0 {
+		t.Fatalf("over-budget reply = %q with %d rows, want %q and none", first.err, len(first.sentences), want)
+	}
+	second, err := c.readResponse()
+	if err != nil {
+		t.Fatalf("next reply: %v", err)
+	}
+	if len(second.sentences) != 1 || second.sentences[0].attributes["index"] != "7" {
+		t.Fatalf("next reply rows = %v, want index=7", second.sentences)
+	}
+}
+
+func TestMikrotikReplyEndingOverByteBudget(t *testing.T) {
+	// The sentence that crosses the budget ends the reply, so nothing is
+	// left to drain.
+	const word = 9 << 20
+	for _, final := range []string{"!done", "!fatal"} {
+		t.Run(final, func(t *testing.T) {
+			var readers []io.Reader
+			for _, typ := range []string{"!re", final} {
+				readers = append(readers, bytes.NewReader(append(encodeLength(len(typ)), typ...)))
+				readers = append(readers, hmTFillerWord(word)...)
+				readers = append(readers, bytes.NewReader([]byte{0}))
+			}
+			readers = append(readers, bytes.NewReader(okReply(7)))
+			c := &mikrotikClient{conn: &hmTReadConn{r: io.MultiReader(readers...)}}
+
+			resp, err := c.readResponse()
+			if final == "!fatal" {
+				if err == nil || err.Error() != "fatal: fatal error" {
+					t.Fatalf("readResponse error = %v, want fatal", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("over-budget reply: %v", err)
+			}
+			if want := fmt.Sprintf("response exceeds %d bytes", maxMikrotikResponse); resp.err != want {
+				t.Fatalf("over-budget reply = %q, want %q", resp.err, want)
+			}
+			next, err := c.readResponse()
+			if err != nil || len(next.sentences) != 1 {
+				t.Fatalf("next reply = %v, %v; want its own row", next, err)
+			}
+		})
+	}
+}
+
+// readSizeConn records the largest buffer a caller offers to Read.
+type readSizeConn struct {
+	r       io.Reader
+	maxRead int
+}
+
+func (c *readSizeConn) Read(p []byte) (int, error) {
+	c.maxRead = max(c.maxRead, len(p))
+	return c.r.Read(p)
+}
+func (c *readSizeConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *readSizeConn) Close() error                { return nil }
+
+func TestReadWordDoesNotPreallocateDeclaredLength(t *testing.T) {
+	// A device declares a maximum-size word and sends one byte. readWord
+	// must not size its buffer from the untrusted length prefix.
+	conn := &readSizeConn{r: bytes.NewReader(append(encodeLength(maxMikrotikWordSize), 'x'))}
+	c := &mikrotikClient{conn: conn}
+	if _, err := c.readWord(); err == nil {
+		t.Fatal("truncated word accepted")
+	}
+	if conn.maxRead > 64<<10 {
+		t.Fatalf("readWord offered a %d-byte buffer for a %d-byte declared word", conn.maxRead, maxMikrotikWordSize)
+	}
+}
+
+func TestReadWordReadsLargeWordInChunks(t *testing.T) {
+	const size = 1 << 20
+	payload := bytes.Repeat([]byte("ab"), size/2)
+	c := &mikrotikClient{conn: &readSizeConn{r: bytes.NewReader(append(encodeLength(size), payload...))}}
+	got, err := c.readWord()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != string(payload) {
+		t.Fatalf("got %d bytes, want the %d-byte payload", len(got), size)
 	}
 }

@@ -42,6 +42,8 @@ var mikrotikDial = mikrotikConnect
 // mikrotikClient is a RouterOS binary API client.
 type mikrotikClient struct {
 	conn io.ReadWriteCloser
+	// password is scrubbed from every device message before it leaves the client.
+	password string
 }
 
 type mikrotikSentence struct {
@@ -70,17 +72,6 @@ func mikrotikConnect(ctx context.Context, ip string, port uint32, username, pass
 		dialCtx, dialCancel := context.WithTimeout(ctx, mikrotikConnTimeout)
 		defer dialCancel()
 		conn, err = dialer.DialContext(dialCtx, "tcp", addr)
-		if err == nil {
-			// Verify TLS cert fingerprint via TOFU
-			tlsConn, ok := conn.(*tls.Conn)
-			if ok && len(tlsConn.ConnectionState().PeerCertificates) > 0 {
-				fp := tlsCertFingerprint(tlsConn.ConnectionState().PeerCertificates[0])
-				if verifyErr := getHostKeyStore().verify("tls:"+addr, fp); verifyErr != nil {
-					_ = conn.Close()
-					return nil, fmt.Errorf("TLS TOFU verification failed for %s: %w", addr, verifyErr)
-				}
-			}
-		}
 	} else {
 		dialer := net.Dialer{Timeout: mikrotikConnTimeout}
 		conn, err = dialer.DialContext(ctx, "tcp", addr)
@@ -89,35 +80,48 @@ func mikrotikConnect(ctx context.Context, ip string, port uint32, username, pass
 		return nil, fmt.Errorf("connect %s: %w", addr, err)
 	}
 
-	c := &mikrotikClient{conn: conn}
+	c := &mikrotikClient{conn: conn, password: password}
+	if err := c.open(ctx, addr, username); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// open pins the TLS certificate and logs in. The caller closes the
+// connection on any error.
+func (c *mikrotikClient) open(ctx context.Context, addr, username string) error {
+	if tlsConn, ok := c.conn.(*tls.Conn); ok && len(tlsConn.ConnectionState().PeerCertificates) > 0 {
+		fp := tlsCertFingerprint(tlsConn.ConnectionState().PeerCertificates[0])
+		if err := getHostKeyStore().verify("tls:"+addr, fp); err != nil {
+			return fmt.Errorf("TLS TOFU verification failed for %s: %w", addr, err)
+		}
+	}
+
 	// Login sentences can stall for mikrotikReadTimeout each; closing the conn
 	// on ctx cancellation aborts a wedged login instead of pinning the worker.
-	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	stopCancel := context.AfterFunc(ctx, func() { _ = c.conn.Close() })
 	defer stopCancel()
 
-	resp, err := c.execute("/login", map[string]string{"name": username, "password": password})
+	resp, err := c.execute("/login", map[string]string{"name": username, "password": c.password})
 	if err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("auth: %w", err)
+		return fmt.Errorf("auth: %w", err)
 	}
 	if challenge := mikrotikLoginChallenge(resp); challenge != "" {
-		response, responseErr := legacyMikrotikLoginResponse(password, challenge)
-		if responseErr != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("auth challenge: %w", responseErr)
+		response, err := legacyMikrotikLoginResponse(c.password, challenge)
+		if err != nil {
+			return fmt.Errorf("auth challenge: %w", err)
 		}
 		resp, err = c.execute("/login", map[string]string{"name": username, "response": response})
 		if err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("auth challenge: %w", err)
+			return fmt.Errorf("auth challenge: %w", err)
 		}
 	}
 	if resp.err != "" {
-		_ = conn.Close()
-		return nil, fmt.Errorf("auth failed: %s", resp.err)
+		// readResponse already scrubbed and bounded the device's message.
+		return fmt.Errorf("auth failed: %s", resp.err)
 	}
-
-	return c, nil
+	return nil
 }
 
 func mikrotikLoginChallenge(resp *mikrotikResponse) string {
@@ -255,9 +259,9 @@ func (c *mikrotikClient) readResponse() (*mikrotikResponse, error) {
 		}
 		for _, word := range words {
 			totalBytes += len(word)
-			if totalBytes > maxMikrotikResponse {
-				return nil, fmt.Errorf("response exceeds %d bytes", maxMikrotikResponse)
-			}
+		}
+		if totalBytes > maxMikrotikResponse {
+			return c.discardResponse(fmt.Sprintf("response exceeds %d bytes", maxMikrotikResponse), words)
 		}
 
 		switch words[0] {
@@ -270,23 +274,48 @@ func (c *mikrotikClient) readResponse() (*mikrotikResponse, error) {
 		case "!re":
 			resp.sentences = append(resp.sentences, mikrotikSentence{attributes: parseMikrotikAttrs(words[1:])})
 		case "!trap":
-			attrs := parseMikrotikAttrs(words[1:])
-			if msg := attrs["message"]; msg != "" {
-				resp.err = msg
-			} else {
-				resp.err = "unknown error"
-			}
+			resp.err = c.deviceMessage(words, "unknown error")
 			// Continue reading until !done
 		case "!fatal":
-			attrs := parseMikrotikAttrs(words[1:])
-			msg := "fatal error"
-			if m, ok := attrs["message"]; ok {
-				msg = m
-			}
-			return nil, fmt.Errorf("fatal: %s", msg)
+			return nil, c.fatalError(words)
 		}
 	}
-	return nil, fmt.Errorf("response exceeds %d sentences", maxMikrotikSentences)
+	return c.discardResponse(fmt.Sprintf("response exceeds %d sentences", maxMikrotikSentences), nil)
+}
+
+// discardResponse drops the rest of an over-budget reply up to its !done, so
+// the next command on the connection reads its own reply. words is the
+// sentence that crossed the budget, or nil; it may itself end the reply.
+// Memory stays bounded by one sentence, and the read deadline readResponse
+// set bounds the time. The caller records reason as a command failure.
+func (c *mikrotikClient) discardResponse(reason string, words []string) (*mikrotikResponse, error) {
+	for {
+		if len(words) > 0 {
+			switch words[0] {
+			case "!done":
+				return &mikrotikResponse{err: reason}, nil
+			case "!fatal":
+				return nil, c.fatalError(words)
+			}
+		}
+		var err error
+		if words, err = c.readSentenceWords(); err != nil {
+			return nil, fmt.Errorf("%s: %w", reason, err)
+		}
+	}
+}
+
+func (c *mikrotikClient) fatalError(words []string) error {
+	return fmt.Errorf("fatal: %s", c.deviceMessage(words, "fatal error"))
+}
+
+// deviceMessage returns a !trap or !fatal sentence's message passed through
+// sanitizeMikrotikFailure, or fallback when nothing is left.
+func (c *mikrotikClient) deviceMessage(words []string, fallback string) string {
+	if msg := sanitizeMikrotikFailure(parseMikrotikAttrs(words[1:])["message"], c.password); msg != "" {
+		return msg
+	}
+	return fallback
 }
 
 func (c *mikrotikClient) setReadDeadline() error {
@@ -296,13 +325,6 @@ func (c *mikrotikClient) setReadDeadline() error {
 		}
 	}
 	return nil
-}
-
-func (c *mikrotikClient) readSentence() ([]string, error) {
-	if err := c.setReadDeadline(); err != nil {
-		return nil, err
-	}
-	return c.readSentenceWords()
 }
 
 func (c *mikrotikClient) readSentenceWords() ([]string, error) {
@@ -336,11 +358,14 @@ func (c *mikrotikClient) readWord() (string, error) {
 	if length > maxMikrotikWordSize {
 		return "", fmt.Errorf("word size %d exceeds max %d", length, maxMikrotikWordSize)
 	}
-	buf := make([]byte, length)
-	if _, err := io.ReadFull(c.conn, buf); err != nil {
+	// The length prefix is untrusted. io.CopyN reads in chunks of at most
+	// 32 KB and the builder grows only as bytes arrive, so a declared 10 MB
+	// word that never arrives allocates no more than one chunk.
+	var word strings.Builder
+	if _, err := io.CopyN(&word, c.conn, int64(length)); err != nil {
 		return "", fmt.Errorf("read word: %w", err)
 	}
-	return string(buf), nil
+	return word.String(), nil
 }
 
 func (c *mikrotikClient) readLength() (int, error) {
@@ -501,10 +526,10 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue)
 			return
 		}
 		if resp.err != "" {
-			// A !trap rejects only this command; the connection stays usable.
-			message := sanitizeMikrotikFailure(resp.err, dev.Password)
-			slog.Warn("mikrotik command rejected", "device", job.DeviceId, "command", cmd.Command, "error", message)
-			failures = append(failures, &pb.MikrotikCommandFailure{Command: cmd.Command, Message: message})
+			// A !trap or an over-budget reply rejects only this command; the
+			// connection stays usable. readResponse already sanitized resp.err.
+			slog.Warn("mikrotik command rejected", "device", job.DeviceId, "command", cmd.Command, "error", resp.err)
+			failures = append(failures, &pb.MikrotikCommandFailure{Command: cmd.Command, Message: resp.err})
 			continue
 		}
 
@@ -530,8 +555,9 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue)
 	sendResult(ctx, out, "mikrotik_result", result, job.JobId)
 }
 
-// sanitizeMikrotikFailure reduces a device's !trap message to one bounded
-// line with the job password scrubbed, as classifyConfigBackupError does.
+// sanitizeMikrotikFailure reduces a device's !trap or !fatal message to one
+// bounded line with the job password scrubbed, as classifyConfigBackupError
+// does.
 func sanitizeMikrotikFailure(message, password string) string {
 	if password != "" {
 		message = strings.ReplaceAll(message, password, "***")
