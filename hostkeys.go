@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -50,6 +51,10 @@ type hostKeyStore struct {
 }
 
 var globalHostKeys *hostKeyStore
+
+// errHostKeyChanged tags a TOFU mismatch so callers can tell it from a store
+// failure.
+var errHostKeyChanged = errors.New("TOFU: host key changed")
 
 // hostKeyTempFile is the subset of *os.File that save uses. Together with the
 // hostKeyCreateTemp and hostKeyMarshal seams it lets tests exercise the
@@ -269,9 +274,10 @@ func (s *hostKeyStore) persist(force bool) error {
 		return err
 	}
 	s.base, s.diskInfo = snapshot, info
-	if err := syncDirectory(dir); err != nil {
-		return err
-	}
+	// The rename has replaced the file, so the snapshot is what the file
+	// holds. Mark it saved before the directory fsync: failing here made
+	// verifyKey roll back an entry that was already on disk, and the next
+	// save wrote a snapshot without it.
 	s.mu.Lock()
 	if gen > s.savedGen {
 		s.savedGen = gen
@@ -282,6 +288,10 @@ func (s *hostKeyStore) persist(force bool) error {
 		}
 	}
 	s.mu.Unlock()
+	if err := syncDirectory(dir); err != nil {
+		slog.Warn("host key store saved but its directory fsync failed; the rename may not survive a crash",
+			"path", s.path, "error", err)
+	}
 	return nil
 }
 
@@ -390,7 +400,7 @@ func (s *hostKeyStore) verifyKey(host, fingerprint, keyType string) error {
 					continue
 				}
 			}
-			return fmt.Errorf("TOFU: host key changed for %s (stored=%s, got=%s) - possible MITM", host, storedFingerprint, fingerprint)
+			return fmt.Errorf("%w for %s (stored=%s, got=%s) - possible MITM", errHostKeyChanged, host, storedFingerprint, fingerprint)
 		}
 
 		// Migrate a matching entry in one save when it is stored under the

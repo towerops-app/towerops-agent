@@ -63,11 +63,31 @@ var sshResolve = func(ctx context.Context, addr string) (string, error) {
 // the transport stays usable; a device that dropped mid-export closes the
 // whole connection and the request fails. That is what separates a
 // RouterOS-style close that may succeed from a lost-connection close whose
-// partial output must not be stored as a good backup.
+// partial output must not be stored as a good backup. A nil client is dead,
+// and so is one that leaves the request unanswered for sshKeepaliveTimeout:
+// SendRequest with wantReply blocks until a reply or the connection closes.
+// The abandoned request goroutine ends when the caller closes the client.
 func sshClientAlive(c *ssh.Client) bool {
-	_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
-	return err == nil
+	if c == nil {
+		return false
+	}
+	reply := make(chan error, 1)
+	go func() {
+		_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
+		reply <- err
+	}()
+	timer := time.NewTimer(sshKeepaliveTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-reply:
+		return err == nil
+	case <-timer.C:
+		return false
+	}
 }
+
+// sshKeepaliveTimeout bounds sshClientAlive. A var so tests can shrink it.
+var sshKeepaliveTimeout = 10 * time.Second
 
 // redactBackupDetail mirrors configBackupError: scrub the credentials the
 // legacy SSH backup carries, then shorten device output to one 300-byte

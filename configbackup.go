@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +29,20 @@ var errConfigBackupHostKeyMismatch = errors.New("config backup host key mismatch
 // errConfigBackupTooLarge tags a session whose output crossed the caller's
 // byte cap so the job reports TOO_LARGE instead of the channel-close error.
 var errConfigBackupTooLarge = errors.New("config backup output exceeds the byte limit")
+
+// errUnansweredKeyboardQuestion tags a keyboard-interactive question that is
+// not a password request (a verification code, say), so the login reports
+// AUTH_FAILED without the password going into that field.
+var errUnansweredKeyboardQuestion = errors.New("keyboard-interactive question is not a password prompt")
+
+// keyboardPasswordQuestionRe matches a keyboard-interactive password question:
+// "Password:", "user@host's password:", "Password for user:".
+var keyboardPasswordQuestionRe = regexp.MustCompile(`(?i)\bpass(word|code)?\b[^:\n]*:\s*$`)
+
+// configBackupCloseGrace is how long an aborted exec session waits for the
+// device to answer CHANNEL_CLOSE before the whole connection is closed. A var
+// so tests can shrink it.
+var configBackupCloseGrace = 2 * time.Second
 
 const (
 	configBackupDefaultTimeoutMs = 120_000
@@ -139,6 +154,12 @@ func executeConfigBackupJobCtx(sessionCtx, jobCtx context.Context, job *pb.Agent
 		fail(pb.ConfigBackupErrorCode_INTERNAL, "config backup job missing payload")
 		return
 	}
+	if strings.TrimSpace(cb.Host) == "" {
+		// net.Dial routes ":22" to the local system: the credentials would
+		// go to the agent host's own sshd.
+		fail(pb.ConfigBackupErrorCode_INTERNAL, "config backup job missing host")
+		return
+	}
 
 	if _, ok := jobCtx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -201,25 +222,37 @@ func executeConfigBackupJobCtx(sessionCtx, jobCtx context.Context, job *pb.Agent
 
 // configBackupAuthMethods builds the credential order for a backup login:
 // public key when the job carries a parseable private key, then the
-// password, then keyboard-interactive answering every prompt with the
-// password. An unparseable key is dropped silently — password auth covers
-// it — and a parse failure is reported in no result field.
-func configBackupAuthMethods(cb *pb.ConfigBackupJob) []ssh.AuthMethod {
-	var auth []ssh.AuthMethod
+// password, then keyboard-interactive answering password questions. An
+// unparseable or passphrase-protected key is skipped so password auth can
+// still log in; keyErr returns the parse failure for the caller to report.
+func configBackupAuthMethods(cb *pb.ConfigBackupJob) (auth []ssh.AuthMethod, keyErr error) {
 	if key := cb.GetPrivateKey(); key != "" {
-		if signer, err := ssh.ParsePrivateKey([]byte(key)); err == nil {
+		signer, err := ssh.ParsePrivateKey([]byte(key))
+		if err == nil {
 			auth = append(auth, ssh.PublicKeys(signer))
+		} else {
+			keyErr = err
 		}
 	}
 	auth = append(auth, ssh.Password(cb.GetPassword()))
-	auth = append(auth, ssh.KeyboardInteractive(func(name, instruction string, questions []string, _ []bool) ([]string, error) {
+	auth = append(auth, ssh.KeyboardInteractive(configBackupKeyboardInteractive(cb.GetPassword())))
+	return auth, keyErr
+}
+
+// configBackupKeyboardInteractive answers password questions with the
+// password and refuses any other question, such as a verification code,
+// that TACACS or RADIUS might log in clear.
+func configBackupKeyboardInteractive(password string) ssh.KeyboardInteractiveChallenge {
+	return func(_, _ string, questions []string, _ []bool) ([]string, error) {
 		answers := make([]string, len(questions))
-		for i := range answers {
-			answers[i] = cb.GetPassword()
+		for i, q := range questions {
+			if !keyboardPasswordQuestionRe.MatchString(q) {
+				return nil, fmt.Errorf("%w: %q", errUnansweredKeyboardQuestion, truncateBytes(q, 80))
+			}
+			answers[i] = password
 		}
 		return answers, nil
-	}))
-	return auth
+	}
 }
 
 // configBackupDial connects to the target and returns the client plus the
@@ -229,9 +262,14 @@ func configBackupDial(ctx context.Context, job *pb.AgentJob) (*ssh.Client, strin
 	cb := job.ConfigBackup
 	expected := strings.TrimSpace(cb.ExpectedHostKeyFingerprint)
 	var observed string
+	auth, keyErr := configBackupAuthMethods(cb)
+	if keyErr != nil {
+		slog.Warn("config backup private key unusable; trying password auth",
+			"job_id", job.JobId, "device_id", job.DeviceId, "error", keyErr)
+	}
 	config := &ssh.ClientConfig{
 		User:            cb.Username,
-		Auth:            configBackupAuthMethods(cb),
+		Auth:            auth,
 		HostKeyCallback: configBackupHostKeyCallback(expected, &observed),
 		// Timeout is intentionally unset: sshDial never calls ssh.Dial, so the
 		// field would be ignored. The context deadline below is the bound.
@@ -255,19 +293,34 @@ func configBackupDial(ctx context.Context, job *pb.AgentJob) (*ssh.Client, strin
 		if dialCtx.Err() != nil {
 			err = fmt.Errorf("%w: %w", dialCtx.Err(), err)
 		}
+		if keyErr != nil {
+			// Name the skipped key so an AUTH_FAILED detail shows the cause.
+			err = fmt.Errorf("%w (private key unusable: %v)", err, keyErr)
+		}
 		return nil, observed, err
 	}
 	return conn, observed, nil
 }
 
-// configBackupHostKeyCallback accepts first-use fingerprints, verifies known
-// ones, and records the observed fingerprint even when it rejects.
+// configBackupHostKeyCallback verifies the key against the server's expected
+// fingerprint, or against the agent's TOFU store when the job carries none,
+// and records the observed fingerprint even when it rejects.
 func configBackupHostKeyCallback(expected string, observed *string) ssh.HostKeyCallback {
-	return func(_ string, _ net.Addr, key ssh.PublicKey) error {
+	return func(_ string, remote net.Addr, key ssh.PublicKey) error {
 		actual := ssh.FingerprintSHA256(key)
 		*observed = actual
 		if expected == "" {
-			return nil
+			// Pinned under the same "ssh:<ip:port>" key as the legacy /export
+			// path, so credentials never go to an unverified key.
+			store := getHostKeyStore()
+			if store == nil {
+				return errors.New("no host key store to verify the device key")
+			}
+			err := store.verifySSHKey("ssh:"+remote.String(), key)
+			if errors.Is(err, errHostKeyChanged) {
+				return fmt.Errorf("%w: %w", errConfigBackupHostKeyMismatch, err)
+			}
+			return err
 		}
 		if strings.HasPrefix(expected, "SHA256:") {
 			if actual == expected {
@@ -295,7 +348,7 @@ func classifyConfigBackupError(err error, job *pb.AgentJob) (pb.ConfigBackupErro
 		code = pb.ConfigBackupErrorCode_UNREACHABLE
 	case errors.Is(err, context.DeadlineExceeded):
 		code = pb.ConfigBackupErrorCode_TIMEOUT
-	case isAuthFailure(err):
+	case errors.Is(err, errUnansweredKeyboardQuestion), isAuthFailure(err):
 		code = pb.ConfigBackupErrorCode_AUTH_FAILED
 	case isConnRefused(err):
 		code = pb.ConfigBackupErrorCode_CONNECTION_REFUSED
@@ -361,10 +414,24 @@ func runConfigBackupSession(ctx context.Context, c *ssh.Client, cmd string, maxB
 		return nil, nil, err
 	}
 	defer func() { _ = session.Close() }()
-	// A step context must be able to abort a stalled exec: closing the
-	// session unblocks Run. Plan steps derive their context from the job
-	// context, so the job deadline still wins.
-	stopAbort := context.AfterFunc(ctx, func() { _ = session.Close() })
+	// A step context must be able to abort a stalled exec. session.Close
+	// only sends CHANNEL_CLOSE, and Run returns once the device answers it;
+	// a device that never answers would hold Run until the job deadline, so
+	// the connection is closed after configBackupCloseGrace. Plan steps
+	// derive their context from the job context, so the job deadline still
+	// wins.
+	runDone := make(chan struct{})
+	defer close(runDone)
+	stopAbort := context.AfterFunc(ctx, func() {
+		_ = session.Close()
+		grace := time.NewTimer(configBackupCloseGrace)
+		defer grace.Stop()
+		select {
+		case <-runDone:
+		case <-grace.C:
+			_ = c.Close()
+		}
+	})
 	defer stopAbort()
 
 	outBuf := boundedBuffer{
@@ -563,7 +630,11 @@ func (v mikrotikBackupVendor) Backup(ctx context.Context, c *ssh.Client, job *pb
 		return configBackupError(job, jobID, deviceID, pb.ConfigBackupErrorCode_INTERNAL, err.Error())
 	}
 
-	identity, _ := v.readIdentity(ctx, c)
+	// The export is good; a failed identity read only leaves Identity empty.
+	identity, err := v.readIdentity(ctx, c)
+	if err != nil {
+		slog.Debug("config backup identity read failed", "device_id", deviceID, "error", err)
+	}
 
 	return &pb.ConfigBackupResult{
 		DeviceId:        deviceID,

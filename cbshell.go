@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -334,7 +335,9 @@ func (f *shellFilter) sinceWithMarkers(start int) (string, []pagerMatch) {
 // returns the answer that dismisses it ("" when there is none). The scan
 // never reaches before floor — the current collect's start, never negative —
 // so a marker left in the buffer by an earlier command is not answered
-// again.
+// again. A match counts only as the buffer's trailing line: a device waiting
+// on a pager has printed nothing after it, while pager-like config text
+// ("description trunk lines 10-20") sits inside a line or before more output.
 func (f *shellFilter) matchPager(floor int, answeredTo *int, pagers []pagerPattern) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -346,6 +349,10 @@ func (f *shellFilter) matchPager(floor int, answeredTo *int, pagers []pagerPatte
 		}
 	}
 	f.markers = kept
+	// A bare \r redraw can shrink the buffer below the recorded floor.
+	if floor > len(f.out) {
+		return ""
+	}
 
 	start := len(f.out) - pagerWindow
 	if start < floor {
@@ -356,6 +363,9 @@ func (f *shellFilter) matchPager(floor int, answeredTo *int, pagers []pagerPatte
 	for _, pg := range pagers {
 		for _, loc := range pg.re.FindAllIndex(window, -1) {
 			end := start + loc[1]
+			if !isTrailingLine(f.out, start+loc[0], end) {
+				continue
+			}
 			if end > *answeredTo && (bestEnd < 0 || end < bestEnd) {
 				bestStart, bestEnd, bestAnswer = start+loc[0], end, pg.answer
 			}
@@ -369,6 +379,30 @@ func (f *shellFilter) matchPager(floor int, answeredTo *int, pagers []pagerPatte
 	return bestAnswer
 }
 
+// isTrailingLine reports whether out[from:to] is the last non-empty line of
+// out: only whitespace precedes it on its line and only whitespace follows.
+func isTrailingLine(out []byte, from, to int) bool {
+	if len(bytes.TrimSpace(out[to:])) != 0 {
+		return false
+	}
+	lineStart := bytes.LastIndexByte(out[:from], '\n') + 1
+	return len(bytes.TrimSpace(out[lineStart:from])) == 0
+}
+
+// discardCompleteLines drops every complete line, keeping only the line in
+// progress (the prompt the last command returned to), and returns the new
+// buffer size. Recorded marker ranges belong to finished collects and go
+// too. The byte cap then counts one collect at a time, so output of earlier
+// or excluded steps cannot push a later step to TOO_LARGE.
+func (f *shellFilter) discardCompleteLines() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.out = append([]byte(nil), f.out[f.lineStart:]...)
+	f.lineStart = 0
+	f.markers = nil
+	return len(f.out)
+}
+
 // shellSession is one interactive PTY session against a device. Output is
 // filtered as it arrives; collection waits for prompts, answers pagers and
 // strips the echoed command.
@@ -378,8 +412,7 @@ type shellSession struct {
 	filter  *shellFilter
 	pagers  []pagerPattern
 
-	eofC    chan struct{}
-	waitErr error
+	eofC chan struct{}
 }
 
 // newShellSession opens a vt100 PTY shell with ECHO on and starts the
@@ -411,7 +444,9 @@ func newShellSession(c *ssh.Client, maxBytes uint64, pagers []pagerPattern) (*sh
 	}
 	s.eofC = make(chan struct{})
 	go func() {
-		s.waitErr = session.Wait()
+		// The exit status of an interactive shell carries nothing the
+		// collection uses; only the session's end matters.
+		_ = session.Wait()
 		close(s.eofC)
 	}()
 	return s, nil
@@ -507,9 +542,10 @@ func (s *shellSession) learnPrompt(ctx context.Context) (*devicePrompt, error) {
 
 // collect sends cmd and gathers output until the prompt returns. While
 // collecting it answers pager markers (each position once) and fails when
-// the step's deadline passes without a prompt.
+// the step's deadline passes without a prompt. Output of earlier commands
+// is discarded first, so the byte cap applies to this command alone.
 func (s *shellSession) collect(ctx context.Context, cmd string, p *devicePrompt) (string, error) {
-	start := s.filter.size()
+	start := s.filter.discardCompleteLines()
 	if err := s.send(cmd + "\r"); err != nil {
 		return "", err
 	}
@@ -618,8 +654,11 @@ func (s *shellSession) runPrivileged(ctx context.Context, step *pb.ConfigBackupS
 			case shellPasswordPromptRe.MatchString(final):
 				// A second password request means the first answer was
 				// refused — never loop feeding the enable password.
-				if enablePassword == "" || answered >= 1 {
+				if enablePassword == "" {
 					return nil, errEnableFailed("device requested an enable password the job does not carry")
+				}
+				if answered >= 1 {
+					return nil, errEnableFailed("device refused the enable password and asked again")
 				}
 				answered++
 				if err := s.send(enablePassword + "\r"); err != nil {

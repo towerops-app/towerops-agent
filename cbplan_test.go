@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -93,22 +94,22 @@ func TestClassifyStepOutputConfigText(t *testing.T) {
 	}
 }
 
-// TestClientAlive covers the liveness check behind the ExitMissingError
+// TestSSHClientAlive covers the liveness check behind the ExitMissingError
 // gate: a live connection answers the keepalive, a closed one does not.
-func TestClientAlive(t *testing.T) {
+func TestSSHClientAlive(t *testing.T) {
 	fake := startFakeShellServer(t, "", "sw1> ", shellScript{})
 	client := cbShellClient(t, fake.addr)
-	if !clientAlive(client) {
-		t.Fatal("clientAlive = false on a live connection")
+	if !sshClientAlive(client) {
+		t.Fatal("sshClientAlive = false on a live connection")
 	}
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if clientAlive(client) {
-		t.Fatal("clientAlive = true on a closed connection")
+	if sshClientAlive(client) {
+		t.Fatal("sshClientAlive = true on a closed connection")
 	}
-	if clientAlive(nil) {
-		t.Fatal("clientAlive(nil) = true")
+	if sshClientAlive(nil) {
+		t.Fatal("sshClientAlive(nil) = true")
 	}
 }
 
@@ -206,7 +207,9 @@ func TestPlanExecChannelCloseWithoutExit(t *testing.T) {
 // non-enable error mapping.
 func TestPlanRunnerInternals(t *testing.T) {
 	cb := &pb.ConfigBackupJob{Plan: &pb.ConfigBackupPlan{
-		PagerPatterns: []string{"[unterminated", `::MARKER::(?:\r?\n)?`},
+		// "x*" matches the empty string at every offset: each quiet window
+		// would answer it and strip one newline per marker.
+		PagerPatterns: []string{"[unterminated", `::MARKER::(?:\r?\n)?`, "x*"},
 	}}
 	r := newPlanRunner(context.Background(), nil, cb, "job-1", "dev-1")
 	if len(r.pagers) != len(builtinPagerPatterns())+1 {
@@ -227,16 +230,26 @@ func TestPlanRunnerInternals(t *testing.T) {
 	defer func() { gzipTo = orig }()
 	gzipTo = func(io.Writer, []byte) error { return errors.New("gzip boom") }
 	r.failed = false
+	r.gotOutput = true
 	result = r.successResult()
 	if result.ErrorCode != pb.ConfigBackupErrorCode_INTERNAL {
 		t.Fatalf("successResult on gzip failure = %v, want INTERNAL", result.ErrorCode)
 	}
 
-	if got := r.privilegedFailure(context.Background(), errShellClosed); got.ErrorCode != pb.ConfigBackupErrorCode_EXPORT_FAILED {
-		t.Fatalf("privilegedFailure(errShellClosed) = %v, want EXPORT_FAILED", got.ErrorCode)
-	}
-	if got := r.privilegedFailure(context.Background(), context.DeadlineExceeded); got.ErrorCode != pb.ConfigBackupErrorCode_TIMEOUT {
-		t.Fatalf("privilegedFailure(deadline) = %v, want TIMEOUT", got.ErrorCode)
+	for _, tc := range []struct {
+		err  error
+		want pb.ConfigBackupErrorCode
+	}{
+		{errShellClosed, pb.ConfigBackupErrorCode_EXPORT_FAILED},
+		{context.DeadlineExceeded, pb.ConfigBackupErrorCode_TIMEOUT},
+		{fmt.Errorf("enable: %w", context.DeadlineExceeded), pb.ConfigBackupErrorCode_TIMEOUT},
+		{io.EOF, pb.ConfigBackupErrorCode_EXPORT_FAILED},
+		{context.Canceled, pb.ConfigBackupErrorCode_EXPORT_FAILED},
+		{errors.New(`line "-1#" is not a device prompt`), pb.ConfigBackupErrorCode_EXPORT_FAILED},
+	} {
+		if got := r.privilegedFailure(tc.err); got.ErrorCode != tc.want {
+			t.Errorf("privilegedFailure(%v) = %v, want %v", tc.err, got.ErrorCode, tc.want)
+		}
 	}
 }
 
@@ -572,4 +585,156 @@ func TestPlanProbeFailures(t *testing.T) {
 			t.Fatal("probe succeeded against a prompt it cannot learn")
 		}
 	})
+}
+
+// TestPlanEmptyOutputIsExportEmpty pins that a plan whose included steps
+// produce no text reports EXPORT_EMPTY instead of storing an empty gzip as
+// a good backup. Section headers alone do not count as output.
+func TestPlanEmptyOutputIsExportEmpty(t *testing.T) {
+	cases := []struct {
+		name      string
+		responses map[string]cbExecResponse
+		plan      *pb.ConfigBackupPlan
+	}{
+		{
+			name:      "empty reply",
+			responses: map[string]cbExecResponse{"show running-config": {out: ""}},
+			plan:      cbExecPlan(cbCommand("show running-config")),
+		},
+		{
+			name:      "whitespace reply",
+			responses: map[string]cbExecResponse{"show running-config": {out: " \n\n"}},
+			plan:      cbExecPlan(cbCommand("show running-config")),
+		},
+		{
+			name: "headers around empty sections",
+			responses: map[string]cbExecResponse{
+				"show a": {out: ""},
+				"show b": {out: "\n"},
+			},
+			plan: cbExecPlan(
+				&pb.ConfigBackupStep{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_COMMAND, Command: "show a", Section: "a"},
+				&pb.ConfigBackupStep{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_COMMAND, Command: "show b", Section: "b"},
+			),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetHostKeyStore(t)
+			addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), cbExecHandler(tc.responses, nil))
+			defer cleanup()
+			host, port := cbAddrPort(t, addr)
+
+			out := testQueue()
+			executeConfigBackupJob(context.Background(), cbPlanJob(host, port, tc.plan), out)
+
+			result := cbReceiveConfigBackupResult(t, out)
+			if result.ErrorCode != pb.ConfigBackupErrorCode_EXPORT_EMPTY {
+				t.Fatalf("code = %v (%q, %d bytes), want EXPORT_EMPTY", result.ErrorCode, result.ErrorDetail, result.ConfigBytes)
+			}
+		})
+	}
+}
+
+// TestPlanExecSessionFailureStopsPlan pins that a session that cannot open
+// is a transport failure: it reports EXPORT_FAILED and stops the plan even
+// past an ignore_failure step, instead of reading as COMMAND_UNSUPPORTED
+// and running every fallback against a dead connection.
+func TestPlanExecSessionFailureStopsPlan(t *testing.T) {
+	fake := startFakeShellServer(t, "", "sw1> ", shellScript{})
+	defer fake.cleanup()
+	client := cbShellClient(t, fake.addr)
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ignored := cbCommand("terminal length 0")
+	ignored.IgnoreFailure = true
+	cb := &pb.ConfigBackupJob{Plan: cbExecPlan(ignored, cbCommand("show run", "show conf"))}
+	r := newPlanRunner(context.Background(), client, cb, "job-1", "dev-1")
+	result := r.runExecPlan(context.Background())
+	if result.ErrorCode != pb.ConfigBackupErrorCode_EXPORT_FAILED {
+		t.Fatalf("code = %v (%q), want EXPORT_FAILED", result.ErrorCode, result.ErrorDetail)
+	}
+}
+
+// TestPlanExecDeadlineBeatsOutputClassification pins that a step whose
+// deadline fires is a TIMEOUT even when its partial output carries
+// invalid-command text: the fallbacks must not run against a device that
+// may still be streaming.
+func TestPlanExecDeadlineBeatsOutputClassification(t *testing.T) {
+	resetHostKeyStore(t)
+	var mu sync.Mutex
+	var seen []string
+	addr, cleanup := startTestSSHServerWithSigner(t, cbNewSigner(t), func(ch ssh.Channel, command string) {
+		mu.Lock()
+		seen = append(seen, command)
+		mu.Unlock()
+		_, _ = ch.Write([]byte("% Invalid input detected\n"))
+		time.Sleep(2 * time.Second) // stall past the step deadline
+		_ = ch.Close()
+	})
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	plan := cbExecPlan(cbCommand("show stall", "show fallback"))
+	plan.StepTimeoutMs = 400
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), cbPlanJob(host, port, plan), out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_TIMEOUT {
+		t.Fatalf("code = %v (%q), want TIMEOUT", result.ErrorCode, result.ErrorDetail)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, cmd := range seen {
+		if cmd == "show fallback" {
+			t.Fatal("a fallback ran after the step deadline")
+		}
+	}
+}
+
+// TestClassifyStepOutputLongOutputIgnoresPermissionText pins that a
+// permission phrase classifies only short output. Device refusals are a line
+// or two; a banner line in a long config is config text.
+func TestClassifyStepOutputLongOutputIgnoresPermissionText(t *testing.T) {
+	config := "Building configuration...\n!\nAccess denied to unauthorized users\n" +
+		strings.Repeat("interface Gi0/1\n", stepFailureScanLines)
+	if f := classifyStepOutput(config, ""); f != nil {
+		t.Fatalf("long config with a banner line classified as %v (%+v)", f.code, f)
+	}
+	if f := classifyStepOutput(config, "Permission denied\n"); f == nil || f.code != pb.ConfigBackupErrorCode_PERMISSION_DENIED {
+		t.Fatalf("stderr refusal next to long stdout = %+v, want PERMISSION_DENIED", f)
+	}
+	if f := classifyStepOutput("Access denied\n", ""); f == nil || f.code != pb.ConfigBackupErrorCode_PERMISSION_DENIED {
+		t.Fatalf("short refusal = %+v, want PERMISSION_DENIED", f)
+	}
+}
+
+// TestPlanProbeStepsGetTheirOwnDeadline pins that a probe gives prompt
+// learning and each privileged step a step timeout of their own, as the
+// backup path does. Learning alone takes three quiet windows (1.5 s).
+func TestPlanProbeStepsGetTheirOwnDeadline(t *testing.T) {
+	resetHostKeyStore(t)
+	fake := startFakeShellServer(t, "", "sw1> ", shellScript{
+		"enable": {lines: []string{"sw1# "}},
+	})
+	defer fake.cleanup()
+	host, port := cbAddrPort(t, fake.addr)
+
+	plan := cbShellPlan(cbPrivileged("enable"), cbCommand("show run"))
+	plan.StepTimeoutMs = 1700
+	job := cbPlanJob(host, port, plan)
+	job.ConfigBackup.Mode = pb.ConfigBackupMode_CONFIG_BACKUP_MODE_PROBE
+	out := testQueue()
+	executeConfigBackupJob(context.Background(), job, out)
+
+	result := cbReceiveConfigBackupResult(t, out)
+	if result.ErrorCode != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
+		t.Fatalf("code = %v (%q), want OK", result.ErrorCode, result.ErrorDetail)
+	}
+	if result.Identity != "sw1" {
+		t.Fatalf("identity = %q, want sw1", result.Identity)
+	}
 }

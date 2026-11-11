@@ -66,6 +66,9 @@ type planStepFailure struct {
 	code       pb.ConfigBackupErrorCode
 	detail     string
 	permission bool
+	// session marks a transport failure: the connection is unusable, so
+	// the plan stops even past an ignore_failure step.
+	session bool
 }
 
 func (f *planStepFailure) errorResult(cb *pb.ConfigBackupJob, jobID, deviceID string) *pb.ConfigBackupResult {
@@ -82,7 +85,12 @@ func classifyStepOutput(stdout, stderr string) *planStepFailure {
 	return scanFailureLines(stderr)
 }
 
+// scanFailureLines classifies one output stream. Permission phrases count
+// only when the whole stream fits in the scan window: a device refusal is a
+// line or two, while a longer stream is config whose banner text ("Access
+// denied to unauthorized users") must not fail the step.
 func scanFailureLines(output string) *planStepFailure {
+	checkPermission := countNonEmptyLines(output, stepFailureScanLines+1) <= stepFailureScanLines
 	scanned := 0
 	for line := range strings.Lines(output) {
 		trimmed := strings.TrimSpace(line)
@@ -94,7 +102,7 @@ func scanFailureLines(output string) *planStepFailure {
 			return nil
 		}
 		for _, re := range permissionDeniedRes {
-			if re.MatchString(trimmed) {
+			if checkPermission && re.MatchString(trimmed) {
 				return &planStepFailure{
 					code:       pb.ConfigBackupErrorCode_PERMISSION_DENIED,
 					detail:     trimmed,
@@ -112,6 +120,22 @@ func scanFailureLines(output string) *planStepFailure {
 	return nil
 }
 
+// countNonEmptyLines counts the lines of output with content, stopping at
+// limit.
+func countNonEmptyLines(output string, limit int) int {
+	n := 0
+	for line := range strings.Lines(output) {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		n++
+		if n >= limit {
+			break
+		}
+	}
+	return n
+}
+
 // planRunner carries the state shared by every step of one plan job.
 type planRunner struct {
 	client   *ssh.Client
@@ -123,9 +147,10 @@ type planRunner struct {
 	stepTimeout time.Duration
 	pagers      []pagerPattern
 
-	shared   *boundedBuffer // the job's total output, headers included
-	overflow bool
-	failed   bool
+	shared    *boundedBuffer // the job's total output, headers included
+	overflow  bool
+	failed    bool
+	gotOutput bool // some included step produced non-whitespace text
 
 	headersWanted bool // section headers written when >1 included labelled step
 }
@@ -153,6 +178,12 @@ func newPlanRunner(ctx context.Context, client *ssh.Client, cb *pb.ConfigBackupJ
 			slog.Debug("plan pager pattern ignored", "pattern", expr, "error", err)
 			continue
 		}
+		if re.MatchString("") {
+			// A pattern matching the empty string matches at every offset:
+			// each quiet window would answer it and strip a newline.
+			slog.Debug("plan pager pattern ignored", "pattern", expr, "error", "matches the empty string")
+			continue
+		}
 		r.pagers = append(r.pagers, pagerPattern{re: re, answer: " "})
 	}
 	r.shared = &boundedBuffer{limit: r.maxBytes, onOverflow: func() { r.overflow = true }}
@@ -178,6 +209,9 @@ func (r *planRunner) include(section, text string) {
 		_, _ = r.shared.Write([]byte("# ---- " + section + " ----\n"))
 	}
 	_, _ = r.shared.Write([]byte(text))
+	if strings.TrimSpace(text) != "" {
+		r.gotOutput = true
+	}
 	if r.overflow {
 		r.failed = true
 	}
@@ -211,6 +245,11 @@ func (r *planRunner) successResult() *pb.ConfigBackupResult {
 		return configBackupError(r.cb, r.jobID, r.deviceID, pb.ConfigBackupErrorCode_TOO_LARGE,
 			fmt.Sprintf("backup exceeded the %d byte limit", r.maxBytes))
 	}
+	if !r.gotOutput {
+		// Section headers alone are not a config.
+		return configBackupError(r.cb, r.jobID, r.deviceID, pb.ConfigBackupErrorCode_EXPORT_EMPTY,
+			"plan steps produced no output")
+	}
 	var gz bytes.Buffer
 	if err := gzipTo(&gz, r.shared.Bytes()); err != nil {
 		return configBackupError(r.cb, r.jobID, r.deviceID, pb.ConfigBackupErrorCode_INTERNAL, err.Error())
@@ -238,34 +277,40 @@ func (r *planRunner) probe(ctx context.Context) *pb.ConfigBackupResult {
 		return configBackupError(r.cb, r.jobID, r.deviceID, sessionErrCode(ctx, err), err.Error())
 	}
 	defer sess.close()
-	ctx, cancel := r.stepContext(ctx)
-	defer cancel()
-	prompt, err := sess.learnPrompt(ctx)
+	// Prompt learning and each privileged step get their own step timeout,
+	// as in runShellPlan.
+	learnCtx, cancel := r.stepContext(ctx)
+	prompt, err := sess.learnPrompt(learnCtx)
+	cancel()
 	if err != nil {
-		return configBackupError(r.cb, r.jobID, r.deviceID, sessionErrCode(ctx, err), err.Error())
+		return r.shellSessionFailure(ctx, err)
 	}
 	for _, step := range r.cb.GetPlan().GetSteps() {
 		if step.GetKind() != pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_PRIVILEGED {
 			continue
 		}
-		prompt, err = sess.runPrivileged(ctx, step, r.cb.GetEnablePassword(), prompt)
+		stepCtx, cancel := r.stepContext(ctx)
+		prompt, err = sess.runPrivileged(stepCtx, step, r.cb.GetEnablePassword(), prompt)
+		cancel()
 		if err != nil {
-			return r.privilegedFailure(ctx, err)
+			return r.privilegedFailure(err)
 		}
 	}
 	return &pb.ConfigBackupResult{DeviceId: r.deviceID, JobId: r.jobID, Identity: prompt.host}
 }
 
-// privilegedFailure maps a privileged-mode step failure to ENABLE_FAILED.
-func (r *planRunner) privilegedFailure(ctx context.Context, err error) *pb.ConfigBackupResult {
+// privilegedFailure maps a privileged-mode step failure: a device refusal is
+// ENABLE_FAILED, a fired step or job deadline is TIMEOUT, and anything else
+// (closed session, failed write, unparseable prompt) is EXPORT_FAILED.
+func (r *planRunner) privilegedFailure(err error) *pb.ConfigBackupResult {
+	code := pb.ConfigBackupErrorCode_EXPORT_FAILED
 	switch {
 	case isEnableFailed(err):
-		return configBackupError(r.cb, r.jobID, r.deviceID, pb.ConfigBackupErrorCode_ENABLE_FAILED, err.Error())
-	case errors.Is(err, errShellClosed):
-		return configBackupError(r.cb, r.jobID, r.deviceID, pb.ConfigBackupErrorCode_EXPORT_FAILED, err.Error())
-	default:
-		return configBackupError(r.cb, r.jobID, r.deviceID, pb.ConfigBackupErrorCode_TIMEOUT, err.Error())
+		code = pb.ConfigBackupErrorCode_ENABLE_FAILED
+	case errors.Is(err, context.DeadlineExceeded):
+		code = pb.ConfigBackupErrorCode_TIMEOUT
 	}
+	return configBackupError(r.cb, r.jobID, r.deviceID, code, err.Error())
 }
 
 // runExecPlan executes a plan over exec channels: one fresh session per
@@ -279,7 +324,7 @@ func (r *planRunner) runExecPlan(ctx context.Context) *pb.ConfigBackupResult {
 			continue // privileged mode is a shell-transport concept
 		}
 		if failure := r.execStep(ctx, step); failure != nil {
-			if step.GetIgnoreFailure() {
+			if step.GetIgnoreFailure() && !failure.session {
 				continue
 			}
 			return failure.errorResult(r.cb, r.jobID, r.deviceID)
@@ -304,30 +349,43 @@ func (r *planRunner) execStep(ctx context.Context, step *pb.ConfigBackupStep) *p
 			r.failed = true
 			return nil
 		}
-		// A lost connection closes the exec channel, which surfaces as
-		// *ssh.ExitMissingError with only the output that arrived before
-		// the drop. The session runner already tolerates the missing exit
-		// status of a live RouterOS 6-style channel close, so one arriving
-		// here means the client is gone; a keepalive confirms it. Passing
-		// the truncated output as a good step would store a partial config
-		// as a successful backup.
-		var exitMissing *ssh.ExitMissingError
-		if errors.As(err, &exitMissing) && !clientAlive(r.client) {
-			return &planStepFailure{
-				code:   pb.ConfigBackupErrorCode_EXPORT_FAILED,
-				detail: "ssh connection dropped while running " + cmd,
-			}
-		}
-		if failure := classifyStepOutput(string(stdout), string(stderr)); failure != nil {
-			lastFailure = failure
-			continue
-		}
+		// A fired deadline wins over the partial output: a device still
+		// streaming must not have its fallbacks run on top of it.
 		if errors.Is(stepCtx.Err(), context.DeadlineExceeded) ||
 			errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return &planStepFailure{
 				code:   pb.ConfigBackupErrorCode_TIMEOUT,
 				detail: "step timed out running " + cmd,
 			}
+		}
+		// A lost connection closes the exec channel, which surfaces as
+		// *ssh.ExitMissingError with only the output that arrived before
+		// the drop. runConfigBackupSession clears that error when the
+		// connection still answers a keepalive (a RouterOS 6-style channel
+		// close), so one arriving here means the client is gone. Passing the
+		// truncated output as a good step would store a partial config as a
+		// successful backup.
+		var exitMissing *ssh.ExitMissingError
+		if errors.As(err, &exitMissing) {
+			return &planStepFailure{
+				code:    pb.ConfigBackupErrorCode_EXPORT_FAILED,
+				detail:  "ssh connection dropped while running " + cmd,
+				session: true,
+			}
+		}
+		// Only an exit status is the device judging the command. Any other
+		// error (no session could open, the channel failed) is the transport.
+		var exitErr *ssh.ExitError
+		if err != nil && !errors.As(err, &exitErr) {
+			return &planStepFailure{
+				code:    pb.ConfigBackupErrorCode_EXPORT_FAILED,
+				detail:  "ssh session failed running " + cmd + ": " + err.Error(),
+				session: true,
+			}
+		}
+		if failure := classifyStepOutput(string(stdout), string(stderr)); failure != nil {
+			lastFailure = failure
+			continue
 		}
 		if err != nil {
 			// A non-zero exit without diagnostic text still counts as a
@@ -345,17 +403,6 @@ func (r *planRunner) execStep(ctx context.Context, step *pb.ConfigBackupStep) *p
 		return nil
 	}
 	return lastFailure
-}
-
-// clientAlive reports that the client's transport still answers a keepalive
-// request. Local to the plan runner (nil-safe); ssh.go carries the shared
-// sshClientAlive for the session runner paths.
-func clientAlive(c *ssh.Client) bool {
-	if c == nil {
-		return false
-	}
-	_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
-	return err == nil
 }
 
 // runShellPlan executes a plan over one interactive PTY session.
@@ -380,7 +427,7 @@ func (r *planRunner) runShellPlan(ctx context.Context) *pb.ConfigBackupResult {
 			prompt, err = sess.runPrivileged(stepCtx, step, r.cb.GetEnablePassword(), prompt)
 			cancel()
 			if err != nil {
-				return r.privilegedFailure(ctx, err)
+				return r.privilegedFailure(err)
 			}
 			continue
 		}

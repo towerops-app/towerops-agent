@@ -175,6 +175,82 @@ func TestShellFilterMatchPagerPrune(t *testing.T) {
 	}
 }
 
+// TestShellFilterMatchPagerFloorPastBuffer pins a panic: a bare \r redraw
+// can shrink the buffer below the floor a collect recorded, and the window
+// slice must not start past the buffer end.
+func TestShellFilterMatchPagerFloorPastBuffer(t *testing.T) {
+	f := newShellFilter(1 << 20)
+	if _, err := f.Write([]byte("banner\nsw1> ")); err != nil {
+		t.Fatal(err)
+	}
+	floor := f.size()
+	// The bare \r erases back to the line start once "s" arrives.
+	if _, err := f.Write([]byte("\rs")); err != nil {
+		t.Fatal(err)
+	}
+	if f.size() >= floor {
+		t.Fatalf("buffer size %d, want the redraw to shrink it below %d", f.size(), floor)
+	}
+	answered := -1
+	if answer := f.matchPager(floor, &answered, builtinPagerPatterns()); answer != "" {
+		t.Fatalf("matchPager = %q, want no answer for a floor past the buffer", answer)
+	}
+}
+
+// TestShellFilterMatchPagerTrailingOnly pins that a pager marker is
+// answered only when it is the buffer's trailing line. Config text that a
+// pager regex matches, either mid-line or followed by more output, stays.
+func TestShellFilterMatchPagerTrailingOnly(t *testing.T) {
+	cases := []struct {
+		name   string
+		buffer string
+		want   string
+	}{
+		{"marker on the last line", "hostname sw1\n --More-- ", " "},
+		{"marker line with its newline", "hostname sw1\nlines 24-48/240\n", " "},
+		{"less end marker", "hostname sw1\n(END)", "q"},
+		{"marker followed by more config", "description lines 10-20\nhostname sw1\n", ""},
+		{"marker text inside the last config line", "interface Gi0/1\n description trunk lines 10-20\n", ""},
+		{"banner text mid-line", "banner motd Press any key to continue", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newShellFilter(0)
+			if _, err := f.Write([]byte(tc.buffer)); err != nil {
+				t.Fatal(err)
+			}
+			answered := -1
+			if got := f.matchPager(0, &answered, builtinPagerPatterns()); got != tc.want {
+				t.Fatalf("matchPager = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestShellCollectDiscardsEarlierSteps pins that the filter's byte cap
+// counts one collect at a time: output of an earlier step, such as an
+// excluded "show version", no longer counts toward the cap of the next.
+func TestShellCollectDiscardsEarlierSteps(t *testing.T) {
+	fake := startFakeShellServer(t, "", "sw1> ", shellScript{
+		"show big":   {lines: []string{strings.Repeat("v", 600), "sw1> "}},
+		"show small": {lines: []string{"hostname sw1", "sw1> "}},
+	})
+	sess, err := newShellSession(cbShellClient(t, fake.addr), 1024, builtinPagerPatterns())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.close()
+	prompt := cbLearnPrompt(t, sess)
+	for i := range 2 {
+		if got := cbCollectOne(t, sess, "show big", prompt); len(got) < 600 {
+			t.Fatalf("collect %d = %d bytes, want the 600-byte line", i+1, len(got))
+		}
+	}
+	if got := cbCollectOne(t, sess, "show small", prompt); got != "hostname sw1\n" {
+		t.Fatalf("last collect = %q, want %q", got, "hostname sw1\n")
+	}
+}
+
 // TestShellFilterEraseDropsMarkers covers the real path: a bare-\r line
 // erase runs adjustMarkers and drops the marker range it cut through.
 func TestShellFilterEraseDropsMarkers(t *testing.T) {
@@ -419,8 +495,8 @@ func TestShellCollect(t *testing.T) {
 		},
 		{
 			name:   "config text matching a pager pattern is kept",
-			script: shellScript{"show running-config": {lines: []string{"description online 2-3", "sw1> "}}},
-			want:   "description online 2-3\n",
+			script: shellScript{"show running-config": {lines: []string{"description lines 2-3", "sw1> "}}},
+			want:   "description lines 2-3\n",
 		},
 	}
 	for _, tc := range cases {
@@ -536,6 +612,7 @@ func TestShellPrivilegedStep(t *testing.T) {
 		prompt         string
 		enablePassword string
 		wantErr        error
+		wantMsg        string // substring of the enable-failed message
 		wantPrivileged bool
 	}{
 		{
@@ -561,6 +638,7 @@ func TestShellPrivilegedStep(t *testing.T) {
 			prompt:         "sw1> ",
 			enablePassword: "s3cret",
 			wantErr:        errEnableFailed("x"),
+			wantMsg:        "refused the enable password",
 		},
 		{
 			name:           "no enable password supplied",
@@ -569,6 +647,7 @@ func TestShellPrivilegedStep(t *testing.T) {
 			prompt:         "sw1> ",
 			enablePassword: "",
 			wantErr:        errEnableFailed("x"),
+			wantMsg:        "does not carry",
 		},
 		{
 			name:           "mode changing step re-learns the prompt",
@@ -594,6 +673,9 @@ func TestShellPrivilegedStep(t *testing.T) {
 				}
 				if !isEnableFailed(err) {
 					t.Fatalf("error = %v (%T), want an enable-failed error", err, err)
+				}
+				if !strings.Contains(err.Error(), tc.wantMsg) {
+					t.Fatalf("error = %q, want it to mention %q", err, tc.wantMsg)
 				}
 				return
 			}
