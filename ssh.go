@@ -63,8 +63,11 @@ var sshResolve = func(ctx context.Context, addr string) (string, error) {
 // the transport stays usable; a device that dropped mid-export closes the
 // whole connection and the request fails. That is what separates a
 // RouterOS-style close that may succeed from a lost-connection close whose
-// partial output must not be stored as a good backup.
+// partial output must not be stored as a good backup. A nil client is dead.
 func sshClientAlive(c *ssh.Client) bool {
+	if c == nil {
+		return false
+	}
 	_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
 	return err == nil
 }
