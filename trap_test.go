@@ -163,6 +163,96 @@ func TestTrapToProtoV1(t *testing.T) {
 	}
 }
 
+func TestTrapToProtoV1AgentAddress(t *testing.T) {
+	// A relay forwards a device's v1 trap from its own address, so source_ip
+	// names the relay and only agent-addr names the device.
+	relay := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 162}
+	tests := []struct {
+		name    string
+		version gosnmp.SnmpVersion
+		pduType gosnmp.PDUType
+		agent   string
+		want    string
+	}{
+		{"relayed v1 trap keeps the device address", gosnmp.Version1, gosnmp.Trap, "192.0.2.20", "192.0.2.20"},
+		{"v1 unspecified address is empty", gosnmp.Version1, gosnmp.Trap, "0.0.0.0", ""},
+		{"v1 missing address is empty", gosnmp.Version1, gosnmp.Trap, "", ""},
+		{"v1 non-IPv4 address is empty", gosnmp.Version1, gosnmp.Trap, "2001:db8::1", ""},
+		{"v1 garbage address is empty", gosnmp.Version1, gosnmp.Trap, "not-an-ip", ""},
+		{"v2c ignores the v1 header field", gosnmp.Version2c, gosnmp.SNMPv2Trap, "192.0.2.20", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			packet := &gosnmp.SnmpPacket{
+				Version: tt.version,
+				PDUType: tt.pduType,
+				SnmpTrap: gosnmp.SnmpTrap{
+					Enterprise:   ".1.3.6.1.4.1.9",
+					AgentAddress: tt.agent,
+					GenericTrap:  2,
+				},
+			}
+
+			trap := trapToProto(packet, relay)
+
+			if trap.AgentAddress != tt.want {
+				t.Errorf("AgentAddress = %q, want %q", trap.AgentAddress, tt.want)
+			}
+			if trap.SourceIp != "198.51.100.7" {
+				t.Errorf("SourceIp = %q, want the relay address", trap.SourceIp)
+			}
+		})
+	}
+}
+
+func TestTrapListenerReceivesV1AgentAddress(t *testing.T) {
+	port := freeUDPPort(t)
+
+	l, err := startTrapListener("127.0.0.1", port, "public")
+	if err != nil {
+		t.Skipf("cannot bind trap port %d: %v", port, err)
+	}
+	defer l.Close()
+
+	sender := &gosnmp.GoSNMP{
+		Target:    "127.0.0.1",
+		Port:      port,
+		Transport: "udp",
+		Community: "public",
+		Version:   gosnmp.Version1,
+		Timeout:   2 * time.Second,
+		MaxOids:   gosnmp.MaxOids,
+	}
+	if err := sender.Connect(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = sender.Conn.Close() }()
+
+	if _, err := sender.SendTrap(gosnmp.SnmpTrap{
+		Enterprise:   ".1.3.6.1.4.1.9",
+		AgentAddress: "192.0.2.44",
+		GenericTrap:  2,
+		Timestamp:    100,
+		Variables: []gosnmp.SnmpPDU{
+			{Name: ".1.3.6.1.2.1.2.2.1.1.3", Type: gosnmp.Integer, Value: 3},
+		},
+	}); err != nil {
+		t.Fatalf("send trap: %v", err)
+	}
+
+	select {
+	case trap := <-l.Traps():
+		if trap.AgentAddress != "192.0.2.44" {
+			t.Errorf("AgentAddress = %q, want 192.0.2.44", trap.AgentAddress)
+		}
+		if trap.SourceIp != "127.0.0.1" {
+			t.Errorf("SourceIp = %q, want 127.0.0.1", trap.SourceIp)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the v1 trap")
+	}
+}
+
 func TestV1TrapOID(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -1284,4 +1374,171 @@ func TestTpTQueueFullDropsCoalesceUnderContention(t *testing.T) {
 		}
 	}
 	t.Fatalf("every one of %d concurrent drops warned in all %d rounds, want at least one drop coalesced", drops, rounds)
+}
+
+// tpTFastProbes shortens the probe cadence for one test.
+func tpTFastProbes(t *testing.T, interval time.Duration, misses int) {
+	t.Helper()
+	prevInterval, prevMisses := trapProbeInterval, trapProbeMisses
+	t.Cleanup(func() { trapProbeInterval, trapProbeMisses = prevInterval, prevMisses })
+	trapProbeInterval, trapProbeMisses = interval, misses
+}
+
+func TestTrapListenerHandleConsumesProbe(t *testing.T) {
+	for _, community := range []string{"", "secret"} {
+		t.Run("community filter "+strconv.Quote(community), func(t *testing.T) {
+			tl := &trapListener{traps: make(chan *pb.SnmpTrap, 1), community: community}
+			addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5003}
+
+			tl.handle(tpTV2cTrap(trapProbeNonce), addr)
+
+			if got := len(tl.traps); got != 0 {
+				t.Fatalf("queued %d traps, want the probe consumed", got)
+			}
+			if !tl.probeSeen.Load() {
+				t.Fatal("probe was not recorded")
+			}
+		})
+	}
+}
+
+func TestTrapListenerHandleForwardsForgedProbe(t *testing.T) {
+	tl := &trapListener{traps: make(chan *pb.SnmpTrap, 1)}
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5004}
+
+	tl.handle(tpTV2cTrap(trapProbeNonce+"x"), addr)
+
+	if got := len(tl.traps); got != 1 {
+		t.Fatalf("queued %d traps, want the forged probe forwarded as a trap", got)
+	}
+	if tl.probeSeen.Load() {
+		t.Fatal("forged probe was recorded as a probe")
+	}
+}
+
+func TestTrapProbeHost(t *testing.T) {
+	for in, want := range map[string]string{
+		"0.0.0.0":    "127.0.0.1",
+		"::":         "::1",
+		"127.0.0.1":  "127.0.0.1",
+		"192.0.2.9":  "192.0.2.9",
+		"2001:db8::": "2001:db8::",
+	} {
+		if got := trapProbeHost(net.ParseIP(in)); got != want {
+			t.Errorf("trapProbeHost(%s) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSendTrapProbeRejectsUnresolvableBindAddress(t *testing.T) {
+	if err := sendTrapProbe("bad host", 162); err == nil {
+		t.Fatal("sendTrapProbe succeeded for an unresolvable bind address")
+	}
+}
+
+func TestTrapListenerProbesKeepHealthyListener(t *testing.T) {
+	tpTFastProbes(t, 20*time.Millisecond, 3)
+	for _, bind := range []string{"127.0.0.1", "0.0.0.0"} {
+		t.Run(bind, func(t *testing.T) {
+			port := freeUDPPort(t)
+			l, err := startTrapListener(bind, port, "public")
+			if err != nil {
+				t.Skipf("cannot bind trap port %d: %v", port, err)
+			}
+			defer l.Close()
+			l.mu.Lock()
+			original := l.listener
+			l.mu.Unlock()
+
+			deadline := time.Now().Add(3 * time.Second)
+			for !l.probeWorks.Load() {
+				if time.Now().After(deadline) {
+					t.Fatal("no probe reached the listener")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			// Ten intervals is more than three misses' worth: a listener that
+			// kept receiving its probes must not have been restarted.
+			time.Sleep(10 * trapProbeInterval)
+
+			l.mu.Lock()
+			current := l.listener
+			l.mu.Unlock()
+			if current != original {
+				t.Fatal("healthy listener was restarted")
+			}
+			select {
+			case trap := <-l.Traps():
+				t.Fatalf("probe was forwarded as a trap: %v", trap)
+			default:
+			}
+		})
+	}
+}
+
+func TestTrapProbeClosesListenerThatStopsReceiving(t *testing.T) {
+	tpTFastProbes(t, 10*time.Millisecond, 3)
+	silenced := tpTWatchLog(t, "stopped receiving its own probes", 1)
+
+	// The listener's socket is on one port and the probes go to another, which
+	// is what a socket that has stopped delivering datagrams looks like.
+	listenPort := freeUDPPort(t)
+	tl := &trapListener{
+		traps:    make(chan *pb.SnmpTrap, 1),
+		closed:   make(chan struct{}),
+		bindAddr: "127.0.0.1",
+		port:     freeUDPPort(t),
+	}
+	tl.probeWorks.Store(true)
+	listener := tl.newListener()
+	done := make(chan struct{})
+	go func() {
+		_ = listener.Listen(net.JoinHostPort("127.0.0.1", strconv.Itoa(int(listenPort))))
+		close(done)
+	}()
+	select {
+	case <-listener.Listening():
+	case <-time.After(3 * time.Second):
+		t.Fatal("listener did not start")
+	}
+
+	probed := make(chan struct{})
+	go func() {
+		tl.probe(listener, done)
+		close(probed)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		listener.Close()
+		t.Fatal("probe never closed the silent listener")
+	}
+	select {
+	case <-probed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("probe goroutine did not stop")
+	}
+	select {
+	case <-silenced:
+	default:
+		t.Fatal("closing the silent listener was not logged")
+	}
+}
+
+func TestTrapProbeDisablesItselfWhenNoProbeEverArrives(t *testing.T) {
+	tpTFastProbes(t, time.Millisecond, 3)
+	disabled := tpTWatchLog(t, "health check disabled", 1)
+
+	// An unresolvable bind address makes every send fail, standing in for a
+	// firewall that drops loopback traffic to the trap port. No probe ever
+	// arrives, so the listener (nil here) must never be closed.
+	tl := &trapListener{bindAddr: "bad host", port: 162}
+	tl.probe(nil, make(chan struct{}))
+
+	select {
+	case <-disabled:
+	default:
+		t.Fatal("disabling the health check was not logged")
+	}
 }

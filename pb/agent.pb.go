@@ -3992,8 +3992,12 @@ type SnmpTrap struct {
 	SpecificTrap uint32 `protobuf:"varint,6,opt,name=specific_trap,json=specificTrap,proto3" json:"specific_trap,omitempty"` // SNMPv1 only
 	UptimeTicks  uint64 `protobuf:"varint,7,opt,name=uptime_ticks,json=uptimeTicks,proto3" json:"uptime_ticks,omitempty"`    // sysUpTime.0, hundredths of a second
 	// Keys carry no leading dot, as in SnmpResult.oid_values.
-	Varbinds      map[string]string `protobuf:"bytes,8,rep,name=varbinds,proto3" json:"varbinds,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Timestamp     int64             `protobuf:"varint,9,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	Varbinds  map[string]string `protobuf:"bytes,8,rep,name=varbinds,proto3" json:"varbinds,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Timestamp int64             `protobuf:"varint,9,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// SNMPv1 only: the PDU's agent-addr as dotted IPv4. Empty for v2c and
+	// when the PDU carries 0.0.0.0. Differs from source_ip when a relay
+	// forwarded the trap.
+	AgentAddress  string `protobuf:"bytes,10,opt,name=agent_address,json=agentAddress,proto3" json:"agent_address,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4089,6 +4093,13 @@ func (x *SnmpTrap) GetTimestamp() int64 {
 		return x.Timestamp
 	}
 	return 0
+}
+
+func (x *SnmpTrap) GetAgentAddress() string {
+	if x != nil {
+		return x.AgentAddress
+	}
+	return ""
 }
 
 var File_proto_agent_proto protoreflect.FileDescriptor
@@ -4432,7 +4443,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"L\n" +
 	"\x16MikrotikCommandFailure\x12\x18\n" +
 	"\acommand\x18\x01 \x01(\tR\acommand\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage\"\x86\x03\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\xab\x03\n" +
 	"\bSnmpTrap\x12\x1b\n" +
 	"\tsource_ip\x18\x01 \x01(\tR\bsourceIp\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x19\n" +
@@ -4444,7 +4455,9 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\rspecific_trap\x18\x06 \x01(\rR\fspecificTrap\x12!\n" +
 	"\fuptime_ticks\x18\a \x01(\x04R\vuptimeTicks\x12B\n" +
 	"\bvarbinds\x18\b \x03(\v2&.towerops.agent.SnmpTrap.VarbindsEntryR\bvarbinds\x12\x1c\n" +
-	"\ttimestamp\x18\t \x01(\x03R\ttimestamp\x1a;\n" +
+	"\ttimestamp\x18\t \x01(\x03R\ttimestamp\x12#\n" +
+	"\ragent_address\x18\n" +
+	" \x01(\tR\fagentAddress\x1a;\n" +
 	"\rVarbindsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01*\x84\x01\n" +
