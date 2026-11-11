@@ -494,7 +494,7 @@ func TestRunMainInvalidLogLevelWarnsAndUsesInfo(t *testing.T) {
 		if err := json.Unmarshal([]byte(line), &record); err != nil {
 			t.Fatalf("log line is not JSON: %q: %v", line, err)
 		}
-		if record["msg"] == "ignoring unrecognised log level" && record["value"] == "verbose" {
+		if record["msg"] == "ignoring unrecognized log level" && record["value"] == "verbose" {
 			foundWarning = true
 		}
 	}
@@ -541,7 +541,7 @@ func TestRunMainInvalidLogFormatWarnsAndUsesText(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read stderr: %v", err)
 	}
-	if !strings.Contains(string(output), "WARN ignoring unrecognised log format value=xml") {
+	if !strings.Contains(string(output), "WARN ignoring unrecognized log format value=xml") {
 		t.Fatalf("logs missing invalid-format warning:\n%s", output)
 	}
 }

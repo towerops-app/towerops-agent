@@ -104,10 +104,10 @@ func runMain(ctx context.Context, args []string) int {
 	format, validLogFormat := resolveLogFormat(*logFormat)
 	slog.SetDefault(slog.New(newLogHandler(os.Stderr, level, format)))
 	if !validLogLevel {
-		slog.Warn("ignoring unrecognised log level", "value", *logLevel)
+		slog.Warn("ignoring unrecognized log level", "value", *logLevel)
 	}
 	if !validLogFormat {
-		slog.Warn("ignoring unrecognised log format", "value", *logFormat)
+		slog.Warn("ignoring unrecognized log format", "value", *logFormat)
 	}
 
 	// Forget-and-exit runs without credentials: its only prerequisite is the

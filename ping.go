@@ -304,7 +304,7 @@ func (s *icmpSocket) readLoop() {
 // usable. On raw ICMP sockets the kernel reports a pending ICMP hard error
 // (sk_err) once on the next recvfrom - ECONNREFUSED, EHOSTUNREACH and the like
 // - which says nothing about the socket itself. A closed socket and anything
-// unrecognised are fatal, so sharedSocket opens a fresh one.
+// unrecognized are fatal, so sharedSocket opens a fresh one.
 func isTransientICMPReadError(err error) bool {
 	if errors.Is(err, net.ErrClosed) {
 		return false

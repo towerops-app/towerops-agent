@@ -1563,9 +1563,9 @@ func TestTpTPeerIPMapsAddrKinds(t *testing.T) {
 		{name: "udp addr", addr: &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 33434}, want: net.ParseIP("198.51.100.7")},
 		{name: "nil ip addr pointer", addr: (*net.IPAddr)(nil), want: nil},
 		{name: "nil udp addr pointer", addr: (*net.UDPAddr)(nil), want: nil},
-		{name: "tcp addr is unrecognised", addr: &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 80}, want: nil},
-		{name: "unix addr is unrecognised", addr: &net.UnixAddr{Name: "/tmp/sock", Net: "unix"}, want: nil},
-		{name: "custom addr is unrecognised", addr: tpTOpaqueAddr{}, want: nil},
+		{name: "tcp addr is unrecognized", addr: &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 80}, want: nil},
+		{name: "unix addr is unrecognized", addr: &net.UnixAddr{Name: "/tmp/sock", Net: "unix"}, want: nil},
+		{name: "custom addr is unrecognized", addr: tpTOpaqueAddr{}, want: nil},
 		{name: "nil addr", addr: nil, want: nil},
 	}
 
