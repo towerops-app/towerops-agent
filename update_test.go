@@ -63,9 +63,10 @@ func stageExecutable(t *testing.T) string {
 
 func forceBareBinaryUpdate(t *testing.T) {
 	t.Helper()
-	orig := runningInContainer
+	orig, origGOOS := runningInContainer, updateGOOS
 	runningInContainer = func() bool { return false }
-	t.Cleanup(func() { runningInContainer = orig })
+	updateGOOS = "linux"
+	t.Cleanup(func() { runningInContainer, updateGOOS = orig, origGOOS })
 }
 
 type cancelUpdateReader struct {
@@ -2279,5 +2280,213 @@ func TestSelfUpdateShutdownCancelWithFailedRestore(t *testing.T) {
 	}
 	if _, statErr := os.Stat(exePath + ".update-pending"); !os.IsNotExist(statErr) {
 		t.Error("update-pending marker survived the cancelled update")
+	}
+}
+
+// resetArmedUpdate clears the watchdog state checkPendingUpdate arms, so a
+// test that simulates a boot does not leak a live timer into the next test.
+func resetArmedUpdate(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		armedUpdate.Store(nil)
+		if timer := updateWatchdog.Swap(nil); timer != nil {
+			timer.Stop()
+		}
+	})
+}
+
+// Two updates in a row, with the first build proving itself by joining in
+// between: the second must not fail on the first update's backup link.
+func TestSelfUpdateTwiceInARow(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	resetArmedUpdate(t)
+	exePath := stageExecutable(t)
+	first := elfUpdateBodyForHost()
+	srv1, url1, sum1 := updateTestServer(t, first)
+	stubUpdateIO(t, srv1, exePath)
+
+	if err := selfUpdateContext(context.Background(), url1, sum1, "1.0.1"); err != nil {
+		t.Fatalf("first update: %v", err)
+	}
+	// The re-execd build boots and its session joins.
+	if checkPendingUpdate() == nil {
+		t.Fatal("first update left no pending marker")
+	}
+	updateJoined()
+	if _, err := os.Stat(exePath + ".prev"); !os.IsNotExist(err) {
+		t.Errorf("backup link survived the join that proved the build: %v", err)
+	}
+
+	second := append(elfUpdateBodyForHost(), "second build"...)
+	srv2, url2, sum2 := updateTestServer(t, second)
+	httpDo = srv2.Client().Do
+	if err := selfUpdateContext(context.Background(), url2, sum2, "1.0.2"); err != nil {
+		t.Fatalf("second update: %v", err)
+	}
+	if got, _ := os.ReadFile(exePath); string(got) != string(second) {
+		t.Error("second build is not installed at the executable path")
+	}
+	if got, _ := os.ReadFile(exePath + ".prev"); string(got) != string(first) {
+		t.Error("backup does not hold the first update's build")
+	}
+}
+
+// A backup left behind by an update that resolved without removing it (for
+// example a failed restore) must not block the next update.
+func TestSelfUpdateReplacesStaleBackup(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	srv, downloadURL, checksum := updateTestServer(t, elfUpdateBodyForHost())
+	exePath := stageExecutable(t)
+	stubUpdateIO(t, srv, exePath)
+	if err := os.WriteFile(exePath+".prev", []byte("stale backup"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3"); err != nil {
+		t.Fatalf("selfUpdateContext with a stale backup: %v", err)
+	}
+	if got, _ := os.ReadFile(exePath + ".prev"); string(got) != "previous binary" {
+		t.Errorf("backup = %q, want the build that was running", got)
+	}
+}
+
+// cancelActiveUpdate can run from the shutdown path at any moment, including
+// between beginUpdate publishing the handle and filling it in.
+func TestCancelActiveUpdateRacesBeginUpdate(t *testing.T) {
+	t.Cleanup(func() { currentUpdate.Store(nil) })
+	currentUpdate.Store(nil)
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				cancelActiveUpdate()
+			}
+		}
+	}()
+	for range 2000 {
+		if u := beginUpdate(context.Background()); u != nil {
+			u.finish()
+		}
+	}
+	close(stop)
+	<-done
+}
+
+// The marker must be on disk before the staged build lands: a crash between
+// the swap and a later marker write would boot the unproven build with no
+// rollback watchdog.
+func TestSelfUpdateWritesMarkerBeforeSwap(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	srv, downloadURL, checksum := updateTestServer(t, elfUpdateBodyForHost())
+	exePath := stageExecutable(t)
+	stubUpdateIO(t, srv, exePath)
+
+	markerAtSwap := false
+	osRename = func(oldpath, newpath string) error {
+		if newpath == exePath && oldpath != exePath+".prev" {
+			_, err := os.Stat(exePath + ".update-pending")
+			markerAtSwap = err == nil
+		}
+		return os.Rename(oldpath, newpath)
+	}
+
+	if err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3"); err != nil {
+		t.Fatalf("selfUpdateContext: %v", err)
+	}
+	if !markerAtSwap {
+		t.Error("update-pending marker was not on disk when the staged build landed")
+	}
+}
+
+// A failed staged rename leaves the running build in place, so the marker
+// written ahead of it must go too, or the next boot treats it as unproven.
+func TestSelfUpdateStagedRenameFailureRemovesMarker(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	srv, downloadURL, checksum := updateTestServer(t, elfUpdateBodyForHost())
+	exePath := stageExecutable(t)
+	stubUpdateIO(t, srv, exePath)
+	osRename = func(string, string) error { return errors.New("device busy") }
+
+	if err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3"); err == nil {
+		t.Fatal("selfUpdateContext succeeded despite the rename failure")
+	}
+	if _, err := os.Stat(exePath + ".update-pending"); !os.IsNotExist(err) {
+		t.Errorf("update-pending marker survived the failed staged rename: %v", err)
+	}
+}
+
+// Release builds are Linux ELF binaries. Any other host must refuse before
+// downloading, with an error that names the cause.
+func TestSelfUpdateRejectsNonLinuxBeforeDownload(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	origGOOS, origDo := updateGOOS, httpDo
+	t.Cleanup(func() { updateGOOS, httpDo = origGOOS, origDo })
+	updateGOOS = "darwin"
+	httpDo = func(*http.Request) (*http.Response, error) {
+		t.Error("update downloaded on an unsupported OS")
+		return nil, errors.New("unexpected download")
+	}
+
+	err := selfUpdateContext(context.Background(), "https://example.com/agent", strings.Repeat("a", 64), "1.2.3")
+	if !errors.Is(err, errSelfUpdateUnsupportedOS) {
+		t.Fatalf("selfUpdate error = %v, want %v", err, errSelfUpdateUnsupportedOS)
+	}
+	if !strings.Contains(err.Error(), "darwin") {
+		t.Errorf("error %q does not name the host OS", err)
+	}
+}
+
+// The success report carries the time the update was attempted, which the
+// marker records at swap time, and not the later join time.
+func TestUpdateJoinedReportsAttemptTime(t *testing.T) {
+	forceBareBinaryUpdate(t)
+	resetArmedUpdate(t)
+	srv, downloadURL, checksum := updateTestServer(t, elfUpdateBodyForHost())
+	exePath := stageExecutable(t)
+	stubUpdateIO(t, srv, exePath)
+	origNow := updateAttemptedAtUnix
+	t.Cleanup(func() { updateAttemptedAtUnix = origNow })
+
+	updateAttemptedAtUnix = func() time.Time { return time.Unix(1000, 0) }
+	if err := selfUpdateContext(context.Background(), downloadURL, checksum, "1.2.3"); err != nil {
+		t.Fatalf("selfUpdateContext: %v", err)
+	}
+	updateAttemptedAtUnix = func() time.Time { return time.Unix(5000, 0) }
+	if checkPendingUpdate() == nil {
+		t.Fatal("update left no pending marker")
+	}
+	updateJoined()
+
+	if res := readUpdateResult(); res == nil || res.AttemptedAt != 1000 {
+		t.Errorf("success result = %+v, want AttemptedAt 1000", res)
+	}
+}
+
+// A marker written by an older build has no attempt time; the join time is
+// the best remaining estimate.
+func TestUpdateJoinedFallsBackToJoinTime(t *testing.T) {
+	resetArmedUpdate(t)
+	origExe, origNow := osExecutable, updateAttemptedAtUnix
+	t.Cleanup(func() { osExecutable, updateAttemptedAtUnix = origExe, origNow })
+	exePath := stageExecutable(t)
+	osExecutable = func() (string, error) { return exePath, nil }
+	updateAttemptedAtUnix = func() time.Time { return time.Unix(5000, 0) }
+	if err := os.WriteFile(exePath+".update-pending", []byte(`{"version":"1.2.3","attempts":0}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if checkPendingUpdate() == nil {
+		t.Fatal("pending update was not armed")
+	}
+	updateJoined()
+
+	if res := readUpdateResult(); res == nil || res.AttemptedAt != 5000 {
+		t.Errorf("success result = %+v, want AttemptedAt 5000", res)
 	}
 }

@@ -70,9 +70,12 @@ const maxUpdateBootAttempts = 3
 
 // pendingUpdate is the marker file written beside the binary before re-exec.
 // It survives the exec, so the next boot knows it is running an unproven build.
+// AttemptedAt is the Unix time of the swap, reported on a successful join;
+// markers from older builds omit it.
 type pendingUpdate struct {
-	Version  string `json:"version"`
-	Attempts int    `json:"attempts"`
+	Version     string `json:"version"`
+	Attempts    int    `json:"attempts"`
+	AttemptedAt int64  `json:"attempted_at,omitempty"`
 }
 
 // updateResult is the outcome file the heartbeat reports to the server. It
@@ -222,8 +225,9 @@ func checkPendingUpdate() *pendingUpdate {
 }
 
 // updateJoined clears the pending state once a session join proves the new
-// build works: the watchdog is stopped, the marker removed, and success
-// recorded for the heartbeat. With nothing armed it is a no-op.
+// build works: the watchdog is stopped, the marker and the <exe>.prev
+// rollback target removed, and success recorded for the heartbeat. With
+// nothing armed it is a no-op.
 func updateJoined() {
 	p := armedUpdate.Swap(nil)
 	if p == nil {
@@ -235,7 +239,14 @@ func updateJoined() {
 	if path, err := pendingUpdatePath(); err == nil {
 		_ = os.Remove(path)
 	}
-	recordUpdateSuccess(p.Version, updateAttemptedAtUnix().Unix())
+	if exe, err := osExecutable(); err == nil {
+		_ = os.Remove(exe + ".prev")
+	}
+	attemptedAt := p.AttemptedAt
+	if attemptedAt == 0 {
+		attemptedAt = updateAttemptedAtUnix().Unix()
+	}
+	recordUpdateSuccess(p.Version, attemptedAt)
 	slog.Info("self-update verified: session joined", "version", p.Version)
 }
 
@@ -278,8 +289,8 @@ func rollbackUpdate(reason string) {
 // validateStagedBinary rejects a staged download that cannot execute here:
 // anything that is not a real ELF executable for this machine's architecture
 // must fail before the running binary is touched, not after (issue #2736).
-// Builds whose GOARCH has no ELF mapping (darwin test hosts run the binary
-// fine; the check matters for linux releases) skip the arch check only.
+// selfUpdateContext refuses non-Linux hosts first, so the ELF check always
+// applies. A GOARCH with no ELF mapping skips the arch check only.
 func validateStagedBinary(path, goarch string) error {
 	f, err := elfOpen(path)
 	if err != nil {
@@ -410,6 +421,15 @@ var errSelfUpdateIdleTimeout = errors.New("update download idle timeout")
 var errSelfUpdateInContainer = errors.New(
 	"self-update unsupported in this deployment: the agent runs in a container image; update by pulling a new image")
 
+// updateGOOS is the host OS, a var so tests on any host can exercise both
+// the supported and the refused path.
+var updateGOOS = runtime.GOOS
+
+// errSelfUpdateUnsupportedOS refuses self-update off Linux. Releases ship
+// only Linux ELF binaries: on another OS a native build fails the ELF check
+// and a Linux build fails exec.
+var errSelfUpdateUnsupportedOS = errors.New("self-update unsupported on this OS: releases are Linux binaries only")
+
 type updateIdleReader struct {
 	reader  io.Reader
 	timer   *time.Timer
@@ -451,11 +471,14 @@ var errUpdateShutdown = errors.New("update canceled by shutdown")
 // returns its coordination handle. It returns nil when an update is already
 // running, which the caller reports as a duplicate.
 func beginUpdate(ctx context.Context) *activeUpdate {
+	// The handle is complete before the CompareAndSwap publishes it:
+	// cancelActiveUpdate may Load it from the shutdown path at any moment.
 	u := &activeUpdate{done: make(chan struct{})}
+	u.ctx, u.cancel = context.WithCancelCause(context.WithoutCancel(ctx))
 	if !currentUpdate.CompareAndSwap(nil, u) {
+		u.cancel(context.Canceled)
 		return nil
 	}
-	u.ctx, u.cancel = context.WithCancelCause(context.WithoutCancel(ctx))
 	return u
 }
 
@@ -508,6 +531,9 @@ func waitActiveUpdate(budget time.Duration) {
 func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum, version string) error {
 	if runningInContainer() {
 		return errSelfUpdateInContainer
+	}
+	if updateGOOS != "linux" {
+		return fmt.Errorf("%w (host is %s)", errSelfUpdateUnsupportedOS, updateGOOS)
 	}
 
 	u, err := url.Parse(downloadURL)
@@ -628,27 +654,36 @@ func selfUpdateContext(ctx context.Context, downloadURL, expectedChecksum, versi
 	// link is what makes the window safe: until the rename lands, the old
 	// binary is still at the executable path, so a crash mid-swap — or a
 	// restore that fails below — can never leave nothing to run.
+	// A leftover <exe>.prev belongs to an update that already resolved:
+	// updateJoined runs on every join before any update message is
+	// handled, so no armed rollback still needs it, and os.Link fails with
+	// EEXIST while it exists.
 	prevExe := currentExe + ".prev"
+	_ = os.Remove(prevExe)
 	if err := osLink(currentExe, prevExe); err != nil {
 		return fmt.Errorf("backup current binary: %w", err)
 	}
-	if err := osRename(tempPath, currentExe); err != nil {
-		// The staged build never landed, so the running one is still in
-		// place at the executable path; only the link needs to go.
-		_ = os.Remove(prevExe)
-		return fmt.Errorf("rename new binary: %w", err)
-	}
-	slog.Warn("replaced binary does not inherit file capabilities granted with setcap", "path", currentExe)
 
+	// The marker goes down before the swap. Written after it, a crash
+	// between the two would boot the unproven build with no watchdog.
 	markerPath, err := pendingUpdatePath()
 	if err != nil {
 		markerPath = currentExe + ".update-pending"
 	}
-	marker := pendingUpdate{Version: version, Attempts: 0}
+	marker := pendingUpdate{Version: version, Attempts: 0, AttemptedAt: updateAttemptedAtUnix().Unix()}
 	if err := os.WriteFile(markerPath, mustJSON(marker), 0600); err != nil {
 		slog.Warn("cannot write update-pending marker; a bad build cannot self-recover",
 			"path", markerPath, "error", err)
 	}
+
+	if err := osRename(tempPath, currentExe); err != nil {
+		// The staged build never landed, so the running one is still in
+		// place at the executable path; only the link and marker go.
+		_ = os.Remove(prevExe)
+		_ = os.Remove(markerPath)
+		return fmt.Errorf("rename new binary: %w", err)
+	}
+	slog.Warn("replaced binary does not inherit file capabilities granted with setcap", "path", currentExe)
 
 	if err := syncDirectory(filepath.Dir(currentExe)); err != nil {
 		// The new binary is installed but not proven durable on disk. Restore
