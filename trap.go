@@ -72,17 +72,6 @@ const (
 	trapStateFailed
 )
 
-func setTrapListenerState(state string) {
-	switch state {
-	case "listening":
-		trapListenerState.Store(trapStateListening)
-	case "failed":
-		trapListenerState.Store(trapStateFailed)
-	default:
-		trapListenerState.Store(trapStateUnset)
-	}
-}
-
 func trapListenerStateString() string {
 	switch trapListenerState.Load() {
 	case trapStateListening:
@@ -157,11 +146,11 @@ func startTrapListener(bindAddr string, port uint16, community string) (*trapLis
 
 	select {
 	case <-t.ready:
-		setTrapListenerState("listening")
+		trapListenerState.Store(trapStateListening)
 		slog.Info("snmp trap listener started", "bind_address", bindAddr, "port", port, "community_filter", community != "")
 		return t, nil
 	case err := <-errCh:
-		setTrapListenerState("failed")
+		trapListenerState.Store(trapStateFailed)
 		t.Close()
 		return nil, fmt.Errorf("bind trap port %d: %w", port, err)
 	}
@@ -224,7 +213,7 @@ func (t *trapListener) serve(listener *gosnmp.TrapListener, done chan struct{}, 
 		go func(currentReady <-chan struct{}) {
 			select {
 			case <-currentReady:
-				setTrapListenerState("listening")
+				trapListenerState.Store(trapStateListening)
 				slog.Info("snmp trap listener rebound", "port", t.port)
 			case <-t.closed:
 			}
@@ -279,6 +268,13 @@ func (t *trapListener) handle(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) {
 		slog.Debug("dropping trap with unexpected community", "source", addr.IP.String())
 		return
 	}
+	if packet.PDUType == gosnmp.Trap && (packet.GenericTrap < 0 || packet.GenericTrap > genericEnterpriseSpecific) {
+		// RFC 1157 bounds generic-trap to 0..6. Out of range it has no trap
+		// OID, and a negative value would wrap to 4294967295 in the uint32
+		// field, which the server rejects.
+		slog.Debug("dropping v1 trap with out-of-range generic trap", "source", addr.IP.String(), "generic_trap", packet.GenericTrap)
+		return
+	}
 
 	trap := trapToProto(packet, addr)
 	select {
@@ -321,7 +317,7 @@ func trapToProto(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) *pb.SnmpTrap {
 
 	if packet.PDUType == gosnmp.Trap {
 		trap.Enterprise = trimOID(packet.Enterprise)
-		trap.GenericTrap = uint32(packet.GenericTrap)   //nolint:gosec // 0-6 per RFC 1157
+		trap.GenericTrap = uint32(packet.GenericTrap)   //nolint:gosec // handle drops values outside 0-6
 		trap.SpecificTrap = uint32(packet.SpecificTrap) //nolint:gosec // device-supplied trap number
 		trap.UptimeTicks = uint64(packet.Timestamp)
 		trap.TrapOid = v1TrapOID(trap.Enterprise, packet.GenericTrap, packet.SpecificTrap)

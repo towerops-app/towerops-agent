@@ -429,6 +429,28 @@ func TestTrapListenerHandle(t *testing.T) {
 			t.Errorf("dropped = %d, want 0", got)
 		}
 	})
+
+	// RFC 1157 bounds generic-trap to 0..6. An out-of-range value would ship
+	// as a wrapped uint32 with no trap OID, which the server rejects.
+	for _, generic := range []int{-1, 7} {
+		t.Run(fmt.Sprintf("v1 generic trap %d is dropped", generic), func(t *testing.T) {
+			l := &trapListener{traps: make(chan *pb.SnmpTrap, 1)}
+			l.handle(&gosnmp.SnmpPacket{
+				Version: gosnmp.Version1,
+				PDUType: gosnmp.Trap,
+				SnmpTrap: gosnmp.SnmpTrap{
+					Enterprise:  ".1.3.6.1.4.1.9",
+					GenericTrap: generic,
+				},
+			}, addr)
+			if len(l.traps) != 0 {
+				t.Errorf("queued %d traps, want 0", len(l.traps))
+			}
+			if got := l.dropped.Load(); got != 0 {
+				t.Errorf("dropped = %d, want 0 (malformed, not queue-full)", got)
+			}
+		})
+	}
 }
 
 // freeUDPPort reserves and immediately releases an ephemeral UDP port so the

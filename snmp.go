@@ -269,9 +269,31 @@ const defaultMaxResultBytes = 8 << 20
 const maxResultOIDValues = 50_000
 
 // maxResultPayloadHeadroom covers the channelMsg JSON envelope around the
-// base64 payload and the frame metadata fields (completed_roots, sequence,
-// flags) that oidEntrySize does not account for.
+// base64 payload and the scalar frame fields (ids, sequence, flags) that
+// oidEntrySize does not account for. rootListsReserve covers the root lists.
 const maxResultPayloadHeadroom = 4096
+
+// rootListsReserve bounds the encoded completed_roots and truncated_roots of
+// any one frame. A walk label appears at most once in a frame's
+// completed_roots and once in the truncated_roots every frame carries; the
+// shared GET bucket can only appear in truncated_roots, as its sentinel.
+func rootListsReserve(buckets []snmpResultBucket) int64 {
+	var reserve int64
+	for _, bucket := range buckets {
+		if bucket.label == "" {
+			reserve += repeatedStringSize(getBucketTruncatedLabel)
+			continue
+		}
+		reserve += 2 * repeatedStringSize(bucket.label)
+	}
+	return reserve
+}
+
+// repeatedStringSize is the encoded size of one element of a repeated
+// string field numbered below 16: a one-byte tag, the length, the bytes.
+func repeatedStringSize(s string) int64 {
+	return int64(1 + varintLen(len(s)) + len(s))
+}
 
 // snmpResultBucket groups the OID values collected under one walk root. The
 // empty label is the shared GET bucket. completed marks roots whose walk
@@ -304,7 +326,7 @@ func buildSnmpResultFrames(
 	}
 	// The bound applies to the base64 payload; keep the decoded protobuf
 	// under three quarters of it, minus the envelope/metadata headroom.
-	maxDecoded := maxPayload*3/4 - maxResultPayloadHeadroom
+	maxDecoded := maxPayload*3/4 - maxResultPayloadHeadroom - rootListsReserve(buckets)
 	if maxDecoded < 1024 {
 		maxDecoded = 1024
 	}
@@ -507,6 +529,11 @@ requestLoop:
 		if err != nil {
 			return results, err
 		}
+		// Only the first GETNEXT/GETBULK of the root can reveal a leaf root.
+		// It answers beyond the root, or with end-of-view (v1: noSuchName)
+		// when the leaf is the last object in the device's MIB view. Either
+		// way fall back to one exact GET (gosnmp issues #78, #93).
+		firstRequest := !exactGet && oid == root
 
 		switch packet.Error {
 		case gosnmp.NoError:
@@ -514,6 +541,10 @@ requestLoop:
 			if v1 {
 				// Normal end of the MIB for a v1 GETNEXT walk: never
 				// consume the echoed varbinds of an error response.
+				if firstRequest {
+					exactGet = true
+					continue requestLoop
+				}
 				return results, nil
 			}
 			return results, fmt.Errorf("device answered %v (error index %d) for %s", packet.Error, packet.ErrorIndex, canonicalOID(oid))
@@ -527,6 +558,10 @@ requestLoop:
 		for i, pdu := range packet.Variables {
 			switch pdu.Type {
 			case gosnmp.EndOfMibView, gosnmp.NoSuchObject, gosnmp.NoSuchInstance:
+				if firstRequest && i == 0 {
+					exactGet = true
+					continue requestLoop
+				}
 				// The subtree is exhausted (or the root itself is absent):
 				// a clean end, not a failure.
 				return results, nil
@@ -536,12 +571,10 @@ requestLoop:
 					// The requested root itself was answered: a leaf walk.
 					results = append(results, pdu)
 				}
-				if !exactGet && oid == root && i == 0 {
-					// The first GETNEXT/GETBULK answered beyond the root, so
-					// the root names a leaf those requests cannot discover.
-					// Fall back to one exact GET (gosnmp issues #78, #93).
+				if firstRequest && i == 0 {
+					// The first answer escaped the subtree: the root names a
+					// leaf GETNEXT/GETBULK cannot discover.
 					exactGet = true
-					oid = root
 					continue requestLoop
 				}
 				return results, nil
@@ -612,6 +645,9 @@ func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[s
 				}
 				into[canonicalOID(v.Name)] = snmpValueToString(v)
 			}
+			if len(result.Variables) < len(oids) {
+				absent += recordOmittedOIDs(result.Variables, oids, into)
+			}
 			return absent, nil
 		case gosnmp.NoSuchName, gosnmp.TooBig:
 			if result.Error == gosnmp.NoSuchName && isSnmpV1(dev.Version) &&
@@ -652,6 +688,27 @@ func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[s
 	return absent, nil
 }
 
+// recordOmittedOIDs records as absent every requested OID a NoError reply
+// left out of its varbind list, and returns how many it recorded. The
+// device answered the request, so the OID reads "collected, empty".
+func recordOmittedOIDs(answered []gosnmp.SnmpPDU, requested []string, into map[string]string) int {
+	names := make(map[string]struct{}, len(answered))
+	for _, v := range answered {
+		names[canonicalOID(v.Name)] = struct{}{}
+	}
+	omitted := 0
+	for _, oid := range requested {
+		key := canonicalOID(oid)
+		if _, ok := names[key]; ok {
+			continue
+		}
+		names[key] = struct{}{}
+		into[key] = ""
+		omitted++
+	}
+	return omitted
+}
+
 func snmpValueUsable(pdu gosnmp.SnmpPDU) bool {
 	return pdu.Type != gosnmp.Null &&
 		pdu.Type != gosnmp.NoSuchObject &&
@@ -688,133 +745,64 @@ func truncateBytes(s string, n int) string {
 	return s[:n]
 }
 
-// sleepContext waits for d or returns early when ctx is cancelled.
-func sleepContext(ctx context.Context, d time.Duration) bool {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
-}
-
 // executeCredentialTest tests SNMP credentials by reading the system group.
 func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
-	dev := job.SnmpDevice
-	if dev == nil {
+	result := &pb.CredentialTestResult{TestId: job.JobId}
+	if job.SnmpDevice == nil {
 		slog.Error("job missing snmp device", "job_id", job.JobId)
-		result := &pb.CredentialTestResult{
-			TestId:       job.JobId,
-			Success:      false,
-			ErrorMessage: "missing device configuration",
-			Timestamp:    time.Now().Unix(),
-		}
-		slog.Info("credential test complete", "test_id", result.TestId, "success", result.Success)
-		sendResult(ctx, out, "credential_test_result", result, job.JobId)
-		return
+		result.ErrorMessage = "missing device configuration"
+	} else if values, err := readSystemGroup(ctx, job, "SNMP test failed"); err != nil {
+		result.ErrorMessage = err.Error()
+	} else {
+		// A successful GET proves the credentials work even when the system
+		// values are unavailable.
+		result.Success = true
+		result.SystemDescription = truncateBytes(values[oidSysDescr], probeMaxDescrBytes)
+		result.SysObjectId = truncateBytes(values[oidSysObjectID], probeMaxOIDBytes)
+		result.SysName = truncateBytes(values[oidSysName], probeMaxNameBytes)
 	}
-
-	conn, closeFn, err := snmpDial(ctx, job)
-	timestamp := time.Now().Unix()
-
-	if err != nil {
-		result := &pb.CredentialTestResult{
-			TestId:       job.JobId,
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("connection failed: %v", err),
-			Timestamp:    timestamp,
-		}
-		slog.Info("credential test complete", "test_id", result.TestId, "success", result.Success)
-		sendResult(ctx, out, "credential_test_result", result, job.JobId)
-		return
-	}
-	defer closeOnCancellation(ctx, closeFn)()
-
-	// Prove the credential with sysDescr.0 alone: under SNMPv1 one missing
-	// object fails the whole PDU with noSuchName, so bundling the identity
-	// OIDs here would report a working credential as failed.
-	packet, err := conn.Get([]string{oidSysDescr})
-	if err != nil {
-		result := &pb.CredentialTestResult{
-			TestId:       job.JobId,
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("SNMP test failed: %v", err),
-			Timestamp:    timestamp,
-		}
-		slog.Info("credential test complete", "test_id", result.TestId, "success", result.Success)
-		sendResult(ctx, out, "credential_test_result", result, job.JobId)
-		return
-	}
-
-	if packet.Error != gosnmp.NoError {
-		result := &pb.CredentialTestResult{
-			TestId:       job.JobId,
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("SNMP test failed: status %v (error index %d)", packet.Error, packet.ErrorIndex),
-			Timestamp:    timestamp,
-		}
-		slog.Info("credential test complete", "test_id", result.TestId, "success", result.Success)
-		sendResult(ctx, out, "credential_test_result", result, job.JobId)
-		return
-	}
-
-	values := systemValues(packet)
-
-	// Best effort: sysObjectID/sysName enrich the result for device
-	// identification but their absence never fails the credential proof.
-	// snmpGetInto recovers supported instances from noSuchName responses,
-	// so a device missing sysName still yields its sysObjectID.
-	_, _ = snmpGetInto(conn, dev, []string{oidSysObjectID, oidSysName}, values)
-	// A successful GET proves the credentials work even when the system
-	// values are unavailable.
-	result := &pb.CredentialTestResult{
-		TestId:            job.JobId,
-		Success:           true,
-		SystemDescription: truncateBytes(values[oidSysDescr], probeMaxDescrBytes),
-		SysObjectId:       truncateBytes(canonicalOID(values[oidSysObjectID]), probeMaxOIDBytes),
-		SysName:           truncateBytes(values[oidSysName], probeMaxNameBytes),
-		Timestamp:         timestamp,
-	}
+	result.Timestamp = time.Now().Unix()
 	slog.Info("credential test complete", "test_id", result.TestId, "success", result.Success)
 	sendResult(ctx, out, "credential_test_result", result, job.JobId)
 }
 
 // probeCandidate performs one probe attempt: dial the candidate and prove
-// the credential with a sysDescr.0 GET within the attempt timeout. The
-// timeout bounds the whole exchange, including gosnmp's own retries.
+// the credential within the attempt timeout. The timeout bounds the whole
+// exchange, including gosnmp's own retries.
+func probeCandidate(ctx context.Context, dev *pb.SnmpDevice, timeout time.Duration) (map[string]string, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return readSystemGroup(attemptCtx, &pb.AgentJob{SnmpDevice: dev}, "SNMP probe failed")
+}
+
+// readSystemGroup dials the job's device and proves the credential with a
+// sysDescr.0 GET. failure prefixes the error of a proof GET that fails or
+// answers an error status; a dial error reads "connection failed".
 //
 // The proof GET asks for sysDescr.0 alone: under SNMPv1 a single missing
 // object fails the whole PDU with noSuchName, so bundling the identity
 // OIDs into the proof would report a working credential as failed. The
-// sysObjectID/sysName GET is a second, best-effort exchange — its failure
-// yields empty identity values, not a rejected credential.
-func probeCandidate(ctx context.Context, dev *pb.SnmpDevice, timeout time.Duration) (map[string]string, error) {
-	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	conn, closeFn, err := snmpDial(attemptCtx, &pb.AgentJob{SnmpDevice: dev})
+// sysObjectID/sysName GET is a second, best-effort exchange: its failure
+// yields empty identity values, not a rejected credential. snmpGetInto
+// recovers supported instances from noSuchName responses, so a device
+// missing sysName still yields its sysObjectID.
+func readSystemGroup(ctx context.Context, job *pb.AgentJob, failure string) (map[string]string, error) {
+	conn, closeFn, err := snmpDial(ctx, job)
 	if err != nil {
 		return nil, fmt.Errorf("connection failed: %w", err)
 	}
-	defer closeOnCancellation(attemptCtx, closeFn)()
+	defer closeOnCancellation(ctx, closeFn)()
 
 	packet, err := conn.Get([]string{oidSysDescr})
 	if err != nil {
-		return nil, fmt.Errorf("SNMP probe failed: %w", err)
+		return nil, fmt.Errorf("%s: %w", failure, err)
 	}
 	if packet.Error != gosnmp.NoError {
-		return nil, fmt.Errorf("SNMP probe failed: status %v (error index %d)", packet.Error, packet.ErrorIndex)
+		return nil, fmt.Errorf("%s: status %v (error index %d)", failure, packet.Error, packet.ErrorIndex)
 	}
 
 	values := systemValues(packet)
-
-	// Best effort: identity OIDs enrich the result but never fail the
-	// proof. snmpGetInto recovers supported instances from noSuchName
-	// responses, so a device missing sysName still yields its sysObjectID.
-	_, _ = snmpGetInto(conn, dev, []string{oidSysObjectID, oidSysName}, values)
-
+	_, _ = snmpGetInto(conn, job.SnmpDevice, []string{oidSysObjectID, oidSysName}, values)
 	return values, nil
 }
 
@@ -857,8 +845,12 @@ func executeCredentialProbe(ctx context.Context, job *pb.AgentJob, out *resultQu
 			if ctx.Err() != nil {
 				return
 			}
-			if !first && !sleepContext(ctx, delay) {
-				return
+			if !first {
+				// jitterDispatch returns early on cancellation.
+				jitterDispatch(ctx, delay)
+				if ctx.Err() != nil {
+					return
+				}
 			}
 			first = false
 
@@ -877,7 +869,7 @@ func executeCredentialProbe(ctx context.Context, job *pb.AgentJob, out *resultQu
 			// when the probe keeps validating the rest of the list.
 			if !matched {
 				result.MatchedIndex = int32(i)
-				result.SysObjectId = truncateBytes(canonicalOID(values[oidSysObjectID]), probeMaxOIDBytes)
+				result.SysObjectId = truncateBytes(values[oidSysObjectID], probeMaxOIDBytes)
 				result.SysDescr = truncateBytes(values[oidSysDescr], probeMaxDescrBytes)
 				result.SysName = truncateBytes(values[oidSysName], probeMaxNameBytes)
 				result.ErrorMessage = ""
@@ -961,8 +953,13 @@ func newSnmpConn(ctx context.Context, dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error
 			conn.MsgFlags = gosnmp.AuthNoPriv
 			usmParams.AuthenticationPassphrase = dev.V3AuthPassword
 			usmParams.AuthenticationProtocol = authProtocol
-		default: // noAuthNoPriv
+		case "noAuthNoPriv", "":
+			// The server sends "" for a credential with no stored level.
 			conn.MsgFlags = gosnmp.NoAuthNoPriv
+		default:
+			// A misspelled level must not fall through to unauthenticated
+			// requests for a credential meant to authenticate.
+			return nil, fmt.Errorf("unsupported SNMPv3 security level %q", dev.V3SecurityLevel)
 		}
 
 		conn.SecurityParameters = usmParams
@@ -1043,7 +1040,9 @@ func snmpValueToString(pdu gosnmp.SnmpPDU) string {
 	case gosnmp.ObjectIdentifier:
 		switch value := pdu.Value.(type) {
 		case string:
-			return value
+			// gosnmp decodes OID values with a leading dot; every other OID
+			// the agent reports (keys, probe sysObjectID) carries none.
+			return canonicalOID(value)
 		case []byte:
 			return formatHex(value)
 		default:
