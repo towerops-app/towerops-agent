@@ -4,6 +4,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"log/slog"
 	"net"
@@ -44,6 +45,20 @@ const (
 // inline in gosnmp's read loop, so warning on every drop during a burst would
 // itself slow the reader down and make the loss worse.
 var trapDropLogInterval = time.Minute
+
+// The listener health probe. gosnmp's read loop logs and retries every read
+// error and returns only after Close, so serve's rebind never runs for a
+// socket that has stopped delivering datagrams. The agent sends itself a
+// trap every trapProbeInterval and closes the listener after trapProbeMisses
+// probes in a row fail to arrive, which hands control back to serve.
+var (
+	trapProbeInterval = 30 * time.Second
+	trapProbeMisses   = 3
+	// trapProbeNonce is the community string that marks a probe. It is random
+	// per process, so a packet from anywhere else cannot pass as a probe and
+	// hide itself from the server.
+	trapProbeNonce = "towerops-probe-" + rand.Text()
+)
 
 // Process-wide trap listener telemetry for the heartbeat (issue 2754). The
 // session does not know the listener exists, so the state lives here: one
@@ -116,6 +131,10 @@ type trapListener struct {
 	lastDropLog atomic.Int64
 	closed      chan struct{}
 	port        uint16
+	// probeSeen is set by handle when a probe arrives and cleared by probe
+	// on each check. probeWorks records that any probe ever arrived.
+	probeSeen  atomic.Bool
+	probeWorks atomic.Bool
 }
 
 // startTrapListener binds the trap port and serves until Close is called.
@@ -137,17 +156,20 @@ func startTrapListener(bindAddr string, port uint16, community string) (*trapLis
 		port:      port,
 	}
 
-	t.listener = t.newListener()
-	t.done = make(chan struct{})
-	t.ready = trapReady(t.listener, t.done)
+	listener := t.newListener()
+	done := make(chan struct{})
+	t.listener = listener
+	t.done = done
+	t.ready = trapReady(listener, done)
 
 	errCh := make(chan error, 1)
-	go t.serve(t.listener, t.done, errCh)
+	go t.serve(listener, done, errCh)
 
 	select {
 	case <-t.ready:
 		trapListenerState.Store(trapStateListening)
 		slog.Info("snmp trap listener started", "bind_address", bindAddr, "port", port, "community_filter", community != "")
+		go t.probe(listener, done)
 		return t, nil
 	case err := <-errCh:
 		trapListenerState.Store(trapStateFailed)
@@ -210,14 +232,15 @@ func (t *trapListener) serve(listener *gosnmp.TrapListener, done chan struct{}, 
 			t.done = done
 			t.mu.Unlock()
 		}
-		go func(currentReady <-chan struct{}) {
+		go func(currentReady <-chan struct{}, current *gosnmp.TrapListener, currentDone <-chan struct{}) {
 			select {
 			case <-currentReady:
 				trapListenerState.Store(trapStateListening)
 				slog.Info("snmp trap listener rebound", "port", t.port)
+				t.probe(current, currentDone)
 			case <-t.closed:
 			}
-		}(ready)
+		}(ready, listener, done)
 	}
 }
 
@@ -231,6 +254,87 @@ func trapReady(listener *gosnmp.TrapListener, done <-chan struct{}) <-chan struc
 		}
 	}()
 	return ready
+}
+
+// probe sends a probe trap to listener every trapProbeInterval and closes it
+// after trapProbeMisses consecutive probes fail to arrive. It returns when
+// listener's serve iteration ends (done) or after it closes the listener.
+//
+// If no probe has ever arrived, the probe path itself is blocked (a host
+// firewall dropping loopback traffic to the trap port, say). Closing would
+// then restart a working listener every few intervals, so probe stops instead.
+func (t *trapListener) probe(listener *gosnmp.TrapListener, done <-chan struct{}) {
+	ticker := time.NewTicker(trapProbeInterval)
+	defer ticker.Stop()
+	t.probeSeen.Store(false)
+	misses := 0
+	for {
+		if err := sendTrapProbe(t.bindAddr, t.port); err != nil {
+			slog.Debug("snmp trap probe send failed", "error", err)
+		}
+		select {
+		case <-ticker.C:
+		case <-done:
+			return
+		}
+		if t.probeSeen.Swap(false) {
+			t.probeWorks.Store(true)
+			misses = 0
+			continue
+		}
+		misses++
+		if misses < trapProbeMisses {
+			continue
+		}
+		if !t.probeWorks.Load() {
+			slog.Warn("snmp trap probe never arrived; listener health check disabled",
+				"bind_address", t.bindAddr, "port", t.port)
+			return
+		}
+		slog.Error("snmp trap listener stopped receiving its own probes; restarting",
+			"port", t.port, "missed", misses)
+		listener.Close()
+		return
+	}
+}
+
+// sendTrapProbe sends one v2c trap carrying trapProbeNonce to the listener's
+// bound address. It resolves the address the way gosnmp's listener does, so a
+// hostname that maps to both families probes the family that was bound.
+func sendTrapProbe(bindAddr string, port uint16) error {
+	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(bindAddr, strconv.Itoa(int(port))))
+	if err != nil {
+		return err
+	}
+	sender := &gosnmp.GoSNMP{
+		Target:    trapProbeHost(addr.IP),
+		Port:      port,
+		Transport: "udp",
+		Community: trapProbeNonce,
+		Version:   gosnmp.Version2c,
+		Timeout:   time.Second,
+		MaxOids:   gosnmp.MaxOids,
+	}
+	if err = sender.Connect(); err == nil {
+		_, err = sender.SendTrap(gosnmp.SnmpTrap{Variables: []gosnmp.SnmpPDU{
+			// zeroDotZero: the probe identifies itself by community alone.
+			{Name: oidSnmpTrapOID, Type: gosnmp.ObjectIdentifier, Value: "0.0"},
+		}})
+		_ = sender.Conn.Close()
+	}
+	return err
+}
+
+// trapProbeHost maps a wildcard bind address to the loopback address of the
+// same family, which the wildcard socket also receives on.
+func trapProbeHost(ip net.IP) string {
+	if !ip.IsUnspecified() {
+		return ip.String()
+	}
+	if ip.To4() != nil {
+		return "127.0.0.1"
+	}
+	return "::1"
 }
 
 // Close stops the listener. Safe to call from any goroutine.
@@ -262,6 +366,11 @@ func (t *trapListener) Traps() <-chan *pb.SnmpTrap {
 // blocking here drops traps in the kernel buffer.
 func (t *trapListener) handle(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) {
 	if packet == nil || addr == nil {
+		return
+	}
+	if packet.Community == trapProbeNonce {
+		// Our own health probe: proof the socket still delivers, never a trap.
+		t.probeSeen.Store(true)
 		return
 	}
 	if t.community != "" && packet.Community != t.community {
