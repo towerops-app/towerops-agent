@@ -578,4 +578,8 @@ message SnmpTrap {
   // Keys carry no leading dot, as in SnmpResult.oid_values.
   map<string, string> varbinds = 8;
   int64 timestamp = 9;
+  // SNMPv1 only: the PDU's agent-addr as dotted IPv4. Empty for v2c and
+  // when the PDU carries 0.0.0.0. Differs from source_ip when a relay
+  // forwarded the trap.
+  string agent_address = 10;
 }
