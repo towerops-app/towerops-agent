@@ -89,6 +89,13 @@ rather than vulnerabilities:
   alongside it. An operator who does not want that can run the binary from a
   directory the agent cannot write to, which is how the published image is
   built.
+- Update integrity rests on that server-supplied SHA-256 alone. Releases
+  carry no signature, and the agent holds no release signing key. The URL
+  and the digest arrive on the same authenticated channel, so the digest
+  detects a corrupted or truncated download. It does not protect against a
+  compromised server, which can supply a binary of its choice together with
+  that binary's matching digest. Self-update runs only on Linux hosts outside a
+  container.
 - Credentials the operator configures for polling (SNMP communities, SSH
   keys) are readable by the agent process. That is what they are for.
 
