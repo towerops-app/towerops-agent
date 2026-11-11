@@ -712,7 +712,7 @@ func TestCliTRunMainTrapListenerBindFailure(t *testing.T) {
 	// route that can surface it. The agent keeps running, marks the
 	// listener "failed" for the next heartbeat, and would rebind on a
 	// later drop.
-	setTrapListenerState("")
+	trapListenerState.Store(trapStateUnset)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan int, 1)

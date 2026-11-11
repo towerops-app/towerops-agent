@@ -321,6 +321,11 @@ func TestSnmpValueToString(t *testing.T) {
 			want: "1.3.6.1.2.1.1.1.0",
 		},
 		{
+			name: "oid with gosnmp leading dot",
+			pdu:  gosnmp.SnmpPDU{Type: gosnmp.ObjectIdentifier, Value: ".1.3.6.1.4.1.14988.1"},
+			want: "1.3.6.1.4.1.14988.1",
+		},
+		{
 			name: "oid bytes",
 			pdu:  gosnmp.SnmpPDU{Type: gosnmp.ObjectIdentifier, Value: []byte{0x2b, 0x06, 0x01}},
 			want: "2b:06:01",
@@ -734,12 +739,23 @@ type mockSnmpQuerier struct {
 	nextFunc     func(oids []string) (*gosnmp.SnmpPacket, error)
 	getBulkFunc  func(oids []string, nonRepeaters uint8, maxRepetitions uint32) (*gosnmp.SnmpPacket, error)
 	closeCalled  bool
+	getRequests  []string
 	nextRequests []string
 	bulkRequests []string
 }
 
 func (m *mockSnmpQuerier) Get(oids []string) (*gosnmp.SnmpPacket, error) {
-	return m.getFunc(oids)
+	m.getRequests = append(m.getRequests, oids...)
+	if m.getFunc != nil {
+		return m.getFunc(oids)
+	}
+	// A walk whose root is at the end of the MIB view falls back to an
+	// exact GET of the root; unscripted, the root is absent.
+	vars := make([]gosnmp.SnmpPDU, len(oids))
+	for i, oid := range oids {
+		vars[i] = gosnmp.SnmpPDU{Name: oid, Type: gosnmp.NoSuchObject}
+	}
+	return &gosnmp.SnmpPacket{Variables: vars}, nil
 }
 
 func (m *mockSnmpQuerier) GetNext(oids []string) (*gosnmp.SnmpPacket, error) {
@@ -1980,7 +1996,7 @@ func TestExecuteCredentialProbe(t *testing.T) {
 		}()
 
 		<-dialed
-		// Let the probe reach sleepContext before cancelling: cancelling
+		// Let the probe reach the inter-attempt delay before cancelling: cancelling
 		// while the dial error is still unwinding trips the ctx.Err() check
 		// instead of the delay return this test targets.
 		time.Sleep(50 * time.Millisecond)
@@ -2102,18 +2118,6 @@ func TestExecuteCredentialProbe(t *testing.T) {
 		default:
 		}
 	})
-}
-
-func TestSleepContext(t *testing.T) {
-	if !sleepContext(context.Background(), time.Millisecond) {
-		t.Error("sleepContext returned false for a completed sleep")
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if sleepContext(ctx, time.Hour) {
-		t.Error("sleepContext returned true for a cancelled context")
-	}
 }
 
 func TestTruncateBytes(t *testing.T) {
@@ -2556,10 +2560,14 @@ func TestExecuteSnmpJobCancelBetweenWalkRoots(t *testing.T) {
 
 	mock := &mockSnmpQuerier{
 		getBulkFunc: func(oids []string, _ uint8, _ uint32) (*gosnmp.SnmpPacket, error) {
-			// The first root's walk still completes cleanly (end-of-MIB)
-			// although the job context ends while it is in flight.
+			// The first root's walk still completes cleanly (one row, then
+			// end-of-MIB) although the job context ends while it is in
+			// flight. A bare end-of-MIB would owe an exact GET of the root.
 			cancel()
-			return endOfMibViewPacket(oids[0]), nil
+			return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{
+				{Name: oids[0] + ".1", Type: gosnmp.Integer, Value: 1},
+				{Name: oids[0] + ".2", Type: gosnmp.EndOfMibView},
+			}}, nil
 		},
 	}
 	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
