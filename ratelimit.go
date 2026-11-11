@@ -45,10 +45,13 @@ func newTokenBucket(rate float64, now func() time.Time) *tokenBucket {
 	return b
 }
 
-// setRate changes the limit. A rate <= 0 disables the bucket entirely.
+// setRate changes the limit. A rate <= 0 disables the bucket entirely. Time
+// elapsed since the last refill accrues at the old rate first; otherwise the
+// next refill would credit that whole span at the new rate.
 func (b *tokenBucket) setRate(rate float64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.refillLocked(b.now())
 	b.rate = rate
 	// The burst covers a tenth of a second of traffic: enough to absorb timer
 	// granularity, small enough that an idle agent cannot dump a second's
@@ -91,7 +94,7 @@ func (b *tokenBucket) reserve() time.Duration {
 
 // charge consumes one token without waiting, letting the balance go negative.
 // It is used where sleeping is unsafe (inside gosnmp's request deadline); the
-// debt is paid off by wait or waitDebt before the next request.
+// debt is paid off by waitDebt before the next request.
 func (b *tokenBucket) charge() {
 	_ = b.reserve()
 }
@@ -114,33 +117,14 @@ func (b *tokenBucket) refund() {
 	}
 }
 
-// wait blocks until one token is available — including paying off debt
-// accumulated by charge — or ctx is cancelled. It consumes the token, so the
-// caller may transmit immediately after it returns.
-func (b *tokenBucket) wait(ctx context.Context) bool {
-	delay := b.reserve()
-	if delay <= 0 {
-		return true
-	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		b.refund()
-		return false
-	case <-timer.C:
-		return true
-	}
-}
-
 // waitDebt blocks until the bucket can afford one more send, or ctx is
 // cancelled. It exists to pace a sequence of requests whose sends are
 // already charged by OnSent — rateLimitedQuerier calls it before every
 // Get, GetNext and GetBulk so pacing happens outside gosnmp's request
 // deadline.
 //
-// It reserves a token like wait, so concurrent walkers (and wait callers) get
-// distinct, ordered slots instead of polling for a non-negative balance —
+// It reserves a token, so concurrent walkers get distinct, ordered slots
+// instead of polling for a non-negative balance —
 // which under sustained load never arrives, and when it does wakes every
 // walker at once. Once its slot comes up it hands the token back, so the
 // OnSent charge for the send that follows is the only token the send costs.
@@ -166,7 +150,7 @@ func (b *tokenBucket) waitDebt(ctx context.Context) bool {
 // snmpSentHook returns the gosnmp OnSent callback that charges every
 // transmitted packet — including retries — against the bucket. It never
 // sleeps: blocking inside OnSent would consume gosnmp's per-request deadline,
-// so the debt is paid by the next wait or waitDebt before the next request
+// so the debt is paid by waitDebt before the next request
 // instead (see rateLimitedQuerier).
 func snmpSentHook(b *tokenBucket) func(*gosnmp.GoSNMP) {
 	return func(*gosnmp.GoSNMP) { b.charge() }
