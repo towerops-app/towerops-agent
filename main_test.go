@@ -494,12 +494,55 @@ func TestRunMainInvalidLogLevelWarnsAndUsesInfo(t *testing.T) {
 		if err := json.Unmarshal([]byte(line), &record); err != nil {
 			t.Fatalf("log line is not JSON: %q: %v", line, err)
 		}
-		if record["msg"] == "ignoring unrecognised log level" && record["value"] == "verbose" {
+		if record["msg"] == "ignoring unrecognized log level" && record["value"] == "verbose" {
 			foundWarning = true
 		}
 	}
 	if !foundWarning {
 		t.Fatalf("logs missing invalid-level warning:\n%s", output)
+	}
+}
+
+func TestRunMainInvalidLogFormatWarnsAndUsesText(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	originalStderr := os.Stderr
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		os.Stderr = originalStderr
+		slog.SetDefault(originalLogger)
+		_ = writer.Close()
+		_ = reader.Close()
+	})
+	os.Stderr = writer
+	t.Setenv("TOWEROPS_AGENT_TOKEN", "test-token")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	code := runMain(ctx, []string{
+		"--api-url=wss://example.com",
+		"--log-format=xml",
+		cliTHostKeysFlag(t),
+	})
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+	if _, ok := slog.Default().Handler().(*colorHandler); !ok {
+		t.Errorf("handler = %T, want *colorHandler text fallback", slog.Default().Handler())
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	os.Stderr = originalStderr
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+	if !strings.Contains(string(output), "WARN ignoring unrecognized log format value=xml") {
+		t.Fatalf("logs missing invalid-format warning:\n%s", output)
 	}
 }
 

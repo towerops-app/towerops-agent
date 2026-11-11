@@ -1297,6 +1297,85 @@ func TestTpTIcmpPingListenFailureFallsBack(t *testing.T) {
 	}
 }
 
+// An unprivileged agent cannot open raw ICMP, and that does not change from
+// one ping to the next. The listen failure is remembered per network so
+// later pings go straight to the fallback until the retry interval passes.
+func TestTpTSharedSocketCachesListenFailurePerNetwork(t *testing.T) {
+	orig := icmpListenPacket
+	t.Cleanup(func() {
+		icmpListenPacket = orig
+		closeSharedSockets()
+	})
+	closeSharedSockets()
+
+	var mu sync.Mutex
+	listens := map[string]int{}
+	icmpListenPacket = func(network, _ string) (icmpConn, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		listens[network]++
+		if network == "ip4:icmp" {
+			return nil, syscall.EPERM
+		}
+		return tpTNewFakeICMPConn(), nil
+	}
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			_, err := sharedSocket("ip4:icmp")
+			var unavailable *errICMPUnavailable
+			if !errors.As(err, &unavailable) || !errors.Is(err, syscall.EPERM) {
+				t.Errorf("sharedSocket error = %v, want cached errICMPUnavailable wrapping EPERM", err)
+			}
+		})
+	}
+	wg.Wait()
+	if _, err := sharedSocket("udp4"); err != nil {
+		t.Fatalf("sharedSocket(udp4): %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if listens["ip4:icmp"] != 1 {
+		t.Errorf("raw ICMP listen attempts = %d, want 1", listens["ip4:icmp"])
+	}
+	if listens["udp4"] != 1 {
+		t.Errorf("udp4 listen attempts = %d, want 1", listens["udp4"])
+	}
+}
+
+func TestTpTSharedSocketRetriesListenAfterInterval(t *testing.T) {
+	orig := icmpListenPacket
+	origRetry := icmpUnavailableRetry
+	t.Cleanup(func() {
+		icmpListenPacket = orig
+		icmpUnavailableRetry = origRetry
+		closeSharedSockets()
+	})
+	closeSharedSockets()
+	icmpUnavailableRetry = 0
+
+	attempts := 0
+	icmpListenPacket = func(string, string) (icmpConn, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, syscall.EPERM
+		}
+		return tpTNewFakeICMPConn(), nil
+	}
+
+	if _, err := sharedSocket("ip4:icmp"); err == nil {
+		t.Fatal("first sharedSocket call succeeded, want listen failure")
+	}
+	if _, err := sharedSocket("ip4:icmp"); err != nil {
+		t.Fatalf("sharedSocket after retry interval: %v", err)
+	}
+	if attempts != 2 {
+		t.Errorf("listen attempts = %d, want 2", attempts)
+	}
+}
+
 func TestTpTDoICMPPingUnreachableShortCircuits(t *testing.T) {
 	target := net.ParseIP("192.0.2.1") // TEST-NET-1, no echo reply will arrive
 	conn := tpTNewFakeICMPConn(tpTICMPErrorFor(t, true, ipv4.ICMPTypeDestinationUnreachable, 0, target))
@@ -1484,9 +1563,9 @@ func TestTpTPeerIPMapsAddrKinds(t *testing.T) {
 		{name: "udp addr", addr: &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 33434}, want: net.ParseIP("198.51.100.7")},
 		{name: "nil ip addr pointer", addr: (*net.IPAddr)(nil), want: nil},
 		{name: "nil udp addr pointer", addr: (*net.UDPAddr)(nil), want: nil},
-		{name: "tcp addr is unrecognised", addr: &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 80}, want: nil},
-		{name: "unix addr is unrecognised", addr: &net.UnixAddr{Name: "/tmp/sock", Net: "unix"}, want: nil},
-		{name: "custom addr is unrecognised", addr: tpTOpaqueAddr{}, want: nil},
+		{name: "tcp addr is unrecognized", addr: &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 80}, want: nil},
+		{name: "unix addr is unrecognized", addr: &net.UnixAddr{Name: "/tmp/sock", Net: "unix"}, want: nil},
+		{name: "custom addr is unrecognized", addr: tpTOpaqueAddr{}, want: nil},
 		{name: "nil addr", addr: nil, want: nil},
 	}
 

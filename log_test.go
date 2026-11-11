@@ -258,6 +258,27 @@ func TestNewLogHandlerText(t *testing.T) {
 	}
 }
 
+func TestResolveLogFormat(t *testing.T) {
+	tests := []struct {
+		value     string
+		want      string
+		wantValid bool
+	}{
+		{"text", "text", true},
+		{"json", "json", true},
+		{"JSON", "json", true},
+		{"Text", "text", true},
+		{"xml", "text", false},
+		{"", "text", false},
+	}
+	for _, tt := range tests {
+		got, valid := resolveLogFormat(tt.value)
+		if got != tt.want || valid != tt.wantValid {
+			t.Errorf("resolveLogFormat(%q) = (%q, %v), want (%q, %v)", tt.value, got, valid, tt.want, tt.wantValid)
+		}
+	}
+}
+
 func TestAppendAttr(t *testing.T) {
 	tests := []struct {
 		name  string

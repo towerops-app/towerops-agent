@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"unicode"
 )
@@ -51,6 +52,19 @@ func newLogHandler(w io.Writer, level slog.Level, format string) slog.Handler {
 		return slog.NewJSONHandler(w, opts)
 	}
 	return newColorHandler(w, level)
+}
+
+// resolveLogFormat maps a --log-format value to "text" or "json". Unknown
+// values fall back to text and report false so the caller can warn.
+func resolveLogFormat(value string) (string, bool) {
+	switch strings.ToLower(value) {
+	case "json":
+		return "json", true
+	case "text":
+		return "text", true
+	default:
+		return "text", false
+	}
 }
 
 func writerSupportsColor(w io.Writer) bool {

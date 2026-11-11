@@ -189,8 +189,9 @@ func ExecuteCheck(ctx context.Context, check *pb.Check) *pb.CheckResult {
 		status, output = checkUnknown, fmt.Sprintf("Unknown check type: %s", check.CheckType)
 	}
 
-	// Always calculate elapsed from the outer startTime for consistency.
-	responseTimeMs := float64(time.Since(startTime).Milliseconds())
+	// Always calculate elapsed from the outer startTime for consistency. The
+	// float division keeps sub-millisecond precision for fast checks.
+	responseTimeMs := float64(time.Since(startTime)) / float64(time.Millisecond)
 
 	return &pb.CheckResult{
 		CheckId:        check.Id,
@@ -227,9 +228,11 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	}
 
 	tlsServerName := ""
+	hostOverride := ""
 	for key, value := range config.Headers {
 		if strings.EqualFold(key, "Host") {
 			req.Host = value
+			hostOverride = value
 			tlsServerName = tlsServerNameForHost(value)
 		} else {
 			req.Header.Set(key, value)
@@ -255,6 +258,13 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 			if config.VerifySsl && tlsServerName != "" && len(via) > 0 &&
 				!strings.EqualFold(req.URL.Hostname(), via[len(via)-1].URL.Hostname()) {
 				return fmt.Errorf("refusing cross-host redirect while Host overrides TLS server name")
+			}
+			// net/http carries req.Host over only for relative Locations. An
+			// absolute Location to the same address clears it, so restore the
+			// override for that hop.
+			if hostOverride != "" && req.Host == "" && len(via) > 0 &&
+				strings.EqualFold(req.URL.Host, via[len(via)-1].URL.Host) {
+				req.Host = hostOverride
 			}
 			return nil
 		},
@@ -356,6 +366,11 @@ func cachedHTTPRegex(pattern string) (*regexp.Regexp, error) {
 
 // executeTCPCheck performs a TCP port connectivity check
 func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs uint32) (uint32, string) {
+	// JoinHostPort("", port) yields ":port", which Go dials on the local
+	// system and would report the agent host as the target.
+	if config.Host == "" {
+		return checkUnknown, "TCP check has no host configured"
+	}
 	timeout := checkTimeout(timeoutMs)
 	address := net.JoinHostPort(config.Host, strconv.Itoa(int(config.Port)))
 
@@ -589,6 +604,11 @@ func resolverForServer(server string, timeout time.Duration) *net.Resolver {
 // certificates are CRITICAL. A trusted certificate inside warning_days is
 // WARNING; every other trusted certificate is OK.
 func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs uint32) (uint32, string) {
+	// An empty host would dial ":port" on the local system and grade the
+	// agent host's own certificate.
+	if config.Host == "" {
+		return checkUnknown, "SSL check has no host configured"
+	}
 	timeout := checkTimeout(timeoutMs)
 
 	host := config.Host
