@@ -5,12 +5,15 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 	"unicode"
 )
 
@@ -76,6 +79,70 @@ func writerSupportsColor(w io.Writer) bool {
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
+// asyncLineWriter decouples log emission from the write syscall (A6). A slow
+// or blocked log driver (journald, a full pipe) can then never stall a
+// worker: callers append one line to a bounded channel and a single
+// goroutine drains it to the destination. On overflow the line is dropped
+// and counted, the same policy as the result spool, and the total is
+// reported when the writer closes.
+type asyncLineWriter struct {
+	ch      chan []byte
+	done    chan struct{}
+	w       io.Writer
+	dropped atomic.Uint64
+}
+
+const asyncLogQueueLines = 4096
+
+func newAsyncLineWriter(w io.Writer) *asyncLineWriter {
+	a := &asyncLineWriter{
+		ch:   make(chan []byte, asyncLogQueueLines),
+		done: make(chan struct{}),
+		w:    w,
+	}
+	go a.pump()
+	return a
+}
+
+func (a *asyncLineWriter) pump() {
+	defer close(a.done)
+	for buf := range a.ch {
+		// Write errors on the destination are surfaced by the driver itself
+		// (journald) or visible as missing output; there is no logger left
+		// to report them to.
+		_, _ = a.w.Write(buf)
+	}
+}
+
+// Write never blocks and never fails: a full queue drops the line. A send
+// against an already-closed queue (a stray slog call after Close, e.g. from
+// a parallel test) is recovered and counted as a drop instead of panicking.
+func (a *asyncLineWriter) Write(p []byte) (n int, err error) {
+	buf := make([]byte, len(p))
+	copy(buf, p)
+	defer func() {
+		if recover() != nil {
+			a.dropped.Add(1)
+		}
+	}()
+	select {
+	case a.ch <- buf:
+	default:
+		a.dropped.Add(1)
+	}
+	return len(p), nil
+}
+
+// Close drains the queue and reports how many lines an overloaded log
+// driver caused the agent to drop.
+func (a *asyncLineWriter) Close() {
+	close(a.ch)
+	<-a.done
+	if dropped := a.dropped.Load(); dropped > 0 {
+		_, _ = fmt.Fprintf(a.w, "log writer dropped %d lines (log driver blocked)\n", dropped)
+	}
+}
+
 func (h *colorHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= h.level
 }
@@ -95,9 +162,10 @@ func levelColor(level slog.Level) string {
 
 func (h *colorHandler) Handle(_ context.Context, r slog.Record) error {
 	levelStr := r.Level.String()
-	h.mu.Lock()
-	defer h.mu.Unlock()
 
+	// Build the line before taking the lock: the mutex serializes writes to
+	// one output stream but must not turn formatting work into hold time
+	// ahead of the actual syscall (A6).
 	buf := make([]byte, 0, 256)
 	buf = append(buf, r.Time.Format("2006/01/02 15:04:05")...)
 	buf = append(buf, ' ')
@@ -121,6 +189,8 @@ func (h *colorHandler) Handle(_ context.Context, r slog.Record) error {
 	})
 
 	buf = append(buf, '\n')
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	_, err := h.w.Write(buf)
 	return err
 }
@@ -193,4 +263,62 @@ func (h *colorHandler) WithGroup(name string) slog.Handler {
 	derived := *h
 	derived.group = g
 	return &derived
+}
+
+// jobSummary aggregates the per-minute run/fail/partial/dropped counters
+// (A6). Individual executor paths record outcomes instead of emitting an
+// info line per poll, so a 3,000-device fleet no longer writes ~1.7 GB of
+// logs per day.
+var jobSummary = struct {
+	run     atomic.Uint64
+	failed  atomic.Uint64
+	partial atomic.Uint64
+	dropped atomic.Uint64
+}{}
+
+// recordJobRun counts a job that started executing (post-jitter/gate).
+func recordJobRun() { jobSummary.run.Add(1) }
+
+// recordJobFailure counts a job that reported an error result.
+func recordJobFailure() { jobSummary.failed.Add(1) }
+
+// recordJobPartial counts a job whose result was flagged partial.
+func recordJobPartial() { jobSummary.partial.Add(1) }
+
+// recordJobDropped counts a result or job the agent could not deliver.
+func recordJobDropped() { jobSummary.dropped.Add(1) }
+
+// jobSummaryInterval is the A6 reporting cadence.
+const jobSummaryInterval = time.Minute
+
+// startJobSummaryLogger emits one summary line per interval until ctx ends.
+// The production agent loop starts it; tests call the record helpers and
+// read the counters directly.
+func startJobSummaryLogger(ctx context.Context) context.CancelFunc {
+	summaryCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	go func() {
+		ticker := time.NewTicker(jobSummaryInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-summaryCtx.Done():
+				return
+			case <-ticker.C:
+				run := jobSummary.run.Swap(0)
+				failed := jobSummary.failed.Swap(0)
+				partial := jobSummary.partial.Swap(0)
+				dropped := jobSummary.dropped.Swap(0)
+				if run|failed|partial|dropped == 0 {
+					continue
+				}
+				slog.Info("job summary",
+					"window", jobSummaryInterval.String(),
+					"run", run,
+					"failed", failed,
+					"partial", partial,
+					"dropped", dropped)
+			}
+		}
+	}()
+	return cancel
 }

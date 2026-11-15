@@ -1454,8 +1454,8 @@ func TestTpTDispatchRoutesByKey(t *testing.T) {
 	sock := &icmpSocket{proto: 1, replyID: os.Getpid() & 0xffff, waiters: make(map[pingKey]*pingWaiter)}
 	target := net.ParseIP("127.0.0.1")
 
-	w1 := sock.register(pingKey{id: 10, seq: 1}, target)
-	w2 := sock.register(pingKey{id: 10, seq: 2}, target)
+	w1 := sock.register(pingKey{id: 10, seq: 1}, target, nil)
+	w2 := sock.register(pingKey{id: 10, seq: 2}, target, nil)
 
 	reply := &icmp.Message{
 		Type: ipv4.ICMPTypeEchoReply,
@@ -1486,7 +1486,7 @@ func TestTpTDispatchRoutesByKey(t *testing.T) {
 	}
 
 	// Waiters without a known identifier match on sequence alone.
-	w3 := sock.register(pingKey{id: -1, seq: 7}, target)
+	w3 := sock.register(pingKey{id: -1, seq: 7}, target, nil)
 	sock.dispatch(&icmp.Message{
 		Type: ipv4.ICMPTypeEchoReply,
 		Body: &icmp.Echo{ID: 4242, Seq: 7},
@@ -1619,7 +1619,7 @@ func TestTpTSharedSocketReplacesDeadSocket(t *testing.T) {
 func TestTpTDispatchDropsMalformedAndUnmatched(t *testing.T) {
 	target := net.ParseIP("127.0.0.1")
 	sock := &icmpSocket{proto: 1, replyID: 1, waiters: make(map[pingKey]*pingWaiter)}
-	w := sock.register(pingKey{id: 1, seq: 9}, target)
+	w := sock.register(pingKey{id: 1, seq: 9}, target, nil)
 	defer sock.unregister(pingKey{id: 1, seq: 9}, w)
 
 	// Echo reply with a non-Echo body is ignored.
@@ -1660,7 +1660,7 @@ func TestTpTDispatchDropsMalformedAndUnmatched(t *testing.T) {
 func TestTpTDispatchPacketTooBig(t *testing.T) {
 	target := net.ParseIP("::1")
 	sock := &icmpSocket{proto: 58, replyID: 1, waiters: make(map[pingKey]*pingWaiter)}
-	w := sock.register(pingKey{id: 1, seq: 3}, target)
+	w := sock.register(pingKey{id: 1, seq: 3}, target, nil)
 	defer sock.unregister(pingKey{id: 1, seq: 3}, w)
 
 	req, err := (&icmp.Message{
@@ -1841,8 +1841,8 @@ func TestTpTReadLoopSurvivesTransientErrors(t *testing.T) {
 	conn := tpTNewScriptedReadConn()
 	sock := &icmpSocket{conn: conn, proto: 1, replyID: 7, waiters: make(map[pingKey]*pingWaiter)}
 	target := net.ParseIP("192.0.2.8")
-	w1 := sock.register(pingKey{id: 7, seq: 1}, target)
-	w2 := sock.register(pingKey{id: 7, seq: 2}, target)
+	w1 := sock.register(pingKey{id: 7, seq: 1}, target, nil)
+	w2 := sock.register(pingKey{id: 7, seq: 2}, target, nil)
 
 	done := make(chan struct{})
 	go func() {
@@ -1952,7 +1952,7 @@ func TestDoICMPPingSequenceWrapPreservesPendingPing(t *testing.T) {
 			conn.replies = []func([]byte) []byte{tpTEchoReplyWithIDFor(t, true, sock.replyID)}
 			oldIP := net.ParseIP("192.0.2.1")
 			key := pingKey{id: sock.replyID, seq: 0}
-			pending := sock.register(key, oldIP)
+			pending := sock.register(key, oldIP, nil)
 			defer sock.unregister(key, pending)
 			pingSeq.Store(65535) // The next request wraps to the occupied sequence 0.
 			if _, err := doICMPPing(context.Background(), net.ParseIP("127.0.0.1"), network, true, 1000); err != nil {
@@ -2010,7 +2010,7 @@ func TestDoICMPPingMarshalFailureAfterSequenceCollision(t *testing.T) {
 	pingSeq.Store(65535)
 	t.Cleanup(func() { pingSeq.Store(originalSeq) })
 	key := pingKey{id: sock.replyID, seq: 0}
-	pending := sock.register(key, net.ParseIP("192.0.2.1"))
+	pending := sock.register(key, net.ParseIP("192.0.2.1"), nil)
 	originalMarshal := icmpMarshal
 	t.Cleanup(func() { icmpMarshal = originalMarshal })
 	want := errors.New("marshal failed after collision")
@@ -2062,7 +2062,7 @@ func TestTpTDispatchIgnoresErrorQuotingOtherDestination(t *testing.T) {
 				proto, echoType, unreach = 58, ipv6.ICMPTypeEchoRequest, ipv6.ICMPTypeDestinationUnreachable
 			}
 			sock := &icmpSocket{proto: proto, replyID: 5, waiters: make(map[pingKey]*pingWaiter)}
-			w := sock.register(pingKey{id: 5, seq: 11}, tc.target)
+			w := sock.register(pingKey{id: 5, seq: 11}, tc.target, nil)
 			req, err := (&icmp.Message{Type: echoType, Body: &icmp.Echo{ID: 5, Seq: 11, Data: []byte("x")}}).Marshal(nil)
 			if err != nil {
 				t.Fatal(err)

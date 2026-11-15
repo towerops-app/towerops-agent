@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/towerops-app/towerops-agent/pb"
 )
 
@@ -43,8 +44,10 @@ func joinFrameTopic(conn net.Conn) string {
 	if err != nil {
 		return ""
 	}
-	var join channelMsg
-	_ = json.Unmarshal(data, &join)
+	join, err := decodePhoenixMessage(websocket.MessageText, data)
+	if err != nil {
+		return ""
+	}
 	return join.Topic
 }
 
@@ -158,7 +161,7 @@ func TestDelayedRetryDroppedWhenSpoolFull(t *testing.T) {
 	results.enqueueAfter(outbound{event: "result"}, time.Millisecond)
 
 	deadline := time.Now().Add(2 * time.Second)
-	for !logs.has("result retry dropped, spool full") {
+	for !logs.has("result buffer full - agent overloaded") {
 		if time.Now().After(deadline) {
 			t.Fatalf("no spool-full report\nlogged:\n%s", logs.dump())
 		}

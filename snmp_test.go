@@ -113,12 +113,18 @@ func TestExecuteSnmpJobEmitsFrameCosts(t *testing.T) {
 			time.Sleep(15 * time.Millisecond)
 			requestTime += time.Since(start)
 			bulkRequests++
-			if bulkRequests%2 == 1 {
-				return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{{
-					Name: oids[0] + ".1", Type: gosnmp.OctetString, Value: []byte(value),
-				}}}, nil
+			if bulkRequests == 1 {
+				// Both roots are active in the shared first GETBULK.
+				return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{
+					{Name: ".1.3.6.1.2.1.2.1", Type: gosnmp.OctetString, Value: []byte(value)},
+					{Name: ".1.3.6.1.2.1.4.1", Type: gosnmp.OctetString, Value: []byte(value)},
+				}}, nil
 			}
-			return endOfMibViewPacket(oids[0]), nil
+			// Both roots reached their cursors: the shared second GETBULK ends.
+			return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{
+				{Name: oids[0], Type: gosnmp.EndOfMibView},
+				{Name: oids[1], Type: gosnmp.EndOfMibView},
+			}}, nil
 		},
 	}
 	snmpDial = func(context.Context, *pb.AgentJob) (snmpQuerier, func(), error) {
@@ -135,13 +141,23 @@ func TestExecuteSnmpJobEmitsFrameCosts(t *testing.T) {
 		},
 	}, out)
 	elapsed := time.Since(start)
-	if len(out.items) != 2 {
-		t.Fatalf("got %d results, want two independently measured frames", len(out.items))
-	}
 	first := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
+	maxValue := 0
+	for _, value := range first.OidValues {
+		maxValue = max(maxValue, len(value))
+	}
+	if len(out.items) != 1 {
+		t.Fatalf("got %d result frames, want two (first values=%d max_value=%d sequence=%d final=%t duration=%d bytes=%d)",
+			len(out.items)+1, len(first.OidValues), maxValue, first.Sequence, first.Final, first.DurationMs, first.ResultBytes)
+	}
 	second := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
-	if first.DurationMs < 20 || second.DurationMs < 15 {
-		t.Fatalf("GET plus first WALK / second WALK durations = %d/%d", first.DurationMs, second.DurationMs)
+	if len(first.OidValues)+len(second.OidValues) != 3 {
+		t.Fatalf("frame values = %d/%d, want the GET and one walk row across two frames", len(first.OidValues), len(second.OidValues))
+	}
+	// The two walk roots share GETBULK packets now, so the second frame
+	// carries both roots' work; the GET frame still reports only the GET.
+	if first.DurationMs < 5 || second.DurationMs < 15 {
+		t.Fatalf("GET plus shared-WALK durations = %d/%d", first.DurationMs, second.DurationMs)
 	}
 	total := int64(first.DurationMs) + int64(second.DurationMs)
 	if total < requestTime.Milliseconds()-1 || total > elapsed.Milliseconds()+2 {
@@ -653,7 +669,9 @@ func TestSnmpDialDefault(t *testing.T) {
 	realDial := snmpDial
 
 	t.Run("newSnmpConn error propagates", func(t *testing.T) {
-		q, closeFn, err := realDial(context.Background(), &pb.AgentJob{SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1", Port: 65536}})
+		job := &pb.AgentJob{SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1", Port: 65536}}
+		t.Cleanup(func() { resetSNMPDeviceState(job) })
+		q, closeFn, err := realDial(context.Background(), job)
 		if err == nil || !strings.Contains(err.Error(), "invalid SNMP port") {
 			t.Fatalf("snmpDial error = %v, want invalid SNMP port", err)
 		}
@@ -668,9 +686,11 @@ func TestSnmpDialDefault(t *testing.T) {
 	t.Run("udp success preserves context and returns closer", func(t *testing.T) {
 		// UDP "connect" only binds a socket, so no SNMP server is required.
 		port := snwTFreeUDPPort(t)
+		job := &pb.AgentJob{SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1", Port: port, Version: "2c", Community: "public"}}
+		t.Cleanup(func() { resetSNMPDeviceState(job) })
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		q, closeFn, err := realDial(ctx, &pb.AgentJob{SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1", Port: port, Version: "2c", Community: "public"}})
+		q, closeFn, err := realDial(ctx, job)
 		if err != nil {
 			t.Fatalf("snmpDial: %v", err)
 		}
@@ -694,10 +714,24 @@ func TestSnmpDialDefault(t *testing.T) {
 		if conn.Context != ctx {
 			t.Fatal("dialed connection did not retain caller context")
 		}
+		// closeFn releases the device session for the next tick; the socket
+		// stays in the per-device cache until idle expiry or replacement.
 		closeFn()
-		// The closer released the socket: a second write must now fail.
+		if _, err := conn.Conn.Write([]byte("x")); err != nil {
+			t.Fatalf("write after session release failed: %v", err)
+		}
+		reused, reusedClose, err := realDial(ctx, job)
+		if err != nil {
+			t.Fatalf("second snmpDial: %v", err)
+		}
+		reusedWrapped, ok := reused.(*rateLimitedQuerier)
+		if !ok || reusedWrapped.q.(*gosnmp.GoSNMP) != conn {
+			t.Fatalf("second dial did not reuse the cached device session: %T", reused)
+		}
+		reusedClose()
+		defaultSNMPEngine.state(job).closeIdle(time.Now(), true)
 		if _, err := conn.Conn.Write([]byte("x")); err == nil {
-			t.Error("write succeeded after closeFn, want closed-socket error")
+			t.Error("cache shutdown left the SNMP socket open")
 		}
 	})
 
@@ -939,9 +973,11 @@ func TestExecuteSnmpJob(t *testing.T) {
 		}
 	})
 
-	t.Run("GET error continues", func(t *testing.T) {
+	t.Run("GET timeout aborts", func(t *testing.T) {
 		orig := snmpDial
 		defer func() { snmpDial = orig }()
+		resetJob := &pb.AgentJob{JobId: "1", SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"}}
+		t.Cleanup(func() { resetSNMPDeviceState(resetJob) })
 
 		mock := &mockSnmpQuerier{
 			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
@@ -2466,6 +2502,7 @@ func TestExecuteSnmpJobWalkErrorStatusNeverCompletes(t *testing.T) {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
 			orig := snmpDial
 			defer func() { snmpDial = orig }()
+			t.Cleanup(func() { resetSNMPDeviceState(&pb.AgentJob{DeviceId: "device-1"}) })
 
 			requests := 0
 			mock := &mockSnmpQuerier{
@@ -2579,10 +2616,10 @@ func TestExecuteSnmpJobCancelBetweenWalkRoots(t *testing.T) {
 		JobId:      "between-roots",
 		DeviceId:   "dev-1",
 		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
-		Queries: []*pb.SnmpQuery{{
-			QueryType: pb.QueryType_WALK,
-			Oids:      []string{".1.3.6.1.2.1.2.2.1", ".1.3.6.1.2.1.4.22"},
-		}},
+		Queries: []*pb.SnmpQuery{
+			{QueryType: pb.QueryType_WALK, Oids: []string{".1.3.6.1.2.1.2.2.1"}},
+			{QueryType: pb.QueryType_WALK, Oids: []string{".1.3.6.1.2.1.4.22"}},
+		},
 	}, out)
 
 	result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
@@ -2931,10 +2968,10 @@ func TestExecuteSnmpJobPartialOnCancel(t *testing.T) {
 			JobId:      "partial",
 			DeviceId:   "dev-1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
-			Queries: []*pb.SnmpQuery{{
-				QueryType: pb.QueryType_WALK,
-				Oids:      []string{".1.3.6.1.2.1.2.2.1", ".1.3.6.1.2.1.4.22"},
-			}},
+			Queries: []*pb.SnmpQuery{
+				{QueryType: pb.QueryType_WALK, Oids: []string{".1.3.6.1.2.1.2.2.1"}},
+				{QueryType: pb.QueryType_WALK, Oids: []string{".1.3.6.1.2.1.4.22"}},
+			},
 		}, out)
 	}()
 
@@ -2968,15 +3005,23 @@ func TestSnmpResultSplitFrames(t *testing.T) {
 	// Two roots, each carrying ~6KB of values; an 8KB decoded bound forces
 	// two frames.
 	bigValue := strings.Repeat("x", 6000)
+	// B1 requests both roots together; the first shared response carries one
+	// ~6KB value from each, forcing the two-frame root boundary split.
+	bulkRequests := 0
 	mock := &mockSnmpQuerier{
-		getBulkFunc: bulkTable(map[string]*gosnmp.SnmpPacket{
-			".1.3.6.1.2.1.2.2.1": {Variables: []gosnmp.SnmpPDU{{
-				Name: ".1.3.6.1.2.1.2.2.1.1", Type: gosnmp.OctetString, Value: []byte(bigValue),
-			}}},
-			".1.3.6.1.2.1.4.22": {Variables: []gosnmp.SnmpPDU{{
-				Name: ".1.3.6.1.2.1.4.22.1", Type: gosnmp.OctetString, Value: []byte(bigValue),
-			}}},
-		}),
+		getBulkFunc: func(oids []string, _ uint8, _ uint32) (*gosnmp.SnmpPacket, error) {
+			bulkRequests++
+			if bulkRequests == 1 {
+				return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{
+					{Name: ".1.3.6.1.2.1.2.2.1.1", Type: gosnmp.OctetString, Value: []byte(bigValue)},
+					{Name: ".1.3.6.1.2.1.4.22.1", Type: gosnmp.OctetString, Value: []byte(bigValue)},
+				}}, nil
+			}
+			return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{
+				{Name: oids[0], Type: gosnmp.EndOfMibView},
+				{Name: oids[1], Type: gosnmp.EndOfMibView},
+			}}, nil
+		},
 	}
 	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
 		return mock, func() {}, nil
@@ -3148,13 +3193,13 @@ func TestExecuteSnmpJobCancelInsideWalkLoop(t *testing.T) {
 
 	out := newResultQueue(8)
 	executeSnmpJob(ctx, &pb.AgentJob{
-		JobId:      "walk-cancel",
+		JobId:      "partial",
 		DeviceId:   "dev-1",
 		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
-		Queries: []*pb.SnmpQuery{{
-			QueryType: pb.QueryType_WALK,
-			Oids:      []string{".1.3.6.1.2.2.1", ".1.3.6.1.2.1.4.22"},
-		}},
+		Queries: []*pb.SnmpQuery{
+			{QueryType: pb.QueryType_WALK, Oids: []string{".1.3.6.1.2.2.1"}},
+			{QueryType: pb.QueryType_WALK, Oids: []string{".1.3.6.1.2.1.4.22"}},
+		},
 	}, out)
 
 	result := decodeQueuedResult[*pb.SnmpResult](t, <-out.items)
@@ -3274,15 +3319,32 @@ func TestSnmpResultTruncatedRootAfterPackedFrame(t *testing.T) {
 			Value: []byte(strings.Repeat("z", 1000)),
 		}
 	}
+	// B1 packs both roots into one GETBULK. Bindings interleave by requested
+	// root: the small subtree ends immediately, the oversized subtree answers
+	// 20 rows, and the final round ends both.
+	vars := []gosnmp.SnmpPDU{{
+		Name: ".1.3.6.1.2.1.2.2.1.1", Type: gosnmp.OctetString, Value: []byte("small"),
+	}}
+	for i := 1; i <= 20; i++ {
+		vars = append(vars, oversized[i-1])
+		if i < 20 {
+			vars = append(vars, gosnmp.SnmpPDU{
+				Name: ".1.3.6.1.2.1.2.2.1.1", Type: gosnmp.EndOfMibView,
+			})
+		} else {
+			vars = append(vars, gosnmp.SnmpPDU{
+				Name: ".1.3.6.1.2.1.2.2.1.1", Type: gosnmp.EndOfMibView,
+			})
+		}
+	}
+	vars = append(vars,
+		gosnmp.SnmpPDU{Name: ".1.3.6.1.2.1.2.2.1.1", Type: gosnmp.EndOfMibView},
+		gosnmp.SnmpPDU{Name: oversized[19].Name, Type: gosnmp.EndOfMibView},
+	)
 	mock := &mockSnmpQuerier{
-		getBulkFunc: bulkTable(map[string]*gosnmp.SnmpPacket{
-			".1.3.6.1.2.1.2.2.1": {Variables: []gosnmp.SnmpPDU{{
-				Name:  ".1.3.6.1.2.1.2.2.1.1",
-				Type:  gosnmp.OctetString,
-				Value: []byte("small"),
-			}}},
-			".1.3.6.1.2.1.4.22": {Variables: oversized},
-		}),
+		getBulkFunc: func([]string, uint8, uint32) (*gosnmp.SnmpPacket, error) {
+			return &gosnmp.SnmpPacket{Variables: vars}, nil
+		},
 	}
 	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
 		return mock, func() {}, nil

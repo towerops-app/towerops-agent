@@ -12,10 +12,25 @@ import (
 	"github.com/gosnmp/gosnmp"
 )
 
+// defaultSNMPDevicePDURate is the default per-device ceiling on SNMP request
+// packets per second. It is the safety limit for one misbehaving device, not
+// the fleet limit: a 25-packet poll stays well under 50 packets/s.
+const defaultSNMPDevicePDURate = 50
+
 // defaultSNMPPDURate is the process-wide ceiling on SNMP request packets per
-// second. It is deliberately conservative: a 100-device job push must not turn
-// into tens of thousands of packets in a few seconds from one host.
-const defaultSNMPPDURate = 200
+// second. Zero disables it: the per-device limiter and scheduler admission
+// bound a misbehaving device, so a fleet ceiling would only cap healthy
+// throughput (a 3,000-device inventory needs well over 1,000 packets/s).
+const defaultSNMPPDURate = 0
+
+// snmpRateLimitWait returns the cumulative limiter wait. Reported, never reset.
+func snmpRateLimitWait() time.Duration {
+	return time.Duration(processMetrics.rateLimitWaitNs.Load())
+}
+
+func snmpRateLimitWaitMillis() uint64 {
+	return uint64(snmpRateLimitWait().Milliseconds())
+}
 
 // dispatchJitterMax bounds the random delay applied before a dispatched job
 // starts executing, so a batch push does not start every job in the same
@@ -147,13 +162,42 @@ func (b *tokenBucket) waitDebt(ctx context.Context) bool {
 	return ctx.Err() == nil
 }
 
+// waitSNMPBuckets waits for one send slot from the global ceiling first and
+// the device's own limiter second. It measures only real blocking; an
+// immediate token costs nothing. The reservation is refunded, so the OnSent
+// charge that follows the actual transmission is the only token the send costs.
+func waitSNMPBuckets(ctx context.Context, device *tokenBucket) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	started := time.Now()
+	if !snmpPDUs.waitDebt(ctx) || (device != nil && !device.waitDebt(ctx)) {
+		return false
+	}
+	if waited := time.Since(started); waited > 0 {
+		processMetrics.rateLimitWaitNs.Add(uint64(waited.Nanoseconds()))
+	}
+	return true
+}
+
 // snmpSentHook returns the gosnmp OnSent callback that charges every
-// transmitted packet — including retries — against the bucket. It never
+// transmitted packet — including retries — against the global bucket. It never
 // sleeps: blocking inside OnSent would consume gosnmp's per-request deadline,
 // so the debt is paid by waitDebt before the next request
 // instead (see rateLimitedQuerier).
 func snmpSentHook(b *tokenBucket) func(*gosnmp.GoSNMP) {
 	return func(*gosnmp.GoSNMP) { b.charge() }
+}
+
+// snmpDeviceSentHook charges a transmitted packet against the global ceiling
+// and the owning device's per-device limit.
+func snmpDeviceSentHook(device *tokenBucket) func(*gosnmp.GoSNMP) {
+	return func(*gosnmp.GoSNMP) {
+		snmpPDUs.charge()
+		if device != nil {
+			device.charge()
+		}
+	}
 }
 
 // rateLimitedQuerier waits for a send slot before each SNMP request, outside
@@ -162,31 +206,59 @@ func snmpSentHook(b *tokenBucket) func(*gosnmp.GoSNMP) {
 // returns the reservation so OnSent alone charges transmitted packets,
 // including retries; unsent requests cost nothing. The walk loop in snmp.go
 // drives GetNext/GetBulk through these methods, so every request of a walk
-// is paced and no sleep trails the last response.
+// is paced and no sleep trails the last response. The global bucket defaults
+// to unlimited; device is the per-device safety limit.
 type rateLimitedQuerier struct {
-	ctx context.Context
-	q   snmpQuerier
+	ctx    context.Context
+	q      snmpQuerier
+	device *tokenBucket
+	cached bool
+	// networkObserver sees the delegated request only: limiter waits must
+	// not inflate RTT-based timeout adaptation.
+	networkObserver func(elapsed time.Duration, err error)
+	// respondedFn reports the owning job's response observation for B5.
+	respondedFn func() bool
+}
+
+// responded implements snmpResponseObserver on behalf of the job wrapper.
+func (r *rateLimitedQuerier) responded() bool {
+	return r.respondedFn != nil && r.respondedFn()
+}
+
+func (r *rateLimitedQuerier) observeNetwork(started time.Time, err error) {
+	if r.networkObserver != nil {
+		r.networkObserver(time.Since(started), err)
+	}
 }
 
 func (r *rateLimitedQuerier) Get(oids []string) (*gosnmp.SnmpPacket, error) {
-	if !snmpPDUs.waitDebt(r.ctx) {
-		return nil, r.ctx.Err()
+	if !waitSNMPBuckets(r.ctx, r.device) {
+		return nil, context.Canceled
 	}
-	return r.q.Get(oids)
+	started := time.Now()
+	packet, err := r.q.Get(oids)
+	r.observeNetwork(started, err)
+	return packet, err
 }
 
 func (r *rateLimitedQuerier) GetNext(oids []string) (*gosnmp.SnmpPacket, error) {
-	if !snmpPDUs.waitDebt(r.ctx) {
-		return nil, r.ctx.Err()
+	if !waitSNMPBuckets(r.ctx, r.device) {
+		return nil, context.Canceled
 	}
-	return r.q.GetNext(oids)
+	started := time.Now()
+	packet, err := r.q.GetNext(oids)
+	r.observeNetwork(started, err)
+	return packet, err
 }
 
 func (r *rateLimitedQuerier) GetBulk(oids []string, nonRepeaters uint8, maxRepetitions uint32) (*gosnmp.SnmpPacket, error) {
-	if !snmpPDUs.waitDebt(r.ctx) {
-		return nil, r.ctx.Err()
+	if !waitSNMPBuckets(r.ctx, r.device) {
+		return nil, context.Canceled
 	}
-	return r.q.GetBulk(oids, nonRepeaters, maxRepetitions)
+	started := time.Now()
+	packet, err := r.q.GetBulk(oids, nonRepeaters, maxRepetitions)
+	r.observeNetwork(started, err)
+	return packet, err
 }
 
 // snmpPDUs is the process-wide token bucket for outbound SNMP request packets.
@@ -195,9 +267,15 @@ func (r *rateLimitedQuerier) GetBulk(oids []string, nonRepeaters uint8, maxRepet
 var snmpPDUs = newTokenBucket(defaultSNMPPDURate, nil)
 
 // setSNMPPDURate applies the configured packets-per-second ceiling. Zero
-// disables rate limiting.
+// disables the global ceiling; the per-device limiter remains active.
 func setSNMPPDURate(rate uint) {
 	snmpPDUs.setRate(float64(rate))
+}
+
+// setSNMPDevicePDURate applies the per-device packets-per-second ceiling to
+// existing and future device state. Zero disables a device's limiter too.
+func setSNMPDevicePDURate(rate uint) {
+	defaultSNMPEngine.setDeviceRate(float64(rate))
 }
 
 // dispatchJitter returns a random delay in [0, dispatchJitterMax).

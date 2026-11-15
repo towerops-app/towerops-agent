@@ -202,9 +202,11 @@ func TestRecurringSchedulerIntervalAndNonOverlap(t *testing.T) {
 		t.Fatalf("timer interval = %s, want 17s", timer.interval)
 	}
 
-	fireManualTimer(t, timer.timer)
-	assertNoInvocation(t, runs)
+	// Finish before the next phase, then wait for the timer the scheduler
+	// creates only after it has observed the finished marker.
 	close(first.done)
+	timer = nextManualTimer(t, clock)
+	fireManualTimer(t, timer.timer)
 
 	second := nextInvocation(t, runs)
 	_ = nextManualTimer(t, clock)
@@ -240,12 +242,15 @@ func TestRecurringSchedulerReplacementAndRemoval(t *testing.T) {
 		testScheduleSpec("job-1", "new", time.Minute, runs),
 	})
 	assertNoInvocation(t, runs)
+
+	// The executor barrier waits for the active tick: the intermediate entry
+	// cannot report stopped until the old tick has released the assignment.
+	close(oldRun.done)
 	select {
 	case <-intermediate.stopped:
 	case <-time.After(time.Second):
-		t.Fatal("superseded replacement did not stop")
+		t.Fatal("superseded replacement did not stop after the old tick")
 	}
-	close(oldRun.done)
 
 	// A changed assignment skips the first-tick stagger.
 	newRun := nextInvocation(t, runs)
@@ -377,6 +382,7 @@ func TestRecurringSchedulerPreservesUnchangedAssignment(t *testing.T) {
 	assertNoInvocation(t, runs)
 
 	close(first.done)
+	timer = nextManualTimer(t, clock)
 	fireManualTimer(t, timer.timer)
 	second := nextInvocation(t, runs)
 	close(second.done)

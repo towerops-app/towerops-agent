@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	mikrotikConnTimeout  = 30 * time.Second
+	mikrotikConnTimeout  = 5 * time.Second
 	mikrotikReadTimeout  = 30 * time.Second
 	mikrotikWriteTimeout = 30 * time.Second
 	mikrotikCloseTimeout = 2 * time.Second
@@ -455,6 +455,8 @@ func mikrotikError(job *pb.AgentJob, msg string, ts int64) *pb.MikrotikResult {
 }
 
 // executeMikrotikJob handles a MikroTik API job including backup-via-SSH.
+// A nonzero job.DeadlineMs bounds the entire job — dial, commands and backup —
+// so a stalled device cannot pin a worker past the server's planned budget.
 func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	dev := job.MikrotikDevice
 	if dev == nil {
@@ -467,11 +469,21 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue)
 		return
 	}
 
+	// The deadline context bounds the work; results are sent on the caller's
+	// ctx so a deadline timeout still ships the partial result instead of
+	// silently dropping it.
+	jobCtx := ctx
+	if dl := job.DeadlineMs; dl > 0 {
+		var cancel context.CancelFunc
+		jobCtx, cancel = context.WithTimeout(ctx, time.Duration(dl)*time.Millisecond)
+		defer cancel()
+	}
+
 	timestamp := time.Now().Unix()
 
 	// Backup jobs use SSH
 	if strings.HasPrefix(job.JobId, "backup:") {
-		executeMikrotikBackupViaSSH(ctx, job, dev, out, timestamp)
+		executeMikrotikBackupViaSSH(jobCtx, job, dev, out, timestamp)
 		return
 	}
 
@@ -485,7 +497,7 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue)
 	}
 	slog.Debug("executing mikrotik job", "job_id", job.JobId, "device", dev.Ip, "port", port, "ssl", dev.UseSsl)
 
-	client, err := mikrotikDial(ctx, dev.Ip, port, dev.Username, dev.Password, dev.UseSsl)
+	client, err := mikrotikDial(jobCtx, dev.Ip, port, dev.Username, dev.Password, dev.UseSsl)
 	if err != nil {
 		sendResult(ctx, out, "mikrotik_result", mikrotikError(
 			job,
@@ -495,7 +507,7 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue)
 		return
 	}
 	defer func() { _ = client.close() }()
-	stopCancel := context.AfterFunc(ctx, func() { _ = client.conn.Close() })
+	stopCancel := context.AfterFunc(jobCtx, func() { _ = client.conn.Close() })
 	defer stopCancel()
 
 	var allSentences []*pb.MikrotikSentence
@@ -518,6 +530,7 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue)
 			// The connection is no longer usable: end the job, but keep the
 			// rows and failures the earlier commands produced.
 			errorMessage := fmt.Sprintf("command '%s' failed: %v", cmd.Command, err)
+			recordJobFailure()
 			slog.Error("mikrotik command failed", "device", job.DeviceId, "error", errorMessage)
 			result := mikrotikError(job, errorMessage, timestamp)
 			result.Sentences = allSentences
@@ -548,9 +561,11 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue)
 	}
 	if n := len(job.MikrotikCommands); n > 0 && len(failures) == n {
 		result.Error = fmt.Sprintf("all %d commands failed", n)
+		recordJobFailure()
 		slog.Error("mikrotik job failed", "device", job.DeviceId, "job", job.JobId, "error", result.Error)
 	} else {
-		slog.Info("mikrotik job complete", "device", job.DeviceId, "job", job.JobId, "command_failures", len(failures))
+		recordJobRun()
+		slog.Debug("mikrotik job complete", "device", job.DeviceId, "job", job.JobId, "command_failures", len(failures))
 	}
 	sendResult(ctx, out, "mikrotik_result", result, job.JobId)
 }
@@ -592,7 +607,8 @@ func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.
 		return
 	}
 
-	slog.Info("mikrotik job complete", "device", job.DeviceId, "job", job.JobId)
+	recordJobRun()
+	slog.Debug("mikrotik job complete", "device", job.DeviceId, "job", job.JobId)
 	sendResult(ctx, out, "mikrotik_result", &pb.MikrotikResult{
 		DeviceId: job.DeviceId,
 		JobId:    job.JobId,

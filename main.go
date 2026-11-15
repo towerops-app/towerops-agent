@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/towerops-app/towerops-agent/pb"
 )
@@ -36,6 +37,7 @@ func stopSignalNotifier(ctx context.Context, stop context.CancelFunc) {
 
 // runMain is the testable entry point. Returns an exit code.
 func runMain(ctx context.Context, args []string) int {
+	configureMemoryLimit()
 	fs := flag.NewFlagSet("towerops-agent", flag.ContinueOnError)
 	apiURL := fs.String("api-url", "", "API URL (e.g., wss://towerops.net; or set TOWEROPS_API_URL)")
 	token := fs.String("token", "", "Agent authentication token (or set TOWEROPS_AGENT_TOKEN)")
@@ -51,7 +53,15 @@ func runMain(ctx context.Context, args []string) int {
 	var forgetHostKeys stringListFlag
 	fs.Var(&forgetHostKeys, "forget-host-key", "Remove the stored SSH/TLS trust-on-first-use entry for ip:port and exit (repeatable; a running agent picks up the removal without a restart)")
 	legacyScheduling := fs.Bool("legacy-scheduling", envBool(false, "TOWEROPS_LEGACY_SCHEDULING"), "Run refreshed inventories once (rollback servers with periodic pushes only)")
-	snmpRate := fs.Uint("snmp-rate", envUint(defaultSNMPPDURate, "TOWEROPS_SNMP_RATE"), "Maximum SNMP request packets per second process-wide (0 disables)")
+	snmpRate := fs.Uint("snmp-rate", envUint(0, "TOWEROPS_SNMP_RATE"), "Maximum SNMP request packets per second process-wide (0 disables)")
+	snmpDeviceRate := fs.Uint("snmp-device-rate", envUint(50, "TOWEROPS_SNMP_DEVICE_RATE"), "Maximum SNMP request packets per second per device (0 disables)")
+	snmpConcurrency := fs.Uint("snmp-concurrency", envUint(0, "TOWEROPS_SNMP_CONCURRENCY"), "Concurrent SNMP devices (0 scales with inventory)")
+	pingConcurrency := fs.Uint("ping-concurrency", envUint(0, "TOWEROPS_PING_CONCURRENCY"), "Concurrent ping admissions (0 scales with inventory)")
+	checkConcurrency := fs.Uint("check-concurrency", envUint(0, "TOWEROPS_CHECK_CONCURRENCY"), "Concurrent service checks (0 selects automatic default)")
+	mikrotikConcurrency := fs.Uint("mikrotik-concurrency", envUint(0, "TOWEROPS_MIKROTIK_CONCURRENCY"), "Concurrent MikroTik jobs (0 selects automatic default)")
+	resultSpoolBytes := fs.Uint("result-spool-bytes", envUint(64<<20, "TOWEROPS_RESULT_SPOOL_BYTES"), "Maximum result spool size in bytes")
+	disconnectGrace := fs.Duration("disconnect-grace", envDuration(15*time.Minute, "TOWEROPS_DISCONNECT_GRACE"), "Keep polling through a disconnected transport for this duration")
+	debugListen := fs.String("debug-listen", envOrDefault("", "TOWEROPS_DEBUG_LISTEN"), "Loopback address for pprof and text metrics (empty disables)")
 	showHelp := fs.Bool("help", false, "Show this help message and exit")
 	fs.BoolVar(showHelp, "h", false, "Show this help message and exit (shorthand)")
 
@@ -84,6 +94,17 @@ func runMain(ctx context.Context, args []string) int {
 		*trapCommunity = envFirst("TOWEROPS_TRAP_COMMUNITY", "TRAP_COMMUNITY")
 	}
 
+	configureAgentRuntime(agentRuntimeConfig{
+		SNMPConcurrency:     *snmpConcurrency,
+		PingConcurrency:     *pingConcurrency,
+		CheckConcurrency:    *checkConcurrency,
+		MikrotikConcurrency: *mikrotikConcurrency,
+		SNMPDeviceRate:      *snmpDeviceRate,
+		ResultSpoolBytes:    *resultSpoolBytes,
+		DisconnectGrace:     *disconnectGrace,
+		DebugListen:         *debugListen,
+	})
+
 	// Read token from file if --token-file is provided
 	if *tokenFile != "" {
 		data, err := os.ReadFile(*tokenFile)
@@ -102,7 +123,11 @@ func runMain(ctx context.Context, args []string) int {
 
 	level, validLogLevel := resolveLogLevel(*logLevel)
 	format, validLogFormat := resolveLogFormat(*logFormat)
-	slog.SetDefault(slog.New(newLogHandler(os.Stderr, level, format)))
+	// The stderr sink goes through the bounded async writer so a slow log
+	// driver can never block a poll worker holding a result (A6).
+	logSink := newAsyncLineWriter(os.Stderr)
+	defer logSink.Close()
+	slog.SetDefault(slog.New(newLogHandler(logSink, level, format)))
 	if !validLogLevel {
 		slog.Warn("ignoring unrecognized log level", "value", *logLevel)
 	}
@@ -127,6 +152,17 @@ func runMain(ctx context.Context, args []string) int {
 	}
 
 	slog.Info("towerops agent starting", "version", version, "built", buildDate)
+
+	var stopDebug func()
+	if settings := agentRuntimeSettings(); settings.DebugListen != "" {
+		closer, err := startDebugServer(settings.DebugListen, poolLoadSnapshots)
+		if err != nil {
+			slog.Error("debug listener", "error", err)
+			return 1
+		}
+		stopDebug = closer
+		defer stopDebug()
+	}
 
 	// Convert HTTP(S) to WebSocket URL
 	wsURL, err := toWebSocketURL(*apiURL, *insecure)
@@ -159,6 +195,7 @@ func runMain(ctx context.Context, args []string) int {
 	// Apply the configured process-wide SNMP packet ceiling before any
 	// session can dial a device.
 	setSNMPPDURate(*snmpRate)
+	setSNMPDevicePDURate(*snmpDeviceRate)
 
 	// Run agent with reconnect loop
 	runAgentWithScheduling(ctx, wsURL, *token, traps, !*legacyScheduling)
@@ -310,6 +347,20 @@ func envBool(fallback bool, keys ...string) bool {
 	}
 	parsed, err := strconv.ParseBool(value)
 	if err != nil {
+		slog.Warn("ignoring unparseable environment variable", "keys", strings.Join(keys, ","))
+		return fallback
+	}
+	return parsed
+}
+
+// envDuration reads a Go duration such as "15m", ignoring invalid values.
+func envDuration(fallback time.Duration, keys ...string) time.Duration {
+	value := envFirst(keys...)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed < 0 {
 		slog.Warn("ignoring unparseable environment variable", "keys", strings.Join(keys, ","))
 		return fallback
 	}

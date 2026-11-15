@@ -140,6 +140,16 @@ func newResultQueue(size int) *resultQueue {
 
 // testQueue returns a buffered result queue for tests that only need to see
 // what an executor published.
+// legacyChannelMessage decodes the V1 JSON bytes used by focused loop tests.
+func legacyChannelMessage(t *testing.T, data []byte) channelMsg {
+	t.Helper()
+	msg, err := decodeChannelFrame(data)
+	if err != nil {
+		t.Fatalf("decode test channel frame: %v", err)
+	}
+	return msg
+}
+
 func testQueue() *resultQueue {
 	return newResultQueue(8)
 }
@@ -166,6 +176,12 @@ func decodeQueuedResult[T proto.Message](t *testing.T, result outbound) T {
 	t.Helper()
 	var zero T
 	msg := reflect.New(reflect.TypeOf(zero).Elem()).Interface().(T)
+	if len(result.protoPayload) > 0 {
+		if err := proto.Unmarshal(result.protoPayload, msg); err != nil {
+			t.Fatalf("unmarshal raw protobuf payload: %v", err)
+		}
+		return msg
+	}
 	agtDecodeBinary(t, result.payload, msg)
 	return msg
 }
@@ -184,16 +200,7 @@ func TestEncodeOutboundSnmpResultBytes(t *testing.T) {
 				if !ok {
 					t.Fatal("could not encode SNMP result")
 				}
-				var envelope struct {
-					Binary string `json:"binary"`
-				}
-				if err := json.Unmarshal(encoded.payload, &envelope); err != nil {
-					t.Fatal(err)
-				}
-				bin, err := base64.StdEncoding.DecodeString(envelope.Binary)
-				if err != nil {
-					t.Fatal(err)
-				}
+				bin := encoded.protoPayload
 				var got pb.SnmpResult
 				if err := proto.Unmarshal(bin, &got); err != nil {
 					t.Fatal(err)
@@ -205,7 +212,8 @@ func TestEncodeOutboundSnmpResultBytes(t *testing.T) {
 				if got.JobId != msg.JobId || got.DurationMs != 17 || !got.Final || got.JobType != pb.JobType_POLL {
 					t.Fatalf("measurement metadata changed during encoding: %v", &got)
 				}
-				if len(envelope.Binary) <= len(bin) || len(encoded.payload) <= len(envelope.Binary) {
+				encodedLen := base64.StdEncoding.EncodedLen(len(bin))
+				if encodedLen <= len(bin) || encoded.wireSize() <= encodedLen {
 					t.Fatal("fixture does not distinguish protobuf size from base64 and JSON size")
 				}
 			}
@@ -244,11 +252,21 @@ func TestHandleMessage(t *testing.T) {
 	t.Run("jobs replace recurring inventory while dedicated events remain one-shot", func(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
-
+		requested := make(chan []string, 4)
 		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			return &mockSnmpQuerier{
 				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
-					return &gosnmp.SnmpPacket{}, nil
+					select {
+					case requested <- oids:
+					default:
+					}
+					variables := make([]gosnmp.SnmpPDU, 0, len(oids))
+					for _, oid := range oids {
+						variables = append(variables, gosnmp.SnmpPDU{
+							Name: oid, Type: gosnmp.Integer, Value: 1,
+						})
+					}
+					return &gosnmp.SnmpPacket{Variables: variables}, nil
 				},
 			}, func() {}, nil
 		}
@@ -274,9 +292,26 @@ func TestHandleMessage(t *testing.T) {
 			JobId:      "live_poll:device-1:topic",
 			JobType:    pb.JobType_POLL,
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1", Port: 161},
+			// One-shot dedicated lanes must expand S2 compact columns too.
+			Queries: []*pb.SnmpQuery{{
+				QueryType:  pb.QueryType_GET,
+				Oids:       []string{".1.3.6.1.2.1.1.3.0"},
+				OidColumns: []string{".1.3.6.1.2.1.31.1.1.1.6"},
+				OidIndexes: []uint32{7},
+			}},
 		})
 		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "discovery_job", Payload: oneShot}, "agent:test", pools, out)
 		_ = wantResult[*pb.SnmpResult](t, out, "result", 500*time.Millisecond)
+
+		select {
+		case oids := <-requested:
+			if !slices.Contains(oids, ".1.3.6.1.2.1.31.1.1.1.6.7") {
+				t.Fatalf("one-shot compact GET requested %v, want expanded ifIndex", oids)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("one-shot compact query never reached the SNMP executor")
+		}
+
 		if len(pools.scheduler.jobs) != 1 {
 			t.Fatalf("dedicated one-shot push changed recurring inventory size to %d", len(pools.scheduler.jobs))
 		}
@@ -862,8 +897,7 @@ func TestInventoryRevisionTracking(t *testing.T) {
 			if result.event != "error" {
 				t.Fatalf("event = %q, want the refusal notice", result.event)
 			}
-			var notice pb.AgentError
-			agtDecodeBinary(t, result.payload, &notice)
+			notice := decodeQueuedResult[*pb.AgentError](t, result)
 			if notice.InventoryRejection != "jobs" {
 				t.Fatalf("inventory_rejection = %q, want jobs", notice.InventoryRejection)
 			}
@@ -1111,21 +1145,28 @@ func TestDispatchJob(t *testing.T) {
 	})
 
 	t.Run("PING", func(t *testing.T) {
-		origPing := doPing
-		defer func() { doPing = origPing }()
-		doPing = func(_ context.Context, ip string, timeoutMs int) (float64, error) {
-			return 5.5, nil
+		stopPingEngine()
+		t.Cleanup(stopPingEngine)
+		conn := tpTNewFakeICMPConn()
+		tpTUseFakeICMPConn(t, conn)
+		job := &pb.AgentJob{
+			JobId:         "p1",
+			JobType:       pb.JobType_PING,
+			DeviceId:      "dispatch-ping",
+			SnmpDevice:    &pb.SnmpDevice{Ip: "127.0.0.1"},
+			PingTimeoutMs: 1000,
 		}
 
 		out := testQueue()
 
-		dispatchJob(context.Background(), &pb.AgentJob{
-			JobId:      "p1",
-			JobType:    pb.JobType_PING,
-			SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1"},
-		}, testPools(t), out)
+		dispatchJob(context.Background(), job, testPools(t), out)
 
-		if result := wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", 500*time.Millisecond); result.Status != "success" {
+		for i := range 3 {
+			sent := tpTWaitSent(t, conn, i+1)
+			peTInjectEchoReply(t, conn, sent[i].pkt)
+		}
+
+		if result := wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second); result.Status != "success" {
 			t.Errorf("expected success, got %q", result.Status)
 		}
 	})
@@ -1391,7 +1432,7 @@ func TestSessionLoopReportsPublishedErrorOverCancellation(t *testing.T) {
 			ctx:        sessionCtx,
 			cancel:     cancel,
 			writeCh:    make(chan writeRequest, 1),
-			msgCh:      make(chan []byte, 1),
+			msgCh:      make(chan channelMsg, 1),
 			errCh:      make(chan error, 1),
 			writeErrCh: make(chan error, 1),
 			results:    newResultQueue(1),
@@ -1477,7 +1518,7 @@ func TestSessionLoopReportsAbortWhileContextAlive(t *testing.T) {
 		ctx:        sessionCtx,
 		cancel:     cancel,
 		writeCh:    make(chan writeRequest, 1),
-		msgCh:      make(chan []byte, 1),
+		msgCh:      make(chan channelMsg, 1),
 		errCh:      make(chan error, 1),
 		writeErrCh: make(chan error, 1),
 		abortCh:    make(chan error, 1),
@@ -1920,12 +1961,12 @@ func (s *fakeWSServer) acceptAndJoin(t *testing.T) {
 	resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
 	_, _ = conn.Write([]byte(resp))
 
-	// Read join frame and extract topic
+	// Read join frame. Serializer V2 joins are JSON arrays; focused legacy
+	// tests may still use the V1 object.
 	joinPayload, err := readMaskedFrame(conn)
 	if err == nil {
-		var joinMsg channelMsg
-		if err := json.Unmarshal(joinPayload, &joinMsg); err == nil && joinMsg.Topic != "" {
-			s.topic = joinMsg.Topic
+		if join, err := decodePhoenixMessage(websocket.MessageText, joinPayload); err == nil && join.Topic != "" {
+			s.topic = join.Topic
 		}
 	}
 	if s.topic == "" {
@@ -2145,9 +2186,9 @@ func TestRunSessionEndpointPreservesBaseURLQuery(t *testing.T) {
 	for _, test := range []struct {
 		name, suffix, want string
 	}{
-		{"query", "?tenant=ops", "/socket/agent/websocket?tenant=ops"},
-		{"path and query", "/towerops/?tenant=ops", "/towerops/socket/agent/websocket?tenant=ops"},
-		{"escaped path", "/proxy%2Ftenant/?scope=a%2Fb", "/proxy%2Ftenant/socket/agent/websocket?scope=a%2Fb"},
+		{"query", "?tenant=ops", "/socket/agent/websocket?tenant=ops&vsn=2.0.0"},
+		{"path and query", "/towerops/?tenant=ops", "/towerops/socket/agent/websocket?tenant=ops&vsn=2.0.0"},
+		{"escaped path", "/proxy%2Ftenant/?scope=a%2Fb", "/proxy%2Ftenant/socket/agent/websocket?scope=a%2Fb&vsn=2.0.0"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			requests := make(chan string, 1)
@@ -2195,7 +2236,7 @@ func TestRunAgentPreservesTrailingSlashInQuery(t *testing.T) {
 	runAgent(ctx, baseURL, "token", nil)
 	select {
 	case got := <-requests:
-		if want := "/towerops/socket/agent/websocket?tenant=ops/"; got != want {
+		if want := "/towerops/socket/agent/websocket?tenant=ops/&vsn=2.0.0"; got != want {
 			t.Fatalf("request URI = %q, want %q", got, want)
 		}
 	default:
@@ -2304,7 +2345,7 @@ func TestRunSessionJoinUnmarshalError(t *testing.T) {
 	if err == nil {
 		t.Error("expected unmarshal error")
 	}
-	if !strings.Contains(err.Error(), "join reply unmarshal") {
+	if !strings.Contains(err.Error(), "decode websocket frame") {
 		t.Errorf("expected 'join reply unmarshal' in error, got: %v", err)
 	}
 }
@@ -3293,9 +3334,9 @@ func agtReadJoin(t *testing.T, conn *net.TCPConn) string {
 	if err != nil {
 		t.Fatalf("read join frame: %v", err)
 	}
-	var join channelMsg
-	if err := json.Unmarshal(data, &join); err != nil {
-		t.Fatalf("unmarshal join frame: %v", err)
+	join, err := decodePhoenixMessage(websocket.MessageText, data)
+	if err != nil {
+		t.Fatalf("decode join frame: %v", err)
 	}
 	if join.Event != "phx_join" {
 		t.Fatalf("first frame event = %q, want phx_join", join.Event)
@@ -3348,8 +3389,8 @@ func agtReadFrames(conn net.Conn) <-chan channelMsg {
 			if err != nil {
 				return
 			}
-			var msg channelMsg
-			if err := json.Unmarshal(data, &msg); err != nil {
+			msg, err := decodePhoenixMessage(websocket.MessageText, data)
+			if err != nil {
 				continue
 			}
 			select {
@@ -3886,7 +3927,7 @@ func TestSessionReadExitsOnContextDoneWithFullMsgCh(t *testing.T) {
 		ws:         ws,
 		ctx:        sessionCtx,
 		cancel:     cancel,
-		msgCh:      make(chan []byte),
+		msgCh:      make(chan channelMsg),
 		errCh:      make(chan error, 1),
 		readerDone: make(chan struct{}),
 	}
@@ -3938,7 +3979,7 @@ func TestSessionReadSkipsEchoAfterCancellation(t *testing.T) {
 		ws:         ws,
 		ctx:        sessionCtx,
 		cancel:     cancel,
-		msgCh:      make(chan []byte, 1),
+		msgCh:      make(chan channelMsg, 1),
 		errCh:      make(chan error, 1),
 		readerDone: make(chan struct{}),
 	}
@@ -4461,7 +4502,7 @@ func TestAgtRunSessionPoolShutdownTimeout(t *testing.T) {
 	if err := <-done; !errors.Is(err, errRestartRequested) {
 		t.Fatalf("runSession error = %v, want %v", err, errRestartRequested)
 	}
-	if !logs.has("worker pool shutdown timed out, abandoning in-flight jobs pool=mikrotik") {
+	if !logs.has("pool shutdown timed out, abandoning in-flight jobs pool=mikrotik") {
 		t.Errorf("expected the mikrotik pool to be reported as abandoned\nlogged:\n%s", logs.dump())
 	}
 }
@@ -4840,51 +4881,49 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 	t.Cleanup(func() { dispatchJitterMax = origJitter })
 
 	t.Run("same pool", func(t *testing.T) {
-		origPing := doPing
-		defer func() { doPing = origPing }()
-
-		release := make(chan struct{})
-		var releaseOnce sync.Once
-		defer releaseOnce.Do(func() { close(release) })
-		firstStarted := make(chan struct{})
-		// One ping job now calls doPing three times (pingProbeCount), so
-		// "a second job started" has to be a separate signal from a later
-		// probe of the same job: first call parks until release, every
-		// later call counts, and only a call arriving while probe one is
-		// still parked would mean a second job broke the gate.
-		secondStarted := make(chan struct{}, 8)
-		var calls atomic.Int32
-		doPing = func(_ context.Context, ip string, _ int) (float64, error) {
-			if calls.Add(1) == 1 {
-				close(firstStarted)
-				<-release
-			} else {
-				secondStarted <- struct{}{}
-			}
-			return 1, nil
-		}
+		stopPingEngine()
+		t.Cleanup(stopPingEngine)
+		conn := tpTNewFakeICMPConn()
+		tpTUseFakeICMPConn(t, conn)
 
 		pools := testPools(t)
 		out := testQueue()
 		job := func(id string) *pb.AgentJob {
 			return &pb.AgentJob{
-				JobId:      id,
-				JobType:    pb.JobType_PING,
-				SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+				JobId:         id,
+				JobType:       pb.JobType_PING,
+				DeviceId:      id,
+				SnmpDevice:    &pb.SnmpDevice{Ip: "10.0.0.1"},
+				PingTimeoutMs: 1000,
 			}
 		}
 		dispatchJob(context.Background(), job("p1"), pools, out)
-		<-firstStarted
-		dispatchJob(context.Background(), job("p2"), pools, out)
+		sent := tpTWaitSent(t, conn, 1)
+		peTInjectEchoReply(t, conn, sent[0].pkt)
 
-		select {
-		case <-secondStarted:
-			t.Fatal("second job for the same target ran concurrently with the first")
-		case <-time.After(100 * time.Millisecond):
+		dispatchJob(context.Background(), job("p2"), pools, out)
+		if got := tpTWaitSent(t, conn, 1); len(got) != 1 {
+			t.Fatalf("second job for the same target transmitted %d packets after the first", len(got)-1)
 		}
-		releaseOnce.Do(func() { close(release) })
+		time.Sleep(100 * time.Millisecond)
+		if got := tpTWaitSent(t, conn, 1); len(got) != 1 {
+			t.Fatal("second job for the same target transmitted concurrently with the first")
+		}
+
+		// The gate holds the first job until its full round completes; inject
+		// replies as its remaining probes are transmitted.
+		for i := 1; i < 3; i++ {
+			s := tpTWaitSent(t, conn, i+1)
+			peTInjectEchoReply(t, conn, s[i].pkt)
+		}
 
 		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
+
+		// The gate has now released the second round; answer its probes too.
+		for i := range 3 {
+			sent := tpTWaitSent(t, conn, 4+i)
+			peTInjectEchoReply(t, conn, sent[3+i].pkt)
+		}
 		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
 	})
 
@@ -4941,15 +4980,17 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 	})
 
 	t.Run("ping is not gated behind snmp", func(t *testing.T) {
-		origPing := doPing
 		origDial := snmpDial
-		defer func() { doPing = origPing; snmpDial = origDial }()
+		defer func() { snmpDial = origDial }()
+		stopPingEngine()
+		t.Cleanup(stopPingEngine)
+		conn := tpTNewFakeICMPConn()
+		tpTUseFakeICMPConn(t, conn)
 
 		release := make(chan struct{})
 		var releaseOnce sync.Once
 		defer releaseOnce.Do(func() { close(release) })
 		snmpStarted := make(chan struct{})
-		pingDone := make(chan struct{})
 		snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 			close(snmpStarted)
 			<-release
@@ -4958,12 +4999,6 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 					return &gosnmp.SnmpPacket{}, nil
 				},
 			}, func() {}, nil
-		}
-		var pingOnce sync.Once
-		doPing = func(_ context.Context, ip string, _ int) (float64, error) {
-			// Three probes per job now; only the first completion reports.
-			defer pingOnce.Do(func() { close(pingDone) })
-			return 1, nil
 		}
 
 		pools := testPools(t)
@@ -4975,59 +5010,52 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 		}, pools, out)
 		<-snmpStarted
 		dispatchJob(context.Background(), &pb.AgentJob{
-			JobId:      "ping-1",
-			JobType:    pb.JobType_PING,
-			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
+			JobId:         "ping-1",
+			JobType:       pb.JobType_PING,
+			DeviceId:      "isolated-ping",
+			SnmpDevice:    &pb.SnmpDevice{Ip: "10.0.0.1"},
+			PingTimeoutMs: 1000,
 		}, pools, out)
 
-		// The ping must complete even though the SNMP job for the same IP is
-		// still running: outage signals cannot queue behind a stalled walk.
-		select {
-		case <-pingDone:
-		case <-time.After(time.Second):
-			t.Fatal("ping queued behind an in-flight SNMP job for the same target")
+		// Answer each probe as it is transmitted. The ping completes while
+		// the SNMP walk remains parked.
+		for i := range 3 {
+			s := tpTWaitSent(t, conn, i+1)
+			peTInjectEchoReply(t, conn, s[i].pkt)
 		}
-		// The ping's result must be queued while the SNMP job is still parked
-		// — not just doPing returned — or the assertion proves nothing.
 		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", 2*time.Second)
 		releaseOnce.Do(func() { close(release) })
 		_ = wantResult[*pb.SnmpResult](t, out, "result", 2*time.Second)
 	})
 
 	t.Run("different targets stay parallel", func(t *testing.T) {
-		origPing := doPing
-		defer func() { doPing = origPing }()
-
-		release := make(chan struct{})
-		var releaseOnce sync.Once
-		defer releaseOnce.Do(func() { close(release) })
-		started := make(chan string, 4)
-		doPing = func(_ context.Context, ip string, _ int) (float64, error) {
-			started <- ip
-			<-release
-			return 1, nil
-		}
+		stopPingEngine()
+		t.Cleanup(stopPingEngine)
+		conn := tpTNewFakeICMPConn()
+		tpTUseFakeICMPConn(t, conn)
 
 		pools := testPools(t)
 		out := testQueue()
-		for i, ip := range []string{"10.0.0.1", "10.0.0.2"} {
+		ips := []string{"10.0.0.1", "10.0.0.2"}
+		for i, ip := range ips {
 			dispatchJob(context.Background(), &pb.AgentJob{
-				JobId:      fmt.Sprintf("p%d", i),
-				JobType:    pb.JobType_PING,
-				SnmpDevice: &pb.SnmpDevice{Ip: ip},
+				JobId:         fmt.Sprintf("p%d", i),
+				JobType:       pb.JobType_PING,
+				DeviceId:      fmt.Sprintf("parallel-p%d", i),
+				SnmpDevice:    &pb.SnmpDevice{Ip: ip},
+				PingTimeoutMs: 1000,
 			}, pools, out)
 		}
 
-		for range 2 {
-			select {
-			case <-started:
-			case <-time.After(time.Second):
-				t.Fatal("jobs for different targets did not run in parallel")
-			}
+		// Answer probes as they are transmitted; both independent targets
+		// interleave on the shared socket before either round finishes.
+		for i := range 6 {
+			sent := tpTWaitSent(t, conn, i+1)
+			peTInjectEchoReply(t, conn, sent[i].pkt)
 		}
-		releaseOnce.Do(func() { close(release) })
-		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
-		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
+		for range 2 {
+			_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
+		}
 	})
 }
 
@@ -5038,60 +5066,61 @@ func TestQueuedJobSkipsAfterSessionEnds(t *testing.T) {
 	origJitter := dispatchJitterMax
 	dispatchJitterMax = 0
 	t.Cleanup(func() { dispatchJitterMax = origJitter })
-	origPing := doPing
-	defer func() { doPing = origPing }()
+	origDial := snmpDial
+	defer func() { snmpDial = origDial }()
 	firstStarted := make(chan struct{}, 4)
 	release := make(chan struct{})
 	var ranFor []string
 	var mu sync.Mutex
-	doPing = func(_ context.Context, ip string, _ int) (float64, error) {
+	snmpDial = func(_ context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
 		mu.Lock()
-		ranFor = append(ranFor, ip)
+		ranFor = append(ranFor, job.SnmpDevice.Ip)
 		mu.Unlock()
 		select {
 		case firstStarted <- struct{}{}:
 		default:
 		}
 		<-release
-		return 1, nil
+		return nil, func() {}, errors.New("released")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pools := &jobPools{
-		ping:    newWorkerPool(1),
+		snmp:    newWorkerPool(1),
 		targets: &targetGates{},
 		notices: make(chan outbound, 8),
 	}
-	defer pools.ping.stop()
+	defer pools.snmp.stop()
 	out := testQueue()
 
-	// The first ping occupies the single worker until release closes.
+	// The first discovery occupies the single SNMP worker until release
+	// closes.
 	submitJob(ctx, &pb.AgentJob{
 		JobId:      "held",
-		JobType:    pb.JobType_PING,
+		JobType:    pb.JobType_DISCOVER,
 		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},
 	}, pools, out, func() {}, false)
 	select {
 	case <-firstStarted:
 	case <-time.After(2 * time.Second):
-		t.Fatal("first ping never ran")
+		t.Fatal("first discovery never ran")
 	}
 
-	// The second ping must be enqueued (not just submitted) before its
+	// The second job must be enqueued (not just submitted) before its
 	// session ends, so the cancelled task is what the freed worker picks up.
 	// Same-package access: watch the queue depth until the submit lands.
 	sess2, cancel2 := context.WithCancel(context.Background())
 	done2 := make(chan struct{})
 	submitJob(sess2, &pb.AgentJob{
 		JobId:      "queued",
-		JobType:    pb.JobType_PING,
+		JobType:    pb.JobType_DISCOVER,
 		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.2"},
 	}, pools, out, func() { close(done2) }, false)
 	deadline := time.Now().Add(2 * time.Second)
-	for len(pools.ping.tasks) == 0 {
+	for len(pools.snmp.tasks) == 0 {
 		if time.Now().After(deadline) {
-			t.Fatal("queued ping never reached the pool queue")
+			t.Fatal("queued discovery never reached the pool queue")
 		}
 		runtime.Gosched()
 	}
@@ -5252,12 +5281,10 @@ func TestJobCancelledWhileGated(t *testing.T) {
 	origJitter := dispatchJitterMax
 	dispatchJitterMax = 0
 	t.Cleanup(func() { dispatchJitterMax = origJitter })
-	origPing := doPing
-	defer func() { doPing = origPing }()
-	doPing = func(_ context.Context, ip string, _ int) (float64, error) {
-		t.Error("cancelled job executed")
-		return 0, nil
-	}
+	stopPingEngine()
+	t.Cleanup(stopPingEngine)
+	conn := tpTNewFakeICMPConn()
+	tpTUseFakeICMPConn(t, conn)
 
 	pools := testPools(t)
 	release := pools.targets.acquire(context.Background(), "ping:10.0.0.1")
@@ -5348,37 +5375,34 @@ func TestSequentialJobsOnSameTargetBothRun(t *testing.T) {
 	origJitter := dispatchJitterMax
 	dispatchJitterMax = 0
 	t.Cleanup(func() { dispatchJitterMax = origJitter })
-	origPing := doPing
-	defer func() { doPing = origPing }()
-	// One ping job probes the target three times (pingProbeCount), so the
-	// channel needs room for every probe of both sequential jobs.
-	ran := make(chan string, 8)
-	doPing = func(_ context.Context, ip string, _ int) (float64, error) {
-		ran <- ip
-		return 1, nil
-	}
+	stopPingEngine()
+	t.Cleanup(stopPingEngine)
+	conn := tpTNewFakeICMPConn()
+	tpTUseFakeICMPConn(t, conn)
 
 	pools := testPools(t)
+	sent := 0
 	for _, id := range []string{"first", "second"} {
 		done := make(chan struct{})
+		out := testQueue()
 		submitJob(context.Background(), &pb.AgentJob{
-			JobId:      "seq-" + id,
-			JobType:    pb.JobType_PING,
-			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.9"},
-		}, pools, testQueue(), func() { close(done) }, false)
+			JobId:         "seq-" + id,
+			JobType:       pb.JobType_PING,
+			DeviceId:      "seq-" + id,
+			SnmpDevice:    &pb.SnmpDevice{Ip: "10.0.0.9"},
+			PingTimeoutMs: 1000,
+		}, pools, out, func() { close(done) }, false)
+		for range 3 {
+			packets := tpTWaitSent(t, conn, sent+1)
+			peTInjectEchoReply(t, conn, packets[sent].pkt)
+			sent++
+		}
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
-			t.Fatalf("job %s never ran — the first job's gate was never released", id)
+			t.Fatalf("job %s never ran — the previous job's gate was never released", id)
 		}
-		select {
-		case ip := <-ran:
-			if ip != "10.0.0.9" {
-				t.Fatalf("ping ran for %q, want 10.0.0.9", ip)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("job %s never executed", id)
-		}
+		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
 	}
 }
 
@@ -5392,46 +5416,26 @@ func TestDifferentKindsOnSameTargetRunConcurrently(t *testing.T) {
 
 	pools := testPools(t)
 
-	// Hold a ping slot open so the concurrency is observable, then submit a
-	// backup for the same device: it must not block on the ping's gate.
-	pingStarted := make(chan struct{})
-	pingRelease := make(chan struct{})
+	// Start a real engine ping, then submit a backup for the same device: it
+	// must not block on the ping's protocol-specific gate.
+	stopPingEngine()
+	t.Cleanup(stopPingEngine)
+	conn := tpTNewFakeICMPConn()
+	tpTUseFakeICMPConn(t, conn)
 	pingDone := make(chan struct{})
-	pingSubmitted := false
-	origPing := doPing
-	var startOnce sync.Once
-	doPing = func(_ context.Context, _ string, _ int) (float64, error) {
-		// Only the first of the job's three probes parks; the others run
-		// after the test releases the gate.
-		startOnce.Do(func() { close(pingStarted) })
-		<-pingRelease
-		return 1, nil
-	}
-	// Drain the ping before restoring the global stub. The job may still call
-	// doPing for its remaining probes after the release.
-	defer func() {
-		close(pingRelease)
-		if pingSubmitted {
-			<-pingDone
-		}
-		doPing = origPing
-	}()
+	pingOut := testQueue()
 
 	pools.backup = newWorkerPool(1)
 	t.Cleanup(pools.backup.stop)
 
 	submitJob(context.Background(), &pb.AgentJob{
-		JobId:      "conc-ping",
-		JobType:    pb.JobType_PING,
-		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.10"},
-	}, pools, testQueue(), func() { close(pingDone) }, false)
-	pingSubmitted = true
-	select {
-
-	case <-pingStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("ping never ran")
-	}
+		JobId:         "conc-ping",
+		JobType:       pb.JobType_PING,
+		DeviceId:      "conc-ping",
+		SnmpDevice:    &pb.SnmpDevice{Ip: "10.0.0.10"},
+		PingTimeoutMs: 1000,
+	}, pools, pingOut, func() { close(pingDone) }, false)
+	_ = tpTWaitSent(t, conn, 1)
 
 	backupRan := make(chan struct{})
 	job := &pb.AgentJob{
@@ -5466,6 +5470,12 @@ func TestDifferentKindsOnSameTargetRunConcurrently(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("backup job never completed")
 	}
+	select {
+	case <-pingDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("isolation ping never completed")
+	}
+	_ = wantResult[*pb.MonitoringCheck](t, pingOut, "monitoring_check", time.Second)
 }
 
 // TestHandleResultReplyRetriesRejectedResult covers the phx_reply error path:
@@ -5680,7 +5690,7 @@ func TestSessionLoopDispatchesResultReply(t *testing.T) {
 	sessionCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	results := newResultQueue(4)
-	msgCh := make(chan []byte, 1)
+	msgCh := make(chan channelMsg, 1)
 	s := &session{
 		ctx:        sessionCtx,
 		cancel:     cancel,
@@ -5698,7 +5708,7 @@ func TestSessionLoopDispatchesResultReply(t *testing.T) {
 		"ref":     "5",
 		"payload": map[string]any{"status": "error", "response": map[string]string{"reason": "too large"}},
 	})
-	msgCh <- reply
+	msgCh <- legacyChannelMessage(t, reply)
 
 	done := make(chan error, 1)
 	go func() { done <- s.loop(context.Background()) }()
@@ -6083,7 +6093,7 @@ func TestSessionLoopServicesInboundDuringInFlightWrite(t *testing.T) {
 		t.Fatal("failed to seed result queue")
 	}
 	writeCh := make(chan writeRequest, 1)
-	msgCh := make(chan []byte, 1)
+	msgCh := make(chan channelMsg, 1)
 	reply, _ := json.Marshal(channelMsg{
 		Topic:   "phoenix",
 		Event:   "heartbeat",
@@ -6106,8 +6116,8 @@ func TestSessionLoopServicesInboundDuringInFlightWrite(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.loop(agentCtx) }()
 
-	request := <-writeCh // result is now in flight
-	msgCh <- reply       // must be processed before the ack lands
+	request := <-writeCh                    // result is now in flight
+	msgCh <- legacyChannelMessage(t, reply) // must be processed before the ack lands
 	// Wait until the inbound frame has been consumed; only then ack.
 	deadline := time.After(2 * time.Second)
 	for len(msgCh) > 0 {
@@ -6136,7 +6146,7 @@ func TestSessionLoopRetriesEarlyRejectionWithFullSpool(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	writeCh := make(chan writeRequest, 1)
-	msgCh := make(chan []byte)
+	msgCh := make(chan channelMsg)
 	s := &session{
 		ctx: ctx, cancel: cancel, topic: "agent:test",
 		writeCh: writeCh, msgCh: msgCh, results: results,
@@ -6176,7 +6186,7 @@ func TestSessionLoopRetriesEarlyRejectionWithFullSpool(t *testing.T) {
 	// before the writer's acknowledgment is delivered.
 	for _, data := range [][]byte{reply, []byte(`{"topic":"phoenix","event":"phx_reply","payload":{}}`)} {
 		select {
-		case msgCh <- data:
+		case msgCh <- legacyChannelMessage(t, data):
 		case <-time.After(time.Second):
 			t.Fatal("session did not consume inbound message")
 		}
@@ -6269,8 +6279,7 @@ func TestSubmitJobDispatchSaturated(t *testing.T) {
 	}
 	select {
 	case notice := <-notices:
-		var errMsg pb.AgentError
-		agtDecodeBinary(t, notice.payload, &errMsg)
+		errMsg := decodeQueuedResult[*pb.AgentError](t, notice)
 		if errMsg.JobId != "j-saturated" {
 			t.Fatalf("notice job id = %q, want j-saturated", errMsg.JobId)
 		}

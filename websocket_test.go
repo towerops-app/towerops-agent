@@ -45,9 +45,12 @@ func TestWSDialReadWriteAndClose(t *testing.T) {
 	if err := ws.WriteText(context.Background(), want); err != nil {
 		t.Fatalf("WriteText: %v", err)
 	}
-	got, err := ws.ReadMessage(context.Background())
+	kind, got, err := ws.ReadMessage(context.Background())
 	if err != nil {
 		t.Fatalf("ReadMessage: %v", err)
+	}
+	if kind != websocket.MessageText {
+		t.Fatalf("ReadMessage kind = %d, want text", kind)
 	}
 	if string(got) != string(want) {
 		t.Fatalf("ReadMessage = %q, want %q", got, want)
@@ -183,7 +186,7 @@ func TestWSConnReadLimit(t *testing.T) {
 	}
 	defer func() { _ = ws.Close() }()
 
-	_, err = ws.ReadMessage(context.Background())
+	_, _, err = ws.ReadMessage(context.Background())
 	if !errors.Is(err, websocket.ErrMessageTooBig) {
 		t.Fatalf("ReadMessage error = %v, want ErrMessageTooBig", err)
 	}
@@ -247,9 +250,12 @@ func TestWSReadLimitAdmitsRefusablePayloads(t *testing.T) {
 	}
 	defer func() { _ = ws.Close() }()
 
-	data, err := ws.ReadMessage(context.Background())
+	kind, data, err := ws.ReadMessage(context.Background())
 	if err != nil {
 		t.Fatalf("frame above the decode cap was killed by the read limit: %v", err)
+	}
+	if kind != websocket.MessageBinary {
+		t.Fatalf("oversized frame kind = %d, want binary", kind)
 	}
 	if len(data) != len(oversize) {
 		t.Fatalf("delivered %d bytes, want %d", len(data), len(oversize))

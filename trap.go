@@ -298,6 +298,11 @@ func (t *trapListener) probe(listener *gosnmp.TrapListener, done <-chan struct{}
 	}
 }
 
+// trapSocketReadBufferBytes is the SO_RCVBUF the trap sockets ask for. A
+// burst of traps from a switch reboot can exceed the kernel default; 4 MB
+// absorbs it. Best effort: failure to set it logs and continues.
+const trapSocketReadBufferBytes = 4 << 20
+
 // sendTrapProbe sends one v2c trap carrying trapProbeNonce to the listener's
 // bound address. It resolves the address the way gosnmp's listener does, so a
 // hostname that maps to both families probes the family that was bound.
@@ -316,6 +321,9 @@ func sendTrapProbe(bindAddr string, port uint16) error {
 		MaxOids:   gosnmp.MaxOids,
 	}
 	if err = sender.Connect(); err == nil {
+		if udp, ok := sender.Conn.(*net.UDPConn); ok {
+			applySocketReadBuffer(udp, trapSocketReadBufferBytes, "trap probe")
+		}
 		_, err = sender.SendTrap(gosnmp.SnmpTrap{Variables: []gosnmp.SnmpPDU{
 			// zeroDotZero: the probe identifies itself by community alone.
 			{Name: oidSnmpTrapOID, Type: gosnmp.ObjectIdentifier, Value: "0.0"},
@@ -393,6 +401,14 @@ func (t *trapListener) handle(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) {
 		trapDroppedTotal.Add(1)
 		t.reportDrop(t.dropped.Add(1))
 	}
+}
+
+// countTrapSpoolDrop increments the heartbeat's trap drop count for a trap
+// the result spool could not hold. The session loop calls this when a trap's
+// sendResult lands on a full spool, so traps_dropped covers queue-full AND
+// spool-full drops rather than only the queue's own count.
+func countTrapSpoolDrop() {
+	trapDroppedTotal.Add(1)
 }
 
 // reportDrop warns about a saturated queue at most once per

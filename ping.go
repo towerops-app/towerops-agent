@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -35,8 +36,67 @@ type icmpConn interface {
 	Close() error
 }
 
+// icmpReadBufferBytes is the SO_RCVBUF the shared ICMP sockets ask for. At
+// the target scale the socket receives every host's replies, so the default
+// kernel buffer drops bursts; 4 MB absorbs them. Best effort: failure to set
+// it logs and continues with the kernel default.
+const icmpReadBufferBytes = 4 << 20
+
+// rawICMPAdapter wraps a net.PacketConn (a *net.IPConn for raw ICMP) in the
+// icmpConn interface the shared socket uses. It exists so SO_RCVBUF can be
+// set on the underlying fd before the socket enters the read loop.
+type rawICMPAdapter struct{ pc net.PacketConn }
+
+func (c rawICMPAdapter) WriteTo(b []byte, addr net.Addr) (int, error) { return c.pc.WriteTo(b, addr) }
+func (c rawICMPAdapter) ReadFrom(b []byte) (int, net.Addr, error)     { return c.pc.ReadFrom(b) }
+func (c rawICMPAdapter) LocalAddr() net.Addr                          { return c.pc.LocalAddr() }
+func (c rawICMPAdapter) Close() error                                 { return c.pc.Close() }
+
 var icmpListenPacket = func(network, address string) (icmpConn, error) {
+	// Raw ICMP ("ip4:icmp", "ip6:ipv6-icmp") goes through net.ListenPacket,
+	// whose *net.IPConn exposes SyscallConn — so SO_RCVBUF can be applied.
+	// Unprivileged ICMP ("udp4", "udp6") needs icmp.ListenPacket's
+	// SOCK_DGRAM+IPPROTO_ICMP socket for the kernel's identifier rewrite;
+	// its *icmp.PacketConn does not expose the fd, so the buffer stays at
+	// the kernel default on that path.
+	if strings.HasPrefix(network, "ip") {
+		pc, err := net.ListenPacket(network, address)
+		if err != nil {
+			return nil, err
+		}
+		applySocketReadBuffer(pc, icmpReadBufferBytes, network)
+		return rawICMPAdapter{pc: pc}, nil
+	}
 	return icmp.ListenPacket(network, address)
+}
+
+// applySocketReadBuffer sets SO_RCVBUF on a packet connection when the
+// underlying socket supports it. Unsupported platforms and permission errors
+// are logged and ignored: the socket is still usable.
+func applySocketReadBuffer(pc net.PacketConn, bytes int, label string) {
+	type syscaller interface {
+		SyscallConn() (syscall.RawConn, error)
+	}
+	sc, ok := pc.(syscaller)
+	if !ok {
+		slog.Debug("socket read buffer not configurable", "socket", label)
+		return
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		slog.Debug("socket syscall conn unavailable", "socket", label, "error", err)
+		return
+	}
+	var sockErr error
+	if ctlErr := raw.Control(func(fd uintptr) {
+		sockErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, bytes)
+	}); ctlErr != nil {
+		slog.Debug("socket control failed", "socket", label, "error", ctlErr)
+		return
+	}
+	if sockErr != nil {
+		slog.Debug("socket read buffer set failed", "socket", label, "error", sockErr, "bytes", bytes)
+	}
 }
 
 var icmpMarshal = func(m *icmp.Message) ([]byte, error) { return m.Marshal(nil) }
@@ -127,12 +187,26 @@ type pingKey struct {
 // (unreachable, time exceeded) or the shared socket itself died.
 type icmpReply struct {
 	err error
+	// received is when dispatch or fail delivered the reply; zero for the
+	// synchronous per-ping path which measures RTT after the channel read.
+	received time.Time
 }
 
 // pingWaiter is a single in-flight ping registered on a shared socket.
 type pingWaiter struct {
 	dst net.IP
 	ch  chan icmpReply
+	// notify, when non-nil, receives the same icmpReply the ch would. The
+	// ping engine uses it so its single goroutine can route replies to the
+	// right probe without a goroutine per ping.
+	notify chan<- pingSocketEvent
+}
+
+// pingSocketEvent carries one routed reply from the shared socket's read
+// loop to the ping engine's event loop.
+type pingSocketEvent struct {
+	w     *pingWaiter
+	reply icmpReply
 }
 
 // icmpSocket is one process-wide ICMP socket per network type. Its readLoop
@@ -240,13 +314,13 @@ func (s *icmpSocket) readErr() error {
 // register installs a waiter under key, or returns nil if key is in use.
 // A socket can die before registration; the subsequent write fails and
 // doICMPPing retries once on a fresh socket.
-func (s *icmpSocket) register(key pingKey, dst net.IP) *pingWaiter {
+func (s *icmpSocket) register(key pingKey, dst net.IP, notify chan<- pingSocketEvent) *pingWaiter {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.waiters[key] != nil {
 		return nil
 	}
-	w := &pingWaiter{dst: dst, ch: make(chan icmpReply, 1)}
+	w := &pingWaiter{dst: dst, ch: make(chan icmpReply, 1), notify: notify}
 	s.waiters[key] = w
 	return w
 }
@@ -344,10 +418,7 @@ func (s *icmpSocket) dispatch(rm *icmp.Message, src net.IP) {
 		if w == nil || src == nil || !src.Equal(w.dst) {
 			return
 		}
-		select {
-		case w.ch <- icmpReply{}:
-		default:
-		}
+		s.deliver(w, icmpReply{received: time.Now()})
 	case ipv4.ICMPTypeDestinationUnreachable, ipv6.ICMPTypeDestinationUnreachable,
 		ipv4.ICMPTypeTimeExceeded, ipv6.ICMPTypeTimeExceeded,
 		ipv6.ICMPTypePacketTooBig:
@@ -377,8 +448,21 @@ func (s *icmpSocket) dispatch(rm *icmp.Message, src net.IP) {
 		default:
 			what = "time exceeded"
 		}
+		s.deliver(w, icmpReply{err: fmt.Errorf("icmp %s for %s", what, w.dst), received: time.Now()})
+	}
+}
+
+// deliver routes one terminal reply to its waiter: the synchronous channel
+// always, and the engine's notify channel when one is registered. Both are
+// non-blocking; a full or missing sink means the waiter already timed out.
+func (s *icmpSocket) deliver(w *pingWaiter, reply icmpReply) {
+	select {
+	case w.ch <- reply:
+	default:
+	}
+	if w.notify != nil {
 		select {
-		case w.ch <- icmpReply{err: fmt.Errorf("icmp %s for %s", what, w.dst)}:
+		case w.notify <- pingSocketEvent{w: w, reply: reply}:
 		default:
 		}
 	}
@@ -395,10 +479,7 @@ func (s *icmpSocket) fail(err error) {
 	}
 	s.err = err
 	for key, w := range s.waiters {
-		select {
-		case w.ch <- icmpReply{err: err}:
-		default:
-		}
+		s.deliver(w, icmpReply{err: err, received: time.Now()})
 		delete(s.waiters, key)
 	}
 	_ = s.conn.Close()
@@ -442,44 +523,7 @@ func quotedEchoIDSeq(data []byte, isIPv4 bool) (id, seq int, dst net.IP, ok bool
 // a keyed waiter; the matching reply, an ICMP error quoting the request, the
 // context, or the timeout ends the wait.
 func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, timeoutMs int) (float64, error) {
-	var msgType icmp.Type
-	if isIPv4 {
-		msgType = ipv4.ICMPTypeEcho
-	} else {
-		msgType = ipv6.ICMPTypeEchoRequest
-	}
-
-	// Destination address type depends on network
-	var dst net.Addr
-	if strings.HasPrefix(network, "udp") {
-		dst = &net.UDPAddr{IP: ip}
-	} else {
-		dst = &net.IPAddr{IP: ip}
-	}
-
-	var waiter sentEcho
-	var start time.Time
-	var err error
-	// The 16-bit sequence counter can wrap while a slow ping is still
-	// pending. Try another sequence instead of replacing that ping's waiter.
-	for range 1 << 16 {
-		if ctx.Err() != nil {
-			return 0, fmt.Errorf("icmp ping: %w", ctx.Err())
-		}
-		seq := int(pingSeq.Add(1) & 0xffff)
-		msg := icmp.Message{
-			Type: msgType,
-			Body: &icmp.Echo{ID: os.Getpid() & 0xffff, Seq: seq, Data: []byte("towerops")},
-		}
-		wb, marshalErr := icmpMarshal(&msg)
-		if marshalErr != nil {
-			return 0, fmt.Errorf("icmp marshal: %w", marshalErr)
-		}
-		waiter, start, err = sendEcho(network, seq, ip, wb, dst)
-		if !errors.Is(err, errPingSequenceInUse) {
-			break
-		}
-	}
+	waiter, start, err := startICMPPing(ctx, ip, network, isIPv4, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -501,6 +545,55 @@ func doICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, tim
 	}
 }
 
+// startICMPPing registers a waiter on the shared socket and writes one echo
+// request without waiting for the reply. The caller unregisters
+// waiter.sock/waiter.key/waiter.w when the probe ends. A non-nil notify
+// routes the reply to the ping engine instead of a per-ping goroutine.
+func startICMPPing(ctx context.Context, ip net.IP, network string, isIPv4 bool, notify chan<- pingSocketEvent) (sentEcho, time.Time, error) {
+	var msgType icmp.Type
+	if isIPv4 {
+		msgType = ipv4.ICMPTypeEcho
+	} else {
+		msgType = ipv6.ICMPTypeEchoRequest
+	}
+
+	// Destination address type depends on network
+	var dst net.Addr
+	if strings.HasPrefix(network, "udp") {
+		dst = &net.UDPAddr{IP: ip}
+	} else {
+		dst = &net.IPAddr{IP: ip}
+	}
+
+	// The 16-bit sequence counter can wrap while a slow ping is still
+	// pending. Try another sequence instead of replacing that ping's waiter.
+	var waiter sentEcho
+	var start time.Time
+	var err error
+	for range 1 << 16 {
+		if ctx.Err() != nil {
+			return sentEcho{}, time.Time{}, fmt.Errorf("icmp ping: %w", ctx.Err())
+		}
+		seq := int(pingSeq.Add(1) & 0xffff)
+		msg := icmp.Message{
+			Type: msgType,
+			Body: &icmp.Echo{ID: os.Getpid() & 0xffff, Seq: seq, Data: []byte("towerops")},
+		}
+		wb, marshalErr := icmpMarshal(&msg)
+		if marshalErr != nil {
+			return sentEcho{}, time.Time{}, fmt.Errorf("icmp marshal: %w", marshalErr)
+		}
+		waiter, start, err = sendEchoNotify(network, seq, ip, wb, dst, notify)
+		if !errors.Is(err, errPingSequenceInUse) {
+			break
+		}
+	}
+	if err != nil {
+		return sentEcho{}, time.Time{}, err
+	}
+	return waiter, start, nil
+}
+
 // sentEcho is a written echo request's registration on the socket it went out
 // on; the caller unregisters it when the ping ends.
 type sentEcho struct {
@@ -509,19 +602,19 @@ type sentEcho struct {
 	w    *pingWaiter
 }
 
-// sendEcho registers a waiter on the shared socket for network and writes the
-// echo request. The socket can be closed between sharedSocket returning it
-// and the write - its read loop failed, or it was torn down - so a
-// closed-connection write marks that socket dead and is retried once on a
-// fresh one rather than reporting a healthy device down.
-func sendEcho(network string, seq int, ip net.IP, wb []byte, dst net.Addr) (sentEcho, time.Time, error) {
+// sendEchoNotify registers a waiter on the shared socket and writes the echo
+// request. The socket can be closed between sharedSocket returning it and the
+// write - its read loop failed, or it was torn down - so a closed-connection
+// write marks that socket dead and is retried once on a fresh one rather than
+// reporting a healthy device down.
+func sendEchoNotify(network string, seq int, ip net.IP, wb []byte, dst net.Addr, notify chan<- pingSocketEvent) (sentEcho, time.Time, error) {
 	for attempt := 0; ; attempt++ {
 		sock, err := sharedSocket(network)
 		if err != nil {
 			return sentEcho{}, time.Time{}, err
 		}
 		key := pingKey{id: sock.replyID, seq: seq}
-		w := sock.register(key, ip)
+		w := sock.register(key, ip, notify)
 		if w == nil {
 			return sentEcho{}, time.Time{}, errPingSequenceInUse
 		}

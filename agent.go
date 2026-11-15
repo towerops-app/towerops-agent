@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/towerops-app/towerops-agent/pb"
 	"google.golang.org/protobuf/proto"
 )
@@ -79,12 +80,23 @@ const resultQueueSize = 512
 // from completed results, so a large job push cannot consume the result spool.
 const overloadNoticeQueueSize = 64
 
-// channelMsg is the WebSocket channel message format (JSON wrapper around binary protobuf).
+// channelMsg is the WebSocket channel message format. V1 frames are the JSON
+// envelope; Phoenix V2 binary frames are decoded into the same shape, with
+// JoinRef recording the frame's join_ref. Capability-lane payloads on a V2
+// transport are raw protobuf bytes; every other payload keeps the
+// `%{binary: base64}` JSON object shape.
 type channelMsg struct {
 	Topic   string          `json:"topic"`
 	Event   string          `json:"event"`
 	Payload json.RawMessage `json:"payload"`
 	Ref     *string         `json:"ref"`
+	// JoinRef is only populated when decoding a Phoenix V2 binary frame.
+	JoinRef string `json:"-"`
+	// Status carries V2 binary reply's separate status field.
+	Status string `json:"-"`
+	// Binary records websocket.MessageBinary dispatch for raw capability
+	// lanes. V2 text arrays carrying base64 JSON must remain non-binary.
+	Binary bool `json:"-"`
 }
 type writeRequest struct {
 	data []byte
@@ -93,20 +105,30 @@ type writeRequest struct {
 	// pool once the write completes; nil for frames not built by
 	// marshalChannelFrame.
 	buf *bytes.Buffer
+	// binary selects the Phoenix V2 binary serializer for this frame.
+	binary bool
 }
 
 // inFlightWrite is a result frame handed to the writer but not yet
 // acknowledged. The session loop keeps at most one so wire order is
 // preserved, but it services other events while the write is in flight.
+// results carries every result of the frame: one for a single-frame send,
+// several for a "result_batch".
 type inFlightWrite struct {
 	result outbound
-	ack    chan error
-	ref    string
+	// results is non-empty for batched sends and duplicates result as its
+	// first element, so single-result code paths keep working unchanged.
+	results []outbound
+	event   string
+	ack     chan error
+	ref     string
+	binary  bool
 	// A reply can arrive before the writer's acknowledgment. Delay handling
 	// it until the spool slot is released so a retry can reuse that capacity.
 	reply *channelMsg
-	// spooled means the result holds a resultQueue slot the loop must
-	// release on success or requeue on failure; notices carry no slot.
+	// spooled means the results hold resultQueue capacity the loop must
+	// release on success (legacy) or leave for the server ack (V1-ack mode);
+	// notices carry no capacity.
 	spooled bool
 }
 
@@ -115,6 +137,8 @@ type inFlightWrite struct {
 // are pruned by age rather than removed on success.
 type pendingResult struct {
 	result outbound
+	// results holds every result of a batch frame; nil for single sends.
+	results []outbound
 	// sentAt stays zero until the writer acknowledges completion.
 	sentAt time.Time
 	// seq orders insertions; the count cap evicts the lowest.
@@ -138,6 +162,11 @@ var overloadRetryDelay = 5 * time.Second
 
 // runAgentWithScheduling connects to the server and runs the event loop with
 // reconnect. traps may be nil when the trap listener is disabled.
+//
+// The recurring inventory, scheduler and worker pools live in a process
+// poller that survives transport disconnects for the configured grace period
+// (C1/D2). Only a grace expiry or a drained self-update rebuilds it; the
+// result spool survives every rebuild so finished work is still replayed.
 func runAgentWithScheduling(
 	ctx context.Context,
 	wsURL, token string,
@@ -149,9 +178,18 @@ func runAgentWithScheduling(
 	// gets its predecessor restored instead of crash-looping (issue #2736).
 	_ = checkPendingUpdate()
 
-	results := newResultQueueForAgent(ctx, resultQueueSize)
+	results := newResultQueueForAgentBytes(ctx, resultSpoolByteLimit())
+	stopJobSummary := startJobSummaryLogger(ctx)
+	defer stopJobSummary()
 	retryDelay := initialRetryDelay
 	maxRetry := 10 * time.Second
+
+	var poller *processPoller
+	defer func() {
+		if poller != nil {
+			poller.stop()
+		}
+	}()
 
 	for {
 		select {
@@ -160,14 +198,18 @@ func runAgentWithScheduling(
 		default:
 		}
 
+		if poller == nil || poller.stopped.Load() {
+			poller = newProcessPoller(ctx, results, localScheduling)
+		}
+
 		sessionStart := time.Now()
-		err := runSessionWithResultsAndScheduling(
+		err := runSessionWithPoller(
 			ctx,
 			wsURL,
 			token,
 			traps,
 			results,
-			localScheduling,
+			poller,
 		)
 		sessionDuration := time.Since(sessionStart)
 
@@ -185,8 +227,15 @@ func runAgentWithScheduling(
 		if errors.Is(err, errRestartRequested) || errors.Is(err, errSelfUpdateAborted) {
 			slog.Info("restart requested, reconnecting immediately", "reason", err)
 			retryDelay = initialRetryDelay
+			// A self-update drain paused the poller permanently and a
+			// restart may have invalidated its inventory: rebuild either way.
+			poller.stop()
+			poller = nil
 			continue
 		}
+		// A disconnected session starts the grace countdown; the next join
+		// cancels it. A join failure never attached, so this is a no-op.
+		poller.disconnected()
 		if err != nil {
 			slog.Error("agent disconnected", "error", err)
 		}
@@ -222,7 +271,7 @@ type session struct {
 	jobCancel context.CancelFunc
 
 	writeCh    chan writeRequest
-	msgCh      chan []byte
+	msgCh      chan channelMsg
 	errCh      chan error
 	writeErrCh chan error
 	// abortCh carries errSelfUpdateAborted when a drained session must be
@@ -232,20 +281,47 @@ type session struct {
 	writerDone chan struct{}
 
 	// pools and results exist only once the channel join has been accepted;
-	// see runSessionWithResultsAndScheduling.
+	// see runSessionWithResultsAndScheduling. With a process poller they are
+	// borrowed for the session's lifetime and survive its end (C1/D2).
 	pools     *jobPools
 	scheduler *recurringScheduler
 	results   *resultQueue
 	notices   <-chan outbound
+	// poller is the process-level poller this session transports, if any.
+	// ownsPools marks a session-built pool set that stop must drain (the
+	// compatibility path used by tests and non-poller callers).
+	poller    *processPoller
+	ownsPools bool
 
 	refCounter atomic.Uint64
+
+	// joinRef is the ref used for the successful phx_join; Phoenix V2 push
+	// frames repeat it as join_ref.
+	joinRef string
+	// v2 marks a Phoenix serializer V2 transport (binary frames), confirmed
+	// by the join reply's shape. Legacy servers keep JSON frames.
+	v2 bool
+	// serverCapabilities holds the capability list the join reply confirmed.
+	serverCapabilities map[string]struct{}
+	// resultBatches enables result_batch/result_ack sends.
+	resultBatches bool
+	// inventoryUpdates enables inventory_update handling.
+	inventoryUpdates bool
+
+	// inventoryWork decodes multi-megabyte inventory frames off the session
+	// loop (B8); the decoded result is applied from the loop in order.
+	inventoryWork   chan inventoryDecodeRequest
+	inventoryResult chan inventoryDecodeResult
 
 	// pending tracks result refs awaiting a server phx_reply so a rejected
 	// delivery (e.g. an oversized payload) can be retried instead of being
 	// acked on websocket write alone. Only the session loop touches it.
-	// pendingSeq numbers insertions so the count cap evicts the oldest.
-	pending    map[string]pendingResult
-	pendingSeq uint64
+	// pendingSeq numbers insertions; pendingOrder is a ring of refs so the
+	// count cap evicts the oldest without scanning the map (B8).
+	pending      map[string]pendingResult
+	pendingOrder []string
+	pendingHead  int
+	pendingSeq   uint64
 
 	// ackedResults counts spooled results the writer acknowledged. The
 	// shutdown drain reads it from its own goroutine to log how many
@@ -253,6 +329,10 @@ type session struct {
 	ackedResults atomic.Uint64
 }
 
+// runSessionWithResultsAndScheduling is the compatibility entry point: it
+// builds a poller for this call only and tears it down when the session ends.
+// The production loop uses runSessionWithPoller so the poller outlives the
+// transport (C1/D2).
 func runSessionWithResultsAndScheduling(
 	ctx context.Context,
 	baseURL, token string,
@@ -260,13 +340,28 @@ func runSessionWithResultsAndScheduling(
 	results *resultQueue,
 	localScheduling bool,
 ) error {
+	poller := newProcessPoller(ctx, results, localScheduling)
+	defer poller.stop()
+	return runSessionWithPoller(ctx, baseURL, token, traps, results, poller)
+}
+
+// runSessionWithPoller runs one WebSocket session as a transport for the
+// process poller. The poller's pools, scheduler and inventory survive the
+// session's end; only the socket I/O and the inventory decoder are torn down.
+func runSessionWithPoller(
+	ctx context.Context,
+	baseURL, token string,
+	traps <-chan *pb.SnmpTrap,
+	results *resultQueue,
+	poller *processPoller,
+) error {
 	endpoint, err := url.JoinPath(baseURL, "socket/agent/websocket")
 	if err != nil {
 		return fmt.Errorf("build websocket endpoint: %w", err)
 	}
 	slog.Info("connecting", "url", sanitizeURL(endpoint))
 
-	ws, err := wsDial(ctx, endpoint)
+	ws, err := wsDial(ctx, endpoint, token)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -286,27 +381,31 @@ func runSessionWithResultsAndScheduling(
 	// The session context is detached from the agent context: on process
 	// shutdown the loop must keep writing spooled results while it drains,
 	// which a dead I/O context cannot do. Jobs, checks and scheduled work get
-	// jobCtx — still bound to the agent context — so in-flight work is
-	// cancelled while the spool flushes around it.
+	// the poller's context — still bound to the agent context — so in-flight
+	// work is cancelled on shutdown while the spool flushes around it.
 	sessionCtx, sessionCancel := context.WithCancel(context.WithoutCancel(ctx))
-	jobCtx, jobCancel := context.WithCancel(ctx)
+	// wsDial requests Phoenix serializer V2. Framing is independent of
+	// application capabilities: without them payloads remain base64 JSON in
+	// text arrays; with them raw protobuf rides kind-zero binary frames.
+	v2Framing := true
 	s := &session{
 		ws:              ws,
 		topic:           "agent:" + agentID,
 		hostname:        hostname,
 		traps:           traps,
-		localScheduling: localScheduling,
+		v2:              v2Framing,
+		localScheduling: poller.pools.localScheduling,
 		ctx:             sessionCtx,
 		cancel:          sessionCancel,
-		jobCtx:          jobCtx,
-		jobCancel:       jobCancel,
 		writeCh:         make(chan writeRequest, 256),
-		msgCh:           make(chan []byte, 100),
+		msgCh:           make(chan channelMsg, 100),
 		errCh:           make(chan error, 1),
 		writeErrCh:      make(chan error, 1),
 		abortCh:         make(chan error, 1),
 		readerDone:      make(chan struct{}),
 		writerDone:      make(chan struct{}),
+		results:         results,
+		poller:          poller,
 	}
 	s.refCounter.Store(1)
 
@@ -325,24 +424,23 @@ func runSessionWithResultsAndScheduling(
 	// and stop the rollback watchdog before work starts.
 	updateJoined()
 
-	// Worker pools are created only now: 220 goroutines started before the
-	// join would be abandoned by every early return above, and a revoked token
-	// reconnects every few seconds.
-	notices := make(chan outbound, overloadNoticeQueueSize)
-	s.pools = &jobPools{
-		snmp:            newWorkerPool(100),
-		mikrotik:        newWorkerPool(20),
-		ping:            newWorkerPool(50),
-		checks:          newWorkerPool(50),
-		backup:          newWorkerPool(8),
-		notices:         notices,
-		targets:         &targetGates{},
-		localScheduling: localScheduling,
-	}
-	s.results = results
-	s.notices = notices
-	s.scheduler = newRecurringScheduler(s.jobCtx, realScheduleClock{})
-	s.pools.scheduler = s.scheduler
+	// Attach the process poller only after the join was accepted: a revoked
+	// token reconnects every few seconds and must not stop the poller or
+	// replace the metrics pointer with a failing transport.
+	s.pools = poller.pools
+	s.scheduler = poller.scheduler
+	s.notices = poller.pools.notices
+	s.jobCtx = poller.workCtx
+	poller.connected()
+
+	// Async inventory decoding (B8): multi-megabyte frames no longer stop
+	// result delivery while they decode.
+	s.startInventoryDecoder()
+
+	// C4: a held result whose ack never arrived is resent with its original
+	// sequence after reconnect; the server's cumulative ack deduplicates the
+	// accounting even if the storage layer sees the frame twice.
+	s.results.requeueUnacked()
 
 	// Let the self-update path flush the spool before it re-execs. The hook is
 	// cleared on teardown so a stale session can never be drained.
@@ -364,7 +462,7 @@ func runSessionWithResultsAndScheduling(
 func (s *session) read() {
 	defer close(s.readerDone)
 	for {
-		data, err := s.ws.ReadMessage(s.ctx)
+		kind, data, err := s.ws.ReadMessage(s.ctx)
 		if err != nil {
 			// fail() elsewhere (an abort, the writer) cancels the session;
 			// once that cancellation is visible this read error is only its
@@ -376,8 +474,17 @@ func (s *session) read() {
 			s.fail(s.errCh, err)
 			return
 		}
+		msg, err := decodePhoenixMessage(kind, data)
+		if err != nil {
+			// A malformed Phoenix frame is a protocol failure, not a message
+			// to ignore: the peer (or a proxy) is not speaking the negotiated
+			// serializer, so reconnect and renegotiate.
+			s.fail(s.errCh, fmt.Errorf("decode websocket frame: %w", err))
+			return
+		}
+		msg.Binary = kind == websocket.MessageBinary
 		select {
-		case s.msgCh <- data:
+		case s.msgCh <- msg:
 		case <-s.ctx.Done():
 			return
 		}
@@ -388,7 +495,12 @@ func (s *session) read() {
 func (s *session) write() {
 	defer close(s.writerDone)
 	for request := range s.writeCh {
-		err := s.ws.WriteText(s.ctx, request.data)
+		var err error
+		if request.binary {
+			err = s.ws.WriteBinary(s.ctx, request.data)
+		} else {
+			err = s.ws.WriteText(s.ctx, request.data)
+		}
 		if request.ack != nil {
 			request.ack <- err
 		}
@@ -426,7 +538,9 @@ func (s *session) fail(ch chan<- error, err error) {
 }
 
 // stop tears the session down within one shared shutdown budget: socket I/O
-// first, then worker pools and the scheduler, then both I/O goroutines.
+// first, then any session-owned worker pools and scheduler, then both I/O
+// goroutines. A process-poller session stops only its transport; the poller
+// keeps polling across disconnects (C1/D2) and is drained by its own stop.
 func (s *session) stop() {
 	s.cancel()
 	if s.jobCancel != nil {
@@ -434,19 +548,25 @@ func (s *session) stop() {
 	}
 	_ = s.ws.Close()
 
-	if s.scheduler != nil {
-		s.scheduler.cancelAll()
+	if s.inventoryWork != nil {
+		close(s.inventoryWork)
 	}
-	deadline := time.Now().Add(poolShutdownTimeout)
-	if s.pools != nil {
-		for _, name := range s.pools.stop(time.Until(deadline)) {
-			slog.Warn("worker pool shutdown timed out, abandoning in-flight jobs", "pool", name)
+
+	if s.ownsPools {
+		if s.scheduler != nil {
+			s.scheduler.cancelAll()
 		}
-	}
-	if s.scheduler != nil {
-		remaining := time.Until(deadline)
-		if remaining <= 0 || !s.scheduler.wait(remaining) {
-			slog.Warn("recurring scheduler shutdown timed out")
+		deadline := time.Now().Add(poolShutdownTimeout)
+		if s.pools != nil {
+			for _, name := range s.pools.stop(time.Until(deadline)) {
+				slog.Warn("worker pool shutdown timed out, abandoning in-flight jobs", "pool", name)
+			}
+		}
+		if s.scheduler != nil {
+			remaining := time.Until(deadline)
+			if remaining <= 0 || !s.scheduler.wait(remaining) {
+				slog.Warn("recurring scheduler shutdown timed out")
+			}
 		}
 	}
 	close(s.writeCh)
@@ -454,16 +574,24 @@ func (s *session) stop() {
 	<-s.readerDone
 }
 
-// join performs the phx_join exchange and validates the reply.
+// join performs the phx_join exchange, validates the reply and records the
+// transport/capability negotiation. The join payload carries the agent's
+// capability tokens because the initial inventory can arrive before the
+// first heartbeat; the reply's `response.capabilities` is authoritative for
+// what the server will send.
 func (s *session) join(token string) error {
-	joinPayload, _ := json.Marshal(map[string]string{"token": token})
-	joinMsg := channelMsg{
-		Topic:   s.topic,
-		Event:   "phx_join",
-		Payload: joinPayload,
-		Ref:     new("1"),
+	joinPayload, _ := json.Marshal(struct {
+		Token        string   `json:"token"`
+		Capabilities []string `json:"capabilities"`
+	}{Token: token, Capabilities: inventoryCapabilities()})
+	joinRef := "1"
+	s.joinRef = joinRef
+	joinBuf, joinData, err := encodePhoenixV2Text(
+		s.topic, "phx_join", joinRef, &joinRef, joinPayload)
+	if err != nil {
+		return fmt.Errorf("encode join: %w", err)
 	}
-	joinData, _ := json.Marshal(joinMsg)
+	defer putFrameBuffer(joinBuf)
 	if err := s.ws.WriteText(s.ctx, joinData); err != nil {
 		return fmt.Errorf("send join: %w", err)
 	}
@@ -472,17 +600,119 @@ func (s *session) join(token string) error {
 	timer := time.NewTimer(joinTimeout)
 	defer timer.Stop()
 	select {
-	case data := <-s.msgCh:
-		if err := validateJoinReply(data, s.topic); err != nil {
+	case msg := <-s.msgCh:
+		capabilities, err := parseJoinReplyMsg(msg, s.topic)
+		if err != nil {
 			return err
 		}
-		slog.Info("channel joined")
+		s.serverCapabilities = make(map[string]struct{}, len(capabilities))
+		for _, capability := range capabilities {
+			s.serverCapabilities[capability] = struct{}{}
+		}
+		// Serializer V2 framing is already negotiated by the dial query. The
+		// confirmed application capabilities only select raw protobuf lanes.
+		s.resultBatches = s.hasCapability(capabilityResultBatch)
+		s.inventoryUpdates = s.hasCapability(capabilityInventoryUpdate)
+		slog.Info("channel joined",
+			"serializer", map[bool]string{true: "v2", false: "v1"}[s.v2],
+			"capabilities", len(capabilities))
 		return nil
 	case err := <-s.errCh:
 		return fmt.Errorf("read during join: %w", err)
 	case <-timer.C:
 		return errors.New("join timeout")
 	}
+}
+
+func (s *session) hasCapability(capability string) bool {
+	_, ok := s.serverCapabilities[capability]
+	return ok
+}
+
+// rawBinaryPayload reports whether this server confirmed the capability lanes
+// that consume raw protobuf in Phoenix V2 binary frames. Without them, V2
+// framing still carries the legacy base64 JSON payload in text arrays.
+func (s *session) rawBinaryPayload() bool {
+	return s.v2 && len(s.serverCapabilities) > 0
+}
+
+// marshalPhoenixEnvelope selects the exact wire representation: raw protobuf
+// in a kind-zero binary client push for capability servers, base64 JSON in a
+// V2 text array otherwise, and the legacy V1 object without V2 framing.
+func marshalPhoenixEnvelope(
+	topic, event, joinRef string,
+	payload []byte,
+	ref *string,
+	v2, raw bool,
+) (*bytes.Buffer, []byte, bool, error) {
+	if raw {
+		frameRef := ""
+		if ref != nil {
+			frameRef = *ref
+		}
+		buf, data, err := encodePhoenixV2Push(topic, event, joinRef, frameRef, payload)
+		return buf, data, true, err
+	}
+	if v2 {
+		buf, data, err := encodePhoenixV2Text(topic, event, joinRef, ref, payload)
+		return buf, data, false, err
+	}
+	buf, data := marshalChannelFrame(topic, event, json.RawMessage(payload), ref)
+	return buf, data, false, nil
+}
+
+// parseJoinReply validates a legacy JSON reply byte slice for callers that
+// only need the V1 validity check.
+func parseJoinReply(data []byte, topic string) ([]string, error) {
+	reply, err := decodeChannelFrame(data)
+	if err != nil {
+		return nil, fmt.Errorf("join reply unmarshal: %w", err)
+	}
+	return parseJoinReplyMsg(reply, topic)
+}
+
+// parseJoinReplyMsg validates an already kind-dispatched Phoenix frame. Both
+// V2 arrays/binary replies and a legacy V1 object reply produce channelMsg.
+func parseJoinReplyMsg(reply channelMsg, topic string) ([]string, error) {
+	if reply.Event != "phx_reply" {
+		return nil, fmt.Errorf("expected phx_reply, got %s", reply.Event)
+	}
+	status := reply.Status
+	var payloadStatus struct {
+		Status   string `json:"status"`
+		Response struct {
+			Reason       string   `json:"reason"`
+			Capabilities []string `json:"capabilities"`
+		} `json:"response"`
+	}
+	if status == "" {
+		if err := json.Unmarshal(reply.Payload, &payloadStatus); err != nil {
+			return nil, fmt.Errorf("join reply payload: %w", err)
+		}
+		status = payloadStatus.Status
+	} else if err := json.Unmarshal(reply.Payload, &payloadStatus.Response); err != nil && len(reply.Payload) > 0 && string(reply.Payload) != "{}" {
+		return nil, fmt.Errorf("join reply payload: %w", err)
+	}
+	if reply.Topic != topic {
+		return nil, fmt.Errorf("join reply for topic %q, want %q", reply.Topic, topic)
+	}
+	if reply.Ref == nil || *reply.Ref != "1" {
+		return nil, fmt.Errorf("join reply has unexpected ref")
+	}
+	if status != "ok" {
+		if payloadStatus.Response.Reason != "" {
+			return nil, fmt.Errorf("join rejected: %s (%s)", status, payloadStatus.Response.Reason)
+		}
+		return nil, fmt.Errorf("join rejected: %s", status)
+	}
+	return payloadStatus.Response.Capabilities, nil
+}
+
+// validateJoinReply preserves the pre-negotiation behavior for callers that
+// only need the validity check.
+func validateJoinReply(data []byte, topic string) error {
+	_, err := parseJoinReply(data, topic)
+	return err
 }
 
 func (s *session) nextRef() string {
@@ -548,19 +778,63 @@ func marshalChannelFrame(topic, event string, payload json.RawMessage, ref *stri
 	return buf, buf.Bytes()
 }
 
-// sendBinary queues a protobuf message inside the channel envelope.
+// marshalChannelFrameV2 builds the V1-shaped message as a Phoenix V2 binary
+// frame when the session negotiated that transport, or falls back to the
+// JSON envelope for a legacy server.
+func marshalChannelFrameV2(
+	topic, event, joinRef string,
+	payload json.RawMessage,
+	ref *string,
+	v2 bool,
+) (*bytes.Buffer, []byte, bool) {
+	if !v2 {
+		buf, data := marshalChannelFrame(topic, event, payload, ref)
+		return buf, data, false
+	}
+	frameRef := ""
+	if ref != nil {
+		frameRef = *ref
+	}
+	buf, data, err := encodePhoenixV2Push(topic, event, joinRef, frameRef, payload)
+	if err != nil {
+		// A field over the V2 length bound is a programming error; legacy
+		// JSON encoding still gets the message out.
+		buf, data = marshalChannelFrame(topic, event, payload, ref)
+		return buf, data, false
+	}
+	return buf, data, true
+}
+
+// sendBinary queues a protobuf message. Capability servers receive the exact
+// protobuf bytes in a V2 binary client push; V2 framing without capabilities
+// receives the legacy base64 JSON object in a text array.
 func (s *session) sendBinary(event string, msg proto.Message) bool {
+	raw := s.rawBinaryPayload()
 	payload := framePool.Get().(*bytes.Buffer)
-	if err := appendBinaryPayload(payload, msg); err != nil {
+	if raw {
+		bin, err := proto.Marshal(msg)
+		if err != nil {
+			putFrameBuffer(payload)
+			slog.Error("marshal protobuf", "error", err)
+			return false
+		}
+		payload.Write(bin)
+	} else if err := appendBinaryPayload(payload, msg); err != nil {
 		putFrameBuffer(payload)
 		slog.Error("marshal protobuf", "error", err)
 		return false
 	}
-	buf, data := marshalChannelFrame(s.topic, event, payload.Bytes(), nil)
+	buf, data, binaryFrame, err := marshalPhoenixEnvelope(
+		s.topic, event, s.joinRef, payload.Bytes(), nil, s.v2, raw)
 	putFrameBuffer(payload)
+	if err != nil {
+		slog.Error("marshal channel frame", "error", err)
+		return false
+	}
 	if !enqueueWrite(s.ctx, s.writeCh, writeRequest{
-		data: data,
-		buf:  buf,
+		data:   data,
+		buf:    buf,
+		binary: binaryFrame,
 	}, event) {
 		putFrameBuffer(buf)
 		return false
@@ -578,52 +852,217 @@ func (s *session) sendBinary(event string, msg proto.Message) bool {
 // to this result: a rejected delivery (oversized payload, decode failure) is
 // retried once by handleResultReply instead of being silently dropped.
 func (s *session) queueResultWrite(result outbound, spooled bool) (*inFlightWrite, error) {
+	return s.queueResultFrame([]outbound{result}, result.event, spooled)
+}
+
+// queueResultFrame sends one frame containing results. With result_batch_v1
+// negotiated the frame is a single "result_batch" envelope; without it the
+// results must arrive one per frame and only the first is sent.
+func (s *session) queueResultFrame(results []outbound, event string, spooled bool) (*inFlightWrite, error) {
+	if s.ctx.Err() != nil {
+		return nil, s.sessionErr()
+	}
+	if len(results) == 0 {
+		return nil, errors.New("queue result frame without results")
+	}
+	// Capability servers always receive the raw result_batch protobuf lane,
+	// including a singleton; this keeps one payload representation per lane
+	// and lets the cumulative ack release every spooled sequence.
+	batched := spooled && s.resultBatches
+	frameEvent := event
+	var msg proto.Message
+	if batched {
+		frameEvent = "result_batch"
+		msg = encodeResultBatch(results)
+	} else {
+		results = results[:1]
+	}
+
+	// Assign delivery sequences in send order and hold them until the
+	// server's cumulative ack. A retried frame keeps its sequence.
+	if spooled && s.results.byteBounded() {
+		for i := range results {
+			if results[i].sequence == 0 {
+				results[i].sequence = s.results.nextSeq.Add(1)
+			}
+			s.results.hold(results[i])
+		}
+	}
+
 	ref := s.nextRef()
-	s.trackPending(ref, result)
-	buf, data := marshalChannelFrame(s.topic, result.event, result.payload, &ref)
+	var payload []byte
+	if batched {
+		// Capability lanes over V2 carry raw protobuf bytes: no base64, no
+		// JSON pass over a multi-megabyte batch (D5, B7). proto.Marshal is
+		// the one allocation; the envelope bytes go straight to the frame
+		// builder, which performs the only remaining copy into the wire
+		// buffer.
+		bin, err := proto.Marshal(msg)
+		if err != nil {
+			s.unholdSpooled(results)
+			return nil, fmt.Errorf("encode %s frame: %w", frameEvent, err)
+		}
+		payload = bin
+	} else {
+		result := results[0]
+		if len(result.protoPayload) > 0 {
+			// Capability-less V2 and V1 servers consume the legacy base64
+			// JSON object. This wrapper is intentionally only built on send.
+			payload = base64BinaryPayload(result.protoPayload)
+		} else {
+			payload = result.payload
+		}
+	}
+	buf, data, binaryFrame, envErr := marshalPhoenixEnvelope(
+		s.topic, frameEvent, s.joinRef, payload, &ref, s.v2, batched)
+	if envErr != nil {
+		s.unholdSpooled(results)
+		putFrameBuffer(buf)
+		return nil, fmt.Errorf("encode %s frame: %w", frameEvent, envErr)
+	}
 	ack := make(chan error, 1)
 	if !enqueueWrite(s.ctx, s.writeCh, writeRequest{
-		data: data,
-		ack:  ack,
-		buf:  buf,
-	}, result.event) {
+		data:   data,
+		ack:    ack,
+		buf:    buf,
+		binary: binaryFrame,
+	}, frameEvent) {
 		putFrameBuffer(buf)
-		delete(s.pending, ref)
+		s.trackPendingCleanup(ref, results)
+		s.unholdSpooled(results)
 		if s.ctx.Err() != nil {
 			return nil, s.sessionErr()
 		}
-		return nil, fmt.Errorf("queue %s result for websocket write: timeout", result.event)
+		return nil, fmt.Errorf("queue %s result for websocket write: timeout", frameEvent)
 	}
-	return &inFlightWrite{result: result, ack: ack, ref: ref, spooled: spooled}, nil
+	s.trackPendingFrame(ref, results)
+	return &inFlightWrite{
+		result:  results[0],
+		results: results,
+		event:   frameEvent,
+		ack:     ack,
+		ref:     ref,
+		binary:  binaryFrame,
+		spooled: spooled,
+	}, nil
 }
 
-// resolveInFlight settles a completed write: spooled results free their slot
-// on success and are requeued on failure so the next session retries them.
-// The retry lane has capacity one and only the session loop pushes to it, so
-// retry never blocks while at most one write is in flight.
-func (s *session) resolveInFlight(w *inFlightWrite, err error) error {
-	if err != nil {
-		delete(s.pending, w.ref)
-		if w.spooled {
-			s.results.retry(w.result)
+// unholdSpooled removes held sequences before a retry re-enters the spool, so
+// capacity is not double-charged while the payload is retained.
+func (s *session) unholdSpooled(results []outbound) {
+	if !s.results.byteBounded() {
+		return
+	}
+	for _, result := range results {
+		s.results.unhold(result.sequence)
+	}
+}
+
+// trackPendingFrame records a sent frame for rejection correlation.
+func (s *session) trackPendingFrame(ref string, results []outbound) {
+	if s.pending == nil {
+		s.pending = make(map[string]pendingResult)
+	}
+	s.pendingSeq++
+	entry := pendingResult{
+		result:  results[0],
+		results: results,
+		seq:     s.pendingSeq,
+	}
+	s.pushPendingOrder(ref)
+	s.pending[ref] = entry
+}
+
+func (s *session) trackPendingCleanup(ref string, results []outbound) {
+	// The frame never reached the writer; nothing waits on its ref.
+	delete(s.pending, ref)
+	s.removePendingOrder(ref)
+	_ = results
+}
+
+// pushPendingOrder appends a ref to the eviction ring, growing it once.
+func (s *session) pushPendingOrder(ref string) {
+	if len(s.pendingOrder) < maxPendingResults {
+		s.pendingOrder = append(s.pendingOrder, ref)
+		return
+	}
+	if len(s.pending) >= maxPendingResults {
+		s.evictOldestPending()
+	}
+	s.pendingOrder[s.pendingHead] = ref
+	s.pendingHead = (s.pendingHead + 1) % len(s.pendingOrder)
+}
+
+// removePendingOrder drops a ref from the eviction ring after a failed queue.
+func (s *session) removePendingOrder(ref string) {
+	for i := range s.pendingOrder {
+		pos := (s.pendingHead + i) % len(s.pendingOrder)
+		if s.pendingOrder[pos] == ref {
+			s.pendingOrder[pos] = ""
+			return
 		}
-		return fmt.Errorf("write %s result: %w", w.result.event, err)
+	}
+}
+
+// resolveInFlight settles a completed write. Count mode frees the spool slot
+// on writer success (legacy at-most-once). Byte mode with result_ack_v1 keeps
+// the result held until the server's cumulative storage sequence arrives
+// (C4); without the capability negotiation it falls back to write success.
+// The retry lane has bounded capacity and only the session loop pushes to it.
+func (s *session) resolveInFlight(w *inFlightWrite, err error) error {
+	results := inFlightResults(w)
+	if err != nil {
+		s.trackPendingCleanup(w.ref, results)
+		if w.spooled {
+			s.retryResults(results)
+		}
+		return fmt.Errorf("write %s result: %w", w.event, err)
 	}
 	if pending, ok := s.pending[w.ref]; ok {
 		pending.sentAt = time.Now()
 		s.pending[w.ref] = pending
 	}
 	if w.spooled {
-		s.results.ack(w.result)
-		s.ackedResults.Add(1)
-		slog.Debug("sent result", "event", w.result.event)
+		s.ackedResults.Add(uint64(len(results)))
+		if s.results.byteBounded() && s.hasCapability(capabilityResultAck) {
+			// Held until result_ack; the ring releases the capacity.
+			slog.Debug("awaiting result ack", "event", w.event, "count", len(results))
+		} else {
+			for _, result := range results {
+				s.results.ack(result)
+			}
+		}
+		slog.Debug("sent result", "event", w.event, "count", len(results))
 	} else {
-		slog.Debug("sent overload notice", "event", w.result.event)
+		slog.Debug("sent overload notice", "event", w.event)
 	}
 	if w.reply != nil {
 		s.handleResultReply(*w.reply)
 	}
 	return nil
+}
+
+// retryResults puts a failed frame's results back at the head of the spool.
+func (s *session) retryResults(results []outbound) {
+	if len(results) == 0 {
+		return
+	}
+	if s.results.byteBounded() {
+		s.unholdSpooled(results)
+		s.results.retryBatch(results)
+		return
+	}
+	s.results.retry(results[0])
+}
+
+func inFlightResults(w *inFlightWrite) []outbound {
+	if w == nil {
+		return nil
+	}
+	if len(w.results) > 0 {
+		return w.results
+	}
+	return []outbound{w.result}
 }
 
 // settleInFlight resolves a still-pending write when the loop is ending for
@@ -640,7 +1079,7 @@ func (s *session) settleInFlight(w *inFlightWrite) {
 		_ = s.resolveInFlight(w, err)
 	default:
 		if w.spooled {
-			s.results.retry(w.result)
+			s.retryResults(inFlightResults(w))
 		}
 	}
 }
@@ -648,23 +1087,16 @@ func (s *session) settleInFlight(w *inFlightWrite) {
 // trackPending records a result under its message ref. Successful handle_in
 // calls produce no phx_reply, so expired entries are swept on the channel
 // heartbeat tick. Between sweeps the map is capped at maxPendingResults: at
-// the cap the oldest entry is evicted, which costs one map scan per insert
-// only while the cap is reached. The evicted result was sent longest ago; a
-// rejection for it arriving later is ignored like any unknown ref.
+// the cap the oldest entry is evicted through the order ring (B8). The
+// evicted result was sent longest ago; a rejection for it arriving later is
+// ignored like any unknown ref.
 func (s *session) trackPending(ref string, result outbound) {
-	if s.pending == nil {
-		s.pending = make(map[string]pendingResult)
-	}
-	if len(s.pending) >= maxPendingResults {
-		s.evictOldestPending()
-	}
-	s.pendingSeq++
-	// The TTL starts after the writer finishes. Large frames can take longer
-	// than pendingReplyTTL, and the server cannot reject them until arrival.
-	s.pending[ref] = pendingResult{result: result, seq: s.pendingSeq}
+	s.trackPendingFrame(ref, []outbound{result})
+	s.pending[ref] = pendingResult{result: result, seq: s.pending[ref].seq}
 }
 
-// evictOldestPending deletes the entry with the lowest insertion sequence.
+// evictOldestPending deletes the entry with the lowest insertion sequence via
+// the pending-order ring.
 func (s *session) evictOldestPending() {
 	var oldestRef string
 	var oldestSeq uint64
@@ -673,7 +1105,11 @@ func (s *session) evictOldestPending() {
 			oldestRef, oldestSeq = ref, p.seq
 		}
 	}
+	if oldestRef == "" {
+		return
+	}
 	delete(s.pending, oldestRef)
+	s.removePendingOrder(oldestRef)
 }
 
 // prunePending drops entries the server never answered. It runs on the
@@ -744,10 +1180,7 @@ func (s *session) drainSpool(ctx context.Context) bool {
 // and the shutdown drain, which differ only in who waits for it (issue 2757).
 func (s *session) resultsDrained() bool {
 	poolsIdle := s.pools == nil || s.pools.idle()
-	return poolsIdle &&
-		len(s.results.items) == 0 &&
-		len(s.results.slots) == 0 &&
-		len(s.results.reservedSlots) == 0
+	return poolsIdle && s.results.empty()
 }
 
 // drainForShutdown runs the spool drain behind a bounded budget on the
@@ -778,7 +1211,7 @@ func (s *session) drainForShutdown(done chan<- struct{}) {
 		return
 	}
 
-	lost := len(s.results.items)
+	lost := len(s.results.items) + s.results.pendingAckCount()
 	if lost > 0 {
 		slog.Warn("shutdown drain timed out, results lost",
 			"lost", lost,
@@ -809,12 +1242,13 @@ func abortDrainedSession() {
 }
 
 // handleResultReply consumes a phx_reply addressed to this channel. A reply
-// with an error status means the server rejected the result. Deterministic
-// rejections (oversized payload) are dropped immediately — re-sending the
-// identical marshalled bytes can only be rejected again — while transient
-// rejections are retried once, then dropped loudly. The previous behaviour
-// logged the rejection at debug while the spool slot had already been
-// acked, so oversized results vanished with a false success.
+// with an error status means the server rejected the result (or a whole
+// result_batch frame). Deterministic rejections (oversized payload) are
+// dropped immediately — re-sending the identical marshalled bytes can only
+// be rejected again — while transient rejections are retried once, then
+// dropped loudly. The previous behaviour logged the rejection at debug while
+// the spool slot had already been acked, so oversized results vanished with
+// a false success.
 func (s *session) handleResultReply(msg channelMsg) {
 	if msg.Ref == nil {
 		return
@@ -824,6 +1258,11 @@ func (s *session) handleResultReply(msg channelMsg) {
 		return
 	}
 	delete(s.pending, *msg.Ref)
+	s.removePendingOrder(*msg.Ref)
+	results := p.results
+	if len(results) == 0 {
+		results = []outbound{p.result}
+	}
 
 	var reply struct {
 		Status   string `json:"status"`
@@ -848,26 +1287,60 @@ func (s *session) handleResultReply(msg channelMsg) {
 	// again on every retry.
 	if strings.HasPrefix(reason, "Message too large") || strings.HasPrefix(reason, "Invalid message") {
 		slog.Error("server rejected result as undeliverable, dropping",
-			"event", p.result.event, "reason", reason)
+			"event", p.result.event, "reason", reason, "count", len(results))
+		for _, result := range results {
+			s.results.dropSent(result.sequence)
+		}
 		return
 	}
 	if p.result.attempts == 0 {
-		p.result.attempts++
+		for i := range results {
+			results[i].attempts = p.result.attempts + 1
+		}
 		if reason == "overloaded" {
 			slog.Warn("server overloaded, retrying result after a delay",
-				"event", p.result.event, "delay", overloadRetryDelay)
-			s.results.enqueueAfter(p.result, overloadRetryDelay)
+				"event", p.result.event, "delay", overloadRetryDelay,
+				"count", len(results))
+			s.requeueRejected(results, overloadRetryDelay)
 			return
 		}
 		slog.Warn("server rejected result, retrying once",
-			"event", p.result.event, "reason", reason)
-		if !s.results.enqueue(p.result) {
-			slog.Error("result retry dropped, spool full", "event", p.result.event)
-		}
+			"event", p.result.event, "reason", reason, "count", len(results))
+		s.requeueRejected(results, 0)
 		return
 	}
 	slog.Error("server rejected result twice, dropping",
-		"event", p.result.event, "reason", reason)
+		"event", p.result.event, "reason", reason, "count", len(results))
+	for _, result := range results {
+		s.results.dropSent(result.sequence)
+	}
+}
+
+// requeueRejected returns server-rejected results to the spool, preserving
+// their delivery sequences. The held ring entry is removed first so the
+// requeue does not double-charge the byte budget.
+func (s *session) requeueRejected(results []outbound, delay time.Duration) {
+	if s.results.byteBounded() {
+		s.unholdSpooled(results)
+	}
+	if delay > 0 {
+		for _, result := range results {
+			s.results.enqueueAfter(result, delay)
+		}
+		return
+	}
+	if s.results.byteBounded() && len(results) > 1 {
+		if !s.results.enqueueBatch(results) {
+			slog.Error("result retry dropped, spool full",
+				"event", results[0].event, "count", len(results))
+		}
+		return
+	}
+	for _, result := range results {
+		if !s.results.enqueue(result) {
+			slog.Error("result retry dropped, spool full", "event", result.event)
+		}
+	}
 }
 
 // sessionErr reports why the session context was cancelled. Both I/O
@@ -921,6 +1394,30 @@ func (s *session) heartbeat() *pb.AgentHeartbeat {
 		TrapsEnabled:      trapsReportingEnabled.Load(),
 		TrapListenerState: trapListenerStateString(),
 		TrapsDropped:      trapDroppedTotal.Load(),
+		// Protocol capabilities mirror the join payload: the server can use
+		// the heartbeat alone for later protocol turns (result acks), while
+		// the join payload covers the initial inventory.
+		Capabilities: inventoryCapabilities(),
+	}
+
+	// Load telemetry (C6): one consistent snapshot of the process counters,
+	// the active spool and every worker pool.
+	metrics := heartbeatMetrics(s.results)
+	hb.ResultsDropped = metrics.ResultDropped
+	hb.SpoolDepth = metrics.SpoolDepth
+	hb.SpoolBytes = metrics.SpoolBytes
+	hb.SpoolLimitBytes = metrics.SpoolLimit
+	hb.ScheduleLagMsP95 = metrics.ScheduleLagMS
+	hb.SnmpTimeouts = metrics.SNMPTimeouts
+	hb.RateLimitWaitMs = metrics.RateLimitWaitMS
+	hb.SkippedTicks = metrics.SkippedTicks
+	hb.InventoryCapacityDevices = uint32(metrics.InventoryCapacity)
+	for _, load := range metrics.Pools {
+		hb.Pools = append(hb.Pools, &pb.PoolLoad{
+			Name:   load.Name,
+			Busy:   uint32(load.Busy),
+			Queued: uint32(load.Queued),
+		})
 	}
 
 	// Inventory reconciliation (issue #2755): the newest pushed inventory
@@ -982,6 +1479,11 @@ func localVantagePoint() (localIPs, subnets []string) {
 // loop is the session event loop. ctx is the agent-wide context; the session's
 // own context signals connection failure.
 //
+// Result delivery is lane-aware (C3) and, with result_batch_v1, batched
+// (D5): outage signals leave first, small measurements share one frame every
+// 250 ms or 256 KB, and byte-bounded results stay held until the server's
+// cumulative storage ack (C4).
+//
 // When ctx is cancelled the loop switches to draining instead of returning:
 // drainResults — the same wait the self-update path uses — runs against the
 // spool while the loop keeps delivering its contents, so a restart flushes
@@ -991,12 +1493,24 @@ func (s *session) loop(ctx context.Context) error {
 	defer heartbeatTicker.Stop()
 	channelHeartbeatTicker := time.NewTicker(channelHeartbeatInterval)
 	defer channelHeartbeatTicker.Stop()
+	var batchTicker *time.Ticker
+	var batchFlush <-chan time.Time
+	if s.resultBatches {
+		batchTicker = time.NewTicker(resultBatchFlushDelay)
+		defer batchTicker.Stop()
+		batchFlush = batchTicker.C
+	}
 
 	// inFlight is the one result frame the writer owns but has not yet
 	// acknowledged. Keeping the cap at one preserves wire order — retries
 	// always go out before newer spooled results — while the loop stays
 	// responsive to inbound messages, traps and heartbeats during the write.
 	var inFlight *inFlightWrite
+
+	// lanes hold results already taken from the spool, grouped by delivery
+	// priority, until they form the next frame.
+	var lanes [4][]outbound
+	flushDue := false
 
 	// Shutdown asks for the same drain the self-update path gets (issue
 	// 2757): the goroutine waits for pools to idle and the spool to empty
@@ -1009,13 +1523,17 @@ func (s *session) loop(ctx context.Context) error {
 
 	for {
 		if inFlight == nil {
-			if result, ok := s.results.takeRetry(); ok {
-				if w, err := s.queueResultWrite(result, true); err != nil {
-					s.results.retry(result)
+			s.stageResults(&lanes)
+			frame, event := s.nextResultFrame(&lanes, flushDue)
+			flushDue = false
+			if len(frame) > 0 {
+				w, err := s.queueResultFrame(frame, event, true)
+				if err != nil {
+					s.retryResults(frame)
+					s.results.requeueLanes(&lanes)
 					return err
-				} else {
-					inFlight = w
 				}
+				inFlight = w
 			}
 		}
 
@@ -1024,9 +1542,16 @@ func (s *session) loop(ctx context.Context) error {
 		var resultsCh <-chan outbound
 		var noticesCh <-chan outbound
 		var ackCh <-chan error
+		trapCh := (<-chan *pb.SnmpTrap)(nil)
 		if inFlight == nil {
 			resultsCh = s.results.items
 			noticesCh = s.notices
+			// Trap backpressure (C5): stop reading the trap channel while
+			// the spool has no room for even a small trap, rather than
+			// dropping it as a generic result overflow.
+			if s.results.hasRoomFor(1 << 10) {
+				trapCh = s.traps
+			}
 		} else {
 			ackCh = inFlight.ack
 		}
@@ -1046,69 +1571,42 @@ func (s *session) loop(ctx context.Context) error {
 
 		case <-drainDone:
 			waitActiveUpdate(shutdownUpdateWait)
-			s.settleInFlight(inFlight)
-			return nil
+			return s.endLoop(&lanes, inFlight, nil)
 		case <-s.ctx.Done():
-			s.settleInFlight(inFlight)
-			return s.sessionErr()
+			return s.endLoop(&lanes, inFlight, s.sessionErr())
 
 		case err := <-s.errCh:
-			s.settleInFlight(inFlight)
-			return fmt.Errorf("read: %w", err)
+			return s.endLoop(&lanes, inFlight, fmt.Errorf("read: %w", err))
 
 		case err := <-s.writeErrCh:
 			// The writer publishes its ack before writeErrCh, so a pending
 			// in-flight write is already resolved on its channel.
-			s.settleInFlight(inFlight)
-			return fmt.Errorf("write: %w", err)
+			return s.endLoop(&lanes, inFlight, fmt.Errorf("write: %w", err))
 
 		case err := <-s.abortCh:
-			s.settleInFlight(inFlight)
-			return err
+			return s.endLoop(&lanes, inFlight, err)
 
 		case err := <-ackCh:
 			w := inFlight
 			inFlight = nil
 			if err := s.resolveInFlight(w, err); err != nil {
-				return err
-			}
-
-		case data := <-s.msgCh:
-			var msg channelMsg
-			if err := json.Unmarshal(data, &msg); err != nil {
-				slog.Debug("invalid message", "error", err)
-				continue
-			}
-			if msg.Event == "phx_reply" && (msg.Topic == s.topic || msg.Topic == "phoenix") {
-				if inFlight != nil && msg.Ref != nil && *msg.Ref == inFlight.ref {
-					inFlight.reply = &msg
-				} else {
-					s.handleResultReply(msg)
-				}
-				continue
-			}
-			shouldEnd, endErr := handleMessage(s.jobCtx, msg, s.topic, s.pools, s.results)
-			if shouldEnd {
-				s.settleInFlight(inFlight)
-				return endErr
+				return s.endLoop(&lanes, nil, err)
 			}
 
 		case result := <-resultsCh:
-			w, err := s.queueResultWrite(result, true)
-			if err != nil {
-				s.results.retry(result)
-				return err
-			}
-			inFlight = w
+			lanes[result.lane] = append(lanes[result.lane], result)
 
 		case notice := <-noticesCh:
 			w, err := s.queueResultWrite(notice, false)
 			if err != nil {
-				return err
+				return s.endLoop(&lanes, nil, err)
 			}
 			inFlight = w
 
-		case trap, ok := <-s.traps:
+		case trap, ok := <-trapCh:
+			if trapCh == nil {
+				continue
+			}
 			if !ok {
 				slog.Warn("snmp trap listener stopped")
 				s.traps = nil
@@ -1119,9 +1617,46 @@ func (s *session) loop(ctx context.Context) error {
 				continue
 			}
 			// Traps are process-scoped input, not session-scoped work. Spool
-			// them so a failed write is retried by the next connection.
-			sendResult(s.results.agentCtx, s.results, "trap", trap, "")
-			slog.Info("spooled snmp trap", "source", trap.SourceIp, "trap_oid", trap.TrapOid)
+			// them so a failed write is retried by the next connection. The
+			// enqueue verdict for THIS trap is the drop signal: a shared
+			// spool counter would also count poll results another
+			// goroutine dropped between load and check (C5).
+			if sendResult(s.results.agentCtx, s.results, "trap", trap, "") {
+				slog.Debug("spooled snmp trap", "source", trap.SourceIp, "trap_oid", trap.TrapOid)
+			} else {
+				countTrapSpoolDrop()
+			}
+
+		case msg := <-s.msgCh:
+			if msg.Event == "phx_reply" && (msg.Topic == s.topic || msg.Topic == "phoenix") {
+				if inFlight != nil && msg.Ref != nil && *msg.Ref == inFlight.ref {
+					inFlight.reply = &msg
+				} else {
+					s.handleResultReply(msg)
+				}
+				continue
+			}
+			if msg.Event == "result_ack" {
+				if sequence, ok := decodeResultAck(msg); ok {
+					if released := s.results.ackThrough(sequence); released > 0 {
+						slog.Debug("server acknowledged results", "through", released)
+					}
+				}
+				continue
+			}
+			if s.isInventoryEvent(msg.Event) {
+				if shouldEnd, endErr := s.queueInventoryDecode(msg, s.pools, s.results); shouldEnd || endErr != nil {
+					return s.endLoop(&lanes, inFlight, endErr)
+				}
+				continue
+			}
+			shouldEnd, endErr := handleMessage(s.jobCtx, msg, s.topic, s.pools, s.results)
+			if shouldEnd {
+				return s.endLoop(&lanes, inFlight, endErr)
+			}
+
+		case decoded := <-s.inventoryResult:
+			s.applyInventoryDecode(decoded, s.pools, s.results)
 
 		case <-heartbeatTicker.C:
 			hb := s.heartbeat()
@@ -1134,18 +1669,55 @@ func (s *session) loop(ctx context.Context) error {
 			// replies on rejection, so TTL — not ack — bounds the map.
 			s.prunePending()
 			ref := s.nextRef()
-			msg := channelMsg{
-				Topic:   "phoenix",
-				Event:   "heartbeat",
-				Payload: json.RawMessage(`{}`),
-				Ref:     &ref,
+			payload := []byte(`{}`)
+			buf, data, binaryFrame, err := marshalPhoenixEnvelope(
+				"phoenix", "heartbeat", s.joinRef, payload, &ref, s.v2, false)
+			if err != nil {
+				slog.Error("marshal channel heartbeat", "error", err)
+				continue
 			}
-			data, _ := json.Marshal(msg)
-			if enqueueWrite(s.ctx, s.writeCh, writeRequest{data: data}, "heartbeat") {
+			if enqueueWrite(s.ctx, s.writeCh, writeRequest{
+				data:   data,
+				buf:    buf,
+				binary: binaryFrame,
+			}, "heartbeat") {
 				slog.Debug("sent channel heartbeat", "ref", ref)
+			} else {
+				putFrameBuffer(buf)
+			}
+
+		case <-batchFlush:
+			// The 250 ms window closed: the next loop pass flushes whatever
+			// the lanes hold.
+			if batchTicker == nil {
+				continue
+			}
+			flushDue = true
+			if inFlight == nil {
+				s.stageResults(&lanes)
+				frame, event := s.nextResultFrame(&lanes, true)
+				if len(frame) > 0 {
+					w, err := s.queueResultFrame(frame, event, true)
+					if err != nil {
+						s.retryResults(frame)
+						s.results.requeueLanes(&lanes)
+						return err
+					}
+					inFlight = w
+				}
+				flushDue = false
 			}
 		}
 	}
+}
+
+// endLoop settles the in-flight write and returns staged-but-unsent lane
+// results to the spool before the session returns. The next session (or
+// poller) replays them.
+func (s *session) endLoop(lanes *[4][]outbound, inFlight *inFlightWrite, err error) error {
+	s.settleInFlight(inFlight)
+	s.results.requeueLanes(lanes)
+	return err
 }
 
 // enqueueWrite gives the session writer a bounded opportunity to accept a
@@ -1183,38 +1755,6 @@ func newAgentID() string {
 	return fmt.Sprintf("agent-%d-%d", time.Now().UnixNano(), agentIDCounter.Add(1))
 }
 
-func validateJoinReply(data []byte, topic string) error {
-	var reply channelMsg
-	if err := json.Unmarshal(data, &reply); err != nil {
-		return fmt.Errorf("join reply unmarshal: %w", err)
-	}
-	if reply.Event != "phx_reply" {
-		return fmt.Errorf("expected phx_reply, got %s", reply.Event)
-	}
-	if reply.Topic != topic {
-		return fmt.Errorf("join reply for topic %q, want %q", reply.Topic, topic)
-	}
-	if reply.Ref == nil || *reply.Ref != "1" {
-		return fmt.Errorf("join reply has unexpected ref")
-	}
-	var status struct {
-		Status   string `json:"status"`
-		Response struct {
-			Reason string `json:"reason"`
-		} `json:"response"`
-	}
-	if err := json.Unmarshal(reply.Payload, &status); err != nil {
-		return fmt.Errorf("join reply payload: %w", err)
-	}
-	if status.Status != "ok" {
-		if status.Response.Reason != "" {
-			return fmt.Errorf("join rejected: %s (%s)", status.Status, status.Response.Reason)
-		}
-		return fmt.Errorf("join rejected: %s", status.Status)
-	}
-	return nil
-}
-
 // handleMessage dispatches incoming channel messages.
 // Returns whether the session should end and the reason for reconnecting.
 func handleMessage(
@@ -1250,29 +1790,7 @@ func handleMessage(
 			reportPayloadRejection(ctx, out, msg.Event)
 			return false, nil
 		}
-		if !pools.localScheduling {
-			pools.scheduler.replaceJobs(nil, pools, out)
-			for _, job := range jobList.Jobs {
-				if job != nil {
-					dispatchJob(ctx, job, pools, out)
-				}
-			}
-			break
-		}
-
-		recurring, oneShot := splitRecurringJobs(jobList.Jobs)
-		slog.Info("received recurring jobs", "count", len(recurring))
-		// A jobs frame containing only ad-hoc work is not an authoritative
-		// inventory. Preserve scheduled assignments until an interval-bearing
-		// or explicitly empty inventory arrives.
-		if len(recurring) > 0 || len(jobList.Jobs) == 0 {
-			pools.scheduler.replaceJobs(recurring, pools, out)
-			pools.applyInventoryRevision(msg.Event, jobList.Revision)
-		}
-		for _, job := range oneShot {
-			slog.Info("received one-shot job", "job_id", job.JobId, "type", job.JobType)
-			dispatchJob(ctx, job, pools, out)
-		}
+		applyJobList(ctx, msg.Event, &jobList, pools, out)
 
 	case "discovery_job", "backup_job":
 		if pools.stopAccepting.Load() {
@@ -1287,6 +1805,7 @@ func handleMessage(
 		slog.Info("received one-shot jobs", "event", msg.Event, "count", len(jobList.Jobs))
 		for _, job := range jobList.Jobs {
 			if job != nil {
+				expandJobQueries(job)
 				dispatchJob(ctx, job, pools, out)
 			}
 		}
@@ -1302,18 +1821,7 @@ func handleMessage(
 			reportPayloadRejection(ctx, out, msg.Event)
 			return false, nil
 		}
-		if !pools.localScheduling {
-			pools.scheduler.replaceChecks(nil, pools, out)
-			for _, check := range checkList.Checks {
-				if check != nil {
-					_ = submitCheck(ctx, check, pools, out, func() {}, false)
-				}
-			}
-			break
-		}
-		slog.Info("received recurring checks", "count", len(checkList.Checks))
-		pools.scheduler.replaceChecks(checkList.Checks, pools, out)
-		pools.applyInventoryRevision(msg.Event, checkList.Revision)
+		applyCheckList(ctx, msg.Event, &checkList, pools, out)
 
 	case "restart":
 		slog.Info("restart requested by server")
@@ -1455,51 +1963,160 @@ func decodeBinaryPayload(event string, raw json.RawMessage, msg proto.Message) b
 	return true
 }
 
-// outbound is one pre-encoded protobuf result addressed to a Phoenix channel
-// event. Keeping the payload process-wide allows a later WebSocket session to
-// retry it without retaining mutable executor state. reserved marks results
-// eligible for the reserved spool lane; reservedSlot records which lane's slot
-// the result holds so ack can release it.
+// outbound is one pre-encoded result addressed to a Phoenix channel event.
+// The payload is built exactly once into a pooled buffer (B7): no protobuf
+// re-marshal, no base64 string, and no JSON map at enqueue time. It survives
+// reconnects without retaining mutable executor state. reserved marks results
+// on the bulk lane; reservedSlot records a legacy count spool lane.
 type outbound struct {
-	event        string
+	event string
+	// protoPayload is the exact protobuf bytes. It is the source of truth for
+	// result_batch envelopes and is wrapped into base64 JSON only for a
+	// single legacy/V2-text frame.
+	protoPayload []byte
+	// payload is a prebuilt legacy JSON frame payload, used by direct
+	// session tests and by inbound notices that do not originate from a
+	// proto.Message executor result.
 	payload      json.RawMessage
 	reserved     bool
 	reservedSlot bool
 	// attempts counts server-rejected deliveries; handleResultReply retries
 	// the first rejection and drops the second.
 	attempts int
+	// Delivery sequence, assigned in send order. The server acks results by
+	// sequence; a retried frame keeps the sequence it was assigned.
+	sequence uint64
+	// Delivery lane. Lower is more urgent; see resultPriority.
+	lane uint8
+	// encodedBytes is the spool charge: the retained payload length.
+	encodedBytes int
+	// buf owns payload when it was built in a pooled buffer; release returns
+	// it once the server (legacy) or the storage ack (result_batch_v1)
+	// frees the result.
+	buf *bytes.Buffer
 }
 
-// resultQueue is a bounded process-wide spool. A slot remains reserved while
-// the session writer has a result in flight. Failed writes use a dedicated
-// one-item retry lane so they remain ahead of newer queued measurements.
+// wireSize charges the spool conservatively. A raw protobuf result may be
+// sent as raw result_batch now and replayed as base64 JSON after reconnect to
+// a legacy server, so charge the larger legacy wire representation.
+func (o *outbound) wireSize() int {
+	if len(o.protoPayload) > 0 {
+		encoded := base64.StdEncoding.EncodedLen(len(o.protoPayload))
+		return encoded + len(`{"binary":""}`)
+	}
+	return len(o.payload)
+}
+
+// resultQueue is a bounded process-wide spool. Two modes share one struct:
 //
-// A quarter of the slots are reserved for results the server cannot retry —
-// discovery data and config backups — so a flood of pings and checks cannot
-// evict them; they overflow into the general lane when the reserve is
-// exhausted, never the reverse.
+//   - byte mode (newResultQueueForAgentBytes) bounds retained payloads by
+//     encoded bytes (default 64 MB, --result-spool-bytes). Depth, byte usage
+//     and drops ride the heartbeat. Every result keeps a delivery sequence
+//     and stays in the sent ring until the server's cumulative ack arrives.
+//   - count mode (newResultQueueForAgent) preserves the historical behavior
+//     for callers that do not carry the runtime byte budget: a slot remains
+//     reserved while the session writer has a result in flight.
+//
+// Failed writes use a dedicated one-item retry lane so they remain ahead of
+// newer queued measurements.
 type resultQueue struct {
 	items         chan outbound
 	retries       chan outbound
 	slots         chan struct{}
 	reservedSlots chan struct{}
 	agentCtx      context.Context
-	dropped       atomic.Uint64
-	lastDropLog   atomic.Int64
+
+	// byte mode state.
+	byteLimit   int64
+	byteUsage   atomic.Int64
+	depth       atomic.Uint64
+	dropped     atomic.Uint64
+	nextSeq     atomic.Uint64
+	lastDropLog atomic.Int64
+
+	// sent is the pending-ack ring (C4/B8): results the agent sent and the
+	// server has not yet acknowledged, ordered by sequence. head/count make
+	// cumulative acks an O(1) pop from the front instead of a full-map scan.
+	sentMu    sync.Mutex
+	sent      []outbound
+	sentHead  int
+	sentCount int
 }
 
+// resultIngressDepth bounds the queue handoff between producers and the
+// session loop in byte mode. The byte budget is the authoritative memory
+// bound; this only keeps the channel itself small while allowing the small
+// results that dominate a healthy fleet to use their full byte budget.
+const resultIngressDepth = 65536
+
+// resultRetryLaneDepth bounds how many results of failed frames wait ahead of
+// newer spooled work. One large batch can hold more entries than the old
+// one-slot lane, so the lane is sized for the largest batch frame.
+const resultRetryLaneDepth = 256
+
+// newResultQueueForAgent creates the historical count-bounded spool.
 func newResultQueueForAgent(agentCtx context.Context, size int) *resultQueue {
 	reserved := size / 4
 	return &resultQueue{
 		items:         make(chan outbound, size),
-		retries:       make(chan outbound, 1),
+		retries:       make(chan outbound, resultRetryLaneDepth),
 		slots:         make(chan struct{}, size-reserved),
 		reservedSlots: make(chan struct{}, reserved),
 		agentCtx:      agentCtx,
 	}
 }
 
+// newResultQueueForAgentBytes creates the byte-bounded spool (C2).
+func newResultQueueForAgentBytes(agentCtx context.Context, byteLimit int64) *resultQueue {
+	if byteLimit <= 0 {
+		byteLimit = defaultResultSpoolBytes
+	}
+	return &resultQueue{
+		items:     make(chan outbound, resultIngressDepth),
+		retries:   make(chan outbound, resultRetryLaneDepth),
+		slots:     make(chan struct{}, resultIngressDepth),
+		agentCtx:  agentCtx,
+		byteLimit: byteLimit,
+	}
+}
+
+// byteBounded reports which accounting mode the queue runs in.
+func (q *resultQueue) byteBounded() bool { return q.byteLimit > 0 }
+
+// enqueue queues one completed result, dropping the newest when the bound is
+// exhausted. In byte mode the result's lane is recorded before handoff; the
+// session loop picks lanes in priority order (C3).
 func (q *resultQueue) enqueue(result outbound) bool {
+	if q.byteBounded() {
+		// Delivery sequences are assigned in send order (queueResultFrame),
+		// not enqueue order: a priority trap that jumps ahead of queued
+		// polls must not receive a later sequence than results the server
+		// has not been offered yet. Retries keep their assigned sequence.
+		result.lane = resultPriority(result.event, result.reserved)
+		result.encodedBytes = result.wireSize()
+		for {
+			current := q.byteUsage.Load()
+			if current+int64(result.encodedBytes) > q.byteLimit {
+				q.reportDrop("", result.event)
+				return false
+			}
+			if q.byteUsage.CompareAndSwap(current, current+int64(result.encodedBytes)) {
+				break
+			}
+		}
+		q.depth.Add(1)
+		select {
+		case q.items <- result:
+			return true
+		default:
+			// The ingress channel is small and fixed; treat it as bound
+			// exhaustion rather than blocking a worker.
+			q.releaseCapacity(result, true)
+			q.reportDrop("", result.event)
+			return false
+		}
+	}
+
 	if result.reserved {
 		select {
 		case q.reservedSlots <- struct{}{}:
@@ -1522,19 +2139,190 @@ func (q *resultQueue) enqueue(result outbound) bool {
 	}
 }
 
+// enqueueBatch reserves a place for every result of a batch at once, so a
+// batch is never half-dropped. The first failure rolls back the reservations
+// already taken and drops the whole frame.
+func (q *resultQueue) enqueueBatch(results []outbound) bool {
+	queued := make([]outbound, 0, len(results))
+	for _, result := range results {
+		if q.enqueue(result) {
+			queued = append(queued, result)
+			continue
+		}
+		for _, taken := range queued {
+			// Remove the just-queued copies; the caller retries the batch
+			// once capacity recovers. Buffers stay with the payloads.
+			q.releaseCapacity(taken, false)
+		}
+		return false
+	}
+	return true
+}
+
 // enqueueAfter queues result once delay has passed. The timer goroutine
 // holds the payload outside the spool until then; enqueue is safe from any
 // goroutine. The spool is process-wide, so the retry still lands when the
 // session that scheduled it has ended.
 func (q *resultQueue) enqueueAfter(result outbound, delay time.Duration) {
 	time.AfterFunc(delay, func() {
-		if !q.enqueue(result) {
-			slog.Error("result retry dropped, spool full", "event", result.event)
+		if !q.enqueue(result) && !q.byteBounded() {
+			q.reportDrop("", result.event)
 		}
 	})
 }
 
+// hold records a sent result in the pending-ack ring. Byte mode only: the
+// result's capacity stays charged until ackThrough/dropSent releases it.
+func (q *resultQueue) hold(result outbound) {
+	if !q.byteBounded() || result.sequence == 0 {
+		return
+	}
+	q.sentMu.Lock()
+	defer q.sentMu.Unlock()
+	if q.sentCount == len(q.sent) {
+		grown := make([]outbound, len(q.sent)*2+8)
+		for i := range q.sentCount {
+			grown[i] = q.sent[(q.sentHead+i)%len(q.sent)]
+		}
+		q.sent = grown
+		q.sentHead = 0
+	}
+	pos := (q.sentHead + q.sentCount) % len(q.sent)
+	q.sent[pos] = result
+	q.sentCount++
+}
+
+// ackThrough releases every held result up to and including the server's
+// cumulative storage sequence. Rejections can re-enter a lower sequence after
+// newer ones were sent, so the ring may contain holes: release any entry the
+// ack covers and compact the remainder. It returns the highest sequence
+// actually released.
+func (q *resultQueue) ackThrough(cumulative uint64) uint64 {
+	if !q.byteBounded() || cumulative == 0 {
+		return 0
+	}
+	q.sentMu.Lock()
+	defer q.sentMu.Unlock()
+	released := uint64(0)
+	kept := make([]outbound, 0, q.sentCount)
+	for i := range q.sentCount {
+		pos := (q.sentHead + i) % len(q.sent)
+		entry := q.sent[pos]
+		q.sent[pos] = outbound{}
+		if entry.sequence > cumulative {
+			kept = append(kept, entry)
+			continue
+		}
+		q.releaseLocked(entry, true)
+		if entry.sequence > released {
+			released = entry.sequence
+		}
+	}
+	copy(q.sent, kept)
+	// Clear the vacated tail so stale payloads never linger in the ring.
+	for i := len(kept); i < q.sentCount; i++ {
+		q.sent[i] = outbound{}
+	}
+	q.sentHead = 0
+	q.sentCount = len(kept)
+	return released
+}
+
+// dropSent releases one held result the server explicitly rejected. Used by
+// deterministic rejection handling: the result will never be stored, and
+// holding its bytes forever would leak the spool budget.
+func (q *resultQueue) dropSent(sequence uint64) {
+	if !q.byteBounded() || sequence == 0 {
+		return
+	}
+	q.sentMu.Lock()
+	defer q.sentMu.Unlock()
+	for i := range q.sentCount {
+		pos := (q.sentHead + i) % len(q.sent)
+		if q.sent[pos].sequence == sequence {
+			q.releaseLocked(q.sent[pos], true)
+			q.sent[pos] = outbound{}
+			// Keep ordering dense: shift the tail one slot forward.
+			for j := i + 1; j < q.sentCount; j++ {
+				from := (q.sentHead + j) % len(q.sent)
+				to := (q.sentHead + j - 1) % len(q.sent)
+				q.sent[to] = q.sent[from]
+			}
+			last := (q.sentHead + q.sentCount - 1) % len(q.sent)
+			q.sent[last] = outbound{}
+			q.sentCount--
+			return
+		}
+	}
+}
+
+// releaseLocked frees a held result's capacity. returnBuf hands the pooled
+// payload buffer back to the pool; retry paths must pass false because the
+// same buffer carries the payload back into the spool.
+func (q *resultQueue) releaseLocked(result outbound, returnBuf bool) {
+	q.byteUsage.Add(-int64(result.encodedBytes))
+	q.depth.Add(^uint64(0))
+	if returnBuf && result.buf != nil {
+		putFrameBuffer(result.buf)
+	}
+}
+
+// unhold removes one held sequence before its retry re-enters the spool. The
+// payload buffer is retained: the retry sends the exact same bytes.
+func (q *resultQueue) unhold(sequence uint64) {
+	if !q.byteBounded() || sequence == 0 {
+		return
+	}
+	q.sentMu.Lock()
+	defer q.sentMu.Unlock()
+	for i := range q.sentCount {
+		pos := (q.sentHead + i) % len(q.sent)
+		if q.sent[pos].sequence == sequence {
+			q.releaseLocked(q.sent[pos], false)
+			q.sent[pos] = outbound{}
+			// Keep ordering dense: shift the tail one slot forward.
+			for j := i + 1; j < q.sentCount; j++ {
+				from := (q.sentHead + j) % len(q.sent)
+				to := (q.sentHead + j - 1) % len(q.sent)
+				q.sent[to] = q.sent[from]
+			}
+			last := (q.sentHead + q.sentCount - 1) % len(q.sent)
+			q.sent[last] = outbound{}
+			q.sentCount--
+			return
+		}
+	}
+}
+
+// releaseCapacity frees the retained capacity of a result without the sent
+// ring. returnBuf releases the pooled payload buffer only when the payload
+// is not about to retry.
+func (q *resultQueue) releaseCapacity(result outbound, returnBuf bool) {
+	if !q.byteBounded() {
+		if result.reservedSlot {
+			<-q.reservedSlots
+			return
+		}
+		<-q.slots
+		return
+	}
+	q.byteUsage.Add(-int64(result.encodedBytes))
+	q.depth.Add(^uint64(0))
+	if returnBuf && result.buf != nil {
+		putFrameBuffer(result.buf)
+	}
+}
+
+// ack releases a result the writer acknowledged. Legacy count mode frees the
+// slot here; byte mode leaves the charge to the server's storage ack.
 func (q *resultQueue) ack(result outbound) {
+	if q.byteBounded() {
+		// A direct consumer (tests) acks without the server path; keep the
+		// budget consistent rather than leaking it.
+		q.dropSent(result.sequence)
+		q.releaseCapacity(result, true)
+		return
+	}
 	if result.reservedSlot {
 		<-q.reservedSlots
 		return
@@ -1542,11 +2330,19 @@ func (q *resultQueue) ack(result outbound) {
 	<-q.slots
 }
 
-// retry is intentionally blocking. The session loop calls it only for the
-// single result previously removed from items/retries, then immediately ends
-// the failed session, so the one-slot lane is necessarily empty.
+// retry is intentionally blocking. The session loop calls it only for a
+// failed frame's results before ending the session, so the bounded lane
+// cannot be contended by another producer.
 func (q *resultQueue) retry(result outbound) {
 	q.retries <- result
+}
+
+// retryBatch returns every result of a failed frame to the retry lane ahead
+// of newer work, preserving their delivery sequences.
+func (q *resultQueue) retryBatch(results []outbound) {
+	for _, result := range results {
+		q.retries <- result
+	}
 }
 
 func (q *resultQueue) takeRetry() (outbound, bool) {
@@ -1558,6 +2354,62 @@ func (q *resultQueue) takeRetry() (outbound, bool) {
 	}
 }
 
+// requeueUnacked moves held, unacknowledged results back into the spool so a
+// reconnect resends them with their original sequences (C4). The capacity is
+// already charged, so byte mode releases the held entry and re-enqueues the
+// same payload; a truly saturated spool drops it instead of leaking the ring.
+func (q *resultQueue) requeueUnacked() {
+	if !q.byteBounded() {
+		return
+	}
+	q.sentMu.Lock()
+	held := make([]outbound, 0, q.sentCount)
+	for i := range q.sentCount {
+		pos := (q.sentHead + i) % len(q.sent)
+		if q.sent[pos].sequence != 0 {
+			held = append(held, q.sent[pos])
+		}
+		q.sent[pos] = outbound{}
+	}
+	q.sentHead = 0
+	q.sentCount = 0
+	q.sentMu.Unlock()
+	for _, result := range held {
+		q.releaseLocked(result, false)
+		q.enqueue(result)
+	}
+}
+
+// requeueLanes returns results the loop staged but did not send before the
+// session ended. Byte mode releases and re-enqueues so a full spool applies
+// normal drop accounting; count mode still holds its slot token, so the
+// channel send is guaranteed room.
+func (q *resultQueue) requeueLanes(lanes *[4][]outbound) {
+	for lane := range lanes {
+		for _, result := range lanes[lane] {
+			if q.byteBounded() {
+				q.releaseCapacity(result, false)
+				q.enqueue(result)
+				continue
+			}
+			q.items <- result
+		}
+		lanes[lane] = nil
+	}
+}
+
+// empty reports whether nothing is queued, in flight or awaiting an ack.
+// Shared by the self-update drain and the shutdown drain.
+func (q *resultQueue) empty() bool {
+	if q.byteBounded() {
+		q.sentMu.Lock()
+		pendingAcks := q.sentCount
+		q.sentMu.Unlock()
+		return pendingAcks == 0 && len(q.items) == 0 && len(q.retries) == 0
+	}
+	return len(q.items) == 0 && len(q.slots) == 0 && len(q.reservedSlots) == 0
+}
+
 // jobPools holds the worker pools for each job type and the per-target
 // semaphores that serialize jobs for the same device across all of them.
 type jobPools struct {
@@ -1566,7 +2418,7 @@ type jobPools struct {
 	ping            *workerPool
 	checks          *workerPool
 	backup          *workerPool
-	notices         chan<- outbound
+	notices         chan outbound
 	scheduler       *recurringScheduler
 	targets         *targetGates
 	localScheduling bool
@@ -1583,6 +2435,33 @@ type jobPools struct {
 	// every device the missed frame covered.
 	appliedRevision   atomic.Uint64
 	rejectedInventory atomic.Value // string; "" means nothing outstanding
+}
+
+// loadSnapshots samples every pool for the heartbeat and the debug page.
+func (p *jobPools) loadSnapshots() []poolLoadSnapshot {
+	if p == nil {
+		return nil
+	}
+	definitions := []struct {
+		name string
+		pool *workerPool
+	}{
+		{"snmp", p.snmp}, {"mikrotik", p.mikrotik}, {"ping", p.ping},
+		{"checks", p.checks}, {"backup", p.backup},
+	}
+	loads := make([]poolLoadSnapshot, 0, len(definitions))
+	for _, definition := range definitions {
+		if definition.pool == nil {
+			continue
+		}
+		stats := definition.pool.stats()
+		loads = append(loads, poolLoadSnapshot{
+			Name:   definition.name,
+			Busy:   uint64(stats.Busy),
+			Queued: uint64(stats.Queued),
+		})
+	}
+	return loads
 }
 
 // idle reports whether every pool has finished all admitted work.
@@ -1713,7 +2592,7 @@ func submitJob(
 		done()
 		return false
 	}
-	slog.Info("starting job", "job_id", job.JobId, "type", job.JobType)
+	slog.Debug("starting job", "job_id", job.JobId, "type", job.JobType)
 
 	if job.JobType == pb.JobType_CONFIG_BACKUP {
 		return submitConfigBackupJob(ctx, job, pools, out, done, wait)
@@ -1725,6 +2604,7 @@ func submitJob(
 			if ctx.Err() != nil {
 				return
 			}
+			recordJobRun()
 			execute()
 		}
 	}
@@ -1742,8 +2622,34 @@ func submitJob(
 		pool = pools.snmp
 		execute = func() { executeCredentialProbe(ctx, job, out) }
 	case pb.JobType_PING:
-		pool = pools.ping
-		execute = func() { executePingJob(ctx, job, out) }
+		// Pings run on the shared ICMP engine instead of holding a worker
+		// for each timeout window. The worker closure returns as soon as the
+		// engine admits the round; the target gate is released by the
+		// engine's completion callback, so one target's active round still
+		// serializes later jobs without occupying a worker while ICMP waits.
+		if ctx.Err() != nil || pools.ping.refusing() {
+			done()
+			return false
+		}
+		pools.ping.dispatchGated(ctx, ctx, pools.targets, jobTargetKey(job),
+			dispatchJitter(),
+			func(release func()) {
+				if !submitPingJob(ctx, job, out, func() {
+					release()
+					done()
+				}) {
+					release()
+					reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
+					done()
+				}
+			},
+			func(reason dispatchFailure) {
+				if reason != dispatchCancelled {
+					reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
+				}
+				done()
+			})
+		return true
 	case pb.JobType_DISCOVER, pb.JobType_POLL:
 		pool = pools.snmp
 		execute = func() { executeSnmpJob(ctx, job, out) }
@@ -1903,25 +2809,37 @@ func jobTargetKey(job *pb.AgentJob) string {
 		prefix = "mikrotik:"
 	}
 	if job.SnmpDevice != nil && job.SnmpDevice.Ip != "" {
-		return prefix + job.SnmpDevice.Ip
+		return prefix + hostPortKey(job.SnmpDevice.Ip, job.SnmpDevice.Port)
 	}
 	if job.MikrotikDevice != nil && job.MikrotikDevice.Ip != "" {
-		return prefix + job.MikrotikDevice.Ip
+		return prefix + hostPortKey(job.MikrotikDevice.Ip, job.MikrotikDevice.Port)
 	}
 	if job.ConfigBackup != nil && job.ConfigBackup.Host != "" {
-		return prefix + job.ConfigBackup.Host
+		return prefix + hostPortKey(job.ConfigBackup.Host, job.ConfigBackup.SshPort)
 	}
 	// Probe jobs carry the target in their candidates (snmp_device is nil):
 	// key on the shared address so a probe cannot run concurrently with a
 	// poll or discovery on the same device.
 	if job.CredentialProbe != nil && len(job.CredentialProbe.Candidates) > 0 &&
 		job.CredentialProbe.Candidates[0].Ip != "" {
-		return prefix + job.CredentialProbe.Candidates[0].Ip
+		candidate := job.CredentialProbe.Candidates[0]
+		return prefix + hostPortKey(candidate.Ip, candidate.Port)
 	}
 	if job.DeviceId != "" {
 		return prefix + "device:" + job.DeviceId
 	}
 	return prefix + "job:" + job.JobId
+}
+
+// hostPortKey folds a non-default destination port into the target identity.
+// Two devices behind the same NAT address on different ports are different
+// targets; serializing them behind one gate is unnecessary and, for the load
+// harness, fatal on platforms without a 127/8 loopback alias for each device.
+func hostPortKey(host string, port uint32) string {
+	if port == 0 {
+		return host
+	}
+	return net.JoinHostPort(host, strconv.Itoa(int(port)))
 }
 
 // nextBackoff doubles the current delay (capped at max) and adds up to 25% jitter.
@@ -1941,16 +2859,31 @@ func nextBackoff(current, maxDelay time.Duration) time.Duration {
 	return next + jitter
 }
 
+// base64BinaryPayload wraps exact protobuf bytes in the legacy channel object.
+// It is only used when an endpoint did not confirm the raw capability lane.
+func base64BinaryPayload(raw []byte) []byte {
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	data := make([]byte, 0, len(encoded)+len(`{"binary":""}`))
+	data = append(data, `{"binary":"`...)
+	data = append(data, encoded...)
+	data = append(data, `"}`...)
+	return data
+}
+
+// encodeOutbound marshals one result and keeps its exact protobuf bytes.
 func encodeOutbound(event string, msg proto.Message, jobID string) (outbound, bool) {
 	if result, ok := msg.(*pb.SnmpResult); ok && result != nil {
-		// Field 13 includes its own tag and varint in the reported size.
-		// Walk the payload once, solve that small fixed point, then marshal
-		// only once; base64 and the channel envelope are not protobuf bytes.
 		result.ResultBytes = 0
-		baseSize := proto.Size(result)
-		size := baseSize + 2
+		base, err := proto.Marshal(result)
+		if err != nil {
+			slog.Error("marshal protobuf", "job_id", jobID, "event", event, "error", err)
+			return outbound{}, false
+		}
+		// Field 13 includes its own tag and varint in the reported size.
+		// Solve the small fixed point, then marshal the final form.
+		size := len(base) + 2
 		for {
-			next := baseSize + 1 + varintLen(size)
+			next := len(base) + 1 + varintLen(size)
 			if next == size {
 				break
 			}
@@ -1958,14 +2891,16 @@ func encodeOutbound(event string, msg proto.Message, jobID string) (outbound, bo
 		}
 		result.ResultBytes = uint32(size)
 	}
-	bin, err := proto.Marshal(msg)
+	raw, err := proto.Marshal(msg)
 	if err != nil {
 		slog.Error("marshal protobuf", "job_id", jobID, "event", event, "error", err)
 		return outbound{}, false
 	}
-	encoded := base64.StdEncoding.EncodeToString(bin)
-	payload, _ := json.Marshal(map[string]string{"binary": encoded})
-	return outbound{event: event, payload: payload, reserved: usesReservedLane(msg)}, true
+	return outbound{
+		event:        event,
+		protoPayload: raw,
+		reserved:     usesReservedLane(msg),
+	}, true
 }
 
 // usesReservedLane reports whether a result message carries data the server
@@ -1985,31 +2920,37 @@ func usesReservedLane(msg proto.Message) bool {
 // sendResult queues a completed measurement for at-most-once WebSocket
 // delivery. Cancellation means no measurement was completed and is never
 // translated into a failure result.
-func sendResult(ctx context.Context, out *resultQueue, event string, msg proto.Message, jobID string) {
+func sendResult(ctx context.Context, out *resultQueue, event string, msg proto.Message, jobID string) bool {
 	if ctx.Err() != nil {
 		if out.agentCtx.Err() != nil {
 			slog.Debug("result dropped, agent stopped", "job_id", jobID, "event", event)
 		} else {
 			slog.Debug("result discarded, job cancelled", "job_id", jobID, "event", event)
 		}
-		return
+		return false
 	}
 	result, ok := encodeOutbound(event, msg, jobID)
 	if !ok {
-		return
+		return false
 	}
 	if out.enqueue(result) {
-		return
+		return true
 	}
 	if out.agentCtx.Err() != nil {
 		slog.Debug("result dropped, agent stopped", "job_id", jobID, "event", event)
-		return
+		return false
 	}
 	out.reportDrop(jobID, event)
+	return false
 }
 
 func (q *resultQueue) reportDrop(jobID, event string) {
 	dropped := q.dropped.Add(1)
+	resultQueueDroppedTotal.Add(1)
+	recordJobDropped()
+	// Trap spool refusals are counted by the trap path with
+	// countTrapSpoolDrop; reportDrop stays generic so the same result is
+	// never added twice.
 	now := time.Now().UnixNano()
 	last := q.lastDropLog.Load()
 	if last != 0 && now-last < int64(resultDropLogInterval) {
@@ -2090,7 +3031,11 @@ func submitCheck(
 			return
 		}
 		result := ExecuteCheck(ctx, check)
-		slog.Info("check complete", "check", result.CheckId, "status", result.Status)
+		recordJobRun()
+		if result.Status != checkOK {
+			recordJobFailure()
+		}
+		slog.Debug("check complete", "check", result.CheckId, "status", result.Status)
 		sendResult(ctx, out, "check_result", result, check.Id)
 	}, wait)
 	if !ok {
