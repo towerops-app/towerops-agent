@@ -48,19 +48,12 @@ Operational properties:
 - **Trap forwarding survives reconnects** - the trap listener runs independently
   of the WebSocket session and queues up to 1000 traps while the agent is
   reconnecting
-- **Reconnect result buffering** - up to 512 completed job results remain in
-<<<<<<< HEAD
-  memory across temporary WebSocket disconnects and are retried after reconnect
+- **Reconnect result buffering** - a byte-bounded result spool retains completed
+  work across temporary WebSocket disconnects until the server acknowledges
+  persistent storage
 - **Graceful shutdown flush** - on SIGTERM or SIGINT the agent stops accepting
-  work, cancels in-flight jobs and drains the buffered results over the live
-  socket within a five-second budget; anything it could not deliver is logged
-=======
-  memory across temporary WebSocket disconnects and are retried after
-  reconnect. A clean shutdown (SIGTERM, `docker stop`, `systemctl restart`)
-  drains the spool the same way a self-update does: new work is refused and
-  in-flight results are written until the queue is empty or a five-second
-  budget expires, after which the log records what was flushed and dropped
->>>>>>> c605626 (fix(agent): drain the result spool on shutdown, not just self-update (issue 2757))
+  work and drains the buffered results over the live socket within a
+  five-second budget; anything it could not deliver is logged
 
 ## Quick start
 
@@ -108,6 +101,15 @@ Flags override their corresponding environment variables.
 | `TOWEROPS_TRAP_PORT` | `--trap-port` | UDP port for the trap listener | `162` |
 | `TOWEROPS_TRAP_COMMUNITY` | `--trap-community` | Only accept traps carrying this community string. Unset accepts any community. | unset |
 | `TOWEROPS_LEGACY_SCHEDULING` | `--legacy-scheduling` | Run refreshed inventories once and advertise `schedules_jobs: false`. Only for rollback servers that still send periodic inventories; it does not restore refreshes on the current server. | `false` |
+| `TOWEROPS_SNMP_RATE` | `--snmp-rate` | Process-wide SNMP request ceiling in packets/s. Set to at least `devices × packets-per-poll ÷ interval-seconds`, with headroom for retries; `0` is unlimited. | `0` |
+| `TOWEROPS_SNMP_DEVICE_RATE` | `--snmp-device-rate` | Per-device SNMP request limit in packets/s; `0` disables the per-device limit. | `50` |
+| `TOWEROPS_SNMP_CONCURRENCY` | `--snmp-concurrency` | Maximum concurrent SNMP devices. `0` selects `max(100, devices/3)` from the current inventory. | `0` (automatic) |
+| `TOWEROPS_PING_CONCURRENCY` | `--ping-concurrency` | Ping admission limit. The shared ICMP engine does not hold a worker while awaiting replies. | `0` (automatic) |
+| `TOWEROPS_CHECK_CONCURRENCY` | `--check-concurrency` | Concurrent service checks. | `0` (automatic) |
+| `TOWEROPS_MIKROTIK_CONCURRENCY` | `--mikrotik-concurrency` | Concurrent MikroTik jobs. | `0` (automatic) |
+| `TOWEROPS_RESULT_SPOOL_BYTES` | `--result-spool-bytes` | Maximum memory retained by acknowledged-result spooling. | `67108864` (64 MiB) |
+| `TOWEROPS_DISCONNECT_GRACE` | `--disconnect-grace` | How long polling and credentials survive a WebSocket disconnect. | `15m` |
+| `TOWEROPS_DEBUG_LISTEN` | `--debug-listen` | Loopback address for `/debug/pprof/` and `/metrics`, for example `127.0.0.1:6060`. Empty disables the listener; non-loopback addresses are refused. | empty |
 
 The legacy unprefixed variables `LOG_LEVEL`, `LOG_FORMAT`, `TRAP_ENABLED`,
 `TRAP_PORT` and `TRAP_COMMUNITY` remain accepted when the corresponding
@@ -138,30 +140,35 @@ Towerops server ──WebSocket/TLS──▶ agent ──▶ SNMP / ICMP / SSH /
 
 1. The agent connects to `{TOWEROPS_API_URL}/socket/agent/websocket` and joins
    the `agent:<id>` channel with its token. A rejected token ends the session.
-2. The server pushes the connection's complete recurring `jobs` and
-   `check_jobs` inventories on join, then pushes replacements whenever
-   assignments, credentials, or intervals change. Ad-hoc work uses the
-   backwards-compatible `discovery_job` or `backup_job` one-shot lanes.
-3. Newly assigned recurring work runs promptly, then at its configured
-   interval. `AgentJob.interval_seconds = 0` identifies one-shot work. One
-   stable assignment ID never overlaps itself; a changed assignment waits for
-   its active predecessor to stop, and superseded waiters exit immediately.
-4. Jobs execute on bounded worker pools - one per protocol - so a slow or
-   unreachable device cannot stall the rest. Recurring schedulers wait for
-   bounded queue capacity instead of dropping synchronized ticks. Interactive
-   overload remains visible to the server as an `AgentError`.
-5. Results are streamed back as they complete. A cancelled job produces no
-   measurement. Completed results and traps use a bounded process-wide spool
-   across reconnects; a successful socket write removes an item, so delivery is
-   at-most-once rather than server-acknowledged. The server batches ICMP result
-   persistence for up to 100ms; the agent does not batch SNMP results on the wire.
-6. The agent sends a heartbeat every 60s carrying its version, process uptime
-   and architecture, plus a channel keepalive every 25s. Version 1.5.0 and
-   later advertise `schedules_jobs` unless `--legacy-scheduling` is set. The
-   server drops an agent that goes 5 minutes without a heartbeat.
-7. On any disconnect the scheduler is cancelled and its credential-bearing
-   inventory is discarded before reconnect. The new authenticated connection
-   must provide complete lists again; assignments are never persisted locally.
+2. Current agents advertise inventory and result capabilities in their
+   heartbeat. The server then sends revisioned per-device updates, with an
+   atomic chunked full sync on join or after a rejected revision. Legacy
+   servers can still push complete recurring `jobs` and `check_jobs`
+   inventories. Ad-hoc work uses the backwards-compatible `discovery_job` or
+   `backup_job` one-shot lanes.
+3. Recurring work uses a stable wall-clock phase derived from its assignment
+   ID, spreading starts over the entire interval and preserving the phase
+   across reconnects and fleet-wide inventory changes. One stable assignment
+   ID never overlaps itself; skipped ticks and scheduling lag are reported.
+4. Jobs execute with bounded per-protocol concurrency and reserved interactive
+   capacity. A silent SNMP device moves to a short health-probe state instead
+   of occupying a worker through every remaining request. Interactive overload
+   remains visible to the server as an `AgentError`.
+5. Results enter a process-wide spool bounded by bytes and ordered into
+   priority lanes: pings and traps, checks, polls, then discovery and backups.
+   Small results are batched for 250ms or up to 256 KiB. The agent retains each
+   sequence until the server acknowledges persistent storage; a disconnect or
+   socket-buffer loss therefore causes a replay rather than silent loss.
+6. The agent sends a heartbeat every 60s carrying version, process uptime,
+   architecture, pool load, spool depth/bytes/drops, schedule lag and SNMP
+   limiter/timeout metrics, plus a channel keepalive every 25s. Version 1.5.0
+   and later advertise `schedules_jobs` unless `--legacy-scheduling` is set.
+   The server drops an agent that goes 5 minutes without a heartbeat.
+7. On a disconnect the process-level scheduler and credential-bearing
+   inventory continue for the configured 15-minute grace period. Reconnecting
+   resumes result delivery without restarting every schedule. When grace
+   expires, credentials are dropped and polling stops until a complete
+   authenticated inventory arrives.
 8. Reconnection uses exponential backoff (1s to 10s, plus up to 25% jitter). A
    session that lasts 30s resets the backoff.
 
@@ -236,8 +243,24 @@ completed roots. A later successful poll does not erase server-side history.
 An absent OID can also be outside a credential's view; absence alone is not
 proof of an unsupported MIB. Reducing unsupported-OID recovery work does not
 establish that unrelated packet loss, slow device responses or credential
-failures are fixed. No retry, deadline, protocol or packet-rate default changes
-are part of this recovery behavior.
+failures are fixed. Request timeouts, retries and packet pacing are configured
+as described under [Configuration](#configuration).
+
+## Host sizing
+
+For each 1,000 actively polled devices, reserve roughly 64 MiB for concurrent
+gosnmp receive buffers and 64 MiB for the default result spool, in addition to
+the agent baseline and result payloads. A 512 MiB container limit is a
+conservative starting point; measure the heartbeat's pool and spool metrics
+before increasing inventory. At startup the agent sets Go's memory limit to
+90% of the cgroup memory limit unless `GOMEMLIMIT` is explicitly set.
+
+Allow at least 2,048 file descriptors per 1,000 SNMP devices (`LimitNOFILE`
+under systemd, or the container runtime's nofile ulimit). Cached SNMP sessions
+use one socket per active device. The ICMP and trap listeners request a 4 MiB
+receive buffer; permit that with `net.core.rmem_max=4194304` and size the UDP
+receive queues for expected bursts. Keep Docker json-file log rotation enabled
+as in `docker-compose.example.yml`.
 
 ## SNMP trap listener
 
