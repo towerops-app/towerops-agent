@@ -844,6 +844,30 @@ func TestSNMPDialNoRetriesCtx(t *testing.T) {
 	}
 }
 
+func TestSNMPDialReleaseAfterCancel(t *testing.T) {
+	// release() after ctx cancellation must close the socket and evict the
+	// cached session — the arm previously covered only by poll timing.
+	state := newSNMPDeviceState(1000)
+	job := &pb.AgentJob{
+		JobId:      "dial-release-cancel",
+		SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1", Community: "public", Version: "2c"},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	conn, release, err := state.dial(ctx, job)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	sock := conn.(*rateLimitedQuerier).q.(*gosnmp.GoSNMP).Conn
+	cancel()
+	release()
+	if state.session != nil {
+		t.Error("cancelled release must evict the cached session")
+	}
+	if _, err := sock.Write([]byte("x")); err == nil {
+		t.Error("cancelled release must close the socket")
+	}
+}
+
 func TestObserveRTTBranches(t *testing.T) {
 	s := newSNMPDeviceState(10)
 	s.observeRTT(0) // non-positive ignored
