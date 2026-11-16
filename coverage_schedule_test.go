@@ -161,6 +161,28 @@ func TestRunOncePaths(t *testing.T) {
 			t.Error("cancelled run must return false")
 		}
 	})
+
+	t.Run("rejected tick returns immediately", func(t *testing.T) {
+		// runTick's !accepted early-return, driven directly: the goroutine
+		// timing in runOnce made this arm flaky on loaded CI.
+		s := newRecurringScheduler(ctx, newManualScheduleClock())
+		defer s.cancelAll()
+		spec := scheduleSpec{
+			id:       "rtrej",
+			interval: time.Hour,
+			submit:   func(ctx context.Context, done func()) bool { return false },
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.runTick(ctx, spec, false, time.Time{})
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("rejected tick must return without waiting")
+		}
+	})
 }
 
 func TestRunLoopSkipsTicks(t *testing.T) {
