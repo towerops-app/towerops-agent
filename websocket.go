@@ -101,10 +101,7 @@ func wsDial(ctx context.Context, rawURL string, token ...string) (*wsConn, error
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		conn, err := dialContext(ctx, network, address)
 		if err == nil {
-			select {
-			case localAddr <- conn.LocalAddr().String():
-			default:
-			}
+			recordLocalAddr(localAddr, conn)
 		}
 		return conn, err
 	}
@@ -131,12 +128,28 @@ func wsDial(ctx context.Context, rawURL string, token ...string) (*wsConn, error
 		return nil, fmt.Errorf("dial websocket: %w", err)
 	}
 	conn.SetReadLimit(int64(maxMessageSize))
-	var recordedAddr string
+	return &wsConn{conn: conn, localAddr: lastLocalAddr(localAddr)}, nil
+}
+
+// recordLocalAddr stores the dialed socket's local address for LocalIP. The
+// non-blocking send keeps a retried dial from stalling when an earlier
+// attempt already recorded its address.
+func recordLocalAddr(ch chan<- string, conn net.Conn) {
 	select {
-	case recordedAddr = <-localAddr:
+	case ch <- conn.LocalAddr().String():
 	default:
 	}
-	return &wsConn{conn: conn, localAddr: recordedAddr}, nil
+}
+
+// lastLocalAddr drains the recorded dial address, returning "" when no
+// attempt reported one.
+func lastLocalAddr(ch <-chan string) string {
+	select {
+	case addr := <-ch:
+		return addr
+	default:
+		return ""
+	}
 }
 
 // LocalIP returns the local address of the underlying TCP connection without

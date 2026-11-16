@@ -257,7 +257,7 @@ func decodeChannelFrame(data []byte) (channelMsg, error) {
 }
 
 // resultBatchFlushDelay coalesces small results for one frame (issue C3/D5).
-const resultBatchFlushDelay = 250 * time.Millisecond
+var resultBatchFlushDelay = 250 * time.Millisecond
 
 // resultBatchFlushBytes flushes a forming batch once its encoded envelopes
 // approach the frame target, so latency never waits out a large batch.

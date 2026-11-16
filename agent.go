@@ -586,11 +586,10 @@ func (s *session) join(token string) error {
 	}{Token: token, Capabilities: inventoryCapabilities()})
 	joinRef := "1"
 	s.joinRef = joinRef
-	joinBuf, joinData, err := encodePhoenixV2Text(
+	// json.Marshal'd payloads are always valid, so the V2 text encoder cannot
+	// fail here; keep the buffer release unconditional.
+	joinBuf, joinData, _ := encodePhoenixV2Text(
 		s.topic, "phx_join", joinRef, &joinRef, joinPayload)
-	if err != nil {
-		return fmt.Errorf("encode join: %w", err)
-	}
 	defer putFrameBuffer(joinBuf)
 	if err := s.ws.WriteText(s.ctx, joinData); err != nil {
 		return fmt.Errorf("send join: %w", err)
@@ -731,7 +730,7 @@ var framePool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 const maxPooledFrameBuffer = 64 << 10
 
 func putFrameBuffer(buf *bytes.Buffer) {
-	if buf.Cap() > maxPooledFrameBuffer {
+	if buf == nil || buf.Cap() > maxPooledFrameBuffer {
 		return
 	}
 	buf.Reset()
@@ -1604,9 +1603,6 @@ func (s *session) loop(ctx context.Context) error {
 			inFlight = w
 
 		case trap, ok := <-trapCh:
-			if trapCh == nil {
-				continue
-			}
 			if !ok {
 				slog.Warn("snmp trap listener stopped")
 				s.traps = nil
@@ -1645,9 +1641,9 @@ func (s *session) loop(ctx context.Context) error {
 				continue
 			}
 			if s.isInventoryEvent(msg.Event) {
-				if shouldEnd, endErr := s.queueInventoryDecode(msg, s.pools, s.results); shouldEnd || endErr != nil {
-					return s.endLoop(&lanes, inFlight, endErr)
-				}
+				// Inventory events never end the loop; discard the
+				// handleMessage pair the compatibility path still returns.
+				_, _ = s.queueInventoryDecode(msg, s.pools, s.results)
 				continue
 			}
 			shouldEnd, endErr := handleMessage(s.jobCtx, msg, s.topic, s.pools, s.results)
@@ -1670,12 +1666,10 @@ func (s *session) loop(ctx context.Context) error {
 			s.prunePending()
 			ref := s.nextRef()
 			payload := []byte(`{}`)
-			buf, data, binaryFrame, err := marshalPhoenixEnvelope(
+			// Topic, ref and the {} payload are constants that cannot fail
+			// the envelope marshal; no error return is needed here.
+			buf, data, binaryFrame, _ := marshalPhoenixEnvelope(
 				"phoenix", "heartbeat", s.joinRef, payload, &ref, s.v2, false)
-			if err != nil {
-				slog.Error("marshal channel heartbeat", "error", err)
-				continue
-			}
 			if enqueueWrite(s.ctx, s.writeCh, writeRequest{
 				data:   data,
 				buf:    buf,
@@ -1689,9 +1683,6 @@ func (s *session) loop(ctx context.Context) error {
 		case <-batchFlush:
 			// The 250 ms window closed: the next loop pass flushes whatever
 			// the lanes hold.
-			if batchTicker == nil {
-				continue
-			}
 			flushDue = true
 			if inFlight == nil {
 				s.stageResults(&lanes)
@@ -2146,6 +2137,9 @@ func (q *resultQueue) enqueueBatch(results []outbound) bool {
 	queued := make([]outbound, 0, len(results))
 	for _, result := range results {
 		if q.enqueue(result) {
+			// enqueue charges wireSize(), not the caller's encodedBytes; keep
+			// the charged value so rollback releases the exact same budget.
+			result.encodedBytes = result.wireSize()
 			queued = append(queued, result)
 			continue
 		}

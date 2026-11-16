@@ -58,7 +58,7 @@ func configureMemoryLimit() {
 		"/sys/fs/cgroup/memory.max",
 		"/sys/fs/cgroup/memory/memory.limit_in_bytes",
 	} {
-		data, err := os.ReadFile(path)
+		data, err := readCgroupFile(path)
 		if err != nil {
 			continue
 		}
@@ -68,6 +68,10 @@ func configureMemoryLimit() {
 		}
 	}
 }
+
+// readCgroupFile reads a container memory-limit pseudo-file. Tests stub it
+// since cgroup v1/v2 files do not exist on developer workstations.
+var readCgroupFile = os.ReadFile
 
 func parseContainerMemoryLimit(value string) (int64, bool) {
 	value = strings.TrimSpace(value)

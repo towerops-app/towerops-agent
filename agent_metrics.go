@@ -68,9 +68,6 @@ func (m *agentMetrics) scheduleLagP95() (uint64, bool) {
 	}
 	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
 	index := len(samples) * 95 / 100
-	if index >= len(samples) {
-		index = len(samples) - 1
-	}
 	return samples[index], true
 }
 

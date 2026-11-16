@@ -204,7 +204,7 @@ func TestPingEngineNilDeviceRejected(t *testing.T) {
 	}
 	select {
 	case <-done:
+		t.Error("rejected job must not fire done; the caller owns completion")
 	default:
-		t.Error("done callback not invoked for a rejected job")
 	}
 }

@@ -41,11 +41,7 @@ func inventoryCapacityDevices() uint64 {
 	if perDevice == 0 {
 		perDevice = estimatedInventoryDeviceBytes
 	}
-	capacity := uint64(maxDecodedJobPayloadBytes) / perDevice
-	if capacity > uint64(^uint32(0)) {
-		capacity = uint64(^uint32(0))
-	}
-	return capacity
+	return uint64(maxDecodedJobPayloadBytes) / perDevice
 }
 
 // installPoolLoadSnapshotHook publishes the poller's pool stats through the

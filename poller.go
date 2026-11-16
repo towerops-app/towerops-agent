@@ -120,7 +120,7 @@ func (p *processPoller) startSNMPMaintenance() {
 
 // snmpSessionMaintenanceInterval bounds how long an unused SNMP device
 // session can stay open past its idle expiry.
-const snmpSessionMaintenanceInterval = 30 * time.Second
+var snmpSessionMaintenanceInterval = 30 * time.Second
 
 // Pool sizing follows the runtime flags; zero means the historical defaults.
 func snmpPoolSize() int {

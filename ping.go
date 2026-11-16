@@ -60,7 +60,7 @@ var icmpListenPacket = func(network, address string) (icmpConn, error) {
 	// its *icmp.PacketConn does not expose the fd, so the buffer stays at
 	// the kernel default on that path.
 	if strings.HasPrefix(network, "ip") {
-		pc, err := net.ListenPacket(network, address)
+		pc, err := listenICMPRaw(network, address)
 		if err != nil {
 			return nil, err
 		}
@@ -69,6 +69,10 @@ var icmpListenPacket = func(network, address string) (icmpConn, error) {
 	}
 	return icmp.ListenPacket(network, address)
 }
+
+// listenICMPRaw opens a raw ICMP packet socket. A variable so tests can
+// substitute a fake without root.
+var listenICMPRaw = net.ListenPacket
 
 // applySocketReadBuffer sets SO_RCVBUF on a packet connection when the
 // underlying socket supports it. Unsupported platforms and permission errors
@@ -671,8 +675,9 @@ func pingDevice(ctx context.Context, ip string, timeoutMs int) (float64, error) 
 	return 0, err
 }
 
-// execPing uses the system ping command as a fallback.
-func execPing(parent context.Context, ip string, timeoutMs int) (float64, error) {
+// execPing uses the system ping command as a fallback. It is a variable so
+// tests can substitute a stub for the subprocess.
+var execPing = func(parent context.Context, ip string, timeoutMs int) (float64, error) {
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil {
 		return 0, fmt.Errorf("invalid IP address: %s", ip)

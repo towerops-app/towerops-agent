@@ -157,16 +157,18 @@ func submitPingJob(ctx context.Context, job *pb.AgentJob, out *resultQueue, done
 	startPingEngine(context.Background())
 	pj, ok := newPingJob(ctx, job, out, done)
 	if !ok {
-		done()
+		// Refusal: the caller owns done and the target gate.
 		return false
 	}
 	select {
 	case engine.submit <- pj:
 		return true
 	default:
+		// Refusal: the caller owns done and the target gate. Calling done
+		// here as well would release the gate twice and wedge the worker on
+		// a drained semaphore.
 		pj.cancel()
 		recordJobDropped()
-		done()
 		return false
 	}
 }
@@ -547,7 +549,9 @@ func (e *pingEngine) execPingRound(pj *pingJob) {
 	}
 	delete(e.live, pj)
 	pj.finishing = true
-	pj.cancel()
+
+	// Send BEFORE cancel: pj.ctx.Err() gates the send, so cancelling here
+	// would silently drop every exec-fallback result.
 
 	lossPercent := float64(pingProbeCount-pj.replies) * 100.0 / float64(pingProbeCount)
 	status := "success"
@@ -581,6 +585,8 @@ func (e *pingEngine) execPingRound(pj *pingJob) {
 			"replies", pj.replies, "probes", pingProbeCount, "loss_percent", lossPercent)
 		sendResult(pj.ctx, pj.out, "monitoring_check", result, pj.job.JobId)
 	}
+	// Cancel only after the completed measurement has entered the spool.
+	pj.cancel()
 	if pj.done != nil {
 		pj.done()
 		pj.done = nil

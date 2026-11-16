@@ -288,8 +288,9 @@ func recordJobPartial() { jobSummary.partial.Add(1) }
 // recordJobDropped counts a result or job the agent could not deliver.
 func recordJobDropped() { jobSummary.dropped.Add(1) }
 
-// jobSummaryInterval is the A6 reporting cadence.
-const jobSummaryInterval = time.Minute
+// jobSummaryInterval is the A6 reporting cadence. It is a variable so tests
+// can shrink the window.
+var jobSummaryInterval = time.Minute
 
 // startJobSummaryLogger emits one summary line per interval until ctx ends.
 // The production agent loop starts it; tests call the record helpers and
@@ -297,7 +298,10 @@ const jobSummaryInterval = time.Minute
 func startJobSummaryLogger(ctx context.Context) context.CancelFunc {
 	summaryCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	go func() {
-		ticker := time.NewTicker(jobSummaryInterval)
+		// Capture once: tests shrink the variable and restore it, which must
+		// not race the log line below.
+		interval := jobSummaryInterval
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -312,7 +316,7 @@ func startJobSummaryLogger(ctx context.Context) context.CancelFunc {
 					continue
 				}
 				slog.Info("job summary",
-					"window", jobSummaryInterval.String(),
+					"window", interval.String(),
 					"run", run,
 					"failed", failed,
 					"partial", partial,
