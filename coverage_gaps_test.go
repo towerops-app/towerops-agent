@@ -416,6 +416,39 @@ func TestSubmitJobClosedPool(t *testing.T) {
 	}
 }
 
+func TestSubmitJobGateAcquireCancelled(t *testing.T) {
+	// Covers the wait-path targets.acquire ctx-cancellation refusal.
+	ctx, cancel := context.WithCancel(context.Background())
+	pools := testPools(t)
+	out := newResultQueueForAgent(ctx, 8)
+	done := make(chan struct{}, 1)
+	job := &pb.AgentJob{
+		JobId:      "snmp-gate-cancelled",
+		JobType:    pb.JobType_POLL,
+		DeviceId:   "dev-g",
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.2"},
+	}
+
+	// Hold the device gate so acquire blocks on the caller's context.
+	releaseHeld := pools.targets.acquire(context.Background(), jobTargetKey(job))
+	if releaseHeld == nil {
+		t.Fatal("first acquire must succeed")
+	}
+	t.Cleanup(releaseHeld)
+
+	// Cancel the job context mid-acquire with a delayed cancel so the gate
+	// wait is in progress when it fires.
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+
+	if submitJob(ctx, job, pools, out, func() { done <- struct{}{} }, true) {
+		t.Error("cancelled gate acquire must refuse")
+	}
+	<-done
+}
+
 func TestRuntimeSettingDefaults(t *testing.T) {
 	configureAgentRuntime(agentRuntimeConfig{
 		ResultSpoolBytes:    4096,
