@@ -631,14 +631,17 @@ func (s *shellSession) runPrivileged(ctx context.Context, step *pb.ConfigBackupS
 	if p.privileged {
 		return p, nil // already privileged: no bytes are sent
 	}
-	if err := s.send(step.GetCommand() + "\r"); err != nil {
-		return nil, err
-	}
 	// Judge only output that arrives after each send: bytes already in the
 	// buffer are stale — slow TACACS enable auth or an RTT over the quiet
 	// window keeps the pre-send prompt or password line visible, which used
-	// to end the step as ENABLE_FAILED or "stayed unprivileged".
+	// to end the step as ENABLE_FAILED or "stayed unprivileged". Snapshot
+	// BEFORE the send: a reply that lands between send and size() would
+	// otherwise fall outside since(from) and the step would hang until the
+	// ctx deadline instead of judging it.
 	from := s.filter.size()
+	if err := s.send(step.GetCommand() + "\r"); err != nil {
+		return nil, err
+	}
 	answered := 0
 	for {
 		switch s.waitOutput(ctx, shellQuiet) {
@@ -661,10 +664,10 @@ func (s *shellSession) runPrivileged(ctx context.Context, step *pb.ConfigBackupS
 					return nil, errEnableFailed("device refused the enable password and asked again")
 				}
 				answered++
+				from = s.filter.size()
 				if err := s.send(enablePassword + "\r"); err != nil {
 					return nil, err
 				}
-				from = s.filter.size()
 			case shellPromptShapeRe.MatchString(final):
 				next, err := newDevicePrompt(final)
 				if err != nil {

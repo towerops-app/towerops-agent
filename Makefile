@@ -1,4 +1,4 @@
-.PHONY: all proto test test-fast test-short build vet lint
+.PHONY: all proto test test-fast test-short build vet lint loadtest
 
 all: vet lint test build
 
@@ -14,6 +14,9 @@ test-fast:
 
 test-short:
 	go test -count=1 -timeout 30s -short ./...
+
+loadtest:
+	TOWEROPS_LOADTEST=1 go test -count=1 -timeout 30m -run '^TestLoadTestScenarios$$' -v .
 
 build:
 	go build -o towerops-agent .
