@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"hash/fnv"
 	"log/slog"
 	"sync"
@@ -18,10 +19,20 @@ import (
 
 const legacyJobInterval = 60 * time.Second
 
-// maxFirstTickDelay bounds the stagger applied to an entry's first tick. The
-// scheduler is rebuilt every session, so an offset measured in whole intervals
-// would postpone long-interval jobs past the next reconnect indefinitely.
+// maxFirstTickDelay bounds the stagger applied by the legacy (time-free
+// clock) first-tick path. Clocks that report wall time use
+// wallClockPhaseDelay instead, which spreads across the whole interval and
+// survives reconnects (finding B3).
 const maxFirstTickDelay = 60 * time.Second
+
+// immediateChangeSlots is how many in-place assignment changes may skip the
+// phase and run immediately (finding B4). Any single change on a small
+// inventory is immediate; on larger inventories the limit is 5% of the
+// group, so fleet-wide pushes keep every job's existing wall-clock phase
+// instead of aligning the fleet on one instant.
+func immediateChangeSlots(inventorySize int) int {
+	return max(1, inventorySize/20)
+}
 
 type scheduleTimer interface {
 	C() <-chan time.Time
@@ -32,14 +43,23 @@ type scheduleClock interface {
 	NewTimer(time.Duration) scheduleTimer
 }
 
-type realScheduleClock struct{}
-
-type realScheduleTimer struct {
-	*time.Timer
+// scheduleNowClock is implemented by clocks that can report the current
+// wall time. Scheduling uses it for wall-clock phases; clocks without it
+// (deterministic test clocks) fall back to the capped hash stagger.
+type scheduleNowClock interface {
+	Now() time.Time
 }
+
+type realScheduleClock struct{}
 
 func (realScheduleClock) NewTimer(interval time.Duration) scheduleTimer {
 	return realScheduleTimer{Timer: time.NewTimer(interval)}
+}
+
+func (realScheduleClock) Now() time.Time { return time.Now() }
+
+type realScheduleTimer struct {
+	*time.Timer
 }
 
 func (t realScheduleTimer) C() <-chan time.Time {
@@ -59,13 +79,21 @@ type scheduleEntry struct {
 	predecessor <-chan struct{}
 	spec        scheduleSpec
 	fingerprint []byte
-	// immediate skips the first-tick stagger. Set when an existing assignment
-	// changed in place, so an operator's fix runs now rather than after a delay.
+	// immediate skips the first-tick stagger. Set when a small share of the
+	// inventory changed in place, so an operator's fix runs now rather than
+	// after a delay; a fleet-wide change keeps the phase instead. The entry
+	// goroutine clears it after the first tick.
 	immediate bool
+	// stagedImmediate is the immutable admission-time value of immediate,
+	// readable by tests and diagnostics without racing the run loop.
+	stagedImmediate bool
 }
 
 // recurringScheduler owns the credential-bearing assignment inventory for one
 // authenticated WebSocket session. Nothing is persisted across reconnects.
+// Tick lag and skipped (overlapping) ticks are recorded into processMetrics,
+// not per-scheduler counters, so the heartbeat snapshot covers every
+// session uniformly.
 type recurringScheduler struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -96,6 +124,22 @@ func newRecurringScheduler(ctx context.Context, clock scheduleClock) *recurringS
 		retiringJobs:   make(map[string]<-chan struct{}),
 		retiringChecks: make(map[string]<-chan struct{}),
 	}
+}
+
+// now reports the scheduling clock's wall time, or the real clock when the
+// configured clock cannot provide one (deterministic test clocks).
+func (s *recurringScheduler) now() time.Time {
+	if clock, ok := s.clock.(scheduleNowClock); ok {
+		return clock.Now()
+	}
+	return time.Now()
+}
+
+// wallClock reports whether the clock carries wall time, so phases and lag
+// are computed against planned instants instead of the capped legacy stagger.
+func (s *recurringScheduler) wallClock() bool {
+	_, ok := s.clock.(scheduleNowClock)
+	return ok
 }
 
 func (s *recurringScheduler) replaceJobs(
@@ -151,15 +195,18 @@ func interval(seconds uint32) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// payloadFingerprint marshals the payload once so replace can detect unchanged
-// assignments without a protobuf reflection walk on every inbound frame. A nil
-// result marks an unmarshalable payload, which is treated as always changed.
+// payloadFingerprint returns the SHA-256 of the deterministically marshalled
+// payload so replace can detect unchanged assignments without retaining a
+// serialized copy — and its SNMP credentials — per schedule entry (finding
+// B8). A nil result marks an unmarshalable payload, which is treated as
+// always changed.
 func payloadFingerprint(payload proto.Message) []byte {
 	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(payload)
 	if err != nil {
 		return nil
 	}
-	return data
+	sum := sha256.Sum256(data)
+	return sum[:]
 }
 
 func (s *recurringScheduler) replace(group *map[string]*scheduleEntry, specs []scheduleSpec) {
@@ -177,6 +224,22 @@ func (s *recurringScheduler) replace(group *map[string]*scheduleEntry, specs []s
 	if group == &s.jobs {
 		retiring = s.retiringJobs
 	}
+
+	// Count in-place changes before touching the maps: a fleet-wide push
+	// (more than immediateChangeSlots of the group) must not run everything
+	// immediately and align the fleet (finding B4).
+	inventorySize := max(len(*group), len(next))
+	changed := 0
+	for id, spec := range next {
+		current := (*group)[id]
+		fingerprint := payloadFingerprint(spec.payload)
+		if current != nil && current.spec.interval == spec.interval &&
+			fingerprint != nil && bytes.Equal(current.fingerprint, fingerprint) {
+			continue
+		}
+		changed++
+	}
+	immediate := changed > 0 && changed <= immediateChangeSlots(inventorySize)
 
 	for id, current := range *group {
 		if _, ok := next[id]; !ok {
@@ -215,8 +278,9 @@ func (s *recurringScheduler) replace(group *map[string]*scheduleEntry, specs []s
 			predecessor: predecessor,
 			spec:        spec,
 			fingerprint: fingerprint,
-			immediate:   current != nil,
+			immediate:   immediate && current != nil,
 		}
+		entry.stagedImmediate = entry.immediate
 		(*group)[id] = entry
 		s.wg.Add(1)
 		go s.run(ctx, entry)
@@ -242,6 +306,13 @@ func (s *recurringScheduler) retire(retiring map[string]<-chan struct{}, id stri
 	}()
 }
 
+// activeTick tracks one running tick so the scheduler can skip overlapping
+// ticks (finding D3) and so a cancelled entry still waits for the executor
+// before closing its replacement barrier.
+type activeTick struct {
+	finished chan struct{}
+}
+
 func (s *recurringScheduler) run(ctx context.Context, entry *scheduleEntry) {
 	defer s.wg.Done()
 	defer close(entry.stopped)
@@ -257,11 +328,30 @@ func (s *recurringScheduler) run(ctx context.Context, entry *scheduleEntry) {
 		s.mu.Unlock()
 	}
 
-	// Only new entries are staggered; a changed assignment runs as soon as its
-	// predecessor has released the ID.
+	spec := entry.spec
+	phaseInterval := spec.interval
+	if phaseInterval <= 0 {
+		phaseInterval = legacyJobInterval
+	}
+
+	// New entries land on their wall-clock phase hash(id) mod interval, so
+	// the spread covers the whole interval and survives reconnects (B3).
+	// A changed assignment on a small change runs immediately; everything
+	// else keeps its phase. Test clocks without wall time keep the capped
+	// legacy stagger.
+	wall := s.wallClock()
+	var planned time.Time
 	var delay time.Duration
 	if !entry.immediate {
-		delay = firstTickDelay(entry.spec.id, entry.spec.interval)
+		if wall {
+			planned = s.now()
+			delay = wallClockPhaseDelay(spec.id, phaseInterval, planned)
+			planned = planned.Add(delay)
+		} else {
+			delay = firstTickDelay(spec.id, phaseInterval)
+		}
+	} else if wall {
+		planned = s.now()
 	}
 	if delay > 0 {
 		timer := s.clock.NewTimer(delay)
@@ -272,21 +362,115 @@ func (s *recurringScheduler) run(ctx context.Context, entry *scheduleEntry) {
 		case <-timer.C():
 		}
 	}
+	entry.immediate = false
+
+	var active *activeTick
+	// The first tick starts as soon as its phase/stagger delay ends. Later
+	// phase instants wait for the interval grid and skip while the previous
+	// tick is still active.
+	startTick := func() {
+		tickPlanned := planned
+		tick := &activeTick{finished: make(chan struct{})}
+		go func() {
+			defer close(tick.finished)
+			s.runTick(ctx, spec, wall, tickPlanned)
+		}()
+		active = tick
+	}
+	startTick()
+	if wall {
+		planned = planned.Add(phaseInterval)
+	}
 
 	for {
-		if !s.runOnce(ctx, entry.spec) {
+		// A paused scheduler starts no tick; the entry parks until cancelAll,
+		// but a tick already running still finishes and delivers its result.
+		if s.paused.Load() {
+			if active != nil {
+				<-active.finished
+			}
+			<-ctx.Done()
 			return
+		}
+
+		var timer scheduleTimer
+		if wall {
+			wait := planned.Sub(s.now())
+			if wait < 0 {
+				wait = 0
+			}
+			timer = s.clock.NewTimer(wait)
+		} else {
+			timer = s.clock.NewTimer(phaseInterval)
+		}
+		// Hold the phase instant until the timer fires, but drop the active
+		// marker as soon as the running tick finishes so the next phase runs
+		// again instead of being skipped forever.
+		var finished <-chan struct{}
+		if active != nil {
+			finished = active.finished
+		}
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			if active != nil {
+				<-active.finished
+			}
+			return
+		case <-finished:
+			// Clearing the active marker only permits the already scheduled
+			// phase to run; it must not start a new tick before that timer
+			// fires.
+			timer.Stop()
+			active = nil
+			continue
+		case <-timer.C():
+			timer.Stop()
+		}
+
+		if active != nil {
+			// The previous tick is still executing or waiting for pool
+			// capacity: skip this phase rather than silently stretching the
+			// interval (D3), and keep counting.
+			processMetrics.skippedTicks.Add(1)
+			if wall {
+				planned = planned.Add(phaseInterval)
+			}
+		} else {
+			startTick()
+			if wall {
+				planned = planned.Add(phaseInterval)
+			}
 		}
 	}
 }
 
+// runTick starts one execution asynchronously and waits for it to complete.
+// Lag is the actual start minus the planned phase instant; a zero planned
+// instant (legacy test clocks) records nothing. A rejected submission is a
+// completed tick: the scheduler retries on the next phase.
+func (s *recurringScheduler) runTick(ctx context.Context, spec scheduleSpec, wall bool, planned time.Time) {
+	if wall && !planned.IsZero() {
+		processMetrics.recordScheduleLag(s.now().Sub(planned))
+	}
+	done := make(chan struct{})
+	accepted := spec.submit(ctx, func() { close(done) })
+	if !accepted {
+		return
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// Replacement and disconnect cancel the executor. Wait until it has
+		// released the assignment before the entry barrier closes.
+		<-done
+	}
+}
+
 // firstTickDelay returns the deterministic offset in
-// [0, min(interval, maxFirstTickDelay)) that staggers a new entry's first tick.
-// Reconnects replay the whole assignment inventory at once, so spreading first
-// ticks by a hash of the stable job ID avoids a synchronized burst into bounded
-// worker-pool queues. The window is capped because entries restart on every
-// reconnect: an uncapped hourly offset of 40 minutes would never fire on an
-// agent that reconnects every 30 minutes.
+// [0, min(interval, maxFirstTickDelay)) used by clocks that cannot report
+// wall time. Production scheduling instead uses wallClockPhaseDelay, whose
+// spread covers the whole interval and survives reconnects.
 func firstTickDelay(id string, interval time.Duration) time.Duration {
 	window := min(interval, maxFirstTickDelay)
 	if window <= 0 {
@@ -297,11 +481,34 @@ func firstTickDelay(id string, interval time.Duration) time.Duration {
 	return time.Duration(hash.Sum64() % uint64(window))
 }
 
-// runOnce starts one tick promptly, then holds the next tick until both the
-// configured interval has elapsed and the task has completed. The interval
-// timer starts before submission because submission waits for bounded
-// worker-pool capacity; measuring the period from dispatch keeps the
-// configured cadence instead of adding queue-wait time to every cycle.
+// schedulePhase returns the deterministic offset hash(id) mod interval that
+// fixes an assignment's position within its interval.
+func schedulePhase(id string, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(id))
+	return time.Duration(hash.Sum64() % uint64(interval))
+}
+
+// wallClockPhaseDelay returns the delay from now until the next instant t
+// where (t - hash(id)) mod interval == 0. Because the phase is derived from
+// the stable job ID and wall time, entries land on the same schedule across
+// reconnects, inventory pushes and restarts (findings B3/D3).
+func wallClockPhaseDelay(id string, interval time.Duration, now time.Time) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	phase := int64(schedulePhase(id, interval))
+	elapsed := now.UnixNano() % int64(interval)
+	return time.Duration((phase - elapsed + int64(interval)) % int64(interval))
+}
+
+// runOnce is the legacy single-tick primitive: it submits, then holds until
+// both the interval elapsed and the task completed. The phase loop in run
+// supersedes it for live scheduling; it is retained for callers that want
+// one serialized tick.
 func (s *recurringScheduler) runOnce(ctx context.Context, spec scheduleSpec) bool {
 	// A paused scheduler starts no tick; the entry parks until cancelAll.
 	if s.paused.Load() {

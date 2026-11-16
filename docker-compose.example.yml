@@ -8,6 +8,12 @@ services:
     container_name: towerops-agent
     restart: unless-stopped
 
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
     volumes:
       # Persists TOWEROPS_HOST_KEYS_FILE (/data/known_hosts.json) across recreates.
       - towerops-agent-data:/data

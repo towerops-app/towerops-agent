@@ -75,12 +75,17 @@ func TestExecuteSnmpJob_GETFailureAttribution(t *testing.T) {
 				if batch[0] == oids[2] {
 					return nil, timeout
 				}
+				if len(batch) == 1 {
+					return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{
+						{Name: batch[0], Type: gosnmp.Integer, Value: 41},
+					}}, nil
+				}
 				return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{
 					{Name: batch[0], Type: gosnmp.Integer, Value: 41},
 					{Name: batch[1], Type: gosnmp.Integer, Value: 42},
 				}}, nil
 			},
-			failed: oids[2:], excluded: oids[:2], cause: timeout.Error(),
+			failed: oids[2:3], excluded: oids[:2], cause: timeout.Error(),
 			wantValues: map[string]string{canonicalOID(oids[0]): "41", canonicalOID(oids[1]): "42"},
 		},
 		{
@@ -92,7 +97,7 @@ func TestExecuteSnmpJob_GETFailureAttribution(t *testing.T) {
 				}
 				return nil, timeout
 			},
-			failed: oids, cause: timeout.Error(),
+			failed: oids[:1], cause: timeout.Error(),
 		},
 		{
 			name: "indexed recovery excludes absent instance",
@@ -103,7 +108,7 @@ func TestExecuteSnmpJob_GETFailureAttribution(t *testing.T) {
 				}
 				return nil, timeout
 			},
-			failed: []string{oids[0], oids[2], oids[3]}, excluded: oids[1:2], cause: timeout.Error(),
+			failed: oids[:1], excluded: oids[1:2], cause: timeout.Error(),
 			wantValues: map[string]string{canonicalOID(oids[1]): ""},
 		},
 	}
@@ -239,6 +244,10 @@ func runSnmpAttributionJob(t *testing.T, job *pb.AgentJob, mock *mockSnmpQuerier
 		log.SetFlags(originalFlags)
 	})
 	out := testQueue()
+	// Failure attribution exercises one fresh poll per subtest; shared device
+	// health from a prior timeout would replace the scripted GET with a
+	// reachability probe.
+	resetSNMPDeviceState(job)
 	executeSnmpJob(context.Background(), job, out)
 	result := wantResult[*pb.SnmpResult](t, out, "result", time.Second)
 	notice := wantResult[*pb.AgentError](t, out, "error", time.Second)

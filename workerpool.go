@@ -12,7 +12,58 @@ import (
 	"time"
 )
 
-// workerPool is a fixed-size goroutine pool for executing tasks.
+// admissionLane says which queue quota a submission draws from. The
+// distinction matters only for admission control: both lanes feed the same
+// task channel and the same workers.
+type admissionLane uint8
+
+const (
+	// laneOneShot is used by every non-blocking submission (one-shot jobs,
+	// ad-hoc checks, dispatchGated coordinators). It may use the whole task
+	// queue, including the slots reserved against recurring load.
+	laneOneShot admissionLane = iota
+	// laneRecurring is used by blocking scheduler submissions. It may occupy
+	// at most recurringCapacity of the queue so recurring saturation can
+	// never consume the reserved one-shot slots (finding A5).
+	laneRecurring
+)
+
+// workerPoolStats is a point-in-time snapshot for the heartbeat's pool load
+// fields. All values are advisory: each is read without coordinating with
+// concurrent admissions, so a caller sees a consistent-enough sample.
+type workerPoolStats struct {
+	// Limit is the configured worker limit (setWorkerLimit), not the number
+	// of live goroutines during a scale-down drain.
+	Limit int
+	// Workers is the number of worker goroutines the pool currently keeps.
+	Workers int
+	// Busy counts every admitted coordinator (jitter/gate wait) plus queued
+	// and running tasks; the self-update drain waits for zero.
+	Busy int64
+	// Running counts tasks currently executing on workers.
+	Running int64
+	// Queued is the number of tasks waiting in the task channel.
+	Queued int
+	// RecurringInFlight is queued-plus-running recurring work; it is capped
+	// at RecurringCapacity by the recurring lane's admission tokens.
+	RecurringInFlight int
+	// RecurringCapacity is the maximum recurring work the lane admits.
+	RecurringCapacity int
+	// OneShotReserve is the queue capacity recurring load can never occupy.
+	OneShotReserve int
+}
+
+// workerPool is a goroutine pool with a dynamically resizable worker limit
+// for executing tasks. Workers are started and retired on demand by
+// setWorkerLimit; retiring workers drain their current task and exit, so
+// in-flight work is never cancelled by a resize.
+//
+// Admission has two lanes sharing one task channel. Recurring scheduler
+// submissions take an in-flight token first and may occupy at most
+// recurringCapacity = cap(tasks) - oneShotReserve slots, so a saturated
+// recurring schedule always leaves oneShotReserve queue slots for one-shot
+// work (finding A5). One-shot submissions use the whole queue but never take
+// tokens.
 type workerPool struct {
 	tasks chan func()
 	// dispatch bounds the one-shot coordinators parked on a busy target's
@@ -26,6 +77,8 @@ type workerPool struct {
 	// coordinators in jitter or gate wait, queued tasks and running tasks.
 	// The self-update drain waits for it to reach zero.
 	busy atomic.Int64
+	// running counts tasks currently executing; stats only.
+	running atomic.Int64
 	// paused refuses new submissions while admitted work finishes; set by
 	// the self-update drain, never cleared.
 	paused atomic.Bool
@@ -33,31 +86,111 @@ type workerPool struct {
 	once   sync.Once
 	mu     sync.RWMutex
 	closed bool
+	// workers is the live worker set; entries are removed when the worker
+	// exits, so during a scale-down Workers can trail the retiring set only
+	// for tasks already running (they always finish).
+	workers map[*poolWorker]struct{}
+	// limit is the configured worker count; mutated under mu.
+	limit int
+	// recurring holds one token per admitted recurring task (queued or
+	// running). Capacity cap(tasks)-oneShotReserve keeps the reserved queue
+	// slots unreachable from the recurring lane.
+	recurring chan struct{}
+	// oneShotReserve is the number of queue slots held back from recurring
+	// submissions; computed once from the initial pool size.
+	oneShotReserve int
+}
+
+// poolWorker is one worker goroutine. retire is closed by setWorkerLimit to
+// remove it after its current task finishes; stop() never closes it, so the
+// drain still runs out the task channel.
+type poolWorker struct {
+	retire chan struct{}
+}
+
+// oneShotReserveFor returns the queue capacity recurring load cannot touch.
+// The reservation is the smaller of the A5 example (10 slots per pool) and a
+// tenth of the queue, never below one slot on the smallest pools.
+func oneShotReserveFor(n int) int {
+	queue := n * 4
+	return max(1, min(10, queue/10))
+}
+
+// snmpWorkerLimit is the D1 default SNMP concurrency for an inventory of
+// deviceCount devices: at least 100 workers, plus one worker per three
+// devices above that. Callers override it per deployment with
+// setWorkerLimit.
+func snmpWorkerLimit(deviceCount int) int {
+	return max(100, deviceCount/3)
+}
+
+// snmpConcurrencyLimit resolves the SNMP worker limit once the inventory is
+// known: an explicit runtime flag wins; otherwise the pool grows to
+// snmpWorkerLimit(deviceCount). The poller calls this from its inventory
+// path and applies it with snmp.setWorkerLimit.
+func snmpConcurrencyLimit(configured int, deviceCount int) int {
+	if configured > 0 {
+		return configured
+	}
+	return snmpWorkerLimit(deviceCount)
 }
 
 // newWorkerPool creates a pool with n worker goroutines.
 func newWorkerPool(n int) *workerPool {
+	n = max(1, n)
 	p := &workerPool{
-		tasks:    make(chan func(), n*4),
-		dispatch: make(chan struct{}, n*5),
+		tasks:          make(chan func(), n*4),
+		dispatch:       make(chan struct{}, n*5),
+		workers:        make(map[*poolWorker]struct{}, n),
+		limit:          n,
+		oneShotReserve: oneShotReserveFor(n),
 	}
-	p.wg.Add(n)
+	p.recurring = make(chan struct{}, cap(p.tasks)-p.oneShotReserve)
 	for range n {
-		go func() {
-			defer p.wg.Done()
-			for fn := range p.tasks {
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							slog.Error("worker panic recovered", "error", r, "stack", string(debug.Stack()))
-						}
-					}()
-					fn()
-				}()
-			}
-		}()
+		p.startWorkerLocked()
 	}
 	return p
+}
+
+// startWorkerLocked spawns one worker and registers it. Called with p.mu
+// held for writing.
+func (p *workerPool) startWorkerLocked() {
+	w := &poolWorker{retire: make(chan struct{})}
+	p.workers[w] = struct{}{}
+	p.wg.Add(1)
+	go p.work(w)
+}
+
+// work pulls tasks until retired or the pool stops. Tasks wrap fn with the
+// pool's bookkeeping before they reach this loop, so the recover here still
+// catches application panics past the wrapper's defers.
+func (p *workerPool) work(w *poolWorker) {
+	defer p.wg.Done()
+	defer func() {
+		p.mu.Lock()
+		delete(p.workers, w)
+		p.mu.Unlock()
+	}()
+	for {
+		select {
+		case <-w.retire:
+			return
+		case fn, ok := <-p.tasks:
+			if !ok {
+				return
+			}
+			p.running.Add(1)
+			func() {
+				defer p.running.Add(-1)
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("worker panic recovered", "error", r, "stack", string(debug.Stack()))
+					}
+				}()
+				fn()
+			}()
+		}
+	}
 }
 
 // pause makes the pool refuse new submissions for good. Admitted work keeps
@@ -70,15 +203,25 @@ func (p *workerPool) pause() {
 
 // submitMode queues fn. With wait it applies backpressure until a queue slot
 // opens or ctx is cancelled, which recurring schedulers use since they run
-// one goroutine per assignment; without wait it fails at once on a full
-// queue, so the session event loop never stalls. A paused pool refuses.
+// one goroutine per assignment; such submissions take a recurring-lane token
+// first, so they cannot consume the reserved one-shot slots. Without wait it
+// fails at once on a full queue, so the session event loop never stalls;
+// those submissions are one-shot and may use the whole queue. A paused pool
+// refuses.
 func (p *workerPool) submitMode(ctx context.Context, fn func(), wait bool) bool {
-	return p.admit(ctx, fn, wait, true)
+	lane := laneOneShot
+	if wait {
+		lane = laneRecurring
+	}
+	return p.admitLane(ctx, fn, wait, true, lane)
 }
 
-// admit is submitMode with the pause check optional: dispatchGated skips it
-// for coordinators the pool already counts as busy.
-func (p *workerPool) admit(ctx context.Context, fn func(), wait, honorPause bool) bool {
+// admitLane is submitMode with an explicit lane, and with the pause check
+// optional: dispatchGated skips it for coordinators the pool already counts
+// as busy. It holds p.mu for reading across the whole admission so stop
+// cannot close the channel under a blocked queue send — stop blocks on the
+// same lock until waiting admissions return.
+func (p *workerPool) admitLane(ctx context.Context, fn func(), wait, honorPause bool, lane admissionLane) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.closed {
@@ -86,6 +229,15 @@ func (p *workerPool) admit(ctx context.Context, fn func(), wait, honorPause bool
 	}
 	if ctx.Err() != nil {
 		return false
+	}
+	// Recurring work takes its lane token before the busy increment so a
+	// token can never be held by work the pool refused.
+	if lane == laneRecurring {
+		select {
+		case p.recurring <- struct{}{}:
+		case <-ctx.Done():
+			return false
+		}
 	}
 	// Count the task before it can reach a worker so busy never dips to
 	// zero between admission and completion.
@@ -95,10 +247,16 @@ func (p *workerPool) admit(ctx context.Context, fn func(), wait, honorPause bool
 	// this read sees the pause.
 	if honorPause && p.paused.Load() {
 		p.busy.Add(-1)
+		if lane == laneRecurring {
+			<-p.recurring
+		}
 		return false
 	}
 	task := func() {
 		defer p.busy.Add(-1)
+		if lane == laneRecurring {
+			defer func() { <-p.recurring }()
+		}
 		fn()
 	}
 	if wait {
@@ -107,6 +265,9 @@ func (p *workerPool) admit(ctx context.Context, fn func(), wait, honorPause bool
 			return true
 		case <-ctx.Done():
 			p.busy.Add(-1)
+			if lane == laneRecurring {
+				<-p.recurring
+			}
 			return false
 		}
 	}
@@ -115,8 +276,68 @@ func (p *workerPool) admit(ctx context.Context, fn func(), wait, honorPause bool
 		return true
 	default:
 		p.busy.Add(-1)
+		if lane == laneRecurring {
+			<-p.recurring
+		}
 		return false
 	}
+}
+
+// setWorkerLimit resizes the pool to limit live workers, at least one.
+// Growing starts workers immediately; shrinking closes retire channels so
+// surplus workers exit after finishing their current task. A closed pool
+// ignores the call.
+func (p *workerPool) setWorkerLimit(limit int) {
+	limit = max(1, limit)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return
+	}
+	p.limit = limit
+	for len(p.workers) < limit {
+		p.startWorkerLocked()
+	}
+	for len(p.workers) > limit {
+		for w := range p.workers {
+			close(w.retire)
+			delete(p.workers, w)
+			break
+		}
+	}
+}
+
+// workerLimit reports the configured worker count.
+func (p *workerPool) workerLimit() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.limit
+}
+
+// stats returns the heartbeat load snapshot; see workerPoolStats.
+func (p *workerPool) stats() workerPoolStats {
+	p.mu.RLock()
+	limit := p.limit
+	workers := len(p.workers)
+	p.mu.RUnlock()
+	return workerPoolStats{
+		Limit:             limit,
+		Workers:           workers,
+		Busy:              p.busy.Load(),
+		Running:           p.running.Load(),
+		Queued:            len(p.tasks),
+		RecurringInFlight: len(p.recurring),
+		RecurringCapacity: cap(p.recurring),
+		OneShotReserve:    p.oneShotReserve,
+	}
+}
+
+// refusing reports whether admission would be refused immediately: the pool
+// is stopped or paused for a self-update drain.
+func (p *workerPool) refusing() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.closed || p.paused.Load()
 }
 
 // idle reports whether every admitted coordinator and task has finished.
@@ -142,9 +363,11 @@ const (
 // release and must call it when the job ends. Only a job whose target is
 // already busy parks a goroutine — and a dispatch slot — on the gate, and one
 // target may park at most a quarter of the slots, so a stalled device cannot
-// starve the rest of the pool. fail is called exactly once on any path that
-// does not queue run. delay is passed in so the coordinator reads no package
-// globals, which keeps tests that restore the jitter bound race-free.
+// starve the rest of the pool. The queued job lands in the one-shot lane, so
+// recurring saturation cannot push it out of the reserved slots. fail is
+// called exactly once on any path that does not queue run. delay is passed
+// in so the coordinator reads no package globals, which keeps tests that
+// restore the jitter bound race-free.
 func (p *workerPool) dispatchGated(
 	gateCtx, submitCtx context.Context,
 	gates *targetGates,
@@ -176,7 +399,7 @@ func (p *workerPool) dispatchGated(
 		// The gate moves into the queued task so the worker frees it on
 		// every exit path — success, panic past the pool's recover, or the
 		// task's early cancelled-context return.
-		if !p.admit(submitCtx, func() { run(release) }, false, false) {
+		if !p.admitLane(submitCtx, func() { run(release) }, false, false, laneOneShot) {
 			release()
 			fail(dispatchQueueFull)
 		}
@@ -302,7 +525,9 @@ func (g *targetGates) tryAcquire(key string) (func(), int) {
 	}, 0
 }
 
-// stop closes the task channel and waits for all workers to finish.
+// stop closes the task channel and waits for all workers to finish. Workers
+// retired by setWorkerLimit have already left; the rest drain every queued
+// task before the wait returns.
 func (p *workerPool) stop() {
 	p.once.Do(func() {
 		p.mu.Lock()

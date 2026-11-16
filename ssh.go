@@ -292,14 +292,14 @@ func executePingJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	lossPercent := float64(pingProbeCount-replies) * 100.0 / float64(pingProbeCount)
 
 	if replies == 0 {
-		slog.Warn("device down", "device", job.DeviceId, "error", lastErr)
+		slog.Debug("device down", "device", job.DeviceId, "error", lastErr)
 		result := &pb.MonitoringCheck{
 			DeviceId:          job.DeviceId,
 			Status:            "failure",
 			Timestamp:         timestamp,
 			PacketLossPercent: lossPercent,
 		}
-		slog.Info("ping job complete", "device", job.DeviceId, "status", result.Status)
+		slog.Debug("ping job complete", "device", job.DeviceId, "status", result.Status)
 		sendResult(ctx, out, "monitoring_check", result, job.JobId)
 		return
 	}
@@ -313,6 +313,6 @@ func executePingJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 		Timestamp:         timestamp,
 		PacketLossPercent: lossPercent,
 	}
-	slog.Info("ping job complete", "device", job.DeviceId, "status", result.Status)
+	slog.Debug("ping job complete", "device", job.DeviceId, "status", result.Status)
 	sendResult(ctx, out, "monitoring_check", result, job.JobId)
 }

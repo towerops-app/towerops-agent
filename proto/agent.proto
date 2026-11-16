@@ -369,6 +369,39 @@ message AgentJobList {
   uint64 revision = 2;
 }
 
+// Capability-gated incremental inventory. A full sync replaces both recurring
+// collections and may be split into ordered chunks. An incremental update
+// applies only the named upserts/removals. The shared revision is acknowledged
+// on AgentHeartbeat.applied_revision after every chunk has applied.
+message AgentInventoryUpdate {
+  uint64 revision = 1;
+  repeated AgentJob upserts = 2;
+  repeated string remove_job_ids = 3;
+  repeated Check upsert_checks = 4;
+  repeated string remove_check_ids = 5;
+  bool full_sync = 6;
+  uint32 chunk_index = 7;
+  uint32 chunk_count = 8;
+}
+
+// One stored result and its position in the agent's durable result stream.
+// `event` is the existing channel event name and `payload` is that event's
+// existing protobuf message, so batching does not change result semantics.
+message AgentResultEnvelope {
+  string event = 1;
+  bytes payload = 2;
+  uint64 sequence = 3;
+}
+
+message AgentResultBatch {
+  repeated AgentResultEnvelope results = 1;
+}
+
+// Sent only after every result through this cumulative sequence is stored.
+message AgentResultAck {
+  uint64 cumulative_sequence = 1;
+}
+
 message AgentJob {
   string job_id = 1;
   JobType job_type = 2;
@@ -390,6 +423,9 @@ message AgentJob {
   CredentialProbe credential_probe = 15;  // Present on CREDENTIAL_PROBE jobs
   ConfigBackupJob config_backup = 16;   // Present on CONFIG_BACKUP jobs
   ThroughputTestJob throughput_test = 17;  // Present on THROUGHPUT_TEST jobs
+  // True when snmp_retries is authoritative, including an explicit zero.
+  // False preserves the legacy agent-default interpretation of zero.
+  bool snmp_retries_set = 18;
 }
 
 message SnmpDevice {
@@ -411,6 +447,11 @@ message SnmpDevice {
 message SnmpQuery {
   QueryType query_type = 1;
   repeated string oids = 2;
+  // Column roots for a WALK and the ifIndex values to collect from each.
+  // Parallel entries in oid_columns and oid_indexes form (root, index) OIDs.
+  // Empty fields preserve the legacy `oids` representation.
+  repeated string oid_columns = 3;
+  repeated uint32 oid_indexes = 4;
 }
 
 message SnmpResult {
@@ -520,6 +561,27 @@ message AgentHeartbeat {
   // agent whose heartbeat lacks the flag; an agent that never heartbeats it
   // predates the job type and cannot run it.
   bool supports_throughput_test = 21;
+  // Protocol and scheduler features implemented by this build, e.g.
+  // "inventory_update_v1", "result_batch_v1" and "result_ack_v1".
+  repeated string capabilities = 22;
+  uint64 results_dropped = 23;
+  uint64 spool_depth = 24;
+  uint64 spool_bytes = 25;
+  uint64 schedule_lag_ms_p95 = 26;
+  uint64 snmp_timeouts = 27;
+  uint64 rate_limit_wait_ms = 28;
+  uint64 skipped_ticks = 29;
+  repeated PoolLoad pools = 30;
+  // Agent-reported device capacity; zero means the build did not report one.
+  uint32 inventory_capacity_devices = 31;
+  // Agent-configured durable spool ceiling in bytes; zero means unbounded.
+  uint64 spool_limit_bytes = 32;
+}
+
+message PoolLoad {
+  string name = 1;
+  uint32 busy = 2;
+  uint32 queued = 3;
 }
 
 message AgentError {

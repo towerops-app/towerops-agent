@@ -9,8 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -62,20 +62,11 @@ type snmpQuerier interface {
 }
 
 // snmpDial connects to the job's SNMP device and returns a querier + close
-// function. The job's snmp_timeout_ms/snmp_retries override the connection
-// defaults; zero keeps them.
+// function. The default implementation reuses one cached connection per
+// device across ticks (B2); the job's snmp_timeout_ms/snmp_retries override
+// the connection defaults; zero keeps them.
 var snmpDial = func(ctx context.Context, job *pb.AgentJob) (snmpQuerier, func(), error) {
-	conn, err := newSnmpConn(ctx, job.SnmpDevice)
-	if err != nil {
-		return nil, nil, err
-	}
-	if job.SnmpTimeoutMs > 0 {
-		conn.Timeout = time.Duration(job.SnmpTimeoutMs) * time.Millisecond
-	}
-	if job.SnmpRetries > 0 {
-		conn.Retries = int(job.SnmpRetries)
-	}
-	return &rateLimitedQuerier{ctx: ctx, q: conn}, func() { _ = conn.Conn.Close() }, nil
+	return defaultSNMPEngine.state(job).dial(ctx, job)
 }
 
 // closeOnCancellation interrupts gosnmp even if a transport path does not
@@ -99,11 +90,43 @@ func closeOnCancellation(ctx context.Context, closeFn func()) func() {
 // the agent context — not the job context — so a cancelled job's partial
 // result still reaches the spool and survives a reconnect.
 func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
+	recordJobRun()
 	dev := job.SnmpDevice
 	if dev == nil {
+		recordJobFailure()
 		slog.Error("job missing snmp device", "job_id", job.JobId)
 		sendResult(out.agentCtx, out, "result", emptySnmpResult(job), job.JobId)
 		return
+	}
+
+	// Limiter debt is paid before deadline_ms starts, so a saturated limiter
+	// cannot consume the job's network budget (A1). The device's cached
+	// session also serializes here.
+	if !waitForSNMPAdmission(ctx, job) {
+		recordJobPartial()
+		sendResult(out.agentCtx, out, "result", emptySnmpPartial(job), job.JobId)
+		return
+	}
+
+	state := defaultSNMPEngine.state(job)
+	if state.isSilent() {
+		// A device that stopped answering is retried with one 2s, zero-retry
+		// sysUpTime GET per tick until it answers. The last ping result can
+		// skip even that request (A3).
+		if snmpPingUnreachable(job) {
+			processMetrics.skippedTicks.Add(1)
+			recordJobPartial()
+			slog.Debug("snmp skipped silent device with unreachable ping hint", "job_id", job.JobId, "device", dev.Ip)
+			sendResult(out.agentCtx, out, "result", emptySnmpPartial(job), job.JobId)
+			return
+		}
+		if err := probeSilentSNMP(ctx, job, state); err != nil {
+			recordJobPartial()
+			slog.Debug("snmp silent-device health probe failed", "job_id", job.JobId, "device", dev.Ip, "error", err)
+			sendResult(out.agentCtx, out, "result", emptySnmpPartial(job), job.JobId)
+			return
+		}
+		state.markHealthy()
 	}
 
 	if job.DeadlineMs > 0 {
@@ -114,11 +137,27 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 
 	conn, closeFn, err := snmpDial(ctx, job)
 	if err != nil {
+		recordJobFailure()
 		slog.Error("snmp connect", "job_id", job.JobId, "device", dev.Ip, "error", err)
 		sendResult(out.agentCtx, out, "result", emptySnmpResult(job), job.JobId)
 		return
 	}
-	defer closeOnCancellation(ctx, closeFn)()
+	defer closeSNMPAfterJob(ctx, conn, closeFn)()
+
+	observation := &snmpObservation{}
+	if limited, ok := conn.(*rateLimitedQuerier); ok && limited.cached {
+		// Observe inside the limiter: a saturated limiter must not make the
+		// device look slow or count its wait as a request timeout.
+		limited.networkObserver = func(elapsed time.Duration, err error) {
+			observation.observe(elapsed, err)
+			if err == nil {
+				state.observeRTT(elapsed)
+			}
+		}
+		limited.respondedFn = func() bool { return observation.responded }
+	} else {
+		conn = &snmpJobQuerier{q: conn, state: state, observation: observation}
+	}
 
 	// Values accumulate per walk root so an oversized result can be split
 	// along root boundaries and a cancelled job can name the roots that
@@ -131,6 +170,8 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 	var queryErrors []string
 	absentOIDs := 0
 	cancelled := false
+	aborted := false
+queryLoop:
 	for _, q := range job.Queries {
 		if ctx.Err() != nil {
 			cancelled = true
@@ -138,13 +179,16 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 		}
 		switch q.QueryType {
 		case pb.QueryType_GET:
-			for batch := range slices.Chunk(q.Oids, snmpMaxOIDsPerGet) {
+			for offset := 0; offset < len(q.Oids); {
 				if ctx.Err() != nil {
 					cancelled = true
 					break
 				}
+				size := state.getSize()
+				end := min(offset+size, len(q.Oids))
+				batch := q.Oids[offset:end]
 				start := time.Now()
-				absent, err := snmpGetInto(conn, dev, batch, getValues)
+				absent, err := snmpGetWithRecovery(ctx, conn, dev, state, batch, getValues)
 				buckets[0].duration += time.Since(start)
 				absentOIDs += absent
 				if err != nil {
@@ -155,64 +199,77 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 						cancelled = true
 						break
 					}
+					// The first request that gets zero responses ends the job:
+					// every later batch would wait through the same silence.
+					// A device that answered an error status stays in the loop.
+					if isSNMPTimeout(err) {
+						aborted = true
+						if !observation.responded {
+							state.markSilent()
+						}
+					}
 					slog.Warn("snmp get failed", "job_id", job.JobId, "device", dev.Ip, "operation", "GET", "error", err)
 					queryErrors = append(queryErrors, fmt.Sprintf("GET: %v", err))
+					if aborted {
+						break
+					}
+					offset = end
+					continue
 				}
+				offset = end
 			}
 		case pb.QueryType_WALK:
 			// SNMPv1 has no GETBULK, so its walk runs on GETNEXT.
 			useV1Walk := isSnmpV1(dev.Version)
-			for _, baseOID := range q.Oids {
-				if ctx.Err() != nil {
-					cancelled = true
-					break
-				}
-				root := canonicalOID(baseOID)
-				values := make(map[string]string)
-				start := time.Now()
-				results, err := snmpWalkAll(ctx, conn, baseOID, useV1Walk)
-				elapsed := time.Since(start)
-				for _, v := range results {
-					if !snmpValueUsable(v) {
-						continue
-					}
-					values[canonicalOID(v.Name)] = snmpValueToString(v)
-				}
-				buckets = append(buckets, snmpResultBucket{
-					label: root, values: values, completed: err == nil, duration: elapsed,
-				})
-				if err != nil {
-					if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-						cancelled = true
-						break
-					}
-					slog.Warn("snmp walk failed", "job_id", job.JobId, "device", dev.Ip, "operation", "WALK", "root", root, "elapsed", elapsed, "error", err)
-					queryErrors = append(queryErrors, fmt.Sprintf("WALK %s: %v (elapsed=%s)", root, err, elapsed))
+			walkBuckets, walkErrs := snmpWalkRoots(ctx, conn, q.Oids, useV1Walk, state)
+			buckets = append(buckets, walkBuckets...)
+			for _, rootErr := range walkErrs {
+				root := canonicalOID(rootErr.root)
+				if rootErr.err == nil {
+					completedRoots = append(completedRoots, root)
 					continue
 				}
-				completedRoots = append(completedRoots, root)
+				if ctx.Err() != nil || errors.Is(rootErr.err, context.DeadlineExceeded) || errors.Is(rootErr.err, context.Canceled) {
+					cancelled = true
+					break queryLoop
+				}
+				if rootErr.noResponse {
+					aborted = true
+					if !observation.responded {
+						state.markSilent()
+					}
+				}
+				slog.Warn("snmp walk failed", "job_id", job.JobId, "device", dev.Ip, "operation", "WALK", "root", root, "elapsed", rootErr.elapsed, "error", rootErr.err)
+				queryErrors = append(queryErrors, fmt.Sprintf("WALK %s: %v (elapsed=%s)", root, rootErr.err, rootErr.elapsed))
+			}
+			if cancelled || aborted {
+				break queryLoop
 			}
 		}
-		if cancelled {
+		if cancelled || aborted {
 			break
 		}
 	}
+	if !aborted && !cancelled && observation.responded {
+		state.markHealthy()
+	}
 
-	partial := cancelled || ctx.Err() != nil
+	partial := cancelled || aborted || ctx.Err() != nil
 	if partial {
-		slog.Warn("snmp job ended early, shipping partial result",
+		recordJobPartial()
+		slog.Debug("snmp job ended early, shipping partial result",
 			"job_id", job.JobId,
 			"completed_roots", len(completedRoots),
 			"error", ctx.Err())
 	} else {
-		slog.Info("snmp job complete", "job_id", job.JobId, "roots", len(completedRoots))
+		slog.Debug("snmp job complete", "job_id", job.JobId, "roots", len(completedRoots))
 	}
 	if absentOIDs > 0 {
 		// Absent answers are recorded as empty values the server may prune,
 		// but the wire cannot tell "object absent" from "OID outside the
 		// credential's view" — surface the count so a scoped credential is
 		// visible instead of silently pruning rows.
-		slog.Warn("snmp job recorded absent OIDs as empty",
+		slog.Debug("snmp job recorded absent OIDs as empty",
 			"job_id", job.JobId, "device", dev.Ip, "absent_oids", absentOIDs)
 	}
 
@@ -221,7 +278,8 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 		frame.DiscoveryPhase = job.DiscoveryPhase
 		sendResult(out.agentCtx, out, "result", frame, job.JobId)
 	}
-	if len(queryErrors) > 0 && !cancelled && ctx.Err() == nil {
+	if len(queryErrors) > 0 && ctx.Err() == nil {
+		recordJobFailure()
 		sendResult(out.agentCtx, out, "error", &pb.AgentError{
 			DeviceId:  job.DeviceId,
 			JobId:     job.JobId,
@@ -258,6 +316,15 @@ func emptySnmpResult(job *pb.AgentJob) *pb.SnmpResult {
 		Final:          true,
 		DiscoveryPhase: job.DiscoveryPhase,
 	}
+}
+
+// emptySnmpPartial marks an aborted run as partial so the server reconciles
+// only the (zero) completed roots instead of treating the poll as complete.
+func emptySnmpPartial(job *pb.AgentJob) *pb.SnmpResult {
+	result := emptySnmpResult(job)
+	result.Final = false
+	result.Partial = true
+	return result
 }
 
 // defaultMaxResultBytes bounds the base64 result payload when the job does
@@ -430,7 +497,7 @@ func buildSnmpResultFrames(
 			frameSize += entry
 		}
 		if dropped > 0 {
-			slog.Warn("snmp result truncated to fit max_result_bytes",
+			slog.Debug("snmp result truncated to fit max_result_bytes",
 				"job_id", job.JobId, "root", label, "dropped", dropped)
 		}
 		if bucket.completed && bucket.label != "" {
@@ -448,8 +515,9 @@ func buildSnmpResultFrames(
 	}
 
 	if len(frames) == 1 {
-		// Unsplit results keep sequence 0 so the server treats them exactly
-		// like a legacy single-frame result.
+		// Unsplit results keep sequence 0 and remain final so the server
+		// treats them exactly like a legacy single-frame result; Partial
+		// carries the incomplete-data signal.
 		frames[0].Final = true
 	} else {
 		for i, f := range frames {
@@ -591,21 +659,82 @@ requestLoop:
 
 // snmpOIDLess reports whether dotted OID a sorts strictly before b, comparing
 // arcs numerically. It guards the walk loop against devices that repeat or
-// wind back OIDs, which would otherwise never terminate.
+// wind back OIDs, which would otherwise never terminate. Arcs are scanned in
+// place: a walk over tens of thousands of varbinds allocates nothing here.
 func snmpOIDLess(a, b string) bool {
-	as := strings.Split(strings.TrimPrefix(a, "."), ".")
-	bs := strings.Split(strings.TrimPrefix(b, "."), ".")
-	for i := range min(len(as), len(bs)) {
-		an, aerr := strconv.ParseUint(as[i], 10, 64)
-		bn, berr := strconv.ParseUint(bs[i], 10, 64)
-		if aerr != nil || berr != nil {
-			return as[i] < bs[i]
+	ai, bi := 0, 0
+	if len(a) > 0 && a[0] == '.' {
+		ai = 1
+	}
+	if len(b) > 0 && b[0] == '.' {
+		bi = 1
+	}
+	for {
+		aArc, aNext := nextOIDArc(a, ai)
+		bArc, bNext := nextOIDArc(b, bi)
+		if len(aArc) == 0 && len(bArc) == 0 {
+			return false
 		}
-		if an != bn {
+		if len(aArc) == 0 {
+			return true
+		}
+		if len(bArc) == 0 {
+			return false
+		}
+		an, aok := parseOIDArc(aArc)
+		bn, bok := parseOIDArc(bArc)
+		if !aok || !bok {
+			// Preserve the legacy fallback for malformed arcs.
+			if aArc != bArc {
+				return aArc < bArc
+			}
+		} else if an != bn {
 			return an < bn
 		}
+		ai, bi = aNext, bNext
+		if aNext == len(a) || bNext == len(b) {
+			// A shorter OID sorts first; equal prefixes keep scanning only
+			// while both still have arcs.
+			if aNext == len(a) && bNext == len(b) {
+				return false
+			}
+			return aNext == len(a)
+		}
 	}
-	return len(as) < len(bs)
+}
+
+// nextOIDArc returns the current dotted arc and the index just past its dot.
+func nextOIDArc(oid string, start int) (string, int) {
+	if start >= len(oid) {
+		return "", start
+	}
+	end := start
+	for end < len(oid) && oid[end] != '.' {
+		end++
+	}
+	next := end
+	if next < len(oid) {
+		next++ // consume the dot
+	}
+	return oid[start:end], next
+}
+
+// parseOIDArc parses a non-empty decimal arc of up to 20 digits.
+func parseOIDArc(arc string) (uint64, bool) {
+	if len(arc) == 0 || len(arc) > 20 {
+		return 0, false
+	}
+	var value uint64
+	for _, digit := range []byte(arc) {
+		if digit < '0' || digit > '9' {
+			return 0, false
+		}
+		if value > (1<<64-1)/10 || (value == (1<<64-1)/10 && uint64(digit-'0') > 1<<64-1-value*10) {
+			return 0, false
+		}
+		value = value*10 + uint64(digit-'0')
+	}
+	return value, true
 }
 
 // isSnmpV1 reports whether a device speaks SNMPv1, which has no GETBULK.
@@ -676,7 +805,7 @@ func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[s
 				slog.Debug("snmp get oid skipped", "device", dev.Ip, "oid", oids[0], "status", result.Error, "error_index", result.ErrorIndex)
 				return absent, nil
 			}
-			slog.Warn("snmp get batch split", "device", dev.Ip, "batch_size", len(oids), "status", result.Error, "error_index", result.ErrorIndex)
+			slog.Debug("snmp get batch split", "device", dev.Ip, "batch_size", len(oids), "status", result.Error, "error_index", result.ErrorIndex)
 			mid := len(oids) / 2
 			loAbsent, loErr := snmpGetInto(conn, dev, oids[:mid], into)
 			hiAbsent, hiErr := snmpGetInto(conn, dev, oids[mid:], into)
@@ -747,6 +876,7 @@ func truncateBytes(s string, n int) string {
 
 // executeCredentialTest tests SNMP credentials by reading the system group.
 func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
+	recordJobRun()
 	result := &pb.CredentialTestResult{TestId: job.JobId}
 	if job.SnmpDevice == nil {
 		slog.Error("job missing snmp device", "job_id", job.JobId)
@@ -762,7 +892,10 @@ func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQue
 		result.SysName = truncateBytes(values[oidSysName], probeMaxNameBytes)
 	}
 	result.Timestamp = time.Now().Unix()
-	slog.Info("credential test complete", "test_id", result.TestId, "success", result.Success)
+	if result.ErrorMessage != "" {
+		recordJobFailure()
+	}
+	slog.Debug("credential test complete", "test_id", result.TestId, "success", result.Success)
 	sendResult(ctx, out, "credential_test_result", result, job.JobId)
 }
 
@@ -811,6 +944,7 @@ func readSystemGroup(ctx context.Context, job *pb.AgentJob, failure string) (map
 // device's system values so the server can classify it and pin the working
 // credential set.
 func executeCredentialProbe(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
+	recordJobRun()
 	probe := job.CredentialProbe
 	started := time.Now()
 	result := &pb.CredentialProbeResult{ProbeId: job.JobId, MatchedIndex: -1}
@@ -818,7 +952,10 @@ func executeCredentialProbe(ctx context.Context, job *pb.AgentJob, out *resultQu
 	send := func() {
 		result.DurationMs = uint32(time.Since(started).Milliseconds())
 		result.Timestamp = time.Now().Unix()
-		slog.Info("credential probe complete",
+		if result.MatchedIndex < 0 {
+			recordJobFailure()
+		}
+		slog.Debug("credential probe complete",
 			"probe_id", result.ProbeId,
 			"matched_index", result.MatchedIndex,
 			"duration_ms", result.DurationMs)
@@ -885,7 +1022,7 @@ func executeCredentialProbe(ctx context.Context, job *pb.AgentJob, out *resultQu
 	}
 
 	if !matched {
-		slog.Info("credential probe found no working credential",
+		slog.Debug("credential probe found no working credential",
 			"probe_id", result.ProbeId,
 			"candidates", len(probe.Candidates))
 	}
@@ -904,8 +1041,8 @@ func newSnmpConn(ctx context.Context, dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error
 	conn := &gosnmp.GoSNMP{
 		Target:         dev.Ip,
 		Port:           uint16(port),
-		Timeout:        10 * time.Second,
-		Retries:        2,
+		Timeout:        defaultSNMPRequestTimeout,
+		Retries:        defaultSNMPRetries,
 		MaxRepetitions: snmpMaxRepetitions,
 		Context:        ctx,
 	}
@@ -970,6 +1107,18 @@ func newSnmpConn(ctx context.Context, dev *pb.SnmpDevice) (*gosnmp.GoSNMP, error
 
 	if err := conn.Connect(); err != nil {
 		return nil, fmt.Errorf("snmp connect %s:%d: %w", dev.Ip, port, err)
+	}
+
+	// GETBULK replies routinely exceed the default loopback datagram budget.
+	// On macOS the loopback MTU is 16 KiB, so a 20 KiB bulk reply arrives as
+	// two IP fragments, and the kernel drops the second when the receive
+	// buffer (default 9 KiB) cannot hold both — the request then times out
+	// with the device perfectly healthy. Raise both directions so a full
+	// bulk read or a dense column GET is never silently truncated by the
+	// socket, on every platform.
+	if udp, ok := conn.Conn.(*net.UDPConn); ok {
+		_ = udp.SetReadBuffer(256 * 1024)
+		_ = udp.SetWriteBuffer(256 * 1024)
 	}
 
 	return conn, nil

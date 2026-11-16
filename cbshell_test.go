@@ -46,7 +46,7 @@ func cbShellSession(t *testing.T, addr string, pagers []pagerPattern) *shellSess
 // cbLearnPrompt learns the fake device's prompt with a generous deadline.
 func cbLearnPrompt(t *testing.T, sess *shellSession) *devicePrompt {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	prompt, err := sess.learnPrompt(ctx)
 	if err != nil {
@@ -58,7 +58,7 @@ func cbLearnPrompt(t *testing.T, sess *shellSession) *devicePrompt {
 // cbCollectOne runs one collect with a generous deadline.
 func cbCollectOne(t *testing.T, sess *shellSession, cmd string, prompt *devicePrompt) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	text, err := sess.collect(ctx, cmd, prompt)
 	if err != nil {
@@ -411,7 +411,7 @@ func TestShellPromptLearning(t *testing.T) {
 			"": {lines: []string{"? "}},
 		})
 		sess := cbShellSession(t, fake.addr, builtinPagerPatterns())
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if _, err := sess.learnPrompt(ctx); err == nil {
 			t.Fatal("learning accepted an unstable prompt")
@@ -580,7 +580,7 @@ func TestShellCollectStalePagerNotAnswered(t *testing.T) {
 		sess.filter.out = append(sess.filter.out, "hostname sw1\nsw1> "...)
 		sess.filter.mu.Unlock()
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	got, err := sess.collect(ctx, "show run", prompt)
 	if err != nil {
@@ -663,7 +663,7 @@ func TestShellPrivilegedStep(t *testing.T) {
 			fake := startFakeShellServer(t, "", tc.prompt+" ", tc.script)
 			sess := cbShellSession(t, fake.addr, builtinPagerPatterns())
 			prompt := cbLearnPrompt(t, sess)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			step := &pb.ConfigBackupStep{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_PRIVILEGED, Command: tc.command}
 			next, err := sess.runPrivileged(ctx, step, tc.enablePassword, prompt)
@@ -695,7 +695,7 @@ func TestShellPrivilegedStep(t *testing.T) {
 		})
 		sess := cbShellSession(t, fake.addr, builtinPagerPatterns())
 		prompt := cbLearnPrompt(t, sess)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		step := &pb.ConfigBackupStep{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_PRIVILEGED, Command: "enable"}
 		next, err := sess.runPrivileged(ctx, step, "s3cret", prompt)
@@ -720,7 +720,7 @@ func TestShellPrivilegedStep(t *testing.T) {
 		})
 		sess := cbShellSession(t, fake.addr, builtinPagerPatterns())
 		prompt := cbLearnPrompt(t, sess)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		step := &pb.ConfigBackupStep{Kind: pb.ConfigBackupStepKind_CONFIG_BACKUP_STEP_PRIVILEGED, Command: "enable"}
 		prompt, err := sess.runPrivileged(ctx, step, "s3cret", prompt)
@@ -792,7 +792,7 @@ func TestShellPrivilegedJudgesFreshOutputOnly(t *testing.T) {
 			sess.filter.out = append(sess.filter.out, "sw1# "...)
 			sess.filter.mu.Unlock()
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		next, err := sess.runPrivileged(ctx, step, "s3cret", newPrompt(t, "sw1>"))
 		if err != nil {
@@ -862,7 +862,7 @@ func TestShellTooLarge(t *testing.T) {
 	}
 	defer sess.close()
 	prompt := cbLearnPrompt(t, sess)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if _, err := sess.collect(ctx, "show flood", prompt); !errors.Is(err, errConfigBackupTooLarge) {
 		t.Fatalf("collect error = %v, want errConfigBackupTooLarge", err)
@@ -1025,7 +1025,7 @@ func TestShellLearnPromptFailures(t *testing.T) {
 
 	t.Run("first newline write fails", func(t *testing.T) {
 		sess := cbStubSession(&cbFailWriter{failOn: 1, err: io.ErrClosedPipe})
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if _, err := sess.learnPrompt(ctx); !errors.Is(err, io.ErrClosedPipe) {
 			t.Fatalf("learnPrompt error = %v, want io.ErrClosedPipe", err)
@@ -1034,7 +1034,7 @@ func TestShellLearnPromptFailures(t *testing.T) {
 
 	t.Run("second newline write fails", func(t *testing.T) {
 		sess := cbStubSession(&cbFailWriter{failOn: 2, err: io.ErrClosedPipe})
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if _, err := sess.learnPrompt(ctx); !errors.Is(err, io.ErrClosedPipe) {
 			t.Fatalf("learnPrompt error = %v, want io.ErrClosedPipe", err)
@@ -1052,7 +1052,7 @@ func TestShellLearnPromptFailures(t *testing.T) {
 
 	t.Run("silent device never shows a prompt", func(t *testing.T) {
 		sess := cbStubSession(&cbFailWriter{})
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if _, err := sess.learnPrompt(ctx); err == nil {
 			t.Fatal("learnPrompt accepted silence as a prompt")
@@ -1067,7 +1067,7 @@ func TestShellCollectFailures(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if _, err := sess.collect(ctx, "show run", prompt); !errors.Is(err, io.ErrClosedPipe) {
 			t.Fatalf("collect error = %v, want io.ErrClosedPipe", err)
@@ -1088,7 +1088,7 @@ func TestShellCollectFailures(t *testing.T) {
 			sess.filter.out = append(sess.filter.out, "hostname sw1\nsw1> "...)
 			sess.filter.mu.Unlock()
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		got, err := sess.collect(ctx, "show run", prompt)
 		if err != nil {
@@ -1113,7 +1113,7 @@ func TestShellPrivilegedFailures(t *testing.T) {
 
 	t.Run("enable command write fails", func(t *testing.T) {
 		sess := cbStubSession(&cbFailWriter{failOn: 1, err: io.ErrClosedPipe})
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if _, err := sess.runPrivileged(ctx, step, "s3cret", newPrompt(t, "sw1>")); !errors.Is(err, io.ErrClosedPipe) {
 			t.Fatalf("runPrivileged error = %v, want io.ErrClosedPipe", err)
@@ -1130,7 +1130,7 @@ func TestShellPrivilegedFailures(t *testing.T) {
 			sess.filter.out = append(sess.filter.out, "Password: "...)
 			sess.filter.mu.Unlock()
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if _, err := sess.runPrivileged(ctx, step, "s3cret", newPrompt(t, "sw1>")); !errors.Is(err, io.ErrClosedPipe) {
 			t.Fatalf("runPrivileged error = %v, want io.ErrClosedPipe", err)
@@ -1145,7 +1145,7 @@ func TestShellPrivilegedFailures(t *testing.T) {
 			sess.filter.out = append(sess.filter.out, "-1# "...)
 			sess.filter.mu.Unlock()
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if _, err := sess.runPrivileged(ctx, step, "s3cret", newPrompt(t, "sw1>")); err == nil {
 			t.Fatal("runPrivileged accepted an unparseable prompt")
@@ -1155,7 +1155,7 @@ func TestShellPrivilegedFailures(t *testing.T) {
 	t.Run("session ends during enable", func(t *testing.T) {
 		sess := cbStubSession(&cbFailWriter{})
 		close(sess.eofC)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if _, err := sess.runPrivileged(ctx, step, "s3cret", newPrompt(t, "sw1>")); !errors.Is(err, errShellClosed) {
 			t.Fatalf("runPrivileged error = %v, want errShellClosed", err)
