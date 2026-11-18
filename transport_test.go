@@ -292,3 +292,39 @@ func TestDecodeResultAckForms(t *testing.T) {
 		t.Fatalf("text-frame ack = %d/%v, want 4/true", got, ok)
 	}
 }
+
+// TestNextResultFrameLegacySendsHeldLanesImmediately covers the legacy lane:
+// a server that never negotiated result_batch_v1 has no flush ticker, so any
+// result held for the 250 ms window is stranded. Small DISCOVER identify
+// results are held most often, which is what froze `last_discovery_at` for
+// every device and stopped polling fleet-wide.
+func TestNextResultFrameLegacySendsHeldLanesImmediately(t *testing.T) {
+	q := newResultQueueForAgentBytes(context.Background(), 1<<20)
+	s := &session{resultBatches: false, results: q}
+	check := outbound{event: "check_result", payload: json.RawMessage(`{}`)}
+	identify := outbound{event: "result", payload: json.RawMessage(`{}`), reserved: true}
+	if !q.enqueue(check) || !q.enqueue(identify) {
+		t.Fatal("enqueue failed")
+	}
+
+	var lanes [4][]outbound
+	s.stageResults(&lanes)
+	if len(lanes[1]) != 1 || len(lanes[3]) != 1 {
+		t.Fatalf("staged lanes = %v, want one check_result and one identify result", lanes)
+	}
+
+	frame, event := s.nextResultFrame(&lanes, false)
+	if len(frame) != 1 || event != "check_result" {
+		t.Fatalf("first legacy frame = %v (%q), want check_result", frame, event)
+	}
+	frame, event = s.nextResultFrame(&lanes, false)
+	if len(frame) != 1 || event != "result" {
+		t.Fatalf("identify frame = %v (%q), want result", frame, event)
+	}
+	if frame[0].reserved != true {
+		t.Fatalf("identify frame lost its reserved lane marker: %+v", frame[0])
+	}
+	if len(lanes[1]) != 0 || len(lanes[3]) != 0 {
+		t.Fatalf("legacy lanes still hold results: %v", lanes)
+	}
+}
