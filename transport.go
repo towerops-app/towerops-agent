@@ -295,6 +295,10 @@ func resultPriority(event string, reserved bool) uint8 {
 	}
 }
 
+// resultBatchEncoder is a test seam: queueResultFrame calls it to build the
+// wire batch, so a test can assert which sequences reached the envelope.
+var resultBatchEncoder = encodeResultBatch
+
 // encodeResultBatch builds the batch envelope. Payload bytes are the exact
 // protobuf message bytes; the server routes by envelope.event. The outbound
 // result was marshalled once when it entered the spool.

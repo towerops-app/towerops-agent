@@ -220,6 +220,50 @@ func TestNextResultFramePrioritiesAndBatch(t *testing.T) {
 	}
 }
 
+// TestQueuedResultBatchAssignsSequenceBeforeEncoding pins the order inside
+// queueResultFrame: the delivery sequence is assigned before the batch is
+// encoded. Encoding first put sequence 0 on every fresh batch, and the server
+// refuses a batch whose first sequence is not above the position it has already
+// handled ("Refusing out-of-order or duplicate result_batch sequences"), so
+// those results were dropped and the ack that would have released them never
+// arrived.
+func TestQueuedResultBatchAssignsSequenceBeforeEncoding(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var encoded []uint64
+	orig := resultBatchEncoder
+	resultBatchEncoder = func(results []outbound) *pb.AgentResultBatch {
+		for _, result := range results {
+			encoded = append(encoded, result.sequence)
+		}
+		return orig(results)
+	}
+	t.Cleanup(func() { resultBatchEncoder = orig })
+
+	s := &session{
+		ctx: ctx, v2: true, resultBatches: true, topic: "agent:test",
+		results:            newResultQueueForAgentBytes(ctx, 1<<20),
+		writeCh:            make(chan writeRequest, 4),
+		serverCapabilities: map[string]struct{}{"result_batch_v1": {}},
+	}
+
+	w, err := s.queueResultFrame([]outbound{{event: "result", protoPayload: []byte("x")}}, "result", true)
+	if err != nil {
+		t.Fatalf("queueResultFrame: %v", err)
+	}
+
+	if len(encoded) != 1 {
+		t.Fatalf("encoder saw %d results, want 1", len(encoded))
+	}
+	if encoded[0] == 0 {
+		t.Fatal("envelope encoded with sequence 0: the batch is built before the delivery sequence is assigned")
+	}
+	if encoded[0] != w.results[0].sequence {
+		t.Fatalf("encoded sequence = %d, held sequence = %d", encoded[0], w.results[0].sequence)
+	}
+}
+
 func TestResultBatchEncodingCarriesSequences(t *testing.T) {
 	results := []outbound{
 		{event: "check_result", payload: json.RawMessage(`{}`), sequence: 4},
