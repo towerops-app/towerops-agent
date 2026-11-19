@@ -869,16 +869,19 @@ func (s *session) queueResultFrame(results []outbound, event string, spooled boo
 	// and lets the cumulative ack release every spooled sequence.
 	batched := spooled && s.resultBatches
 	frameEvent := event
-	var msg proto.Message
-	if batched {
-		frameEvent = "result_batch"
-		msg = encodeResultBatch(results)
-	} else {
+	if !batched {
 		results = results[:1]
 	}
 
 	// Assign delivery sequences in send order and hold them until the
 	// server's cumulative ack. A retried frame keeps its sequence.
+	//
+	// This must run before the batch is encoded: each envelope carries its
+	// sequence, so encoding first put an unassigned result on the wire as
+	// sequence 0 while the in-memory copy was numbered afterwards. The server
+	// refuses a batch whose first sequence is not above the position it has
+	// already handled, so every fresh batch was rejected as a duplicate (and
+	// the ack that would have released it never arrived).
 	if spooled && s.results.byteBounded() {
 		for i := range results {
 			if results[i].sequence == 0 {
@@ -886,6 +889,12 @@ func (s *session) queueResultFrame(results []outbound, event string, spooled boo
 			}
 			s.results.hold(results[i])
 		}
+	}
+
+	var msg proto.Message
+	if batched {
+		frameEvent = "result_batch"
+		msg = resultBatchEncoder(results)
 	}
 
 	ref := s.nextRef()
