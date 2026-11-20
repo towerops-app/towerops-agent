@@ -263,6 +263,14 @@ var resultBatchFlushDelay = 250 * time.Millisecond
 // approach the frame target, so latency never waits out a large batch.
 const resultBatchFlushBytes = 256 << 10
 
+// resultBatchMaxEnvelopes mirrors the server's per-batch envelope cap
+// (`@max_envelopes_per_batch` in agent_channel/result_batch.ex). A batch
+// of tiny results can sit far under the byte target yet still exceed the
+// count cap, and the server rejects the whole frame `batch_too_large`,
+// which the agent cannot split after the fact. Flush on whichever limit
+// arrives first.
+const resultBatchMaxEnvelopes = 500
+
 // batchableEvent reports whether a result is small enough to hold for the
 // batch window. Large discovery and backup frames go out alone immediately:
 // holding 8 MiB behind a 250 ms timer only delays their own write.
@@ -294,6 +302,10 @@ func resultPriority(event string, reserved bool) uint8 {
 		return 2
 	}
 }
+
+// resultBatchEncoder is a test seam: queueResultFrame calls it to build the
+// wire batch, so a test can assert which sequences reached the envelope.
+var resultBatchEncoder = encodeResultBatch
 
 // encodeResultBatch builds the batch envelope. Payload bytes are the exact
 // protobuf message bytes; the server routes by envelope.event. The outbound
@@ -379,6 +391,26 @@ func (s *session) stageResults(lanes *[4][]outbound) {
 // the byte target, a priority trap/ping arrives, or the flush timer fires.
 // Non-batchable bulk results (large discovery/backup frames) go out alone.
 func (s *session) nextResultFrame(lanes *[4][]outbound, flushDue bool) ([]outbound, string) {
+	// A server that did not negotiate result_batch_v1 gets one result per
+	// frame, highest priority first, as soon as it is staged. Holding a small
+	// result for the 250 ms batch window is only meaningful when that window
+	// exists: the flush ticker is created from the same capability, so on the
+	// legacy lane `flushDue` can never become true and a held result would sit
+	// in the lanes until the session ended. That is how the two-phase
+	// discovery identify result (a small DISCOVER result) was lost on every
+	// legacy server, which left `last_discovery_at` frozen and stopped polling
+	// for the whole fleet.
+	if !s.resultBatches {
+		for lane := range lanes {
+			if len(lanes[lane]) > 0 {
+				candidate := lanes[lane][0]
+				lanes[lane] = lanes[lane][1:]
+				return []outbound{candidate}, candidate.event
+			}
+		}
+		return nil, ""
+	}
+
 	// Outage signals preempt a forming lower-priority batch. Send each signal
 	// immediately; lower-lane results remain held until the normal batch rule
 	// applies.
@@ -403,13 +435,14 @@ func (s *session) nextResultFrame(lanes *[4][]outbound, flushDue bool) ([]outbou
 				return batch, batch[0].event
 			}
 			size := candidate.wireSize()
-			if len(batch) > 0 && batchBytes+size > resultBatchFlushBytes {
+			if len(batch) > 0 &&
+				(batchBytes+size > resultBatchFlushBytes || len(batch) >= resultBatchMaxEnvelopes) {
 				break
 			}
 			lanes[lane] = lanes[lane][1:]
 			batch = append(batch, candidate)
 			batchBytes += size
-			if batchBytes >= resultBatchFlushBytes {
+			if batchBytes >= resultBatchFlushBytes || len(batch) >= resultBatchMaxEnvelopes {
 				return batch, batch[0].event
 			}
 		}

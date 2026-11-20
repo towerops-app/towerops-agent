@@ -179,7 +179,7 @@ func TestResultPriority(t *testing.T) {
 }
 
 func TestNextResultFrameSelection(t *testing.T) {
-	s := &session{}
+	s := &session{resultBatches: true}
 	big := resultBatchFlushBytes/2 + 1
 	mk := func(event string, wire int, lane uint8) outbound {
 		return outbound{event: event, payload: make(json.RawMessage, wire), lane: lane}

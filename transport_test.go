@@ -220,6 +220,50 @@ func TestNextResultFramePrioritiesAndBatch(t *testing.T) {
 	}
 }
 
+// TestQueuedResultBatchAssignsSequenceBeforeEncoding pins the order inside
+// queueResultFrame: the delivery sequence is assigned before the batch is
+// encoded. Encoding first put sequence 0 on every fresh batch, and the server
+// refuses a batch whose first sequence is not above the position it has already
+// handled ("Refusing out-of-order or duplicate result_batch sequences"), so
+// those results were dropped and the ack that would have released them never
+// arrived.
+func TestQueuedResultBatchAssignsSequenceBeforeEncoding(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var encoded []uint64
+	orig := resultBatchEncoder
+	resultBatchEncoder = func(results []outbound) *pb.AgentResultBatch {
+		for _, result := range results {
+			encoded = append(encoded, result.sequence)
+		}
+		return orig(results)
+	}
+	t.Cleanup(func() { resultBatchEncoder = orig })
+
+	s := &session{
+		ctx: ctx, v2: true, resultBatches: true, topic: "agent:test",
+		results:            newResultQueueForAgentBytes(ctx, 1<<20),
+		writeCh:            make(chan writeRequest, 4),
+		serverCapabilities: map[string]struct{}{"result_batch_v1": {}},
+	}
+
+	w, err := s.queueResultFrame([]outbound{{event: "result", protoPayload: []byte("x")}}, "result", true)
+	if err != nil {
+		t.Fatalf("queueResultFrame: %v", err)
+	}
+
+	if len(encoded) != 1 {
+		t.Fatalf("encoder saw %d results, want 1", len(encoded))
+	}
+	if encoded[0] == 0 {
+		t.Fatal("envelope encoded with sequence 0: the batch is built before the delivery sequence is assigned")
+	}
+	if encoded[0] != w.results[0].sequence {
+		t.Fatalf("encoded sequence = %d, held sequence = %d", encoded[0], w.results[0].sequence)
+	}
+}
+
 func TestResultBatchEncodingCarriesSequences(t *testing.T) {
 	results := []outbound{
 		{event: "check_result", payload: json.RawMessage(`{}`), sequence: 4},
@@ -290,5 +334,41 @@ func TestDecodeResultAckForms(t *testing.T) {
 		`{"binary":"` + base64.StdEncoding.EncodeToString(legacy) + `"}`)})
 	if !ok || got != 4 {
 		t.Fatalf("text-frame ack = %d/%v, want 4/true", got, ok)
+	}
+}
+
+// TestNextResultFrameLegacySendsHeldLanesImmediately covers the legacy lane:
+// a server that never negotiated result_batch_v1 has no flush ticker, so any
+// result held for the 250 ms window is stranded. Small DISCOVER identify
+// results are held most often, which is what froze `last_discovery_at` for
+// every device and stopped polling fleet-wide.
+func TestNextResultFrameLegacySendsHeldLanesImmediately(t *testing.T) {
+	q := newResultQueueForAgentBytes(context.Background(), 1<<20)
+	s := &session{resultBatches: false, results: q}
+	check := outbound{event: "check_result", payload: json.RawMessage(`{}`)}
+	identify := outbound{event: "result", payload: json.RawMessage(`{}`), reserved: true}
+	if !q.enqueue(check) || !q.enqueue(identify) {
+		t.Fatal("enqueue failed")
+	}
+
+	var lanes [4][]outbound
+	s.stageResults(&lanes)
+	if len(lanes[1]) != 1 || len(lanes[3]) != 1 {
+		t.Fatalf("staged lanes = %v, want one check_result and one identify result", lanes)
+	}
+
+	frame, event := s.nextResultFrame(&lanes, false)
+	if len(frame) != 1 || event != "check_result" {
+		t.Fatalf("first legacy frame = %v (%q), want check_result", frame, event)
+	}
+	frame, event = s.nextResultFrame(&lanes, false)
+	if len(frame) != 1 || event != "result" {
+		t.Fatalf("identify frame = %v (%q), want result", frame, event)
+	}
+	if frame[0].reserved != true {
+		t.Fatalf("identify frame lost its reserved lane marker: %+v", frame[0])
+	}
+	if len(lanes[1]) != 0 || len(lanes[3]) != 0 {
+		t.Fatalf("legacy lanes still hold results: %v", lanes)
 	}
 }
