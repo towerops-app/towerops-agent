@@ -393,3 +393,15 @@ func TestRunUbntProbeListenError(t *testing.T) {
 		t.Fatal("expected a listen error")
 	}
 }
+
+func TestCollectUbntRepliesReadError(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	// Closing the socket under the reader is a non-timeout read error.
+	_ = conn.Close()
+	if _, err := collectUbntReplies(context.Background(), conn, 500*time.Millisecond); err == nil {
+		t.Fatal("expected a read error")
+	}
+}

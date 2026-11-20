@@ -124,7 +124,12 @@ func runUbntProbeOn(ctx context.Context, bindAddr string, dest string, port int,
 	if err := ubntSendRequest(conn, dst, dest); err != nil {
 		return nil, err
 	}
+	return collectUbntReplies(ctx, conn, collect)
+}
 
+// collectUbntReplies reads replies until collect elapses or ctx cancels.
+func collectUbntReplies(ctx context.Context, conn net.PacketConn,
+	collect time.Duration) ([]*pb.UbntDiscoveryPeer, error) {
 	deadline := time.Now().Add(collect)
 	seen := make(map[string]*pb.UbntDiscoveryPeer)
 	buf := make([]byte, ubntReadBufferBytes)
