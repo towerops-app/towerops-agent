@@ -263,6 +263,14 @@ var resultBatchFlushDelay = 250 * time.Millisecond
 // approach the frame target, so latency never waits out a large batch.
 const resultBatchFlushBytes = 256 << 10
 
+// resultBatchMaxEnvelopes mirrors the server's per-batch envelope cap
+// (`@max_envelopes_per_batch` in agent_channel/result_batch.ex). A batch
+// of tiny results can sit far under the byte target yet still exceed the
+// count cap, and the server rejects the whole frame `batch_too_large`,
+// which the agent cannot split after the fact. Flush on whichever limit
+// arrives first.
+const resultBatchMaxEnvelopes = 500
+
 // batchableEvent reports whether a result is small enough to hold for the
 // batch window. Large discovery and backup frames go out alone immediately:
 // holding 8 MiB behind a 250 ms timer only delays their own write.
@@ -427,13 +435,14 @@ func (s *session) nextResultFrame(lanes *[4][]outbound, flushDue bool) ([]outbou
 				return batch, batch[0].event
 			}
 			size := candidate.wireSize()
-			if len(batch) > 0 && batchBytes+size > resultBatchFlushBytes {
+			if len(batch) > 0 &&
+				(batchBytes+size > resultBatchFlushBytes || len(batch) >= resultBatchMaxEnvelopes) {
 				break
 			}
 			lanes[lane] = lanes[lane][1:]
 			batch = append(batch, candidate)
 			batchBytes += size
-			if batchBytes >= resultBatchFlushBytes {
+			if batchBytes >= resultBatchFlushBytes || len(batch) >= resultBatchMaxEnvelopes {
 				return batch, batch[0].event
 			}
 		}
