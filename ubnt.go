@@ -107,33 +107,22 @@ func executeUbntDiscovery(ctx context.Context, job *pb.AgentJob, out *resultQueu
 // the window closes or ctx cancels. Replies dedupe on MAC so a device
 // answering on two interfaces reports once; reply order is stable.
 func runUbntProbe(ctx context.Context, dest string, port int, collect time.Duration) ([]*pb.UbntDiscoveryPeer, error) {
-	// UDPConn with SO_BROADCAST: DialUDP cannot send to a broadcast
-	// address without the option, and ListenUDP gives us the listener the
-	// replies arrive on.
-	lc := net.ListenConfig{
-		Control: func(_, _ string, c syscall.RawConn) error {
-			var err error
-			ctrlErr := c.Control(func(fd uintptr) {
-				err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_BROADCAST, 1)
-			})
-			if ctrlErr != nil {
-				return ctrlErr
-			}
-			return err
-		},
-	}
-	conn, err := lc.ListenPacket(ctx, "udp4", ":0")
+	return runUbntProbeOn(ctx, ":0", dest, port, collect)
+}
+
+// runUbntProbeOn runs the probe on an explicit bind address; callers use
+// ":0". Kept as a parameter so tests can reach the listen failure.
+func runUbntProbeOn(ctx context.Context, bindAddr string, dest string, port int,
+	collect time.Duration) ([]*pb.UbntDiscoveryPeer, error) {
+	conn, err := ubntListen(ctx, bindAddr)
 	if err != nil {
-		return nil, fmt.Errorf("listen: %w", err)
+		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
 
 	dst := &net.UDPAddr{IP: net.ParseIP(dest), Port: port}
-	if dst.IP == nil {
-		return nil, fmt.Errorf("invalid destination %q", dest)
-	}
-	if _, err := conn.WriteTo(ubntDiscoveryRequest, dst); err != nil {
-		return nil, fmt.Errorf("send: %w", err)
+	if err := ubntSendRequest(conn, dst, dest); err != nil {
+		return nil, err
 	}
 
 	deadline := time.Now().Add(collect)
@@ -188,6 +177,46 @@ func runUbntProbe(ctx context.Context, dest string, port int, collect time.Durat
 		return strings.Compare(a.SourceIp, b.SourceIp)
 	})
 	return peers, nil
+}
+
+// ubntListen binds a UDP socket with SO_BROADCAST: DialUDP cannot send
+// to a broadcast address without the option, and the bound socket is
+// also the listener the replies arrive on.
+func ubntListen(ctx context.Context, bindAddr string) (net.PacketConn, error) {
+	lc := net.ListenConfig{
+		Control: func(_, _ string, c syscall.RawConn) error {
+			return ubntSetBroadcast(c)
+		},
+	}
+	conn, err := lc.ListenPacket(ctx, "udp4", bindAddr)
+	if err != nil {
+		return nil, fmt.Errorf("listen: %w", err)
+	}
+	return conn, nil
+}
+
+// ubntSetBroadcast turns on SO_BROADCAST for the bound socket.
+func ubntSetBroadcast(c syscall.RawConn) error {
+	var err error
+	ctrlErr := c.Control(func(fd uintptr) {
+		err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_BROADCAST, 1)
+	})
+	if ctrlErr != nil {
+		return ctrlErr
+	}
+	return err
+}
+
+// ubntSendRequest validates the destination and sends the discovery
+// request on the bound socket.
+func ubntSendRequest(conn net.PacketConn, dst *net.UDPAddr, dest string) error {
+	if dst.IP == nil {
+		return fmt.Errorf("invalid destination %q", dest)
+	}
+	if _, err := conn.WriteTo(ubntDiscoveryRequest, dst); err != nil {
+		return fmt.Errorf("send: %w", err)
+	}
+	return nil
 }
 
 // parseUbntReply decodes one TLV packet into a peer. Packets are a flat

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -163,4 +164,232 @@ func TestExecuteUbntDiscovery(t *testing.T) {
 			t.Errorf("probe_id = %q", result.ProbeId)
 		}
 	})
+}
+
+func TestExecuteUbntDiscoveryDefaults(t *testing.T) {
+	// Every field defaulted: the destination falls back to the global
+	// broadcast and the job still completes (it just sees nothing on the
+	// test machine's broadcast domain).
+	out := testQueue()
+	executeUbntDiscovery(context.Background(), &pb.AgentJob{
+		JobId:         "u3",
+		JobType:       pb.JobType_UBNT_DISCOVERY,
+		UbntDiscovery: &pb.UbntDiscoveryJob{CollectMs: 50},
+	}, out)
+
+	result := wantResult[*pb.UbntDiscoveryResult](t, out, "ubnt_discovery_result", 2*time.Second)
+	// Broadcast may or may not succeed on CI; either way the result lands.
+	if result.ProbeId != "u3" {
+		t.Errorf("probe_id = %q", result.ProbeId)
+	}
+}
+
+func TestExecuteUbntDiscoveryUnicastTarget(t *testing.T) {
+	// An invalid destination reports an error result instead of panicking.
+	out := testQueue()
+	executeUbntDiscovery(context.Background(), &pb.AgentJob{
+		JobId:         "u4",
+		JobType:       pb.JobType_UBNT_DISCOVERY,
+		UbntDiscovery: &pb.UbntDiscoveryJob{Target: "not-an-address", CollectMs: 10},
+	}, out)
+
+	result := wantResult[*pb.UbntDiscoveryResult](t, out, "ubnt_discovery_result", 2*time.Second)
+	if result.ErrorMessage == "" {
+		t.Error("expected an invalid destination error")
+	}
+}
+
+func TestRunUbntProbeCtxCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	responder, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("responder listen: %v", err)
+	}
+	defer func() { _ = responder.Close() }()
+	port := responder.LocalAddr().(*net.UDPAddr).Port
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err = runUbntProbe(ctx, "127.0.0.1", port, 5*time.Second)
+	if err == nil {
+		t.Fatal("expected context cancellation to abort the probe")
+	}
+}
+
+func TestRunUbntProbeDropsMalformedAndKeysByIP(t *testing.T) {
+	responder, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("responder listen: %v", err)
+	}
+	defer func() { _ = responder.Close() }()
+	port := responder.LocalAddr().(*net.UDPAddr).Port
+
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			_, src, err := responder.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			// A truncated packet: the reader drops it and keeps collecting.
+			_, _ = responder.WriteToUDP([]byte{0x0c, 0x00, 0x09, 'n'}, src)
+			// A reply whose only usable field is a model, keyed on source IP
+			// since no MAC TLV arrived.
+			_, _ = responder.WriteToUDP(ubntReply(
+				ubntTLV(ubntTLVModel, []byte("LHG-5nD")),
+			), src)
+		}
+	}()
+
+	peers, err := runUbntProbe(context.Background(), "127.0.0.1", port, 300*time.Millisecond)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if len(peers) != 1 || peers[0].Model != "LHG-5nD" {
+		t.Fatalf("peers = %+v", peers)
+	}
+}
+
+func TestParseUbntReplyTrailingBytes(t *testing.T) {
+	packet := ubntReply(ubntTLV(ubntTLVModel, []byte("m5")))
+	packet = append(packet, 0xff) // one dangling byte after the last TLV
+	if _, err := parseUbntReply(packet, "10.0.0.1"); err == nil {
+		t.Fatal("expected trailing bytes to fail")
+	}
+}
+
+func TestJobTargetKeyUbnt(t *testing.T) {
+	tests := []struct {
+		name string
+		job  *pb.AgentJob
+		want string
+	}{
+		{
+			"broadcast destination keys on the domain",
+			&pb.AgentJob{UbntDiscovery: &pb.UbntDiscoveryJob{BroadcastAddress: "192.168.88.255", Port: 10001}},
+			"ubnt:192.168.88.255:10001",
+		},
+		{
+			"unicast target wins over broadcast",
+			&pb.AgentJob{UbntDiscovery: &pb.UbntDiscoveryJob{Target: "10.0.0.20"}},
+			"ubnt:10.0.0.20",
+		},
+		{
+			"no destination falls back to the job key",
+			&pb.AgentJob{JobId: "job-9", UbntDiscovery: &pb.UbntDiscoveryJob{}},
+			"job:job-9",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := jobTargetKey(tt.job); got != tt.want {
+				t.Errorf("jobTargetKey = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUbntListenErrors(t *testing.T) {
+	// An unparseable bind address surfaces the listen error.
+	if _, err := ubntListen(context.Background(), "256.256.256.256:0"); err == nil {
+		t.Fatal("expected listen error")
+	}
+}
+
+func TestUbntSetBroadcastCtrlError(t *testing.T) {
+	if err := ubntSetBroadcast(failingRawConn{}); err == nil {
+		t.Fatal("expected control error")
+	}
+}
+
+// failingRawConn fails Control so ubntSetBroadcast's ctrlErr branch runs.
+type failingRawConn struct{}
+
+func (failingRawConn) Control(func(uintptr)) error    { return errors.New("ctrl boom") }
+func (failingRawConn) Read(func(uintptr) bool) error  { return nil }
+func (failingRawConn) Write(func(uintptr) bool) error { return nil }
+
+func TestUbntSendRequestErrors(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := ubntSendRequest(conn, &net.UDPAddr{IP: nil, Port: 10001}, "bogus"); err == nil {
+		t.Fatal("expected invalid destination error")
+	}
+	// Writing on a closed socket surfaces the send error.
+	_ = conn.Close()
+	if err := ubntSendRequest(conn, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 10001},
+		"127.0.0.1"); err == nil {
+		t.Fatal("expected send error")
+	}
+}
+
+func TestRunUbntProbeSortsTwoPeers(t *testing.T) {
+	responder, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("responder listen: %v", err)
+	}
+	defer func() { _ = responder.Close() }()
+	port := responder.LocalAddr().(*net.UDPAddr).Port
+
+	go func() {
+		buf := make([]byte, 64)
+		_, src, err := responder.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		// Two replies with different MACs exercise the result sort.
+		_, _ = responder.WriteToUDP(ubntReply(
+			ubntTLV(ubntTLVMAC, ubntTestMAC(0xdc, 0x9f, 0xdb, 0x00, 0x00, 0x02)),
+			ubntTLV(ubntTLVModel, []byte("b")),
+		), src)
+		_, _ = responder.WriteToUDP(ubntReply(
+			ubntTLV(ubntTLVMAC, ubntTestMAC(0xdc, 0x9f, 0xdb, 0x00, 0x00, 0x01)),
+			ubntTLV(ubntTLVModel, []byte("a")),
+		), src)
+	}()
+
+	peers, err := runUbntProbe(context.Background(), "127.0.0.1", port, 300*time.Millisecond)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if len(peers) != 2 {
+		t.Fatalf("expected 2 peers, got %d", len(peers))
+	}
+}
+
+func TestExecuteUbntDiscoveryCtxCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	out := testQueue()
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	executeUbntDiscovery(ctx, &pb.AgentJob{
+		JobId:   "u5",
+		JobType: pb.JobType_UBNT_DISCOVERY,
+		UbntDiscovery: &pb.UbntDiscoveryJob{
+			Target:    "127.0.0.1",
+			CollectMs: 5000,
+		},
+	}, out)
+	// A cancelled ctx returns without emitting a result.
+	select {
+	case msg := <-out.items:
+		t.Fatalf("unexpected result: %+v", msg)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestRunUbntProbeListenError(t *testing.T) {
+	if _, err := runUbntProbeOn(context.Background(), "256.256.256.256:0",
+		"127.0.0.1", 10001, time.Second); err == nil {
+		t.Fatal("expected a listen error")
+	}
 }
