@@ -100,6 +100,7 @@ func testPools(t *testing.T) *jobPools {
 		mikrotik:        newWorkerPool(4),
 		ping:            newWorkerPool(4),
 		checks:          newWorkerPool(4),
+		ubnt:            newWorkerPool(2),
 		notices:         make(chan outbound, overloadNoticeQueueSize),
 		targets:         &targetGates{},
 		localScheduling: true,
@@ -112,6 +113,7 @@ func testPools(t *testing.T) *jobPools {
 		p.mikrotik.stop()
 		p.ping.stop()
 		p.checks.stop()
+		p.ubnt.stop()
 		if !p.scheduler.wait(time.Second) {
 			t.Error("scheduler did not stop")
 		}
@@ -1716,6 +1718,7 @@ func TestDispatchJobCancelledContext(t *testing.T) {
 		mikrotik: newWorkerPool(1),
 		ping:     newWorkerPool(1),
 		checks:   newWorkerPool(1),
+		ubnt:     newWorkerPool(1),
 	}
 	t.Cleanup(func() { p.snmp.stop(); p.mikrotik.stop(); p.ping.stop(); p.checks.stop() })
 
@@ -1766,6 +1769,7 @@ func TestPoolOverloadReportsEveryJobClassWithoutUsingResultSpool(t *testing.T) {
 		mikrotik: newWorkerPool(1),
 		ping:     newWorkerPool(1),
 		checks:   newWorkerPool(1),
+		ubnt:     newWorkerPool(1),
 		notices:  notices,
 		targets:  &targetGates{},
 	}
@@ -3767,6 +3771,7 @@ func TestSessionLoopFlushesQueuedResultsOnShutdown(t *testing.T) {
 		mikrotik: newWorkerPool(1),
 		ping:     newWorkerPool(1),
 		checks:   newWorkerPool(1),
+		ubnt:     newWorkerPool(1),
 		backup:   newWorkerPool(1),
 		targets:  &targetGates{},
 	}
