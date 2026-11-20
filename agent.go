@@ -2421,6 +2421,7 @@ type jobPools struct {
 	ping            *workerPool
 	checks          *workerPool
 	backup          *workerPool
+	ubnt            *workerPool
 	notices         chan outbound
 	scheduler       *recurringScheduler
 	targets         *targetGates
@@ -2450,7 +2451,7 @@ func (p *jobPools) loadSnapshots() []poolLoadSnapshot {
 		pool *workerPool
 	}{
 		{"snmp", p.snmp}, {"mikrotik", p.mikrotik}, {"ping", p.ping},
-		{"checks", p.checks}, {"backup", p.backup},
+		{"checks", p.checks}, {"backup", p.backup}, {"ubnt", p.ubnt},
 	}
 	loads := make([]poolLoadSnapshot, 0, len(definitions))
 	for _, definition := range definitions {
@@ -2487,13 +2488,13 @@ func (p *jobPools) pause() {
 }
 
 func (p *jobPools) all() []*workerPool {
-	return []*workerPool{p.snmp, p.mikrotik, p.ping, p.checks, p.backup}
+	return []*workerPool{p.snmp, p.mikrotik, p.ping, p.checks, p.backup, p.ubnt}
 }
 
 func (p *jobPools) stop(timeout time.Duration) []string {
 	pools := map[string]*workerPool{
 		"snmp": p.snmp, "mikrotik": p.mikrotik, "ping": p.ping, "checks": p.checks,
-		"backup": p.backup,
+		"backup": p.backup, "ubnt": p.ubnt,
 	}
 	done := make(chan string, len(pools))
 	for name, pool := range pools {
@@ -2624,6 +2625,11 @@ func submitJob(
 	case pb.JobType_CREDENTIAL_PROBE:
 		pool = pools.snmp
 		execute = func() { executeCredentialProbe(ctx, job, out) }
+	case pb.JobType_UBNT_DISCOVERY:
+		// UDP broadcast, not SNMP: a dedicated small pool keeps a stuck
+		// collection window from holding an SNMP worker.
+		pool = pools.ubnt
+		execute = func() { executeUbntDiscovery(ctx, job, out) }
 	case pb.JobType_PING:
 		// Pings run on the shared ICMP engine instead of holding a worker
 		// for each timeout window. The worker closure returns as soon as the
@@ -2827,6 +2833,18 @@ func jobTargetKey(job *pb.AgentJob) string {
 		job.CredentialProbe.Candidates[0].Ip != "" {
 		candidate := job.CredentialProbe.Candidates[0]
 		return prefix + hostPortKey(candidate.Ip, candidate.Port)
+	}
+	// UBNT jobs sweep a broadcast domain: key on the destination so two
+	// concurrent sweeps of the same domain serialize instead of doubling
+	// replies, while different domains run in parallel.
+	if job.UbntDiscovery != nil {
+		dest := job.UbntDiscovery.Target
+		if dest == "" {
+			dest = job.UbntDiscovery.BroadcastAddress
+		}
+		if dest != "" {
+			return "ubnt:" + hostPortKey(dest, job.UbntDiscovery.Port)
+		}
 	}
 	if job.DeviceId != "" {
 		return prefix + "device:" + job.DeviceId

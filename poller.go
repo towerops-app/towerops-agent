@@ -79,6 +79,7 @@ func newProcessPoller(
 		ping:            newWorkerPool(pingPoolSize()),
 		checks:          newWorkerPool(checksPoolSize()),
 		backup:          newWorkerPool(backupPoolSize()),
+		ubnt:            newWorkerPool(ubntPoolSize()),
 		notices:         notices,
 		targets:         &targetGates{},
 		localScheduling: localScheduling,
@@ -152,6 +153,10 @@ func checksPoolSize() int {
 }
 
 func backupPoolSize() int { return 8 }
+
+// UBNT discovery is a bounded UDP collection window: two workers is plenty
+// for sweeps that finish in a few seconds each.
+func ubntPoolSize() int { return 2 }
 
 // connected cancels a pending grace expiry: a live session owns the poller.
 func (p *processPoller) connected() {

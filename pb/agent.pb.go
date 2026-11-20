@@ -36,22 +36,24 @@ const (
 	JobType_MIKROTIK         JobType = 2
 	JobType_TEST_CREDENTIALS JobType = 3
 	JobType_PING             JobType = 4
-	JobType_CREDENTIAL_PROBE JobType = 7 // Try an ordered list of SNMP credentials against one target
-	JobType_CONFIG_BACKUP    JobType = 8 // Vendor-neutral device config backup over SSH
-	JobType_THROUGHPUT_TEST  JobType = 9 // One-shot agent-measured throughput test against a target
+	JobType_CREDENTIAL_PROBE JobType = 7  // Try an ordered list of SNMP credentials against one target
+	JobType_CONFIG_BACKUP    JobType = 8  // Vendor-neutral device config backup over SSH
+	JobType_THROUGHPUT_TEST  JobType = 9  // One-shot agent-measured throughput test against a target
+	JobType_UBNT_DISCOVERY   JobType = 10 // Ubiquiti UDP 10001 broadcast discovery; optional job type
 )
 
 // Enum value maps for JobType.
 var (
 	JobType_name = map[int32]string{
-		0: "DISCOVER",
-		1: "POLL",
-		2: "MIKROTIK",
-		3: "TEST_CREDENTIALS",
-		4: "PING",
-		7: "CREDENTIAL_PROBE",
-		8: "CONFIG_BACKUP",
-		9: "THROUGHPUT_TEST",
+		0:  "DISCOVER",
+		1:  "POLL",
+		2:  "MIKROTIK",
+		3:  "TEST_CREDENTIALS",
+		4:  "PING",
+		7:  "CREDENTIAL_PROBE",
+		8:  "CONFIG_BACKUP",
+		9:  "THROUGHPUT_TEST",
+		10: "UBNT_DISCOVERY",
 	}
 	JobType_value = map[string]int32{
 		"DISCOVER":         0,
@@ -62,6 +64,7 @@ var (
 		"CREDENTIAL_PROBE": 7,
 		"CONFIG_BACKUP":    8,
 		"THROUGHPUT_TEST":  9,
+		"UBNT_DISCOVERY":   10,
 	}
 )
 
@@ -3166,7 +3169,8 @@ type AgentJob struct {
 	ThroughputTest  *ThroughputTestJob `protobuf:"bytes,17,opt,name=throughput_test,json=throughputTest,proto3" json:"throughput_test,omitempty"`                                     // Present on THROUGHPUT_TEST jobs
 	// True when snmp_retries is authoritative, including an explicit zero.
 	// False preserves the legacy agent-default interpretation of zero.
-	SnmpRetriesSet bool `protobuf:"varint,18,opt,name=snmp_retries_set,json=snmpRetriesSet,proto3" json:"snmp_retries_set,omitempty"`
+	SnmpRetriesSet bool              `protobuf:"varint,18,opt,name=snmp_retries_set,json=snmpRetriesSet,proto3" json:"snmp_retries_set,omitempty"`
+	UbntDiscovery  *UbntDiscoveryJob `protobuf:"bytes,19,opt,name=ubnt_discovery,json=ubntDiscovery,proto3" json:"ubnt_discovery,omitempty"` // Present on UBNT_DISCOVERY jobs
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -3325,6 +3329,13 @@ func (x *AgentJob) GetSnmpRetriesSet() bool {
 		return x.SnmpRetriesSet
 	}
 	return false
+}
+
+func (x *AgentJob) GetUbntDiscovery() *UbntDiscoveryJob {
+	if x != nil {
+		return x.UbntDiscovery
+	}
+	return nil
 }
 
 type SnmpDevice struct {
@@ -4898,6 +4909,240 @@ func (x *SnmpTrap) GetAgentAddress() string {
 	return ""
 }
 
+// Ubiquiti broadcast discovery (UDP 10001). The agent sends the 4-byte
+// request to broadcast_address (or to target for a unicast probe of one
+// address), collects TLV replies for collect_ms, and reports every
+// responder as one UbntDiscoveryPeer.
+type UbntDiscoveryJob struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Target           string                 `protobuf:"bytes,1,opt,name=target,proto3" json:"target,omitempty"`                                             // Unicast target; empty means use broadcast_address
+	BroadcastAddress string                 `protobuf:"bytes,2,opt,name=broadcast_address,json=broadcastAddress,proto3" json:"broadcast_address,omitempty"` // Default "255.255.255.255"; a directed subnet broadcast works too
+	Port             uint32                 `protobuf:"varint,3,opt,name=port,proto3" json:"port,omitempty"`                                                // 0 means the UBNT default (10001)
+	CollectMs        uint32                 `protobuf:"varint,4,opt,name=collect_ms,json=collectMs,proto3" json:"collect_ms,omitempty"`                     // Reply collection window; 0 means the agent default (3000)
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *UbntDiscoveryJob) Reset() {
+	*x = UbntDiscoveryJob{}
+	mi := &file_proto_agent_proto_msgTypes[47]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UbntDiscoveryJob) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UbntDiscoveryJob) ProtoMessage() {}
+
+func (x *UbntDiscoveryJob) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[47]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UbntDiscoveryJob.ProtoReflect.Descriptor instead.
+func (*UbntDiscoveryJob) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{47}
+}
+
+func (x *UbntDiscoveryJob) GetTarget() string {
+	if x != nil {
+		return x.Target
+	}
+	return ""
+}
+
+func (x *UbntDiscoveryJob) GetBroadcastAddress() string {
+	if x != nil {
+		return x.BroadcastAddress
+	}
+	return ""
+}
+
+func (x *UbntDiscoveryJob) GetPort() uint32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
+}
+
+func (x *UbntDiscoveryJob) GetCollectMs() uint32 {
+	if x != nil {
+		return x.CollectMs
+	}
+	return 0
+}
+
+// One UDP 10001 reply. Field contents come straight out of the device's TLV
+// packet; the agent sends what the TLVs carried and never fabricates values.
+type UbntDiscoveryPeer struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SourceIp      string                 `protobuf:"bytes,1,opt,name=source_ip,json=sourceIp,proto3" json:"source_ip,omitempty"`                 // Reply source address
+	MacAddress    string                 `protobuf:"bytes,2,opt,name=mac_address,json=macAddress,proto3" json:"mac_address,omitempty"`           // Colon-separated hex from TLV 0x01/0x02
+	Model         string                 `protobuf:"bytes,3,opt,name=model,proto3" json:"model,omitempty"`                                       // Short model string (TLV 0x0C)
+	Firmware      string                 `protobuf:"bytes,4,opt,name=firmware,proto3" json:"firmware,omitempty"`                                 // Firmware version (TLV 0x03)
+	Hostname      string                 `protobuf:"bytes,5,opt,name=hostname,proto3" json:"hostname,omitempty"`                                 // Device name (TLV 0x0B)
+	UptimeSeconds uint32                 `protobuf:"varint,6,opt,name=uptime_seconds,json=uptimeSeconds,proto3" json:"uptime_seconds,omitempty"` // TLV 0x0A; 0 when absent
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UbntDiscoveryPeer) Reset() {
+	*x = UbntDiscoveryPeer{}
+	mi := &file_proto_agent_proto_msgTypes[48]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UbntDiscoveryPeer) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UbntDiscoveryPeer) ProtoMessage() {}
+
+func (x *UbntDiscoveryPeer) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[48]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UbntDiscoveryPeer.ProtoReflect.Descriptor instead.
+func (*UbntDiscoveryPeer) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{48}
+}
+
+func (x *UbntDiscoveryPeer) GetSourceIp() string {
+	if x != nil {
+		return x.SourceIp
+	}
+	return ""
+}
+
+func (x *UbntDiscoveryPeer) GetMacAddress() string {
+	if x != nil {
+		return x.MacAddress
+	}
+	return ""
+}
+
+func (x *UbntDiscoveryPeer) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+func (x *UbntDiscoveryPeer) GetFirmware() string {
+	if x != nil {
+		return x.Firmware
+	}
+	return ""
+}
+
+func (x *UbntDiscoveryPeer) GetHostname() string {
+	if x != nil {
+		return x.Hostname
+	}
+	return ""
+}
+
+func (x *UbntDiscoveryPeer) GetUptimeSeconds() uint32 {
+	if x != nil {
+		return x.UptimeSeconds
+	}
+	return 0
+}
+
+type UbntDiscoveryResult struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ProbeId       string                 `protobuf:"bytes,1,opt,name=probe_id,json=probeId,proto3" json:"probe_id,omitempty"` // The job_id of the UBNT_DISCOVERY job
+	Peers         []*UbntDiscoveryPeer   `protobuf:"bytes,2,rep,name=peers,proto3" json:"peers,omitempty"`
+	ErrorMessage  string                 `protobuf:"bytes,3,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"` // Socket/broadcast failure; empty on success
+	Timestamp     int64                  `protobuf:"varint,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	DurationMs    uint32                 `protobuf:"varint,5,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"` // Agent-measured collection window
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UbntDiscoveryResult) Reset() {
+	*x = UbntDiscoveryResult{}
+	mi := &file_proto_agent_proto_msgTypes[49]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UbntDiscoveryResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UbntDiscoveryResult) ProtoMessage() {}
+
+func (x *UbntDiscoveryResult) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[49]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UbntDiscoveryResult.ProtoReflect.Descriptor instead.
+func (*UbntDiscoveryResult) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{49}
+}
+
+func (x *UbntDiscoveryResult) GetProbeId() string {
+	if x != nil {
+		return x.ProbeId
+	}
+	return ""
+}
+
+func (x *UbntDiscoveryResult) GetPeers() []*UbntDiscoveryPeer {
+	if x != nil {
+		return x.Peers
+	}
+	return nil
+}
+
+func (x *UbntDiscoveryResult) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
+func (x *UbntDiscoveryResult) GetTimestamp() int64 {
+	if x != nil {
+		return x.Timestamp
+	}
+	return 0
+}
+
+func (x *UbntDiscoveryResult) GetDurationMs() uint32 {
+	if x != nil {
+		return x.DurationMs
+	}
+	return 0
+}
+
 var File_proto_agent_proto protoreflect.FileDescriptor
 
 const file_proto_agent_proto_rawDesc = "" +
@@ -5135,7 +5380,7 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x10AgentResultBatch\x12=\n" +
 	"\aresults\x18\x01 \x03(\v2#.towerops.agent.AgentResultEnvelopeR\aresults\"A\n" +
 	"\x0eAgentResultAck\x12/\n" +
-	"\x13cumulative_sequence\x18\x01 \x01(\x04R\x12cumulativeSequence\"\xb5\a\n" +
+	"\x13cumulative_sequence\x18\x01 \x01(\x04R\x12cumulativeSequence\"\xfe\a\n" +
 	"\bAgentJob\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x122\n" +
 	"\bjob_type\x18\x02 \x01(\x0e2\x17.towerops.agent.JobTypeR\ajobType\x12\x1b\n" +
@@ -5157,7 +5402,8 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x10credential_probe\x18\x0f \x01(\v2\x1f.towerops.agent.CredentialProbeR\x0fcredentialProbe\x12D\n" +
 	"\rconfig_backup\x18\x10 \x01(\v2\x1f.towerops.agent.ConfigBackupJobR\fconfigBackup\x12J\n" +
 	"\x0fthroughput_test\x18\x11 \x01(\v2!.towerops.agent.ThroughputTestJobR\x0ethroughputTest\x12(\n" +
-	"\x10snmp_retries_set\x18\x12 \x01(\bR\x0esnmpRetriesSet\"\xfb\x02\n" +
+	"\x10snmp_retries_set\x18\x12 \x01(\bR\x0esnmpRetriesSet\x12G\n" +
+	"\x0eubnt_discovery\x18\x13 \x01(\v2 .towerops.agent.UbntDiscoveryJobR\rubntDiscovery\"\xfb\x02\n" +
 	"\n" +
 	"SnmpDevice\x12\x0e\n" +
 	"\x02ip\x18\x01 \x01(\tR\x02ip\x12\x1c\n" +
@@ -5324,7 +5570,28 @@ const file_proto_agent_proto_rawDesc = "" +
 	" \x01(\tR\fagentAddress\x1a;\n" +
 	"\rVarbindsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01*\x99\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8a\x01\n" +
+	"\x10UbntDiscoveryJob\x12\x16\n" +
+	"\x06target\x18\x01 \x01(\tR\x06target\x12+\n" +
+	"\x11broadcast_address\x18\x02 \x01(\tR\x10broadcastAddress\x12\x12\n" +
+	"\x04port\x18\x03 \x01(\rR\x04port\x12\x1d\n" +
+	"\n" +
+	"collect_ms\x18\x04 \x01(\rR\tcollectMs\"\xc6\x01\n" +
+	"\x11UbntDiscoveryPeer\x12\x1b\n" +
+	"\tsource_ip\x18\x01 \x01(\tR\bsourceIp\x12\x1f\n" +
+	"\vmac_address\x18\x02 \x01(\tR\n" +
+	"macAddress\x12\x14\n" +
+	"\x05model\x18\x03 \x01(\tR\x05model\x12\x1a\n" +
+	"\bfirmware\x18\x04 \x01(\tR\bfirmware\x12\x1a\n" +
+	"\bhostname\x18\x05 \x01(\tR\bhostname\x12%\n" +
+	"\x0euptime_seconds\x18\x06 \x01(\rR\ruptimeSeconds\"\xcd\x01\n" +
+	"\x13UbntDiscoveryResult\x12\x19\n" +
+	"\bprobe_id\x18\x01 \x01(\tR\aprobeId\x127\n" +
+	"\x05peers\x18\x02 \x03(\v2!.towerops.agent.UbntDiscoveryPeerR\x05peers\x12#\n" +
+	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage\x12\x1c\n" +
+	"\ttimestamp\x18\x04 \x01(\x03R\ttimestamp\x12\x1f\n" +
+	"\vduration_ms\x18\x05 \x01(\rR\n" +
+	"durationMs*\xad\x01\n" +
 	"\aJobType\x12\f\n" +
 	"\bDISCOVER\x10\x00\x12\b\n" +
 	"\x04POLL\x10\x01\x12\f\n" +
@@ -5333,7 +5600,9 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\x04PING\x10\x04\x12\x14\n" +
 	"\x10CREDENTIAL_PROBE\x10\a\x12\x11\n" +
 	"\rCONFIG_BACKUP\x10\b\x12\x13\n" +
-	"\x0fTHROUGHPUT_TEST\x10\t\"\x04\b\x05\x10\x05\"\x04\b\x06\x10\x06*O\n" +
+	"\x0fTHROUGHPUT_TEST\x10\t\x12\x12\n" +
+	"\x0eUBNT_DISCOVERY\x10\n" +
+	"\"\x04\b\x05\x10\x05\"\x04\b\x06\x10\x06*O\n" +
 	"\x10ConfigBackupMode\x12\x1d\n" +
 	"\x19CONFIG_BACKUP_MODE_BACKUP\x10\x00\x12\x1c\n" +
 	"\x18CONFIG_BACKUP_MODE_PROBE\x10\x01*\\\n" +
@@ -5391,7 +5660,7 @@ func file_proto_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
-var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 53)
+var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 56)
 var file_proto_agent_proto_goTypes = []any{
 	(JobType)(0),                   // 0: towerops.agent.JobType
 	(ConfigBackupMode)(0),          // 1: towerops.agent.ConfigBackupMode
@@ -5449,12 +5718,15 @@ var file_proto_agent_proto_goTypes = []any{
 	(*MikrotikSentence)(nil),       // 53: towerops.agent.MikrotikSentence
 	(*MikrotikCommandFailure)(nil), // 54: towerops.agent.MikrotikCommandFailure
 	(*SnmpTrap)(nil),               // 55: towerops.agent.SnmpTrap
-	nil,                            // 56: towerops.agent.Sensor.MetadataEntry
-	nil,                            // 57: towerops.agent.HttpCheckConfig.HeadersEntry
-	nil,                            // 58: towerops.agent.SnmpResult.OidValuesEntry
-	nil,                            // 59: towerops.agent.MikrotikCommand.ArgsEntry
-	nil,                            // 60: towerops.agent.MikrotikSentence.AttributesEntry
-	nil,                            // 61: towerops.agent.SnmpTrap.VarbindsEntry
+	(*UbntDiscoveryJob)(nil),       // 56: towerops.agent.UbntDiscoveryJob
+	(*UbntDiscoveryPeer)(nil),      // 57: towerops.agent.UbntDiscoveryPeer
+	(*UbntDiscoveryResult)(nil),    // 58: towerops.agent.UbntDiscoveryResult
+	nil,                            // 59: towerops.agent.Sensor.MetadataEntry
+	nil,                            // 60: towerops.agent.HttpCheckConfig.HeadersEntry
+	nil,                            // 61: towerops.agent.SnmpResult.OidValuesEntry
+	nil,                            // 62: towerops.agent.MikrotikCommand.ArgsEntry
+	nil,                            // 63: towerops.agent.MikrotikSentence.AttributesEntry
+	nil,                            // 64: towerops.agent.SnmpTrap.VarbindsEntry
 }
 var file_proto_agent_proto_depIdxs = []int32{
 	10, // 0: towerops.agent.AgentConfig.devices:type_name -> towerops.agent.Device
@@ -5462,7 +5734,7 @@ var file_proto_agent_proto_depIdxs = []int32{
 	11, // 2: towerops.agent.Device.snmp:type_name -> towerops.agent.SnmpConfig
 	12, // 3: towerops.agent.Device.sensors:type_name -> towerops.agent.Sensor
 	13, // 4: towerops.agent.Device.interfaces:type_name -> towerops.agent.Interface
-	56, // 5: towerops.agent.Sensor.metadata:type_name -> towerops.agent.Sensor.MetadataEntry
+	59, // 5: towerops.agent.Sensor.metadata:type_name -> towerops.agent.Sensor.MetadataEntry
 	15, // 6: towerops.agent.MetricBatch.metrics:type_name -> towerops.agent.Metric
 	16, // 7: towerops.agent.Metric.sensor_reading:type_name -> towerops.agent.SensorReading
 	17, // 8: towerops.agent.Metric.interface_stat:type_name -> towerops.agent.InterfaceStat
@@ -5473,7 +5745,7 @@ var file_proto_agent_proto_depIdxs = []int32{
 	22, // 13: towerops.agent.Check.tcp:type_name -> towerops.agent.TcpCheckConfig
 	23, // 14: towerops.agent.Check.dns:type_name -> towerops.agent.DnsCheckConfig
 	24, // 15: towerops.agent.Check.ssl:type_name -> towerops.agent.SslCheckConfig
-	57, // 16: towerops.agent.HttpCheckConfig.headers:type_name -> towerops.agent.HttpCheckConfig.HeadersEntry
+	60, // 16: towerops.agent.HttpCheckConfig.headers:type_name -> towerops.agent.HttpCheckConfig.HeadersEntry
 	20, // 17: towerops.agent.CheckList.checks:type_name -> towerops.agent.Check
 	3,  // 18: towerops.agent.ConfigBackupStep.kind:type_name -> towerops.agent.ConfigBackupStepKind
 	2,  // 19: towerops.agent.ConfigBackupPlan.transport:type_name -> towerops.agent.ConfigBackupTransport
@@ -5498,22 +5770,24 @@ var file_proto_agent_proto_depIdxs = []int32{
 	48, // 38: towerops.agent.AgentJob.credential_probe:type_name -> towerops.agent.CredentialProbe
 	31, // 39: towerops.agent.AgentJob.config_backup:type_name -> towerops.agent.ConfigBackupJob
 	33, // 40: towerops.agent.AgentJob.throughput_test:type_name -> towerops.agent.ThroughputTestJob
-	7,  // 41: towerops.agent.SnmpQuery.query_type:type_name -> towerops.agent.QueryType
-	0,  // 42: towerops.agent.SnmpResult.job_type:type_name -> towerops.agent.JobType
-	58, // 43: towerops.agent.SnmpResult.oid_values:type_name -> towerops.agent.SnmpResult.OidValuesEntry
-	8,  // 44: towerops.agent.SnmpResult.discovery_phase:type_name -> towerops.agent.DiscoveryPhase
-	45, // 45: towerops.agent.AgentHeartbeat.pools:type_name -> towerops.agent.PoolLoad
-	41, // 46: towerops.agent.CredentialProbe.candidates:type_name -> towerops.agent.SnmpDevice
-	59, // 47: towerops.agent.MikrotikCommand.args:type_name -> towerops.agent.MikrotikCommand.ArgsEntry
-	53, // 48: towerops.agent.MikrotikResult.sentences:type_name -> towerops.agent.MikrotikSentence
-	54, // 49: towerops.agent.MikrotikResult.command_failures:type_name -> towerops.agent.MikrotikCommandFailure
-	60, // 50: towerops.agent.MikrotikSentence.attributes:type_name -> towerops.agent.MikrotikSentence.AttributesEntry
-	61, // 51: towerops.agent.SnmpTrap.varbinds:type_name -> towerops.agent.SnmpTrap.VarbindsEntry
-	52, // [52:52] is the sub-list for method output_type
-	52, // [52:52] is the sub-list for method input_type
-	52, // [52:52] is the sub-list for extension type_name
-	52, // [52:52] is the sub-list for extension extendee
-	0,  // [0:52] is the sub-list for field type_name
+	56, // 41: towerops.agent.AgentJob.ubnt_discovery:type_name -> towerops.agent.UbntDiscoveryJob
+	7,  // 42: towerops.agent.SnmpQuery.query_type:type_name -> towerops.agent.QueryType
+	0,  // 43: towerops.agent.SnmpResult.job_type:type_name -> towerops.agent.JobType
+	61, // 44: towerops.agent.SnmpResult.oid_values:type_name -> towerops.agent.SnmpResult.OidValuesEntry
+	8,  // 45: towerops.agent.SnmpResult.discovery_phase:type_name -> towerops.agent.DiscoveryPhase
+	45, // 46: towerops.agent.AgentHeartbeat.pools:type_name -> towerops.agent.PoolLoad
+	41, // 47: towerops.agent.CredentialProbe.candidates:type_name -> towerops.agent.SnmpDevice
+	62, // 48: towerops.agent.MikrotikCommand.args:type_name -> towerops.agent.MikrotikCommand.ArgsEntry
+	53, // 49: towerops.agent.MikrotikResult.sentences:type_name -> towerops.agent.MikrotikSentence
+	54, // 50: towerops.agent.MikrotikResult.command_failures:type_name -> towerops.agent.MikrotikCommandFailure
+	63, // 51: towerops.agent.MikrotikSentence.attributes:type_name -> towerops.agent.MikrotikSentence.AttributesEntry
+	64, // 52: towerops.agent.SnmpTrap.varbinds:type_name -> towerops.agent.SnmpTrap.VarbindsEntry
+	57, // 53: towerops.agent.UbntDiscoveryResult.peers:type_name -> towerops.agent.UbntDiscoveryPeer
+	54, // [54:54] is the sub-list for method output_type
+	54, // [54:54] is the sub-list for method input_type
+	54, // [54:54] is the sub-list for extension type_name
+	54, // [54:54] is the sub-list for extension extendee
+	0,  // [0:54] is the sub-list for field type_name
 }
 
 func init() { file_proto_agent_proto_init() }
@@ -5540,7 +5814,7 @@ func file_proto_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_agent_proto_rawDesc), len(file_proto_agent_proto_rawDesc)),
 			NumEnums:      9,
-			NumMessages:   53,
+			NumMessages:   56,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -202,6 +202,7 @@ enum JobType {
   CREDENTIAL_PROBE = 7;  // Try an ordered list of SNMP credentials against one target
   CONFIG_BACKUP = 8;     // Vendor-neutral device config backup over SSH
   THROUGHPUT_TEST = 9;   // One-shot agent-measured throughput test against a target
+  UBNT_DISCOVERY = 10;   // Ubiquiti UDP 10001 broadcast discovery; optional job type
 }
 
 // BACKUP exports the device configuration; PROBE connects and authenticates
@@ -423,9 +424,11 @@ message AgentJob {
   CredentialProbe credential_probe = 15;  // Present on CREDENTIAL_PROBE jobs
   ConfigBackupJob config_backup = 16;   // Present on CONFIG_BACKUP jobs
   ThroughputTestJob throughput_test = 17;  // Present on THROUGHPUT_TEST jobs
+
   // True when snmp_retries is authoritative, including an explicit zero.
   // False preserves the legacy agent-default interpretation of zero.
   bool snmp_retries_set = 18;
+  UbntDiscoveryJob ubnt_discovery = 19;   // Present on UBNT_DISCOVERY jobs
 }
 
 message SnmpDevice {
@@ -695,4 +698,34 @@ message SnmpTrap {
   // when the PDU carries 0.0.0.0. Differs from source_ip when a relay
   // forwarded the trap.
   string agent_address = 10;
+}
+
+// Ubiquiti broadcast discovery (UDP 10001). The agent sends the 4-byte
+// request to broadcast_address (or to target for a unicast probe of one
+// address), collects TLV replies for collect_ms, and reports every
+// responder as one UbntDiscoveryPeer.
+message UbntDiscoveryJob {
+  string target = 1;             // Unicast target; empty means use broadcast_address
+  string broadcast_address = 2;  // Default "255.255.255.255"; a directed subnet broadcast works too
+  uint32 port = 3;               // 0 means the UBNT default (10001)
+  uint32 collect_ms = 4;         // Reply collection window; 0 means the agent default (3000)
+}
+
+// One UDP 10001 reply. Field contents come straight out of the device's TLV
+// packet; the agent sends what the TLVs carried and never fabricates values.
+message UbntDiscoveryPeer {
+  string source_ip = 1;       // Reply source address
+  string mac_address = 2;     // Colon-separated hex from TLV 0x01/0x02
+  string model = 3;           // Short model string (TLV 0x0C)
+  string firmware = 4;        // Firmware version (TLV 0x03)
+  string hostname = 5;        // Device name (TLV 0x0B)
+  uint32 uptime_seconds = 6;  // TLV 0x0A; 0 when absent
+}
+
+message UbntDiscoveryResult {
+  string probe_id = 1;                 // The job_id of the UBNT_DISCOVERY job
+  repeated UbntDiscoveryPeer peers = 2;
+  string error_message = 3;            // Socket/broadcast failure; empty on success
+  int64 timestamp = 4;
+  uint32 duration_ms = 5;              // Agent-measured collection window
 }
