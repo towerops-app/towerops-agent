@@ -280,9 +280,12 @@ func TestResultBatchEncodingCarriesSequences(t *testing.T) {
 	}
 }
 
-// TestRequeueUnackedPreservesSequences verifies reconnect replay of a held
-// result whose storage ack never arrived.
-func TestRequeueUnackedPreservesSequences(t *testing.T) {
+// TestRequeueUnackedRenumbersReplay verifies reconnect replay of a held
+// result whose storage ack never arrived. Sequences are per-connection, so
+// the replay must re-enter unnumbered and pick up a fresh sequence in send
+// order rather than landing below the new session's handled-through mark
+// (issue 5148).
+func TestRequeueUnackedRenumbersReplay(t *testing.T) {
 	q := newResultQueueForAgentBytes(context.Background(), 1<<20)
 	result := outbound{event: "result", payload: json.RawMessage(`{}`)}
 	if !q.enqueue(result) {
@@ -296,8 +299,8 @@ func TestRequeueUnackedPreservesSequences(t *testing.T) {
 	q.requeueUnacked()
 	select {
 	case replayed := <-q.items:
-		if replayed.sequence != 3 {
-			t.Fatalf("replayed sequence = %d, want 3", replayed.sequence)
+		if replayed.sequence != 0 {
+			t.Fatalf("replayed sequence = %d, want 0 so the next frame renumbers it", replayed.sequence)
 		}
 		q.ack(replayed)
 	default:
@@ -306,6 +309,127 @@ func TestRequeueUnackedPreservesSequences(t *testing.T) {
 	if q.pendingAckCount() != 0 || q.depth.Load() != 0 {
 		t.Fatalf("replay leaked capacity: held=%d depth=%d",
 			q.pendingAckCount(), q.depth.Load())
+	}
+}
+
+// sequenceRecorder swaps the result_batch encoder seam for one that records
+// the delivery sequence of every envelope it frames.
+func sequenceRecorder(t *testing.T) *[][]uint64 {
+	t.Helper()
+	var frames [][]uint64
+	orig := resultBatchEncoder
+	resultBatchEncoder = func(results []outbound) *pb.AgentResultBatch {
+		var sequences []uint64
+		for _, result := range results {
+			sequences = append(sequences, result.sequence)
+		}
+		frames = append(frames, sequences)
+		return orig(results)
+	}
+	t.Cleanup(func() { resultBatchEncoder = orig })
+	return &frames
+}
+
+// batchSession builds a byte-bounded session with result_batch_v1 negotiated,
+// the shape the production loop sends frames through.
+func batchSession(ctx context.Context) *session {
+	return &session{
+		ctx: ctx, v2: true, resultBatches: true, topic: "agent:test",
+		results:            newResultQueueForAgentBytes(ctx, 1<<20),
+		writeCh:            make(chan writeRequest, 8),
+		serverCapabilities: map[string]struct{}{"result_batch_v1": {}},
+	}
+}
+
+// sendFrame stages every spooled result into one frame the way the session
+// loop does and queues it for the writer.
+func sendFrame(t *testing.T, s *session) {
+	t.Helper()
+	var lanes [4][]outbound
+	s.stageResults(&lanes)
+	frame, event := s.nextResultFrame(&lanes, true)
+	if len(frame) == 0 {
+		t.Fatal("no frame staged")
+	}
+	if _, err := s.queueResultFrame(frame, event, true); err != nil {
+		t.Fatalf("queueResultFrame: %v", err)
+	}
+}
+
+func strictlyIncreasing(sequences []uint64) bool {
+	for i := 1; i < len(sequences); i++ {
+		if sequences[i] <= sequences[i-1] {
+			return false
+		}
+	}
+	return true
+}
+
+// Issue 5148: results held for a storage ack replay after a reconnect with
+// fresh sequences in send order. Keeping their old numbers put them below
+// the fresh results produced during the outage, and the server refused the
+// whole frame; the next cumulative ack then freed results it never stored.
+func TestReconnectReplayFramesStrictlyIncreasing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	frames := sequenceRecorder(t)
+	s := batchSession(ctx)
+
+	s.results.enqueue(outbound{event: "result", protoPayload: []byte("a")})
+	s.results.enqueue(outbound{event: "result", protoPayload: []byte("b")})
+	s.results.enqueue(outbound{event: "result", protoPayload: []byte("c")})
+	sendFrame(t, s) // sequences 1-3, held awaiting the storage ack
+
+	// Fresh results produced while the session was down sit ahead of the
+	// replay in the spool.
+	s.results.enqueue(outbound{event: "result", protoPayload: []byte("d")})
+	s.results.enqueue(outbound{event: "result", protoPayload: []byte("e")})
+	s.results.requeueUnacked()
+	sendFrame(t, s)
+
+	if len(*frames) != 2 {
+		t.Fatalf("frames = %v, want 2", *frames)
+	}
+	replay := (*frames)[1]
+	if len(replay) != 5 {
+		t.Fatalf("replay frame = %v, want 5 envelopes", replay)
+	}
+	if !strictlyIncreasing(replay) || replay[0] <= 3 {
+		t.Fatalf("replay sequences %v are not strictly increasing above the first frame", replay)
+	}
+}
+
+// Issue 5148: a batch the server rejects re-enters the spool after newer
+// frames were already numbered. It must renumber in send order too, or the
+// retry lands below handled-through and is refused with its fresh neighbors.
+func TestRejectedBatchRenumbersAboveLaterFrames(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	frames := sequenceRecorder(t)
+	s := batchSession(ctx)
+
+	s.results.enqueue(outbound{event: "result", protoPayload: []byte("a")})
+	s.results.enqueue(outbound{event: "result", protoPayload: []byte("b")})
+	sendFrame(t, s) // sequences 1-2
+	rejected := (*frames)[0]
+
+	s.results.enqueue(outbound{event: "result", protoPayload: []byte("c")})
+	s.results.enqueue(outbound{event: "result", protoPayload: []byte("d")})
+	sendFrame(t, s) // sequences 3-4
+
+	// The rejection of the first frame arrives after the second was sent.
+	s.requeueRejected([]outbound{
+		{event: "result", protoPayload: []byte("a"), sequence: rejected[0], encodedBytes: 1},
+		{event: "result", protoPayload: []byte("b"), sequence: rejected[1], encodedBytes: 1},
+	}, 0)
+	sendFrame(t, s)
+
+	retry := (*frames)[2]
+	if len(retry) != 2 {
+		t.Fatalf("retry frame = %v, want 2 envelopes", retry)
+	}
+	if !strictlyIncreasing(retry) || retry[0] <= 4 {
+		t.Fatalf("retry sequences %v are not above the frames already sent", retry)
 	}
 }
 

@@ -874,7 +874,8 @@ func (s *session) queueResultFrame(results []outbound, event string, spooled boo
 	}
 
 	// Assign delivery sequences in send order and hold them until the
-	// server's cumulative ack. A retried frame keeps its sequence.
+	// server's cumulative ack. A requeued frame arrives with sequence 0 and
+	// is renumbered here (issue 5148).
 	//
 	// This must run before the batch is encoded: each envelope carries its
 	// sequence, so encoding first put an unassigned result on the wire as
@@ -1324,9 +1325,10 @@ func (s *session) handleResultReply(msg channelMsg) {
 	}
 }
 
-// requeueRejected returns server-rejected results to the spool, preserving
-// their delivery sequences. The held ring entry is removed first so the
-// requeue does not double-charge the byte budget.
+// requeueRejected returns server-rejected results to the spool. The held
+// ring entry is removed first so the requeue does not double-charge the byte
+// budget, and the queue clears their delivery sequences so they renumber in
+// send order (issue 5148).
 func (s *session) requeueRejected(results []outbound, delay time.Duration) {
 	if s.results.byteBounded() {
 		s.unholdSpooled(results)
@@ -1984,7 +1986,8 @@ type outbound struct {
 	// the first rejection and drops the second.
 	attempts int
 	// Delivery sequence, assigned in send order. The server acks results by
-	// sequence; a retried frame keeps the sequence it was assigned.
+	// sequence; requeued results are cleared and renumbered in send order
+	// (issue 5148).
 	sequence uint64
 	// Delivery lane. Lower is more urgent; see resultPriority.
 	lane uint8
@@ -2092,7 +2095,11 @@ func (q *resultQueue) enqueue(result outbound) bool {
 		// Delivery sequences are assigned in send order (queueResultFrame),
 		// not enqueue order: a priority trap that jumps ahead of queued
 		// polls must not receive a later sequence than results the server
-		// has not been offered yet. Retries keep their assigned sequence.
+		// has not been offered yet. Anything re-entering the spool is a
+		// replay from an earlier send position; its old sequence is already
+		// below the server's handled-through mark, so it is cleared and
+		// renumbered in send order (issue 5148).
+		result.sequence = 0
 		result.lane = resultPriority(result.event, result.reserved)
 		result.encodedBytes = result.wireSize()
 		for {
@@ -2337,16 +2344,25 @@ func (q *resultQueue) ack(result outbound) {
 // retry puts a failed frame's result back at the head of the spool. The lane
 // is the session loop's own deque, so it can never block its only consumer.
 func (q *resultQueue) retry(result outbound) {
+	// The retry goes out after whatever newer work was already framed, so a
+	// kept sequence would land below handled-through and the server would
+	// refuse the whole frame (issue 5148). It renumbers in send order.
+	result.sequence = 0
 	q.retryMu.Lock()
 	q.retries = append(q.retries, result)
 	q.retryMu.Unlock()
 }
 
 // retryBatch returns every result of a failed frame to the retry lane ahead
-// of newer work, preserving their delivery sequences. It must never block: a
-// frame can hold resultBatchMaxEnvelopes results and the session loop is both
-// the producer and the only consumer (issue 5147).
+// of newer work. It must never block: a frame can hold
+// resultBatchMaxEnvelopes results and the session loop is both the producer
+// and the only consumer (issue 5147).
 func (q *resultQueue) retryBatch(results []outbound) {
+	// Sequences are per-connection and assigned in send order; a retried
+	// frame is renumbered like any other requeue (issue 5148).
+	for i := range results {
+		results[i].sequence = 0
+	}
 	q.retryMu.Lock()
 	q.retries = append(q.retries, results...)
 	q.retryMu.Unlock()
@@ -2365,9 +2381,11 @@ func (q *resultQueue) takeRetry() (outbound, bool) {
 }
 
 // requeueUnacked moves held, unacknowledged results back into the spool so a
-// reconnect resends them with their original sequences (C4). The capacity is
-// already charged, so byte mode releases the held entry and re-enqueues the
-// same payload; a truly saturated spool drops it instead of leaking the ring.
+// reconnect resends them (C4). Sequences are per-connection, so the queue
+// clears them on re-entry and the replay renumbers in send order behind
+// whatever the outage already queued (issue 5148). The capacity is already
+// charged, so byte mode releases the held entry and re-enqueues the same
+// payload; a truly saturated spool drops it instead of leaking the ring.
 func (q *resultQueue) requeueUnacked() {
 	if !q.byteBounded() {
 		return

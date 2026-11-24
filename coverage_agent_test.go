@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -366,8 +367,10 @@ func TestResolveAndSettleInFlight(t *testing.T) {
 		if err := s.resolveInFlight(w, errors.New("write failed")); err == nil {
 			t.Error("resolve must surface the write error")
 		}
-		if got, ok := results.takeRetry(); !ok || got.sequence != 3 {
-			t.Errorf("failed write must retry the result, got %+v %v", got, ok)
+		// The retry is renumbered in send order (issue 5148): its old
+		// sequence is already below the server's handled-through mark.
+		if got, ok := results.takeRetry(); !ok || got.sequence != 0 {
+			t.Errorf("failed write must retry the result renumbered, got %+v %v", got, ok)
 		}
 	})
 
@@ -385,8 +388,8 @@ func TestResolveAndSettleInFlight(t *testing.T) {
 		res := outbound{event: "result", sequence: 5, encodedBytes: 10}
 		w := &inFlightWrite{ack: make(chan error, 1), spooled: true, results: []outbound{res}}
 		s.settleInFlight(w)
-		if got, ok := results.takeRetry(); !ok || got.sequence != 5 {
-			t.Errorf("unfinished write must be retried, got %+v %v", got, ok)
+		if got, ok := results.takeRetry(); !ok || got.sequence != 0 {
+			t.Errorf("unfinished write must be retried renumbered, got %+v %v", got, ok)
 		}
 	})
 }
@@ -435,8 +438,8 @@ func TestRequeueRejectedPaths(t *testing.T) {
 		s.requeueRejected(batch, 0)
 		select {
 		case got := <-results.items:
-			if got.sequence != 11 {
-				t.Errorf("first requeue = %d", got.sequence)
+			if got.sequence != 0 {
+				t.Errorf("first requeue must be renumbered (issue 5148), got %d", got.sequence)
 			}
 		default:
 			t.Error("batch must requeue")
@@ -576,15 +579,15 @@ func TestResultQueueBatchAndRing(t *testing.T) {
 	t.Run("retryBatch preserves order", func(t *testing.T) {
 		q := newResultQueue(4)
 		q.retryBatch([]outbound{
-			{event: "result", sequence: 1},
-			{event: "result", sequence: 2},
+			{event: "first", sequence: 1},
+			{event: "second", sequence: 2},
 		})
 		first, ok := q.takeRetry()
-		if !ok || first.sequence != 1 {
+		if !ok || first.event != "first" {
 			t.Errorf("first retry = %+v %v", first, ok)
 		}
 		second, ok := q.takeRetry()
-		if !ok || second.sequence != 2 {
+		if !ok || second.event != "second" {
 			t.Errorf("second retry = %+v %v", second, ok)
 		}
 	})
@@ -597,7 +600,8 @@ func TestResultQueueBatchAndRing(t *testing.T) {
 		s := &session{ctx: ctx, results: results}
 		frame := make([]outbound, resultBatchMaxEnvelopes)
 		for i := range frame {
-			frame[i] = outbound{event: "check_result", sequence: uint64(i + 1), encodedBytes: 10}
+			frame[i] = outbound{event: "check_result", sequence: uint64(i + 1),
+				payload: json.RawMessage(strconv.Itoa(i)), encodedBytes: 10}
 			results.hold(frame[i])
 		}
 
@@ -629,7 +633,9 @@ func TestResultQueueBatchAndRing(t *testing.T) {
 			}
 			for i, want := range frame {
 				got, ok := results.takeRetry()
-				if !ok || got.sequence != want.sequence {
+				// Order survives; sequences do not, they are renumbered in
+				// send order (issue 5148). The payload marks the slot.
+				if !ok || got.sequence != 0 || string(got.payload) != string(want.payload) {
 					t.Fatalf("%s: retry %d = %+v %v", run.name, i, got, ok)
 				}
 			}
