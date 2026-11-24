@@ -62,6 +62,7 @@ func runMain(ctx context.Context, args []string) int {
 	resultSpoolBytes := fs.Uint("result-spool-bytes", envUint(64<<20, "TOWEROPS_RESULT_SPOOL_BYTES"), "Maximum result spool size in bytes")
 	disconnectGrace := fs.Duration("disconnect-grace", envDuration(15*time.Minute, "TOWEROPS_DISCONNECT_GRACE"), "Keep polling through a disconnected transport for this duration")
 	debugListen := fs.String("debug-listen", envOrDefault("", "TOWEROPS_DEBUG_LISTEN"), "Loopback address for pprof and text metrics (empty disables)")
+	denyPrivateTargets := fs.Bool("deny-private-targets", envBool(false, "TOWEROPS_DENY_PRIVATE_TARGETS"), "Refuse check targets on loopback, private, link-local and other non-routable addresses (cloud pollers)")
 	showHelp := fs.Bool("help", false, "Show this help message and exit")
 	fs.BoolVar(showHelp, "h", false, "Show this help message and exit (shorthand)")
 
@@ -103,6 +104,7 @@ func runMain(ctx context.Context, args []string) int {
 		ResultSpoolBytes:    *resultSpoolBytes,
 		DisconnectGrace:     *disconnectGrace,
 		DebugListen:         *debugListen,
+		DenyPrivateTargets:  *denyPrivateTargets,
 	})
 
 	// Read token from file if --token-file is provided

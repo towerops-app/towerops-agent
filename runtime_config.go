@@ -24,6 +24,11 @@ type agentRuntimeConfig struct {
 	ResultSpoolBytes    uint
 	DisconnectGrace     time.Duration
 	DebugListen         string
+	// DenyPrivateTargets refuses outbound dials to loopback, private,
+	// link-local and other non-routable addresses. The shared cloud poller
+	// deployment sets it; tenant checks then cannot reach inside the
+	// poller's network (issue 5139).
+	DenyPrivateTargets bool
 }
 
 var runtimeSettings = struct {

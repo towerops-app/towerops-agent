@@ -29,10 +29,12 @@ type httpTransportCacheKey struct {
 }
 
 var (
-	defaultHTTPTransport  = newCheckHTTPTransport(false)
-	insecureHTTPTransport = newCheckHTTPTransport(true)
-	sslRootCAsMu          sync.Mutex
-	sslRootCAsPool        *x509.CertPool
+	defaultHTTPTransport      *http.Transport
+	defaultHTTPTransportOnce  sync.Once
+	insecureHTTPTransport     *http.Transport
+	insecureHTTPTransportOnce sync.Once
+	sslRootCAsMu              sync.Mutex
+	sslRootCAsPool            *x509.CertPool
 
 	httpRegexCacheMu        sync.Mutex
 	httpRegexCache          = make(map[string]*regexp.Regexp)
@@ -47,7 +49,7 @@ var (
 	// tcpDialContext establishes the plain TCP connection used by TCP checks.
 	// Overridable for tests.
 	tcpDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		var d net.Dialer
+		d := net.Dialer{Control: privateTargetControl}
 		return d.DialContext(ctx, network, address)
 	}
 
@@ -100,10 +102,32 @@ func newCheckHTTPTransport(insecure bool) *http.Transport {
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 10
 	transport.IdleConnTimeout = 90 * time.Second
+	transport.DialContext = privateTargetDialer.DialContext
+	if agentRuntimeSettings().DenyPrivateTargets {
+		// Deny mode must validate the real target, not a proxy address, so
+		// CONNECT tunneling cannot carry a check inside the poller network.
+		transport.Proxy = nil
+	}
 	if insecure {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 	return transport
+}
+
+// sharedHTTPTransport builds the package transport on first use: the
+// deny-private-targets flag is parsed after package init, and the transport
+// has to drop proxy support in deny mode (issue 5139).
+func sharedHTTPTransport(insecure bool) *http.Transport {
+	if insecure {
+		insecureHTTPTransportOnce.Do(func() {
+			insecureHTTPTransport = newCheckHTTPTransport(true)
+		})
+		return insecureHTTPTransport
+	}
+	defaultHTTPTransportOnce.Do(func() {
+		defaultHTTPTransport = newCheckHTTPTransport(false)
+	})
+	return defaultHTTPTransport
 }
 
 func httpTransportForServerName(serverName string, insecure bool) *http.Transport {
@@ -244,11 +268,11 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 		expectedStatus = 200
 	}
 
-	transport := defaultHTTPTransport
+	transport := sharedHTTPTransport(false)
 	if tlsServerName != "" {
 		transport = httpTransportForServerName(tlsServerName, !config.VerifySsl)
 	} else if !config.VerifySsl {
-		transport = insecureHTTPTransport
+		transport = sharedHTTPTransport(true)
 	}
 	client := &http.Client{
 		Transport: transport,
@@ -282,6 +306,9 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if errors.Is(err, errPrivateTarget) {
+			return checkCritical, errPrivateTarget.Error()
+		}
 		return checkCritical, fmt.Sprintf("Request failed: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -388,6 +415,9 @@ func executeTCPCheck(ctx context.Context, config *pb.TcpCheckConfig, timeoutMs u
 	}
 	conn, err := tcpDialContext(dialCtx, "tcp", address)
 	if err != nil {
+		if errors.Is(err, errPrivateTarget) {
+			return checkCritical, errPrivateTarget.Error()
+		}
 		return checkCritical, fmt.Sprintf("Connection failed: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
@@ -533,6 +563,11 @@ func executeDNSCheck(ctx context.Context, config *pb.DnsCheckConfig, timeoutMs u
 	}
 
 	if err != nil {
+		// DNSError keeps the dial cause as a string, not an unwrap chain,
+		// so the refusal is matched by its message here.
+		if strings.Contains(err.Error(), errPrivateTarget.Error()) {
+			return checkCritical, errPrivateTarget.Error()
+		}
 		return checkCritical, fmt.Sprintf("DNS query failed: %v", err)
 	}
 
@@ -596,7 +631,7 @@ func resolverForServer(server string, timeout time.Duration) *net.Resolver {
 	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			d := net.Dialer{Timeout: timeout}
+			d := net.Dialer{Timeout: timeout, Control: privateTargetControl}
 			return d.DialContext(ctx, network, address)
 		},
 	}
@@ -628,7 +663,7 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 
 	address := net.JoinHostPort(host, strconv.Itoa(int(port)))
 
-	dialer := &net.Dialer{Timeout: timeout}
+	dialer := &net.Dialer{Timeout: timeout, Control: privateTargetControl}
 	rootCAs, err := sslRootCAs()
 	if err != nil {
 		return checkUnknown, fmt.Sprintf("Failed to load system root CAs: %v", err)
@@ -646,6 +681,9 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 	defer cancel()
 	conn, err := sslDialTLS(dialCtx, dialer, tlsConfig, "tcp", address)
 	if err != nil {
+		if errors.Is(err, errPrivateTarget) {
+			return checkCritical, errPrivateTarget.Error()
+		}
 		return checkUnknown, fmt.Sprintf("Connection failed: %v", err)
 	}
 	defer func() { _ = conn.Close() }()

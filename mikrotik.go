@@ -66,14 +66,14 @@ func mikrotikConnect(ctx context.Context, ip string, port uint32, username, pass
 		// self-signed certificates. TOFU verification of the cert fingerprint
 		// is performed after the handshake to detect MITM attacks.
 		dialer := &tls.Dialer{
-			NetDialer: &net.Dialer{Timeout: mikrotikConnTimeout},
+			NetDialer: &net.Dialer{Timeout: mikrotikConnTimeout, Control: privateTargetControl},
 			Config:    &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
 		}
 		dialCtx, dialCancel := context.WithTimeout(ctx, mikrotikConnTimeout)
 		defer dialCancel()
 		conn, err = dialer.DialContext(dialCtx, "tcp", addr)
 	} else {
-		dialer := net.Dialer{Timeout: mikrotikConnTimeout}
+		dialer := net.Dialer{Timeout: mikrotikConnTimeout, Control: privateTargetControl}
 		conn, err = dialer.DialContext(ctx, "tcp", addr)
 	}
 	if err != nil {

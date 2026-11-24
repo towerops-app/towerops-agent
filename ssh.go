@@ -24,7 +24,7 @@ var sshBackupTimeout = 60 * time.Second
 // hold in memory. It is a var so tests can shrink it like sshBackupTimeout.
 var sshBackupMaxOutputBytes uint64 = defaultMaxConfigBytes
 var sshDial = func(ctx context.Context, network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
-	var dialer net.Dialer
+	dialer := net.Dialer{Control: privateTargetControl}
 	conn, err := dialer.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, err
