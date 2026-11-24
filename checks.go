@@ -239,6 +239,11 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 		}
 	}
 
+	expectedStatus := int(config.ExpectedStatus)
+	if expectedStatus == 0 {
+		expectedStatus = 200
+	}
+
 	transport := defaultHTTPTransport
 	if tlsServerName != "" {
 		transport = httpTransportForServerName(tlsServerName, !config.VerifySsl)
@@ -250,6 +255,11 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 		Timeout:   timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if !config.FollowRedirects {
+				return http.ErrUseLastResponse
+			}
+			// A check asserting "this URL redirects" succeeds on the redirect
+			// response itself; following it would land on a different status.
+			if req.Response != nil && req.Response.StatusCode == expectedStatus {
 				return http.ErrUseLastResponse
 			}
 			if len(via) >= 10 {
@@ -281,11 +291,6 @@ func executeHTTPCheck(ctx context.Context, config *pb.HttpCheckConfig, timeoutMs
 	}
 
 	// Check status code
-	expectedStatus := int(config.ExpectedStatus)
-	if expectedStatus == 0 {
-		expectedStatus = 200
-	}
-
 	if resp.StatusCode != expectedStatus {
 		// Drain only a bounded prefix. Larger bodies lose connection reuse but
 		// cannot occupy a worker indefinitely.
