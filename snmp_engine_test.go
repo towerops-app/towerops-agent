@@ -133,7 +133,7 @@ func TestSNMPPingHintSkipsSilentProbeOnly(t *testing.T) {
 
 	state := defaultSNMPEngine.state(&pb.AgentJob{DeviceId: deviceID})
 	t.Cleanup(func() { resetSNMPDeviceState(&pb.AgentJob{DeviceId: deviceID}) })
-	state.markSilent()
+	state.markSilent(false)
 
 	dialed := false
 	snmpDial = func(context.Context, *pb.AgentJob) (snmpQuerier, func(), error) {
@@ -158,7 +158,7 @@ func TestSNMPPingHintSkipsSilentProbeOnly(t *testing.T) {
 	}
 
 	publishReachability(deviceID, net.ParseIP(ip), true, 0, 0)
-	state.markSilent()
+	state.markSilent(false)
 	out = newResultQueue(1)
 	executeSnmpJob(context.Background(), &pb.AgentJob{
 		JobId:      "ping-recovers-probe",

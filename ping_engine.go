@@ -452,8 +452,6 @@ func (e *pingEngine) finishJobLocked(pj *pingJob) {
 		result.ResponseTimeMs = pj.firstRTT
 	}
 
-	publishReachability(pj.job.DeviceId, pj.ip, pj.replies > 0, pj.firstRTT, lossPercent)
-
 	switch pj.replies {
 	case pingProbeCount:
 		recordJobRun()
@@ -465,6 +463,9 @@ func (e *pingEngine) finishJobLocked(pj *pingJob) {
 	}
 
 	if pj.ctx.Err() == nil {
+		// A round cut short by a reconnect or inventory replace measured
+		// nothing: it must not publish an "unreachable" hint (issue 5156).
+		publishReachability(pj.job.DeviceId, pj.ip, pj.replies > 0, pj.firstRTT, lossPercent)
 		slog.Debug("ping job complete", "device", pj.job.DeviceId, "status", status,
 			"replies", pj.replies, "probes", pingProbeCount, "loss_percent", lossPercent)
 		sendResult(pj.ctx, pj.out, "monitoring_check", result, pj.job.JobId)
@@ -568,8 +569,6 @@ func (e *pingEngine) execPingRound(pj *pingJob) {
 		result.ResponseTimeMs = pj.firstRTT
 	}
 
-	publishReachability(pj.job.DeviceId, pj.ip, pj.replies > 0, pj.firstRTT, lossPercent)
-
 	switch pj.replies {
 	case pingProbeCount:
 		recordJobRun()
@@ -581,6 +580,9 @@ func (e *pingEngine) execPingRound(pj *pingJob) {
 	}
 
 	if pj.ctx.Err() == nil {
+		// A round cut short by a reconnect or inventory replace measured
+		// nothing: it must not publish an "unreachable" hint (issue 5156).
+		publishReachability(pj.job.DeviceId, pj.ip, pj.replies > 0, pj.firstRTT, lossPercent)
 		slog.Debug("ping job complete", "device", pj.job.DeviceId, "status", status,
 			"replies", pj.replies, "probes", pingProbeCount, "loss_percent", lossPercent)
 		sendResult(pj.ctx, pj.out, "monitoring_check", result, pj.job.JobId)

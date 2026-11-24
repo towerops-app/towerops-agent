@@ -23,6 +23,14 @@ const (
 	snmpSilentProbeTimeout    = 2 * time.Second
 	snmpSessionIdleTimeout    = 5 * time.Minute
 	oidSNMPsysUpTime          = "1.3.6.1.2.1.1.3.0"
+
+	// snmpPingHintMaxAge bounds how long a ping outcome may suppress silent
+	// recovery probes: a hint from a long-abandoned or cancelled round must
+	// not latch a device into "skip every tick" (issue 5156).
+	snmpPingHintMaxAge = 3 * time.Minute
+	// snmpSilentMaxSkips bounds consecutive hint-suppressed ticks, so a
+	// device that filters ICMP still gets probed periodically.
+	snmpSilentMaxSkips = 10
 )
 
 // The ping engine publishes deviceReachability (ping_engine.go); SNMP reads
@@ -70,8 +78,14 @@ type snmpCachedSession struct {
 type snmpDeviceState struct {
 	limiter *tokenBucket
 
-	mu                sync.Mutex
-	silent            bool
+	mu     sync.Mutex
+	silent bool
+	// pingWasUnreachable records whether the ping hint already said
+	// unreachable when the device went silent: that combination means ICMP
+	// filtering, not a shared outage, so the hint must not suppress probes.
+	pingWasUnreachable bool
+	// silentSkips counts consecutive ticks the ping hint suppressed.
+	silentSkips       int
 	rtt               time.Duration
 	getBatchSize      int
 	bulkMaxRepetition uint32
@@ -94,16 +108,36 @@ func (s *snmpDeviceState) isSilent() bool {
 	return s.silent
 }
 
-func (s *snmpDeviceState) markSilent() {
+func (s *snmpDeviceState) markSilent(pingWasUnreachable bool) {
 	s.mu.Lock()
 	s.silent = true
+	s.pingWasUnreachable = pingWasUnreachable
+	s.silentSkips = 0
 	s.mu.Unlock()
 }
 
 func (s *snmpDeviceState) markHealthy() {
 	s.mu.Lock()
 	s.silent = false
+	s.pingWasUnreachable = false
+	s.silentSkips = 0
 	s.mu.Unlock()
+}
+
+// silentProbeDue decides whether a silent device gets a recovery probe on
+// this tick. A fresh unreachable ping hint may suppress the probe, but never
+// when the hint was already failing before the device went silent (ICMP
+// filtering is unrelated to SNMP health) and never more than
+// snmpSilentMaxSkips ticks in a row (issue 5156).
+func (s *snmpDeviceState) silentProbeDue(job *pb.AgentJob) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.pingWasUnreachable && s.silentSkips < snmpSilentMaxSkips && snmpPingUnreachable(job) {
+		s.silentSkips++
+		return false
+	}
+	s.silentSkips = 0
+	return true
 }
 
 // observeRTT uses an EWMA so one delayed response does not immediately undo
@@ -223,16 +257,21 @@ func (e *snmpEngine) setDeviceRate(rate float64) {
 }
 
 // snmpPingUnreachable reports the ping engine's latest outcome. Either
-// identifier may match; the values are hints, not authoritative health state.
+// identifier may match; the values are hints, not authoritative health
+// state, and a hint older than snmpPingHintMaxAge stops counting so an
+// abandoned round cannot suppress probes forever (issue 5156).
 func snmpPingUnreachable(job *pb.AgentJob) bool {
+	staleOrUnreachable := func(entry deviceReachability) bool {
+		return !entry.reachable && time.Since(entry.at) < snmpPingHintMaxAge
+	}
 	if job.DeviceId != "" {
 		if reachability, ok := lastDeviceReachability(job.DeviceId); ok {
-			return !reachability.reachable
+			return staleOrUnreachable(reachability)
 		}
 	}
 	if job.SnmpDevice != nil {
 		if reachability, ok := lastIPReachability(job.SnmpDevice.Ip); ok {
-			return !reachability.reachable
+			return staleOrUnreachable(reachability)
 		}
 	}
 	return false
