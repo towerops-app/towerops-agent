@@ -1016,7 +1016,7 @@ func (s *session) removePendingOrder(ref string) {
 // on writer success (legacy at-most-once). Byte mode with result_ack_v1 keeps
 // the result held until the server's cumulative storage sequence arrives
 // (C4); without the capability negotiation it falls back to write success.
-// The retry lane has bounded capacity and only the session loop pushes to it.
+// Only the session loop pushes to the retry lane.
 func (s *session) resolveInFlight(w *inFlightWrite, err error) error {
 	results := inFlightResults(w)
 	if err != nil {
@@ -2017,14 +2017,22 @@ func (o *outbound) wireSize() int {
 //     for callers that do not carry the runtime byte budget: a slot remains
 //     reserved while the session writer has a result in flight.
 //
-// Failed writes use a dedicated one-item retry lane so they remain ahead of
-// newer queued measurements.
+// Failed writes use a dedicated retry lane so they remain ahead of newer
+// queued measurements.
 type resultQueue struct {
 	items         chan outbound
-	retries       chan outbound
 	slots         chan struct{}
 	reservedSlots chan struct{}
 	agentCtx      context.Context
+
+	// retryMu guards retries, the lane of failed frames kept ahead of newer
+	// spooled work. A slice rather than a channel: the lane must hold a whole
+	// result_batch frame (resultBatchMaxEnvelopes), and a bounded channel fed
+	// by the session loop itself deadlocks the loop when a frame is larger
+	// than the lane (issue 5147). Memory stays bounded because retried
+	// results keep the spool charge they already carried.
+	retryMu sync.Mutex
+	retries []outbound
 
 	// byte mode state.
 	byteLimit   int64
@@ -2049,17 +2057,11 @@ type resultQueue struct {
 // results that dominate a healthy fleet to use their full byte budget.
 const resultIngressDepth = 65536
 
-// resultRetryLaneDepth bounds how many results of failed frames wait ahead of
-// newer spooled work. One large batch can hold more entries than the old
-// one-slot lane, so the lane is sized for the largest batch frame.
-const resultRetryLaneDepth = 256
-
 // newResultQueueForAgent creates the historical count-bounded spool.
 func newResultQueueForAgent(agentCtx context.Context, size int) *resultQueue {
 	reserved := size / 4
 	return &resultQueue{
 		items:         make(chan outbound, size),
-		retries:       make(chan outbound, resultRetryLaneDepth),
 		slots:         make(chan struct{}, size-reserved),
 		reservedSlots: make(chan struct{}, reserved),
 		agentCtx:      agentCtx,
@@ -2073,7 +2075,6 @@ func newResultQueueForAgentBytes(agentCtx context.Context, byteLimit int64) *res
 	}
 	return &resultQueue{
 		items:     make(chan outbound, resultIngressDepth),
-		retries:   make(chan outbound, resultRetryLaneDepth),
 		slots:     make(chan struct{}, resultIngressDepth),
 		agentCtx:  agentCtx,
 		byteLimit: byteLimit,
@@ -2333,28 +2334,34 @@ func (q *resultQueue) ack(result outbound) {
 	<-q.slots
 }
 
-// retry is intentionally blocking. The session loop calls it only for a
-// failed frame's results before ending the session, so the bounded lane
-// cannot be contended by another producer.
+// retry puts a failed frame's result back at the head of the spool. The lane
+// is the session loop's own deque, so it can never block its only consumer.
 func (q *resultQueue) retry(result outbound) {
-	q.retries <- result
+	q.retryMu.Lock()
+	q.retries = append(q.retries, result)
+	q.retryMu.Unlock()
 }
 
 // retryBatch returns every result of a failed frame to the retry lane ahead
-// of newer work, preserving their delivery sequences.
+// of newer work, preserving their delivery sequences. It must never block: a
+// frame can hold resultBatchMaxEnvelopes results and the session loop is both
+// the producer and the only consumer (issue 5147).
 func (q *resultQueue) retryBatch(results []outbound) {
-	for _, result := range results {
-		q.retries <- result
-	}
+	q.retryMu.Lock()
+	q.retries = append(q.retries, results...)
+	q.retryMu.Unlock()
 }
 
 func (q *resultQueue) takeRetry() (outbound, bool) {
-	select {
-	case result := <-q.retries:
-		return result, true
-	default:
+	q.retryMu.Lock()
+	defer q.retryMu.Unlock()
+	if len(q.retries) == 0 {
 		return outbound{}, false
 	}
+	result := q.retries[0]
+	q.retries[0] = outbound{}
+	q.retries = q.retries[1:]
+	return result, true
 }
 
 // requeueUnacked moves held, unacknowledged results back into the spool so a
@@ -2408,7 +2415,10 @@ func (q *resultQueue) empty() bool {
 		q.sentMu.Lock()
 		pendingAcks := q.sentCount
 		q.sentMu.Unlock()
-		return pendingAcks == 0 && len(q.items) == 0 && len(q.retries) == 0
+		q.retryMu.Lock()
+		retryLen := len(q.retries)
+		q.retryMu.Unlock()
+		return pendingAcks == 0 && len(q.items) == 0 && retryLen == 0
 	}
 	return len(q.items) == 0 && len(q.slots) == 0 && len(q.reservedSlots) == 0
 }
