@@ -203,6 +203,36 @@ func TestWSDialRefusesRedirectAndKeepsToken(t *testing.T) {
 	}
 }
 
+// TestWSDialMarksCredentialRefusals pins issue 5152's classification: a
+// handshake refused 401/403 cannot heal between retries, so the reconnect
+// loop must see it as a refusal and take the slow window. Other statuses
+// (a 404 while the server deploys, say) stay ordinary failures.
+func TestWSDialMarksCredentialRefusals(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, http.StatusText(status), status)
+		}))
+		_, err := wsDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"))
+		srv.Close()
+		if err == nil {
+			t.Fatalf("wsDial succeeded against a %d handler", status)
+		}
+		if !isRefused(err) {
+			t.Errorf("wsDial %d error = %v, want it marked as a refusal", status, err)
+		}
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	if _, err := wsDial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http")); err == nil {
+		t.Fatal("wsDial succeeded against a 404 handler")
+	} else if isRefused(err) {
+		t.Errorf("wsDial 404 error = %v, must not be marked as a refusal", err)
+	}
+}
+
 func TestWSConnReadLimit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)

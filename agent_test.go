@@ -1091,35 +1091,88 @@ func TestDecodeBinaryPayloadZeroesDecodedBuffer(t *testing.T) {
 	})
 }
 
-func TestNextBackoff(t *testing.T) {
-	maxDelay := 60 * time.Second
+func TestRetryCeiling(t *testing.T) {
+	origMax := maxRetryDelay
+	defer func() { maxRetryDelay = origMax }()
+	maxRetryDelay = 60 * time.Second
 
-	// Test doubling with jitter
-	for i := 0; i < 100; i++ {
-		current := 2 * time.Second
-		next := nextBackoff(current, maxDelay)
-		doubled := current * 2
-		maxWithJitter := doubled + doubled/4
-		if next < doubled || next > maxWithJitter {
-			t.Errorf("nextBackoff(%v) = %v, want in [%v, %v]", current, next, doubled, maxWithJitter)
-		}
+	if got := retryCeiling(2 * time.Second); got != 4*time.Second {
+		t.Errorf("retryCeiling(2s) = %v, want 4s", got)
 	}
-
-	// Test cap at max
-	for i := 0; i < 100; i++ {
-		next := nextBackoff(30*time.Second, maxDelay)
-		if next > maxDelay+maxDelay/4 {
-			t.Errorf("nextBackoff(30s) = %v, exceeded max+jitter", next)
-		}
+	if got := retryCeiling(30 * time.Second); got != 60*time.Second {
+		t.Errorf("retryCeiling(30s) = %v, want the 60s cap", got)
 	}
+	if got := retryCeiling(60 * time.Second); got != 60*time.Second {
+		t.Errorf("retryCeiling(60s) = %v, want the 60s cap", got)
+	}
+	if got := retryCeiling(0); got != 2*initialRetryDelay {
+		t.Errorf("retryCeiling(0) = %v, want %v (normalized then doubled)", got, 2*initialRetryDelay)
+	}
+}
 
-	// Test that already-at-max stays at max (with jitter)
-	for i := 0; i < 100; i++ {
-		next := nextBackoff(maxDelay, maxDelay)
-		maxWithJitter := maxDelay + maxDelay/4
-		if next < maxDelay || next > maxWithJitter {
-			t.Errorf("nextBackoff(max) = %v, want in [%v, %v]", next, maxDelay, maxWithJitter)
+func TestReconnectDelay(t *testing.T) {
+	origInitial, origMin, origMaxR, origMax := initialRetryDelay, minRefusalDelay, maxRefusalDelay, maxRetryDelay
+	defer func() {
+		initialRetryDelay, minRefusalDelay, maxRefusalDelay, maxRetryDelay =
+			origInitial, origMin, origMaxR, origMax
+	}()
+	initialRetryDelay = time.Second
+	minRefusalDelay = time.Minute
+	maxRefusalDelay = 5 * time.Minute
+	maxRetryDelay = time.Minute
+
+	t.Run("first retry after a healthy session is jittered inside the window", func(t *testing.T) {
+		seen := make(map[time.Duration]bool)
+		for i := 0; i < 200; i++ {
+			d := reconnectDelay(true, false, initialRetryDelay)
+			if d < initialRetryDelay/2 || d >= 5*initialRetryDelay {
+				t.Fatalf("healthy delay %v outside [%v, %v)", d, initialRetryDelay/2, 5*initialRetryDelay)
+			}
+			seen[d] = true
 		}
+		if len(seen) < 2 {
+			t.Fatalf("healthy delay never varied across 200 draws: %v", seen)
+		}
+	})
+
+	t.Run("sustained failures draw under the ceiling", func(t *testing.T) {
+		ceiling := initialRetryDelay
+		for i := 0; i < 200; i++ {
+			d := reconnectDelay(false, false, ceiling)
+			if d < 0 || d >= ceiling {
+				t.Fatalf("failure delay %v outside [0, %v)", d, ceiling)
+			}
+			ceiling = retryCeiling(ceiling)
+		}
+		if ceiling != maxRetryDelay {
+			t.Fatalf("ceiling = %v after repeated failures, want the %v cap", ceiling, maxRetryDelay)
+		}
+	})
+
+	t.Run("a refusal draws from the refusal window", func(t *testing.T) {
+		for i := 0; i < 100; i++ {
+			d := reconnectDelay(false, true, initialRetryDelay)
+			if d < minRefusalDelay || d >= maxRefusalDelay {
+				t.Fatalf("refusal delay %v outside [%v, %v)", d, minRefusalDelay, maxRefusalDelay)
+			}
+		}
+		// A refusal wins over the post-healthy spread.
+		if d := reconnectDelay(true, true, initialRetryDelay); d < minRefusalDelay {
+			t.Fatalf("refused healthy delay %v below the refusal floor", d)
+		}
+	})
+}
+
+func TestIsRefused(t *testing.T) {
+	if isRefused(nil) {
+		t.Error("nil error must not count as a refusal")
+	}
+	if isRefused(errors.New("boom")) {
+		t.Error("ordinary error must not count as a refusal")
+	}
+	wrapped := fmt.Errorf("connect: %w", refusedError{errors.New("join rejected: error (bad token)")})
+	if !isRefused(wrapped) {
+		t.Error("wrapped refusedError not detected")
 	}
 }
 
@@ -1405,6 +1458,9 @@ func TestRunSessionRejectsFailedJoin(t *testing.T) {
 	if !strings.Contains(err.Error(), "join rejected: error (invalid token)") {
 		t.Errorf("expected rejection reason in error, got: %v", err)
 	}
+	if !isRefused(err) {
+		t.Errorf("a rejected join must be marked as a refusal for the slow retry window, got: %v", err)
+	}
 }
 
 // TestRunSessionRejectedJoinStartsNoWorkerPools pins B1: the four worker pools
@@ -1668,6 +1724,9 @@ func TestValidateJoinReplyRejectionReason(t *testing.T) {
 			err = validateJoinReply(data, "")
 			if err == nil || err.Error() != tt.want {
 				t.Fatalf("validateJoinReply() error = %v, want %q", err, tt.want)
+			}
+			if !isRefused(err) {
+				t.Errorf("validateJoinReply() error = %v, want it marked as a refusal", err)
 			}
 		})
 	}
@@ -4849,55 +4908,41 @@ func TestAgtRunAgentReconnectsImmediatelyAfterRestart(t *testing.T) {
 // backoff arithmetic
 // ---------------------------------------------------------------------------
 
-func TestAgtNextBackoffEdgeCases(t *testing.T) {
-	origRetry := initialRetryDelay
-	defer func() { initialRetryDelay = origRetry }()
+func TestAgtRetryCeilingEdgeCases(t *testing.T) {
+	origRetry, origMax := initialRetryDelay, maxRetryDelay
+	defer func() { initialRetryDelay, maxRetryDelay = origRetry, origMax }()
 	initialRetryDelay = time.Second
+	maxRetryDelay = time.Minute
 
 	for _, current := range []time.Duration{0, -time.Second} {
-		got := nextBackoff(current, time.Minute)
-		if got < 2*time.Second || got >= 2*time.Second+500*time.Millisecond {
-			t.Errorf("nextBackoff(%v, 1m) = %v, want a normalized [2s, 2.5s) delay", current, got)
+		if got := retryCeiling(current); got != 2*time.Second {
+			t.Errorf("retryCeiling(%v) = %v, want 2s (normalized then doubled)", current, got)
 		}
 	}
-
-	// A cap below 4ns leaves no room for jitter, so the delay is exact.
-	if got := nextBackoff(time.Nanosecond, 2*time.Nanosecond); got != 2*time.Nanosecond {
-		t.Errorf("nextBackoff(1ns, 2ns) = %v, want exactly 2ns", got)
+	if got := retryCeiling(time.Nanosecond); got != 2*time.Nanosecond {
+		t.Errorf("retryCeiling(1ns) = %v, want exactly 2ns", got)
 	}
 }
 
-func TestPropAgtNextBackoff(t *testing.T) {
+func TestPropAgtRetryCeiling(t *testing.T) {
 	t.Parallel()
 
 	rapid.Check(t, func(t *rapid.T) {
 		current := time.Duration(rapid.Int64Range(int64(-time.Second), int64(60*time.Second)).Draw(t, "current"))
-		maxDelay := time.Duration(rapid.Int64Range(int64(time.Millisecond), int64(60*time.Second)).Draw(t, "maxDelay"))
 
-		// nextBackoff normalizes a non-positive delay to initialRetryDelay,
-		// doubles it, caps it and then adds strictly less than 25% jitter.
+		// retryCeiling normalizes a non-positive delay to initialRetryDelay,
+		// doubles it and caps it at maxRetryDelay.
 		base := current
 		if base <= 0 {
 			base = initialRetryDelay
 		}
 		want := base * 2
-		if want > maxDelay {
-			want = maxDelay
+		if want > maxRetryDelay {
+			want = maxRetryDelay
 		}
 
-		got := nextBackoff(current, maxDelay)
-		if got < 0 {
-			t.Fatalf("nextBackoff(%v, %v) = %v, want a non-negative delay", current, maxDelay, got)
-		}
-		jitter := want / 4
-		if jitter <= 0 {
-			if got != want {
-				t.Fatalf("nextBackoff(%v, %v) = %v, want exactly %v (no room for jitter)", current, maxDelay, got, want)
-			}
-			return
-		}
-		if got < want || got >= want+jitter {
-			t.Fatalf("nextBackoff(%v, %v) = %v, want in [%v, %v)", current, maxDelay, got, want, want+jitter)
+		if got := retryCeiling(current); got != want {
+			t.Fatalf("retryCeiling(%v) = %v, want exactly %v", current, got, want)
 		}
 	})
 }
