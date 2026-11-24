@@ -419,8 +419,8 @@ func TestHTTPCheck_VerifySslTrueRejectsSelfSigned(t *testing.T) {
 
 func TestHTTPCheck_TransportsPreserveProxySupport(t *testing.T) {
 	for name, transport := range map[string]*http.Transport{
-		"default":  defaultHTTPTransport,
-		"insecure": insecureHTTPTransport,
+		"default":  sharedHTTPTransport(false),
+		"insecure": sharedHTTPTransport(true),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if transport.Proxy == nil {
@@ -436,8 +436,8 @@ func TestHTTPCheck_TransportsPreserveProxySupport(t *testing.T) {
 		})
 	}
 
-	if insecureHTTPTransport.TLSClientConfig == nil ||
-		!insecureHTTPTransport.TLSClientConfig.InsecureSkipVerify {
+	if insecure := sharedHTTPTransport(true); insecure.TLSClientConfig == nil ||
+		!insecure.TLSClientConfig.InsecureSkipVerify {
 		t.Fatal("expected insecure transport to skip TLS verification")
 	}
 }
