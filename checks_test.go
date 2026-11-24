@@ -3082,3 +3082,36 @@ func TestHTTPCheck_HostOverrideSurvivesAbsoluteSameHostRedirect(t *testing.T) {
 		t.Fatalf("status = %d, output = %q; want OK with Host kept across redirect", status, output)
 	}
 }
+
+// Issue 5142: a check that asserts "this URL redirects" passes on the
+// redirect response itself. Following it lands on a different status, so an
+// expected 3xx with follow_redirects must stop at the redirect hop the way
+// the cloud executor does.
+func TestHTTPCheck_ExpectedRedirectStatusStopsFollowing(t *testing.T) {
+	var finalHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/final" {
+			finalHits.Add(1)
+			w.WriteHeader(200)
+			return
+		}
+		http.Redirect(w, r, "/final", http.StatusMovedPermanently)
+	}))
+	defer srv.Close()
+
+	status, output := executeHTTPCheck(context.Background(), &pb.HttpCheckConfig{
+		Url:             srv.URL + "/",
+		FollowRedirects: true,
+		ExpectedStatus:  301,
+	}, 5000)
+
+	if status != 0 {
+		t.Fatalf("expected status 0 for expected 301, got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "HTTP 301") {
+		t.Fatalf("expected output reporting the 301 response, got %s", output)
+	}
+	if finalHits.Load() != 0 {
+		t.Fatalf("expected redirect target to never be requested, got %d hits", finalHits.Load())
+	}
+}
