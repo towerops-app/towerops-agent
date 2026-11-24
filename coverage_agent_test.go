@@ -366,13 +366,8 @@ func TestResolveAndSettleInFlight(t *testing.T) {
 		if err := s.resolveInFlight(w, errors.New("write failed")); err == nil {
 			t.Error("resolve must surface the write error")
 		}
-		select {
-		case got := <-results.retries:
-			if got.sequence != 3 {
-				t.Errorf("retried sequence = %d", got.sequence)
-			}
-		default:
-			t.Error("failed write must retry the result")
+		if got, ok := results.takeRetry(); !ok || got.sequence != 3 {
+			t.Errorf("failed write must retry the result, got %+v %v", got, ok)
 		}
 	})
 
@@ -390,13 +385,8 @@ func TestResolveAndSettleInFlight(t *testing.T) {
 		res := outbound{event: "result", sequence: 5, encodedBytes: 10}
 		w := &inFlightWrite{ack: make(chan error, 1), spooled: true, results: []outbound{res}}
 		s.settleInFlight(w)
-		select {
-		case got := <-results.retries:
-			if got.sequence != 5 {
-				t.Errorf("retried sequence = %d", got.sequence)
-			}
-		default:
-			t.Error("unfinished write must be retried")
+		if got, ok := results.takeRetry(); !ok || got.sequence != 5 {
+			t.Errorf("unfinished write must be retried, got %+v %v", got, ok)
 		}
 	})
 }
@@ -596,6 +586,53 @@ func TestResultQueueBatchAndRing(t *testing.T) {
 		second, ok := q.takeRetry()
 		if !ok || second.sequence != 2 {
 			t.Errorf("second retry = %+v %v", second, ok)
+		}
+	})
+
+	t.Run("retry lane holds a full batch frame without blocking", func(t *testing.T) {
+		// Issue 5147: a result_batch frame can carry resultBatchMaxEnvelopes
+		// results, which overflowed the old bounded retry channel and wedged
+		// the session loop that was pushing to it.
+		results := newResultQueueForAgentBytes(ctx, 1<<20)
+		s := &session{ctx: ctx, results: results}
+		frame := make([]outbound, resultBatchMaxEnvelopes)
+		for i := range frame {
+			frame[i] = outbound{event: "check_result", sequence: uint64(i + 1), encodedBytes: 10}
+			results.hold(frame[i])
+		}
+
+		for _, run := range []struct {
+			name string
+			call func() error
+		}{
+			{"resolveInFlight write error", func() error {
+				return s.resolveInFlight(
+					&inFlightWrite{ref: "w1", spooled: true, results: frame},
+					errors.New("write failed"),
+				)
+			}},
+			{"endLoop with write in flight", func() error {
+				var lanes [4][]outbound
+				return s.endLoop(&lanes, &inFlightWrite{
+					ack:     make(chan error, 1),
+					spooled: true,
+					results: frame,
+				}, nil)
+			}},
+		} {
+			done := make(chan struct{})
+			go func() { _ = run.call(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s blocked on a full batch frame", run.name)
+			}
+			for i, want := range frame {
+				got, ok := results.takeRetry()
+				if !ok || got.sequence != want.sequence {
+					t.Fatalf("%s: retry %d = %+v %v", run.name, i, got, ok)
+				}
+			}
 		}
 	})
 
