@@ -18,9 +18,10 @@ import (
 )
 
 // Ubiquiti broadcast discovery (UDP 10001). Devices answer the 4-byte
-// request below with a TLV packet carrying model, firmware, MAC, hostname
-// and uptime. The job collects replies for a bounded window and reports
-// every responder so the server can seed discovery candidates.
+// request below with a packet in the same framing (4-byte header, then
+// TLV records) carrying model, firmware, MAC, hostname and uptime. The
+// job collects replies for a bounded window and reports every responder
+// so the server can seed discovery candidates.
 
 const (
 	ubntDefaultPort      = 10001
@@ -224,21 +225,32 @@ func ubntSendRequest(conn net.PacketConn, dst *net.UDPAddr, dest string) error {
 	return nil
 }
 
-// parseUbntReply decodes one TLV packet into a peer. Packets are a flat
-// type(1)/length(2 BE)/value sequence; short or malformed packets are
+// parseUbntReply decodes one reply packet into a peer. Replies carry the
+// same framing as the request: a 4-byte header (version 1, command 0,
+// 2-byte big endian payload length) followed by TLV records, each a
+// type(1)/length(2 BE)/value sequence. Short or malformed packets are
 // rejected, unknown TLVs skipped.
 func parseUbntReply(packet []byte, sourceIP string) (*pb.UbntDiscoveryPeer, error) {
+	if len(packet) < 4 {
+		return nil, fmt.Errorf("short reply: %d bytes, no header", len(packet))
+	}
+	if packet[0] != 0x01 || packet[1] != 0x00 {
+		return nil, fmt.Errorf("unexpected reply header: version %#x, command %#x",
+			packet[0], packet[1])
+	}
+	declared := int(binary.BigEndian.Uint16(packet[2:4]))
+	payload := packet[4 : 4+min(declared, len(packet)-4)]
 	peer := &pb.UbntDiscoveryPeer{SourceIp: sourceIP}
-	for len(packet) >= 3 {
-		tlvType := packet[0]
-		length := int(binary.BigEndian.Uint16(packet[1:3]))
-		packet = packet[3:]
-		if length > len(packet) {
+	for len(payload) >= 3 {
+		tlvType := payload[0]
+		length := int(binary.BigEndian.Uint16(payload[1:3]))
+		payload = payload[3:]
+		if length > len(payload) {
 			return nil, fmt.Errorf("truncated tlv type %#x: %d bytes advertised, %d present",
-				tlvType, length, len(packet))
+				tlvType, length, len(payload))
 		}
-		value := packet[:length]
-		packet = packet[length:]
+		value := payload[:length]
+		payload = payload[length:]
 
 		switch tlvType {
 		case ubntTLVMAC:
@@ -261,8 +273,8 @@ func parseUbntReply(packet []byte, sourceIP string) (*pb.UbntDiscoveryPeer, erro
 			peer.Model = truncateBytes(string(value), ubntMaxFieldBytes)
 		}
 	}
-	if len(packet) != 0 {
-		return nil, fmt.Errorf("%d trailing bytes after last tlv", len(packet))
+	if len(payload) != 0 {
+		return nil, fmt.Errorf("%d trailing bytes after last tlv", len(payload))
 	}
 	if peer.MacAddress == "" && peer.Model == "" && peer.Hostname == "" {
 		return nil, errors.New("reply carried no usable device fields")
