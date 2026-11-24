@@ -286,7 +286,7 @@ func TestExecuteSnmpJobSilentProbe(t *testing.T) {
 	t.Cleanup(func() { resetSNMPDeviceState(job) })
 
 	state := defaultSNMPEngine.state(job)
-	state.markSilent()
+	state.markSilent(false)
 	if !state.isSilent() {
 		t.Fatal("markSilent")
 	}
@@ -328,6 +328,101 @@ func TestExecuteSnmpJobSilentProbe(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("no result")
 	}
+}
+
+// Issue 5156: an ICMP-filtered device marked silent must keep getting
+// recovery probes. A stale ping hint never suppresses, a fresh unreachable
+// hint may only suppress a bounded run of ticks, and a hint that was
+// already failing when the device went silent never applies.
+func TestSilentSNMPPingHintBounds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dialCount := 0
+	orig := snmpDial
+	t.Cleanup(func() { snmpDial = orig })
+	snmpDial = func(context.Context, *pb.AgentJob) (snmpQuerier, func(), error) {
+		dialCount++
+		return nil, nil, errors.New("probe dial refused")
+	}
+
+	newJob := func(id string) *pb.AgentJob {
+		return &pb.AgentJob{
+			JobId:      "job-" + id,
+			DeviceId:   "dev-hint-" + id,
+			SnmpDevice: &pb.SnmpDevice{Ip: "10.9.9." + id, Community: "public", Version: "2c"},
+		}
+	}
+	clearHint := func(deviceID string) {
+		reachabilityMu.Lock()
+		delete(reachByDevice, deviceID)
+		reachabilityMu.Unlock()
+	}
+
+	t.Run("stale unreachable hint does not suppress the probe", func(t *testing.T) {
+		job := newJob("1")
+		out := newResultQueueForAgent(ctx, 8)
+		t.Cleanup(func() {
+			resetSNMPDeviceState(job)
+			clearHint(job.DeviceId)
+		})
+
+		state := defaultSNMPEngine.state(job)
+		state.markSilent(false)
+
+		reachabilityMu.Lock()
+		reachByDevice[job.DeviceId] = deviceReachability{
+			reachable: false,
+			at:        time.Now().Add(-snmpPingHintMaxAge - time.Second),
+		}
+		reachabilityMu.Unlock()
+
+		dialCount = 0
+		executeSnmpJob(ctx, job, out)
+		if dialCount == 0 {
+			t.Fatal("a stale unreachable ping hint suppressed the silent probe")
+		}
+	})
+
+	t.Run("fresh unreachable hint skips only so many ticks", func(t *testing.T) {
+		job := newJob("2")
+		out := newResultQueueForAgent(ctx, 64)
+		t.Cleanup(func() {
+			resetSNMPDeviceState(job)
+			clearHint(job.DeviceId)
+		})
+
+		state := defaultSNMPEngine.state(job)
+		state.markSilent(false)
+		publishReachability(job.DeviceId, nil, false, 0, 100)
+
+		dialCount = 0
+		for i := 0; i < snmpSilentMaxSkips+2; i++ {
+			executeSnmpJob(ctx, job, out)
+		}
+		if dialCount == 0 {
+			t.Fatalf("%d suppressed ticks and the silent device was never probed", snmpSilentMaxSkips+2)
+		}
+	})
+
+	t.Run("ping already unreachable at silence bypasses the hint", func(t *testing.T) {
+		job := newJob("3")
+		out := newResultQueueForAgent(ctx, 8)
+		t.Cleanup(func() {
+			resetSNMPDeviceState(job)
+			clearHint(job.DeviceId)
+		})
+
+		state := defaultSNMPEngine.state(job)
+		state.markSilent(true)
+		publishReachability(job.DeviceId, nil, false, 0, 100)
+
+		dialCount = 0
+		executeSnmpJob(ctx, job, out)
+		if dialCount == 0 {
+			t.Fatal("the hint suppressed a device whose ping was already failing at silence")
+		}
+	})
 }
 
 func TestExecuteSnmpJobDialAndDeadline(t *testing.T) {

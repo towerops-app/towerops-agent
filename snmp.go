@@ -113,7 +113,7 @@ func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
 		// A device that stopped answering is retried with one 2s, zero-retry
 		// sysUpTime GET per tick until it answers. The last ping result can
 		// skip even that request (A3).
-		if snmpPingUnreachable(job) {
+		if !state.silentProbeDue(job) {
 			processMetrics.skippedTicks.Add(1)
 			recordJobPartial()
 			slog.Debug("snmp skipped silent device with unreachable ping hint", "job_id", job.JobId, "device", dev.Ip)
@@ -205,7 +205,7 @@ queryLoop:
 					if isSNMPTimeout(err) {
 						aborted = true
 						if !observation.responded {
-							state.markSilent()
+							state.markSilent(snmpPingUnreachable(job))
 						}
 					}
 					slog.Warn("snmp get failed", "job_id", job.JobId, "device", dev.Ip, "operation", "GET", "error", err)
@@ -236,7 +236,7 @@ queryLoop:
 				if rootErr.noResponse {
 					aborted = true
 					if !observation.responded {
-						state.markSilent()
+						state.markSilent(snmpPingUnreachable(job))
 					}
 				}
 				slog.Warn("snmp walk failed", "job_id", job.JobId, "device", dev.Ip, "operation", "WALK", "root", root, "elapsed", rootErr.elapsed, "error", rootErr.err)

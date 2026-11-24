@@ -453,6 +453,28 @@ func TestFinishJobLockedGuards(t *testing.T) {
 	}
 }
 
+// Issue 5156: a ping round cancelled mid-flight measured nothing, so it
+// must leave the previous reachability entry untouched instead of
+// publishing "unreachable".
+func TestCancelledPingRoundKeepsReachability(t *testing.T) {
+	e, pj, _ := newTestPingJob(t, false)
+	publishReachability("dev-1", nil, true, 7, 0)
+	defer func() {
+		reachabilityMu.Lock()
+		delete(reachByDevice, "dev-1")
+		reachabilityMu.Unlock()
+	}()
+
+	e.live[pj] = struct{}{}
+	pj.cancel() // a reconnect or inventory replace cut the round short
+	e.finishJobLocked(pj)
+
+	entry, ok := lastDeviceReachability("dev-1")
+	if !ok || !entry.reachable || entry.rttMs != 7 {
+		t.Fatalf("cancelled round overwrote reachability: %+v %v", entry, ok)
+	}
+}
+
 func TestSendProbeLockedPaths(t *testing.T) {
 	// finishing → immediate return.
 	e, pj, _ := newTestPingJob(t, false)
