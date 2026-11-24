@@ -3748,6 +3748,37 @@ func TestSessionLoopRetainsRetryWhenWriterQueueStalls(t *testing.T) {
 	}
 }
 
+// A session built without startInventoryDecoder (a directly constructed
+// session in tests) routes inventory events through the synchronous
+// handleMessage compatibility path instead of parking on a nil channel.
+func TestSessionLoopCompatPathHandlesInventoryEvent(t *testing.T) {
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	msgCh := make(chan channelMsg, 2)
+	s := &session{
+		ctx:        sessionCtx,
+		cancel:     cancel,
+		jobCtx:     sessionCtx,
+		topic:      "agent:test",
+		writeCh:    make(chan writeRequest, 4),
+		msgCh:      msgCh,
+		errCh:      make(chan error, 1),
+		writeErrCh: make(chan error, 1),
+		results:    newResultQueue(4),
+		pools:      &jobPools{},
+	}
+	msgCh <- channelMsg{Topic: s.topic, Event: "jobs", Payload: json.RawMessage(`"x"`)}
+	msgCh <- channelMsg{Topic: s.topic, Event: "phx_close"}
+
+	err := s.loop(context.Background())
+	if !errors.Is(err, errChannelReloaded) {
+		t.Fatalf("loop error = %v, want channel reload", err)
+	}
+	if rejected, _ := s.pools.rejectedInventory.Load().(string); rejected != "jobs" {
+		t.Fatalf("rejected inventory = %q, want jobs", rejected)
+	}
+}
+
 // Issue 2757: a process shutdown used to exit with the whole spool still
 // in memory. The session loop now drains through the same budget the
 // self-update path uses, so a queued result is written before the loop

@@ -182,40 +182,19 @@ func TestStartInventoryDecoderIdempotent(t *testing.T) {
 	close(s.inventoryWork)
 }
 
-func TestQueueInventoryDecode(t *testing.T) {
-	t.Run("compatibility path without decoder", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		pools := testPools(t)
-		s := &session{ctx: ctx, jobCtx: ctx, topic: "agent:t", pools: pools, results: newResultQueue(4)}
-		msg := channelMsg{Topic: "agent:t", Event: "jobs", Payload: json.RawMessage(`{"binary":""}`)}
-		end, err := s.queueInventoryDecode(msg, pools, s.results)
-		if err != nil {
-			t.Errorf("compat path: %v", err)
-		}
-		_ = end
-	})
-
-	t.Run("full queue refuses with rejection", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		pools := testPools(t)
-		s := &session{ctx: ctx, jobCtx: ctx, results: newResultQueue(8), pools: pools}
-		// An unbuffered work channel with no decoder goroutine is always
-		// "full" — exactly the saturation the refusal path reports.
-		s.inventoryWork = make(chan inventoryDecodeRequest)
-		msg := channelMsg{Topic: "t", Event: "jobs", Payload: json.RawMessage(`{"binary":"e30="}`)}
-		end, err := s.queueInventoryDecode(msg, pools, s.results)
-		if err != nil {
-			t.Fatalf("queueInventoryDecode: %v", err)
-		}
-		if end {
-			t.Error("refusal must not end the session")
-		}
-		if got, _ := pools.rejectedInventory.Load().(string); got != "jobs" {
-			t.Errorf("rejectedInventory = %q", got)
-		}
-	})
+func TestInventoryDecodeCompatibilityPath(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pools := testPools(t)
+	s := &session{ctx: ctx, jobCtx: ctx, topic: "agent:t", pools: pools, results: newResultQueue(4)}
+	msg := channelMsg{Topic: "agent:t", Event: "jobs", Payload: json.RawMessage(`{"binary":""}`)}
+	// The loop's compatibility path runs the synchronous handler when a
+	// session has no decoder goroutine.
+	end, err := handleMessage(s.jobCtx, msg, s.topic, pools, s.results)
+	if err != nil {
+		t.Errorf("compat path: %v", err)
+	}
+	_ = end
 }
 
 func TestDecodeInventoryRequest(t *testing.T) {

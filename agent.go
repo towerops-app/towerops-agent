@@ -1529,6 +1529,14 @@ func (s *session) loop(ctx context.Context) error {
 	ctxDone := ctx.Done()
 	var drainDone chan struct{}
 
+	// msgCh is gated off while an inventory frame waits on a full decode
+	// queue, so a back-to-back full sync applies reader backpressure instead
+	// of dropping chunks (issue 5149). parkedWork is nil until a frame
+	// parks, which disables its send case.
+	msgCh := s.msgCh
+	var parkedReq inventoryDecodeRequest
+	var parkedWork chan inventoryDecodeRequest
+
 	for {
 		if inFlight == nil {
 			s.stageResults(&lanes)
@@ -1632,7 +1640,7 @@ func (s *session) loop(ctx context.Context) error {
 				countTrapSpoolDrop()
 			}
 
-		case msg := <-s.msgCh:
+		case msg := <-msgCh:
 			if msg.Event == "phx_reply" && (msg.Topic == s.topic || msg.Topic == "phoenix") {
 				if inFlight != nil && msg.Ref != nil && *msg.Ref == inFlight.ref {
 					inFlight.reply = &msg
@@ -1650,15 +1658,41 @@ func (s *session) loop(ctx context.Context) error {
 				continue
 			}
 			if s.isInventoryEvent(msg.Event) {
-				// Inventory events never end the loop; discard the
-				// handleMessage pair the compatibility path still returns.
-				_, _ = s.queueInventoryDecode(msg, s.pools, s.results)
+				if s.inventoryWork == nil {
+					// Compatibility path: no decoder (a directly
+					// constructed session). Inventory events never end the
+					// loop; discard the handleMessage pair it returns.
+					_, _ = handleMessage(s.jobCtx, msg, s.topic, s.pools, s.results)
+					continue
+				}
+				request := inventoryDecodeRequest{
+					event:    msg.Event,
+					payload:  msg.Payload,
+					rawProto: msg.Binary && s.inventoryUpdates,
+				}
+				select {
+				case s.inventoryWork <- request:
+				default:
+					// Park instead of refusing: the server pushes a full
+					// sync's chunks back to back faster than the shallow
+					// decode queue can drain, and one refused chunk voids
+					// the whole atomic assembly. Stop reading msgCh until
+					// the decoder takes this frame; heartbeats, acks and
+					// decoded results keep flowing meanwhile.
+					parkedReq = request
+					parkedWork = s.inventoryWork
+					msgCh = nil
+				}
 				continue
 			}
 			shouldEnd, endErr := handleMessage(s.jobCtx, msg, s.topic, s.pools, s.results)
 			if shouldEnd {
 				return s.endLoop(&lanes, inFlight, endErr)
 			}
+
+		case parkedWork <- parkedReq:
+			parkedWork = nil
+			msgCh = s.msgCh
 
 		case decoded := <-s.inventoryResult:
 			s.applyInventoryDecode(decoded, s.pools, s.results)

@@ -334,3 +334,59 @@ func quietLogs(t *testing.T) {
 	})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 }
+
+// Issue 5149: the server pushes every full-sync chunk back to back, faster
+// than the shallow decode queue can drain. Refusing on a full queue used to
+// lose chunks, and one lost chunk voids the whole atomic inventory
+// assembly, leaving the agent connected but polling nothing. The loop now
+// parks the frame and stops reading msgCh until the decoder accepts it, so
+// every chunk applies and the heartbeat reports the revision.
+func TestSessionAppliesFullSyncUnderDecodePressure(t *testing.T) {
+	orig := heartbeatInterval
+	defer func() { heartbeatInterval = orig }()
+	heartbeatInterval = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ports := make([]int, 120)
+	for i := range ports {
+		ports[i] = 40000 + i
+	}
+	jobs := loadtest.BuildJobs(loadtest.SimulatorConfig{
+		DeviceCount: 120,
+		Community:   "public",
+		Interfaces:  30,
+		WalkRoots:   19,
+	}, 60, ports)
+
+	server, err := loadtest.StartChannelServer(ctx, loadtest.ChannelOptions{
+		Jobs: jobs, Revision: 1, ChunkJobs: 10,
+	})
+	if err != nil {
+		t.Fatalf("start stub channel server: %v", err)
+	}
+	defer server.Stop()
+
+	results := newResultQueueForAgentBytes(ctx, 1<<20)
+	agentErr := make(chan error, 1)
+	go func() { agentErr <- runLoadAgent(ctx, server.BaseURL(), results) }()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for !server.RevisionApplied() {
+		if time.Now().After(deadline) {
+			t.Fatal("full sync never applied; a refused chunk voids the assembly")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-agentErr:
+		if err != nil {
+			t.Fatalf("agent loop ended with %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("agent did not stop on context cancel")
+	}
+}
