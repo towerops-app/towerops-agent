@@ -625,6 +625,69 @@ func TestConfigBackupDialDefaultPort(t *testing.T) {
 	}
 }
 
+// TestConfigBackupDialPinsStoredHostKeyAlgorithm: once the TOFU store holds a
+// typed entry for the device, configBackupDial must restrict HostKeyAlgorithms
+// to the pinned key type (issue 5144), the same guarantee the legacy /export
+// path proves in TestSSHBackupPinsStoredHostKeyAlgorithm.
+func TestConfigBackupDialPinsStoredHostKeyAlgorithm(t *testing.T) {
+	resetHostKeyStore(t)
+	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) { _ = ch.Close() })
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	origDial := sshDial
+	defer func() { sshDial = origDial }()
+	var captured *ssh.ClientConfig
+	sshDial = func(ctx context.Context, network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
+		captured = config
+		return chkTOrigSSHDial(ctx, network, addr, config)
+	}
+
+	// First dial TOFU-pins the server's key type; the algorithm list stays
+	// unset so x/crypto's default preference order applies.
+	client, _, err := configBackupDial(context.Background(), cbJob(host, port))
+	if err != nil {
+		t.Fatalf("first dial failed: %v", err)
+	}
+	_ = client.Close()
+	if len(captured.HostKeyAlgorithms) != 0 {
+		t.Fatalf("first-use HostKeyAlgorithms = %v, want unset", captured.HostKeyAlgorithms)
+	}
+
+	// Second dial offers only the pinned key type, so a device that later
+	// gains a higher-preference key still presents the pinned one.
+	captured = nil
+	client, _, err = configBackupDial(context.Background(), cbJob(host, port))
+	if err != nil {
+		t.Fatalf("pinned dial failed: %v", err)
+	}
+	_ = client.Close()
+	if len(captured.HostKeyAlgorithms) != 1 || captured.HostKeyAlgorithms[0] != ssh.KeyAlgoECDSA256 {
+		t.Fatalf("pinned HostKeyAlgorithms = %v, want [%s]", captured.HostKeyAlgorithms, ssh.KeyAlgoECDSA256)
+	}
+}
+
+// TestConfigBackupDialPinnedAlgorithmRejectsOtherKeyTypes proves the pin is
+// active on the config backup path: an RSA pin against an ecdsa-only server
+// must fail the handshake with "no common algorithm", the same failure mode
+// the legacy path proves in TestSSHBackupPinnedAlgorithmRejectsOtherKeyTypes.
+func TestConfigBackupDialPinnedAlgorithmRejectsOtherKeyTypes(t *testing.T) {
+	resetHostKeyStore(t)
+	addr, cleanup := startTestSSHServer(t, func(ch ssh.Channel) { _ = ch.Close() })
+	defer cleanup()
+	host, port := cbAddrPort(t, addr)
+
+	globalHostKeys.keys["ssh:"+addr] = storedHostKeyEntry(strings.Repeat("ab", 32), ssh.KeyAlgoRSA)
+
+	_, _, err := configBackupDial(context.Background(), cbJob(host, port))
+	if err == nil {
+		t.Fatal("dial succeeded despite an RSA-only pin against an ecdsa server")
+	}
+	if !strings.Contains(err.Error(), "no common algorithm") {
+		t.Fatalf("err = %v, want a host-key-algorithm negotiation failure", err)
+	}
+}
+
 func TestConfigBackupHostKeyHexFingerprint(t *testing.T) {
 	resetHostKeyStore(t)
 	serverSigner := cbNewSigner(t)

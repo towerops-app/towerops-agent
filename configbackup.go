@@ -281,10 +281,27 @@ func configBackupDial(ctx context.Context, job *pb.AgentJob) (*ssh.Client, strin
 	}
 	addr := net.JoinHostPort(cb.Host, strconv.Itoa(int(port)))
 	// TCP connect plus handshake share one dial budget so a filtered port
-	// fails fast instead of burning the whole job deadline.
+	// fails fast instead of burning the whole job deadline. DNS resolution
+	// belongs inside the same budget.
 	dialCtx, cancel := context.WithTimeout(ctx, configBackupDialTimeout)
 	defer cancel()
-	conn, err := sshDial(dialCtx, "tcp", addr, config)
+	// Resolve before the pin lookup, same as the legacy /export path: the
+	// TOFU store keys entries by the resolved remote.String() the handshake
+	// reports, so a hostname job would never find its pin under the raw
+	// dial string. Dialing the resolved literal also keeps the dialed
+	// address identical to what the callback sees.
+	resolved, err := sshResolve(dialCtx, addr)
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve %s: %w", addr, err)
+	}
+	// When a key is already pinned, restrict HostKeyAlgorithms to its type
+	// so a device that gains a new key cannot present it and trip a false
+	// HOST_KEY_MISMATCH while the pinned key is still installed (issue
+	// 5144).
+	if alg := getHostKeyStore().pinnedKeyAlgorithm("ssh:" + resolved); alg != "" {
+		config.HostKeyAlgorithms = hostKeyAlgorithmsFor(alg)
+	}
+	conn, err := sshDial(dialCtx, "tcp", resolved, config)
 	if err != nil {
 		// The AfterFunc conn close that aborts a stalled handshake surfaces as
 		// "ssh: handshake failed: …closed", which classifyConfigBackupError
