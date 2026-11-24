@@ -417,14 +417,15 @@ func TestHTTPCheck_VerifySslTrueRejectsSelfSigned(t *testing.T) {
 	}
 }
 
-func TestHTTPCheck_TransportsPreserveProxySupport(t *testing.T) {
+func TestHTTPCheck_TransportsDisableProxySupport(t *testing.T) {
 	for name, transport := range map[string]*http.Transport{
 		"default":  sharedHTTPTransport(false),
 		"insecure": sharedHTTPTransport(true),
+		"fresh":    newCheckHTTPTransport(false),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if transport.Proxy == nil {
-				t.Fatal("expected proxy lookup inherited from http.DefaultTransport")
+			if transport.Proxy != nil {
+				t.Fatal("check transports must dial the target directly, not the HTTP_PROXY env")
 			}
 			if transport.MaxIdleConns != 100 || transport.MaxIdleConnsPerHost != 10 {
 				t.Fatalf("unexpected idle connection limits: %d/%d",

@@ -103,11 +103,12 @@ func newCheckHTTPTransport(insecure bool) *http.Transport {
 	transport.MaxIdleConnsPerHost = 10
 	transport.IdleConnTimeout = 90 * time.Second
 	transport.DialContext = privateTargetDialer.DialContext
-	if agentRuntimeSettings().DenyPrivateTargets {
-		// Deny mode must validate the real target, not a proxy address, so
-		// CONNECT tunneling cannot carry a check inside the poller network.
-		transport.Proxy = nil
-	}
+	// A check must measure the agent's direct path to the target, so the
+	// cloned DefaultTransport proxy lookup is dropped: an HTTP_PROXY set to
+	// reach the TowerOps server would otherwise route every check through
+	// it, and in deny-private mode the guard would validate the proxy
+	// address instead of the real target.
+	transport.Proxy = nil
 	if insecure {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
@@ -115,8 +116,8 @@ func newCheckHTTPTransport(insecure bool) *http.Transport {
 }
 
 // sharedHTTPTransport builds the package transport on first use: the
-// deny-private-targets flag is parsed after package init, and the transport
-// has to drop proxy support in deny mode (issue 5139).
+// runtime flags are parsed after package init, so construction is deferred
+// until the first check runs.
 func sharedHTTPTransport(insecure bool) *http.Transport {
 	if insecure {
 		insecureHTTPTransportOnce.Do(func() {
