@@ -67,35 +67,6 @@ func (s *session) isInventoryEvent(event string) bool {
 	}
 }
 
-// queueInventoryDecode hands an inventory frame to the decoder. A full queue
-// refuses the frame explicitly so the server reconciles and re-pushes it
-// instead of the decode silently blocking the loop.
-func (s *session) queueInventoryDecode(
-	msg channelMsg,
-	pools *jobPools,
-	out *resultQueue,
-) (bool, error) {
-	if s.inventoryWork == nil {
-		// Compatibility path: no decoder (a directly constructed session).
-		return handleMessage(s.jobCtx, msg, s.topic, pools, out)
-	}
-	request := inventoryDecodeRequest{
-		event:    msg.Event,
-		payload:  msg.Payload,
-		rawProto: msg.Binary && s.inventoryUpdates,
-	}
-	select {
-	case s.inventoryWork <- request:
-		return false, nil
-	default:
-		slog.Warn("inventory decode queue full, refusing frame", "event", msg.Event)
-		pools.rejectInventory(msg.Event)
-		reportInventoryRejection(out.agentCtx, out, msg.Event,
-			"Refused "+msg.Event+" inventory: decode queue saturated")
-		return false, nil
-	}
-}
-
 // decodeInventoryRequest decodes one frame off the session loop. A payload
 // that fails the bounded decode is reported as undecoded so the loop applies
 // the same rejection path as the synchronous handler.
