@@ -987,6 +987,43 @@ func TestPendingResultSurvivesSlowWrite(t *testing.T) {
 	}
 }
 
+// TestResolveInFlightWithoutResultAckReleasesOnce verifies the legacy-server
+// spool release: without result_ack_v1 the writer's acknowledgment frees the
+// delivered result exactly once. Before the fix ack ran dropSent and
+// releaseCapacity back to back, so a result still held in the sent ring
+// drained its bytes twice, driving byteUsage negative and depth to
+// uint64 underflow (issue 5151).
+func TestResolveInFlightWithoutResultAckReleasesOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	q := newResultQueueForAgentBytes(ctx, 1<<20)
+	s := &session{
+		ctx: ctx, topic: "agent:test", results: q,
+		writeCh: make(chan writeRequest, 1),
+	}
+	if !q.enqueue(outbound{event: "result", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("enqueue failed")
+	}
+	w, err := s.queueResultFrame([]outbound{<-q.items}, "result", true)
+	if err != nil {
+		t.Fatalf("queueResultFrame: %v", err)
+	}
+	request := <-s.writeCh
+	defer putFrameBuffer(request.buf)
+	if err := s.resolveInFlight(w, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := q.byteUsage.Load(); got != 0 {
+		t.Fatalf("byteUsage = %d after one released result, want 0", got)
+	}
+	if got := q.depth.Load(); got != 0 {
+		t.Fatalf("depth = %d after one released result, want 0", got)
+	}
+	if got := q.pendingAckCount(); got != 0 {
+		t.Fatalf("pendingAckCount = %d, want 0", got)
+	}
+}
+
 func TestFailedResultWriteClearsRejectionTracking(t *testing.T) {
 	s := &session{
 		ctx: context.Background(), results: testQueue(), writeCh: make(chan writeRequest, 1),

@@ -2275,10 +2275,12 @@ func (q *resultQueue) ackThrough(cumulative uint64) uint64 {
 
 // dropSent releases one held result the server explicitly rejected. Used by
 // deterministic rejection handling: the result will never be stored, and
-// holding its bytes forever would leak the spool budget.
-func (q *resultQueue) dropSent(sequence uint64) {
+// holding its bytes forever would leak the spool budget. Reports whether a
+// held entry was found and released, so a caller can skip a second release
+// for results that were never in the ring (issue 5151).
+func (q *resultQueue) dropSent(sequence uint64) bool {
 	if !q.byteBounded() || sequence == 0 {
-		return
+		return false
 	}
 	q.sentMu.Lock()
 	defer q.sentMu.Unlock()
@@ -2296,16 +2298,23 @@ func (q *resultQueue) dropSent(sequence uint64) {
 			last := (q.sentHead + q.sentCount - 1) % len(q.sent)
 			q.sent[last] = outbound{}
 			q.sentCount--
-			return
+			return true
 		}
 	}
+	return false
 }
 
 // releaseLocked frees a held result's capacity. returnBuf hands the pooled
 // payload buffer back to the pool; retry paths must pass false because the
 // same buffer carries the payload back into the spool.
 func (q *resultQueue) releaseLocked(result outbound, returnBuf bool) {
-	q.byteUsage.Add(-int64(result.encodedBytes))
+	if remaining := q.byteUsage.Add(-int64(result.encodedBytes)); remaining < 0 {
+		// A negative balance means a result was released twice, which is a
+		// spool accounting bug, not load. The counter is left negative so the
+		// heartbeat reports the corruption rather than hiding it (issue 5151).
+		slog.Error("result spool byte usage went negative",
+			"remaining_bytes", remaining, "sequence", result.sequence)
+	}
 	q.depth.Add(^uint64(0))
 	if returnBuf && result.buf != nil {
 		putFrameBuffer(result.buf)
@@ -2351,7 +2360,10 @@ func (q *resultQueue) releaseCapacity(result outbound, returnBuf bool) {
 		<-q.slots
 		return
 	}
-	q.byteUsage.Add(-int64(result.encodedBytes))
+	if remaining := q.byteUsage.Add(-int64(result.encodedBytes)); remaining < 0 {
+		slog.Error("result spool byte usage went negative",
+			"remaining_bytes", remaining, "sequence", result.sequence)
+	}
 	q.depth.Add(^uint64(0))
 	if returnBuf && result.buf != nil {
 		putFrameBuffer(result.buf)
@@ -2363,9 +2375,13 @@ func (q *resultQueue) releaseCapacity(result outbound, returnBuf bool) {
 func (q *resultQueue) ack(result outbound) {
 	if q.byteBounded() {
 		// A direct consumer (tests) acks without the server path; keep the
-		// budget consistent rather than leaking it.
-		q.dropSent(result.sequence)
-		q.releaseCapacity(result, true)
+		// budget consistent rather than leaking it. The release is exclusive:
+		// a result still held in the sent ring is freed there, and only a
+		// result the ring never saw takes the capacity path, or both run and
+		// byteUsage dives negative (issue 5151).
+		if !q.dropSent(result.sequence) {
+			q.releaseCapacity(result, true)
+		}
 		return
 	}
 	if result.reservedSlot {

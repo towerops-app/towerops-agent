@@ -280,6 +280,19 @@ func TestResultBatchEncodingCarriesSequences(t *testing.T) {
 	}
 }
 
+// TestResultQueueNegativeByteUsageLogs covers the corruption canary: the
+// exclusive release in ack removes the known double-release, and any future
+// path that frees a result twice must still surface as an error log rather
+// than silently corrupting the spool budget (issue 5151).
+func TestResultQueueNegativeByteUsageLogs(t *testing.T) {
+	q := newResultQueueForAgentBytes(context.Background(), 1<<20)
+	q.releaseLocked(outbound{sequence: 1, encodedBytes: 5}, false)
+	q.releaseCapacity(outbound{sequence: 2, encodedBytes: 5}, false)
+	if got := q.byteUsage.Load(); got != -10 {
+		t.Fatalf("byteUsage = %d, want -10", got)
+	}
+}
+
 // TestRequeueUnackedRenumbersReplay verifies reconnect replay of a held
 // result whose storage ack never arrived. Sequences are per-connection, so
 // the replay must re-enter unnumbered and pick up a fresh sequence in send
