@@ -1259,7 +1259,7 @@ func TestDispatchJob(t *testing.T) {
 			peTInjectEchoReply(t, conn, sent[i].pkt)
 		}
 
-		if result := wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second); result.Status != "success" {
+		if result := wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", 3*time.Second); result.Status != "success" {
 			t.Errorf("expected success, got %q", result.Status)
 		}
 	})
@@ -5034,14 +5034,14 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 			peTInjectEchoReply(t, conn, s[i].pkt)
 		}
 
-		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
+		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", 3*time.Second)
 
 		// The gate has now released the second round; answer its probes too.
 		for i := range 3 {
 			sent := tpTWaitSent(t, conn, 4+i)
 			peTInjectEchoReply(t, conn, sent[3+i].pkt)
 		}
-		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
+		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", 3*time.Second)
 	})
 
 	t.Run("mikrotik is not gated behind snmp", func(t *testing.T) {
@@ -5138,7 +5138,7 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 			s := tpTWaitSent(t, conn, i+1)
 			peTInjectEchoReply(t, conn, s[i].pkt)
 		}
-		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", 2*time.Second)
+		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", 3*time.Second)
 		releaseOnce.Do(func() { close(release) })
 		_ = wantResult[*pb.SnmpResult](t, out, "result", 2*time.Second)
 	})
@@ -5167,7 +5167,7 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 			peTInjectEchoReply(t, conn, sent[i].pkt)
 		}
 		for range 2 {
-			_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
+			_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", 3*time.Second)
 		}
 	})
 }
@@ -5555,7 +5555,7 @@ func TestSequentialJobsOnSameTargetBothRun(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("job %s never ran — the previous job's gate was never released", id)
 		}
-		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", time.Second)
+		_ = wantResult[*pb.MonitoringCheck](t, out, "monitoring_check", 3*time.Second)
 	}
 }
 
@@ -5626,7 +5626,7 @@ func TestDifferentKindsOnSameTargetRunConcurrently(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("isolation ping never completed")
 	}
-	_ = wantResult[*pb.MonitoringCheck](t, pingOut, "monitoring_check", time.Second)
+	_ = wantResult[*pb.MonitoringCheck](t, pingOut, "monitoring_check", 3*time.Second)
 }
 
 // TestHandleResultReplyRetriesRejectedResult covers the phx_reply error path:

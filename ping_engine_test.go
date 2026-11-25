@@ -5,10 +5,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os/exec"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -300,5 +303,134 @@ func TestPingEngineNilDeviceRejected(t *testing.T) {
 	case <-done:
 		t.Error("rejected job must not fire done; the caller owns completion")
 	default:
+	}
+}
+
+// A round whose probes all failed to leave the agent (sendto refused, a
+// dead socket, a marshal error) measured nothing about the device. Before
+// issue 5162 it was sent as a "failure" MonitoringCheck with 100% loss and
+// an "unreachable" reachability hint; now it must report an agent error and
+// leave the reachability entry untouched.
+func TestPingEngineLocalSendFailureReportsAgentError(t *testing.T) {
+	conn := peTInstallFakeICMP(t)
+	conn.writeErr = syscall.EPERM
+	out := newResultQueue(4)
+	e := newPingEngine(context.Background())
+	e.start()
+	t.Cleanup(e.shutdown)
+
+	publishReachability("pe-local", nil, true, 7, 0)
+	defer func() {
+		reachabilityMu.Lock()
+		delete(reachByDevice, "pe-local")
+		reachabilityMu.Unlock()
+	}()
+
+	ok := submitPingJob(context.Background(), e, &pb.AgentJob{
+		JobId:         "pe-local",
+		DeviceId:      "pe-local",
+		SnmpDevice:    &pb.SnmpDevice{Ip: "10.0.0.1"},
+		PingTimeoutMs: 1000,
+	}, out, func() {})
+	if !ok {
+		t.Fatal("submitPingJob rejected a job on an empty queue")
+	}
+
+	agentErr := wantResult[*pb.AgentError](t, out, "error", 5*time.Second)
+	if agentErr.DeviceId != "pe-local" || agentErr.JobId != "pe-local" {
+		t.Errorf("agent error identity: got device=%q job=%q", agentErr.DeviceId, agentErr.JobId)
+	}
+	if agentErr.Message == "" {
+		t.Error("agent error carried no message")
+	}
+	select {
+	case extra := <-out.items:
+		t.Fatalf("unexpected second result: %q", extra.event)
+	default:
+	}
+
+	entry, ok := lastDeviceReachability("pe-local")
+	if !ok || !entry.reachable || entry.rttMs != 7 {
+		t.Fatalf("local send failure overwrote reachability: %+v %v", entry, ok)
+	}
+	if processMetrics.pingLocalErrors.Load() == 0 {
+		t.Error("ping_local_errors metric was not counted")
+	}
+}
+
+// A device the agent cannot reach by name still reports loss (the send
+// left the agent), while an exec fallback whose ping binary cannot run is
+// an agent fault: it must produce an agent error, not a down device
+// (issue 5162).
+func TestPingEngineExecFallbackLocalErrorReportsAgentError(t *testing.T) {
+	// dev-1's hint is shared map state: clear anything an earlier test
+	// published so the assertion below reads only this test's outcome.
+	reachabilityMu.Lock()
+	delete(reachByDevice, "dev-1")
+	delete(reachByIP, "127.0.0.1")
+	reachabilityMu.Unlock()
+
+	orig := execPingSeries
+	execPingSeries = func(context.Context, string, int, int) (int, float64, error) {
+		return 0, 0, &exec.Error{Name: "ping", Err: exec.ErrNotFound}
+	}
+	t.Cleanup(func() { execPingSeries = orig })
+
+	e, pj, out := newTestPingJob(t, true)
+	e.fallback = make(chan *pingJob, 1)
+	e.wg.Add(1)
+	go e.runFallback()
+
+	done := make(chan struct{}, 1)
+	pj.done = func() { done <- struct{}{} }
+	e.enqueueJob(pj)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("exec round never finished")
+	}
+
+	agentErr := wantResult[*pb.AgentError](t, out, "error", 5*time.Second)
+	if agentErr.DeviceId != "dev-1" {
+		t.Errorf("agent error device: got %q, want dev-1", agentErr.DeviceId)
+	}
+	if _, ok := lastDeviceReachability("dev-1"); ok {
+		t.Error("local exec failure published a reachability hint")
+	}
+}
+
+// pingIsLocalExecError: only a failed exec or a non-"no reply" exit is an
+// agent fault; a plain error from the ping output parse is device loss.
+func TestPingIsLocalExecError(t *testing.T) {
+	if !pingIsLocalExecError(&exec.Error{Name: "ping", Err: exec.ErrNotFound}) {
+		t.Error("exec.Error must classify as local")
+	}
+	exit2 := exec.Command("sh", "-c", "exit 2").Run()
+	if !pingIsLocalExecError(exit2) {
+		t.Error("exit status 2 must classify as local")
+	}
+	exit1 := exec.Command("sh", "-c", "exit 1").Run()
+	if pingIsLocalExecError(exit1) {
+		t.Error("exit status 1 (no reply) must stay device loss")
+	}
+	if pingIsLocalExecError(errors.New("no time= line")) {
+		t.Error("a parse failure must stay device loss")
+	}
+}
+
+// firstLocalError scans for a marked probe and yields nil when none is
+// flagged: a guard for callers that classify before counting (issue 5162).
+func TestPingJobFirstLocalErrorNone(t *testing.T) {
+	e, pj, _ := newTestPingJob(t, true)
+	_ = e
+	if err := pj.firstLocalError(); err != nil {
+		t.Fatalf("firstLocalError with no flagged probes = %v, want nil", err)
+	}
+	sent := errors.New("sendto refused")
+	pj.probes[1].localErr = true
+	pj.probes[1].err = sent
+	if err := pj.firstLocalError(); err != sent {
+		t.Fatalf("firstLocalError = %v, want the flagged probe's error", err)
 	}
 }

@@ -26,6 +26,7 @@ type agentMetrics struct {
 	// pingExecFallback flips to 1 the first time a ping job lands on the
 	// exec path because no ICMP socket could be opened.
 	pingExecFallback atomic.Uint64
+	pingLocalErrors  atomic.Uint64
 	scheduleLagMu    sync.Mutex
 	scheduleLag      []uint64
 	scheduleLagPos   int
@@ -83,6 +84,7 @@ type metricsSnapshot struct {
 	HasScheduleLag    bool
 	ResultDropped     uint64
 	TrapsDropped      uint64
+	PingLocalErrors   uint64
 	SpoolDepth        uint64
 	SpoolBytes        uint64
 	SpoolLimit        uint64
@@ -119,6 +121,7 @@ func (m *agentMetrics) snapshot() metricsSnapshot {
 		ResultDropped:    resultQueueDroppedTotal.Load(),
 		TrapsDropped:     trapDroppedTotal.Load(),
 		PingExecFallback: m.pingExecFallback.Load(),
+		PingLocalErrors:  m.pingLocalErrors.Load(),
 	}
 }
 
@@ -131,6 +134,7 @@ func formatMetrics(snapshot metricsSnapshot, poolLoads []poolLoadSnapshot) strin
 	fmt.Fprintf(&b, "results_dropped %d\n", snapshot.ResultDropped)
 	fmt.Fprintf(&b, "traps_dropped %d\n", snapshot.TrapsDropped)
 	fmt.Fprintf(&b, "ping_exec_fallback %d\n", snapshot.PingExecFallback)
+	fmt.Fprintf(&b, "ping_local_errors %d\n", snapshot.PingLocalErrors)
 	fmt.Fprintf(&b, "spool_depth %d\n", snapshot.SpoolDepth)
 	fmt.Fprintf(&b, "spool_bytes %d\n", snapshot.SpoolBytes)
 	if snapshot.InventoryCapacity > 0 {

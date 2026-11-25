@@ -6,8 +6,11 @@ package main
 import (
 	"container/heap"
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -94,8 +97,12 @@ type pingJob struct {
 	probes    []pingProbe
 	replies   int
 	resolved  int
-	firstRTT  float64
-	finishing bool
+	// localErrors counts probes that failed inside the agent (sendto,
+	// marshal, exec): a round of only local errors measured nothing about
+	// the device (issue 5162).
+	localErrors int
+	firstRTT    float64
+	finishing   bool
 }
 
 // pingProbe is one echo request's state inside a job.
@@ -105,8 +112,11 @@ type pingProbe struct {
 	waiter  *pingWaiter
 	rttMs   float64
 	err     error
-	sent    bool
-	checked bool
+	// localErr marks a failure inside the agent rather than silence from
+	// the device (issue 5162).
+	localErr bool
+	sent     bool
+	checked  bool
 }
 
 // deviceReachability is the per-device ping outcome the SNMP engine reads.
@@ -401,6 +411,12 @@ func (e *pingEngine) sendProbeLocked(pj *pingJob, idx int) {
 	echo, start, err := startICMPPing(pj.ctx, pj.ip, pj.network, pj.isIPv4, e.events)
 	if err != nil {
 		pj.probes[idx].err = err
+		if pj.ctx.Err() == nil {
+			// A live context means the echo never left the agent: the
+			// device was not probed at all (issue 5162).
+			pj.probes[idx].localErr = true
+			pj.localErrors++
+		}
 		pj.probes[idx].checked = true
 		pj.resolved++
 		if pj.resolved == pingProbeCount {
@@ -523,12 +539,19 @@ func (e *pingEngine) finishJobLocked(pj *pingJob) {
 	}
 
 	if pj.ctx.Err() == nil {
-		// A round cut short by a reconnect or inventory replace measured
-		// nothing: it must not publish an "unreachable" hint (issue 5156).
-		publishReachability(pj.job.DeviceId, pj.ip, pj.replies > 0, pj.firstRTT, lossPercent)
-		slog.Debug("ping job complete", "device", pj.job.DeviceId, "status", status,
-			"replies", pj.replies, "probes", pingProbeCount, "loss_percent", lossPercent)
-		sendResult(pj.ctx, pj.out, "monitoring_check", result, pj.job.JobId)
+		if pj.allLocalErrors() {
+			// Every probe failed inside the agent: publish no
+			// "unreachable" hint and report the agent fault instead of a
+			// down device (issue 5162).
+			pj.reportLocalPingFailure()
+		} else {
+			// A round cut short by a reconnect or inventory replace measured
+			// nothing: it must not publish an "unreachable" hint (issue 5156).
+			publishReachability(pj.job.DeviceId, pj.ip, pj.replies > 0, pj.firstRTT, lossPercent)
+			slog.Debug("ping job complete", "device", pj.job.DeviceId, "status", status,
+				"replies", pj.replies, "probes", pingProbeCount, "loss_percent", lossPercent)
+			sendResult(pj.ctx, pj.out, "monitoring_check", result, pj.job.JobId)
+		}
 	}
 	// Cancel only after the completed measurement has entered the spool.
 	pj.cancel()
@@ -536,6 +559,39 @@ func (e *pingEngine) finishJobLocked(pj *pingJob) {
 		pj.done()
 		pj.done = nil
 	}
+}
+
+// allLocalErrors reports whether every probe of the round failed inside
+// the agent itself, so the result says nothing about the device.
+func (pj *pingJob) allLocalErrors() bool {
+	return pj.replies == 0 && pj.localErrors == pingProbeCount
+}
+
+// firstLocalError returns the first agent-side probe error for reporting.
+func (pj *pingJob) firstLocalError() error {
+	for i := range pj.probes {
+		if pj.probes[i].localErr {
+			return pj.probes[i].err
+		}
+	}
+	return nil
+}
+
+// reportLocalPingFailure sends an agent error for a round whose probes
+// never left the agent: a sendto refusal, marshal failure or unusable exec
+// binary is host-local, so the device is reported unmeasured, not down
+// (issue 5162).
+func (pj *pingJob) reportLocalPingFailure() {
+	processMetrics.pingLocalErrors.Add(1)
+	err := pj.firstLocalError()
+	slog.Error("ping round could not send any probe",
+		"device", pj.job.DeviceId, "ip", pj.ip, "error", err)
+	sendResult(pj.ctx, pj.out, "error", &pb.AgentError{
+		DeviceId:  pj.job.DeviceId,
+		JobId:     pj.job.JobId,
+		Message:   fmt.Sprintf("ping check could not run on the agent: %v", err),
+		Timestamp: time.Now().Unix(),
+	}, pj.job.JobId)
 }
 
 // drainLive cancels every outstanding job at shutdown without sending results.
@@ -602,8 +658,13 @@ func (e *pingEngine) execPingRound(pj *pingJob) {
 		pj.replies = replies
 		pj.firstRTT = firstRTT
 	}
+	localErr := err != nil && pj.ctx.Err() == nil && pingIsLocalExecError(err)
 	for i := range pj.probes {
 		pj.probes[i].err = err
+		if localErr {
+			pj.probes[i].localErr = true
+			pj.localErrors++
+		}
 		pj.probes[i].checked = true
 		pj.resolved++
 	}
@@ -646,12 +707,16 @@ func (e *pingEngine) execPingRound(pj *pingJob) {
 	}
 
 	if pj.ctx.Err() == nil {
-		// A round cut short by a reconnect or inventory replace measured
-		// nothing: it must not publish an "unreachable" hint (issue 5156).
-		publishReachability(pj.job.DeviceId, pj.ip, pj.replies > 0, pj.firstRTT, lossPercent)
-		slog.Debug("ping job complete", "device", pj.job.DeviceId, "status", status,
-			"replies", pj.replies, "probes", pingProbeCount, "loss_percent", lossPercent)
-		sendResult(pj.ctx, pj.out, "monitoring_check", result, pj.job.JobId)
+		if pj.allLocalErrors() {
+			pj.reportLocalPingFailure()
+		} else {
+			// A round cut short by a reconnect or inventory replace measured
+			// nothing: it must not publish an "unreachable" hint (issue 5156).
+			publishReachability(pj.job.DeviceId, pj.ip, pj.replies > 0, pj.firstRTT, lossPercent)
+			slog.Debug("ping job complete", "device", pj.job.DeviceId, "status", status,
+				"replies", pj.replies, "probes", pingProbeCount, "loss_percent", lossPercent)
+			sendResult(pj.ctx, pj.out, "monitoring_check", result, pj.job.JobId)
+		}
 	}
 	// Cancel only after the completed measurement has entered the spool.
 	pj.cancel()
@@ -660,6 +725,22 @@ func (e *pingEngine) execPingRound(pj *pingJob) {
 		pj.done = nil
 	}
 	e.mu.Unlock()
+}
+
+// pingIsLocalExecError classifies an exec-fallback probe failure. A binary
+// that cannot be started, or that exits for a reason other than "no reply"
+// (exit status 1), is an agent-side fault rather than evidence the device
+// is down (issue 5162). Timeouts and plain no-reply exits stay device loss.
+func pingIsLocalExecError(err error) bool {
+	var execErr *exec.Error
+	if errors.As(err, &execErr) {
+		return true
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode() != 1
+	}
+	return false
 }
 
 // publishReachability records a ping round's outcome for the SNMP engine.
