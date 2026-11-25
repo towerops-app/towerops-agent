@@ -157,6 +157,7 @@ message SslCheckConfig {
   string host = 1;
   uint32 port = 2;          // default 443
   uint32 warning_days = 3;  // alert if expires within this many days
+  bool verify_chain = 4;    // verify chain, hostname and notBefore; false grades expiry only
 }
 
 message CheckResult {

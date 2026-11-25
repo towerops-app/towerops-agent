@@ -644,9 +644,11 @@ func resolverForServer(server string, timeout time.Duration) *net.Resolver {
 // executor and this agent's TCP check (issue 5140). UNKNOWN is reserved for
 // faults local to the agent that say nothing about the target: the empty
 // host guard, a root store load failure, and a cancelled session context.
-// Expired, not-yet-valid, untrusted, and hostname-mismatched certificates
-// are CRITICAL. A trusted certificate inside warning_days is WARNING; every
-// other trusted certificate is OK.
+// An expired certificate is always CRITICAL; a certificate inside
+// warning_days is WARNING and every other certificate is OK. When
+// verify_chain is set, not-yet-valid, untrusted and hostname-mismatched
+// certificates are CRITICAL too, matching the cloud executor's strict
+// handshake policy (issue 5141).
 func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs uint32) (uint32, string) {
 	// An empty host would dial ":port" on the local system and grade the
 	// agent host's own certificate.
@@ -668,9 +670,15 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 	address := net.JoinHostPort(host, strconv.Itoa(int(port)))
 
 	dialer := &net.Dialer{Timeout: timeout, Control: privateTargetControl}
-	rootCAs, err := sslRootCAs()
-	if err != nil {
-		return checkUnknown, fmt.Sprintf("Failed to load system root CAs: %v", err)
+	// The root store is only consulted under verify_chain; expiry-only
+	// grading never loads it.
+	var rootCAs *x509.CertPool
+	if config.VerifyChain {
+		var err error
+		rootCAs, err = sslRootCAs()
+		if err != nil {
+			return checkUnknown, fmt.Sprintf("Failed to load system root CAs: %v", err)
+		}
 	}
 	// Standard verification is deferred so invalid certificates remain
 	// available for the status policy below.
@@ -712,24 +720,26 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 	daysRemaining, expired := certificateDaysRemaining(now, notAfter)
 	expiresStr := notAfter.Format("2006-01-02")
 
-	if now.Before(cert.NotBefore) {
+	if config.VerifyChain && now.Before(cert.NotBefore) {
 		return checkCritical, fmt.Sprintf("CRITICAL: Certificate for %s:%d is not valid until %s", host, port, cert.NotBefore.Format("2006-01-02"))
 	}
 	if expired {
 		return checkCritical, fmt.Sprintf("CRITICAL: Certificate for %s:%d %s (%s)", host, port, certificateExpiryPhrase(-daysRemaining), expiresStr)
 	}
 
-	intermediates := x509.NewCertPool()
-	for _, intermediate := range certs[1:] {
-		intermediates.AddCert(intermediate)
-	}
-	if _, err := cert.Verify(x509.VerifyOptions{
-		Roots:         rootCAs,
-		Intermediates: intermediates,
-		DNSName:       host,
-		CurrentTime:   now,
-	}); err != nil {
-		return checkCritical, fmt.Sprintf("CRITICAL: Certificate for %s:%d is not trusted: %v", host, port, err)
+	if config.VerifyChain {
+		intermediates := x509.NewCertPool()
+		for _, intermediate := range certs[1:] {
+			intermediates.AddCert(intermediate)
+		}
+		if _, err := cert.Verify(x509.VerifyOptions{
+			Roots:         rootCAs,
+			Intermediates: intermediates,
+			DNSName:       host,
+			CurrentTime:   now,
+		}); err != nil {
+			return checkCritical, fmt.Sprintf("CRITICAL: Certificate for %s:%d is not trusted: %v", host, port, err)
+		}
 	}
 
 	if daysRemaining <= int(warningDays) {

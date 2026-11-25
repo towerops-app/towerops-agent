@@ -2162,6 +2162,7 @@ func TestSSLCheck_SelfSignedCertificateIsCritical(t *testing.T) {
 		Host:        "127.0.0.1",
 		Port:        parsePort(portStr),
 		WarningDays: 7,
+		VerifyChain: true,
 	}, 5000)
 
 	if status != 2 {
@@ -2170,6 +2171,93 @@ func TestSSLCheck_SelfSignedCertificateIsCritical(t *testing.T) {
 	if !strings.Contains(output, "CRITICAL: Certificate for") ||
 		!strings.Contains(output, "is not trusted:") {
 		t.Fatalf("expected certificate trust failure output, got %s", output)
+	}
+}
+
+// With verify_chain unset the check grades expiry only, matching the cloud
+// executor's verify_none handshake: a self-signed but otherwise live
+// certificate is OK, not CRITICAL (issue 5141).
+func TestSSLCheck_SelfSignedCertificateExpiryOnlyIsOK(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
+
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host:        "127.0.0.1",
+		Port:        parsePort(portStr),
+		WarningDays: 7,
+	}, 5000)
+
+	if status != 0 {
+		t.Fatalf("expected status 0 grading expiry only, got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "OK: Certificate") {
+		t.Fatalf("expected OK output, got %s", output)
+	}
+}
+
+// A not-yet-valid certificate still grades on its notAfter under the
+// expiry-only policy; the notBefore check belongs to verify_chain.
+func TestSSLCheck_NotYetValidCertificateExpiryOnlyIsOK(t *testing.T) {
+	cert := chkTSelfSignedCert(t, time.Now().Add(48*time.Hour), time.Now().Add(96*time.Hour))
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.TLS = &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+	}
+	srv.StartTLS()
+	defer srv.Close()
+
+	_, portStr, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host:        "127.0.0.1",
+		Port:        parsePort(portStr),
+		WarningDays: 1,
+	}, 5000)
+
+	if status != 0 {
+		t.Fatalf("expected status 0 grading expiry only, got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "OK: Certificate") {
+		t.Fatalf("expected OK output, got %s", output)
+	}
+}
+
+// The root store is only consulted under verify_chain, so a load failure
+// must not break expiry-only grading.
+func TestSSLCheck_ExpiryOnlyIgnoresRootCAFailure(t *testing.T) {
+	orig := sslRootCAs
+	defer func() { sslRootCAs = orig }()
+	sslRootCAs = func() (*x509.CertPool, error) {
+		return nil, errors.New("root store unavailable")
+	}
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
+
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host:        "127.0.0.1",
+		Port:        parsePort(portStr),
+		WarningDays: 7,
+	}, 5000)
+
+	if status != 0 {
+		t.Fatalf("expected status 0 without consulting the root store, got %d: %s", status, output)
+	}
+	if !strings.Contains(output, "OK: Certificate") {
+		t.Fatalf("expected OK output, got %s", output)
 	}
 }
 
@@ -2559,8 +2647,9 @@ func TestChkTSSLCheckRootCALoadFailure(t *testing.T) {
 	}
 
 	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
-		Host: "127.0.0.1",
-		Port: 443,
+		Host:        "127.0.0.1",
+		Port:        443,
+		VerifyChain: true,
 	}, 5000)
 
 	if status != 3 {
@@ -2745,6 +2834,7 @@ func TestSSLCheck_NotYetValidCertificateIsCritical(t *testing.T) {
 		Host:        "127.0.0.1",
 		Port:        parsePort(portStr),
 		WarningDays: 30,
+		VerifyChain: true,
 	}, 5000)
 
 	if status != 2 {
@@ -3011,6 +3101,7 @@ func TestChkTSSLCheckUsesPresentedIntermediates(t *testing.T) {
 				Host:        "127.0.0.1",
 				Port:        port,
 				WarningDays: 30,
+				VerifyChain: true,
 			}, 5000)
 
 			if status != tc.wantStatus {
