@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -111,7 +112,19 @@ func wsDial(ctx context.Context, rawURL string, token ...string) (*wsConn, error
 		headers.Set("x-agent-token", token[0])
 	}
 	opts := &websocket.DialOptions{
-		HTTPClient: &http.Client{Transport: transport},
+		HTTPClient: &http.Client{
+			Transport: transport,
+			// The agent has one configured endpoint and no reason to follow a
+			// redirect: Go's client only strips Authorization, Cookie and
+			// WWW-Authenticate on a cross-host hop, so following would replay
+			// x-agent-token to whatever host and scheme the redirect names
+			// (issue 5154).
+			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+				slog.Warn("websocket dial refused a redirect",
+					"target", sanitizeURL(req.URL.String()))
+				return http.ErrUseLastResponse
+			},
+		},
 		HTTPHeader: headers,
 		// OID-heavy result payloads share long prefixes, so permessage-deflate
 		// with context takeover meaningfully shrinks the uplink. The server

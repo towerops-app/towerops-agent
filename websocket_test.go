@@ -169,6 +169,40 @@ func TestWSDialClosesResponseBodyOnFailedHandshake(t *testing.T) {
 	}
 }
 
+// TestWSDialRefusesRedirectAndKeepsToken: the dial client must not follow
+// redirects. Go only strips Authorization/Cookie/WWW-Authenticate on a
+// cross-host hop, so a 30x from anything answering the configured endpoint
+// would replay x-agent-token to whatever host and scheme it names (issue
+// 5154).
+func TestWSDialRefusesRedirectAndKeepsToken(t *testing.T) {
+	var leaked atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-agent-token") != "" {
+			leaked.Store(true)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	ws, err := wsDial(
+		context.Background(),
+		"ws"+strings.TrimPrefix(redirector.URL, "http"),
+		"secret-agent-token",
+	)
+	if err == nil {
+		_ = ws.Close()
+		t.Fatal("wsDial followed a redirect")
+	}
+	if leaked.Load() {
+		t.Fatal("x-agent-token was forwarded to the redirect target")
+	}
+}
+
 func TestWSConnReadLimit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
