@@ -31,7 +31,17 @@ const (
 	// A device that ships an absurd TLV payload must not grow the result
 	// unboundedly.
 	ubntMaxFieldBytes = 255
+	// collect_ms arrives as an unbounded uint32 (~49 days); the UBNT pool
+	// has two workers, so two long windows would stall the feature. Clamp
+	// the window to a sane sweep length (issue 5160).
+	ubntMaxCollectMS = 30000
 )
+
+// Replies are unauthenticated UDP: any host on the segment can inject
+// replies with distinct MACs, so the peer list is bounded and the server
+// is told when a sweep truncated (issue 5160). A variable so tests can
+// shrink the cap.
+var ubntMaxPeersPerSweep = 1024
 
 // ubntDiscoveryRequest is the fixed 4-byte probe every UBNT device
 // answers: version 1, command 0 (discovery), length 0.
@@ -65,7 +75,22 @@ func executeUbntDiscovery(ctx context.Context, job *pb.AgentJob, out *resultQueu
 			"probe_id", result.ProbeId,
 			"peers", len(result.Peers),
 			"duration_ms", result.DurationMs)
-		sendResult(ctx, out, "ubnt_discovery_result", result, job.JobId)
+		if sendResult(ctx, out, "ubnt_discovery_result", result, job.JobId) || ctx.Err() != nil {
+			return
+		}
+		// The full result did not queue. A marshal failure would otherwise
+		// drop the whole sweep silently, so retry with a minimal result
+		// whose fields are all agent-generated (issue 5160).
+		fallback := &pb.UbntDiscoveryResult{
+			ProbeId:      result.ProbeId,
+			DurationMs:   result.DurationMs,
+			Timestamp:    result.Timestamp,
+			ErrorMessage: result.ErrorMessage,
+		}
+		if fallback.ErrorMessage == "" {
+			fallback.ErrorMessage = "discovery result could not be encoded"
+		}
+		sendResult(ctx, out, "ubnt_discovery_result", fallback, job.JobId)
 	}
 
 	cfg := job.UbntDiscovery
@@ -81,7 +106,7 @@ func executeUbntDiscovery(ctx context.Context, job *pb.AgentJob, out *resultQueu
 	}
 	collect := time.Duration(ubntDefaultCollectMS) * time.Millisecond
 	if cfg.CollectMs > 0 {
-		collect = time.Duration(cfg.CollectMs) * time.Millisecond
+		collect = time.Duration(min(cfg.CollectMs, ubntMaxCollectMS)) * time.Millisecond
 	}
 	dest := cfg.Target
 	if dest == "" {
@@ -91,7 +116,7 @@ func executeUbntDiscovery(ctx context.Context, job *pb.AgentJob, out *resultQueu
 		dest = "255.255.255.255"
 	}
 
-	peers, err := runUbntProbe(ctx, dest, port, collect)
+	peers, truncated, err := runUbntProbe(ctx, dest, port, collect)
 	switch {
 	case err != nil && ctx.Err() != nil:
 		return
@@ -99,44 +124,54 @@ func executeUbntDiscovery(ctx context.Context, job *pb.AgentJob, out *resultQueu
 		result.ErrorMessage = err.Error()
 	default:
 		result.Peers = peers
+		if truncated {
+			result.ErrorMessage = fmt.Sprintf(
+				"peer list capped at %d; sweep truncated", ubntMaxPeersPerSweep)
+		}
 	}
 	send()
 }
 
 // runUbntProbe sends the request to dest:port and collects replies until
 // the window closes or ctx cancels. Replies dedupe on MAC so a device
-// answering on two interfaces reports once; reply order is stable.
-func runUbntProbe(ctx context.Context, dest string, port int, collect time.Duration) ([]*pb.UbntDiscoveryPeer, error) {
+// answering on two interfaces reports once; reply order is stable. The
+// truncated flag reports that more distinct peers answered than the
+// reported list could hold.
+func runUbntProbe(ctx context.Context, dest string, port int, collect time.Duration) ([]*pb.UbntDiscoveryPeer, bool, error) {
 	return runUbntProbeOn(ctx, ":0", dest, port, collect)
 }
 
 // runUbntProbeOn runs the probe on an explicit bind address; callers use
 // ":0". Kept as a parameter so tests can reach the listen failure.
 func runUbntProbeOn(ctx context.Context, bindAddr string, dest string, port int,
-	collect time.Duration) ([]*pb.UbntDiscoveryPeer, error) {
+	collect time.Duration) ([]*pb.UbntDiscoveryPeer, bool, error) {
 	conn, err := ubntListen(ctx, bindAddr)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer func() { _ = conn.Close() }()
 
 	dst := &net.UDPAddr{IP: net.ParseIP(dest), Port: port}
 	if err := ubntSendRequest(conn, dst, dest); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	return collectUbntReplies(ctx, conn, collect)
 }
 
 // collectUbntReplies reads replies until collect elapses or ctx cancels.
+// The peer list is capped at ubntMaxPeersPerSweep: replies are
+// unauthenticated UDP, so an unbounded map would let any host on the
+// segment grow one result without limit (issue 5160).
 func collectUbntReplies(ctx context.Context, conn net.PacketConn,
-	collect time.Duration) ([]*pb.UbntDiscoveryPeer, error) {
+	collect time.Duration) ([]*pb.UbntDiscoveryPeer, bool, error) {
 	deadline := time.Now().Add(collect)
 	seen := make(map[string]*pb.UbntDiscoveryPeer)
 	buf := make([]byte, ubntReadBufferBytes)
+	truncated := false
 
 	for {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, false, ctx.Err()
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -150,7 +185,7 @@ func collectUbntReplies(ctx context.Context, conn net.PacketConn,
 			if errors.As(err, &nerr) && nerr.Timeout() {
 				continue
 			}
-			return nil, fmt.Errorf("read: %w", err)
+			return nil, false, fmt.Errorf("read: %w", err)
 		}
 
 		source := addr.String()
@@ -168,9 +203,14 @@ func collectUbntReplies(ctx context.Context, conn net.PacketConn,
 		}
 		// First reply wins: later copies carry the same TLVs and a second
 		// interface's source would only duplicate the row.
-		if _, ok := seen[key]; !ok {
-			seen[key] = peer
+		if _, ok := seen[key]; ok {
+			continue
 		}
+		if len(seen) >= ubntMaxPeersPerSweep {
+			truncated = true
+			continue
+		}
+		seen[key] = peer
 	}
 
 	peers := make([]*pb.UbntDiscoveryPeer, 0, len(seen))
@@ -181,7 +221,7 @@ func collectUbntReplies(ctx context.Context, conn net.PacketConn,
 	slices.SortFunc(peers, func(a, b *pb.UbntDiscoveryPeer) int {
 		return strings.Compare(a.SourceIp, b.SourceIp)
 	})
-	return peers, nil
+	return peers, truncated, nil
 }
 
 // ubntListen binds a UDP socket with SO_BROADCAST: DialUDP cannot send
@@ -250,15 +290,15 @@ func parseUbntReply(packet []byte, sourceIP string) (*pb.UbntDiscoveryPeer, erro
 				peer.MacAddress = formatMAC(value[:6])
 			}
 		case ubntTLVFirmware:
-			peer.Firmware = truncateBytes(string(value), ubntMaxFieldBytes)
+			peer.Firmware = ubntTextField(value)
 		case ubntTLVUptime:
 			if len(value) == 4 {
 				peer.UptimeSeconds = binary.BigEndian.Uint32(value)
 			}
 		case ubntTLVHostname:
-			peer.Hostname = truncateBytes(string(value), ubntMaxFieldBytes)
+			peer.Hostname = ubntTextField(value)
 		case ubntTLVModel:
-			peer.Model = truncateBytes(string(value), ubntMaxFieldBytes)
+			peer.Model = ubntTextField(value)
 		}
 	}
 	if len(packet) != 0 {
@@ -272,4 +312,13 @@ func parseUbntReply(packet []byte, sourceIP string) (*pb.UbntDiscoveryPeer, erro
 
 func formatMAC(b []byte) string {
 	return net.HardwareAddr(b).String()
+}
+
+// ubntTextField converts a device-supplied TLV string for a protobuf field:
+// truncateBytes returns short input unchanged, so invalid UTF-8 would pass
+// through and proto.Marshal would reject the whole discovery result, hiding
+// every peer on the segment behind one reply (issue 5160). Sanitize first,
+// then bound the length.
+func ubntTextField(value []byte) string {
+	return truncateBytes(strings.ToValidUTF8(string(value), "�"), ubntMaxFieldBytes)
 }

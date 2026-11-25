@@ -7,6 +7,7 @@ import (
 	"net"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/towerops-app/towerops-agent/pb"
 )
@@ -121,7 +122,7 @@ func TestRunUbntProbe(t *testing.T) {
 		), src)
 	}()
 
-	peers, err := runUbntProbe(context.Background(), "127.0.0.1", port, 300*time.Millisecond)
+	peers, _, err := runUbntProbe(context.Background(), "127.0.0.1", port, 300*time.Millisecond)
 	if err != nil {
 		t.Fatalf("probe: %v", err)
 	}
@@ -213,7 +214,7 @@ func TestRunUbntProbeCtxCancel(t *testing.T) {
 		cancel()
 	}()
 
-	_, err = runUbntProbe(ctx, "127.0.0.1", port, 5*time.Second)
+	_, _, err = runUbntProbe(ctx, "127.0.0.1", port, 5*time.Second)
 	if err == nil {
 		t.Fatal("expected context cancellation to abort the probe")
 	}
@@ -244,7 +245,7 @@ func TestRunUbntProbeDropsMalformedAndKeysByIP(t *testing.T) {
 		}
 	}()
 
-	peers, err := runUbntProbe(context.Background(), "127.0.0.1", port, 300*time.Millisecond)
+	peers, _, err := runUbntProbe(context.Background(), "127.0.0.1", port, 300*time.Millisecond)
 	if err != nil {
 		t.Fatalf("probe: %v", err)
 	}
@@ -355,7 +356,7 @@ func TestRunUbntProbeSortsTwoPeers(t *testing.T) {
 		), src)
 	}()
 
-	peers, err := runUbntProbe(context.Background(), "127.0.0.1", port, 300*time.Millisecond)
+	peers, _, err := runUbntProbe(context.Background(), "127.0.0.1", port, 300*time.Millisecond)
 	if err != nil {
 		t.Fatalf("probe: %v", err)
 	}
@@ -388,7 +389,7 @@ func TestExecuteUbntDiscoveryCtxCancel(t *testing.T) {
 }
 
 func TestRunUbntProbeListenError(t *testing.T) {
-	if _, err := runUbntProbeOn(context.Background(), "256.256.256.256:0",
+	if _, _, err := runUbntProbeOn(context.Background(), "256.256.256.256:0",
 		"127.0.0.1", 10001, time.Second); err == nil {
 		t.Fatal("expected a listen error")
 	}
@@ -401,7 +402,76 @@ func TestCollectUbntRepliesReadError(t *testing.T) {
 	}
 	// Closing the socket under the reader is a non-timeout read error.
 	_ = conn.Close()
-	if _, err := collectUbntReplies(context.Background(), conn, 500*time.Millisecond); err == nil {
+	if _, _, err := collectUbntReplies(context.Background(), conn, 500*time.Millisecond); err == nil {
 		t.Fatal("expected a read error")
+	}
+}
+
+// A device name typed in Latin-1 (or any hostile non-UTF-8 bytes) used to
+// pass through truncateBytes unchanged, so proto.Marshal rejected the whole
+// UbntDiscoveryResult and one reply hid every peer on the segment (issue
+// 5160). The text TLVs are sanitized to valid UTF-8 so the result encodes.
+func TestParseUbntReplySanitizesNonUTF8(t *testing.T) {
+	packet := ubntReply(
+		ubntTLV(ubntTLVMAC, ubntTestMAC(0xdc, 0x9f, 0xdb, 0x12, 0x34, 0x56)),
+		ubntTLV(ubntTLVHostname, []byte{0x43, 0x61, 0x66, 0xe9}), // "Caf\xe9" in Latin-1
+		ubntTLV(ubntTLVModel, []byte{0x4c, 0x48, 0x47, 0xfe}),
+		ubntTLV(ubntTLVFirmware, []byte{0x57, 0x41, 0x2e, 0xff}),
+	)
+	peer, err := parseUbntReply(packet, "192.168.88.20")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if !utf8.ValidString(peer.Hostname) || !utf8.ValidString(peer.Model) || !utf8.ValidString(peer.Firmware) {
+		t.Fatalf("non-UTF-8 field survived: host=%q model=%q firmware=%q",
+			peer.Hostname, peer.Model, peer.Firmware)
+	}
+	if _, ok := encodeOutbound("ubnt_discovery_result", &pb.UbntDiscoveryResult{
+		ProbeId: "u-utf8",
+		Peers:   []*pb.UbntDiscoveryPeer{peer},
+	}, "u-utf8"); !ok {
+		t.Fatal("discovery result with sanitized fields did not encode")
+	}
+}
+
+// The peer list is bounded: a burst of replies with distinct MACs beyond
+// the cap is dropped and reported as truncated, so one result can never
+// grow without limit (issue 5160).
+func TestCollectUbntRepliesCapsPeers(t *testing.T) {
+	orig := ubntMaxPeersPerSweep
+	ubntMaxPeersPerSweep = 3
+	t.Cleanup(func() { ubntMaxPeersPerSweep = orig })
+
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	sender, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("sender listen: %v", err)
+	}
+	defer func() { _ = sender.Close() }()
+	dst := conn.LocalAddr().(*net.UDPAddr)
+
+	for i := byte(0); i < 5; i++ {
+		reply := ubntReply(
+			ubntTLV(ubntTLVMAC, ubntTestMAC(0xdc, 0x9f, 0xdb, 0x00, 0x00, i)),
+			ubntTLV(ubntTLVModel, []byte("LHG-5nD")),
+		)
+		if _, err := sender.WriteToUDP(reply, dst); err != nil {
+			t.Fatalf("send reply %d: %v", i, err)
+		}
+	}
+
+	peers, truncated, err := collectUbntReplies(context.Background(), conn, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if len(peers) > 3 {
+		t.Fatalf("cap 3 but collected %d peers", len(peers))
+	}
+	if !truncated {
+		t.Fatal("an over-cap sweep was not reported as truncated")
 	}
 }
