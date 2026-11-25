@@ -31,8 +31,15 @@ const pingSubmitQueue = 16384
 // arrive, so this only needs to absorb a burst.
 const pingEventQueue = 4096
 
-// pingFallbackQueue bounds jobs waiting for the exec-ping fallback worker.
-const pingFallbackQueue = 64
+// pingFallbackQueue bounds jobs waiting for the exec-ping fallback workers.
+// Overflow reports a rejection instead of dropping the job silently.
+const pingFallbackQueue = 1024
+
+// pingFallbackWorkers bounds concurrent exec-ping subprocesses. The fallback
+// is an order of magnitude slower than the ICMP path even with one
+// subprocess per device, so a small pool keeps a partial outage from
+// starving healthy devices behind dead ones.
+const pingFallbackWorkers = 16
 
 // pingEngine replaces the ping worker pool: one goroutine sends echo
 // requests from a time-ordered queue and the shared ICMP socket's read loop
@@ -129,12 +136,14 @@ func newPingEngine(ctx context.Context) *pingEngine {
 	}
 }
 
-// start launches the event loop and the exec fallback worker. The engine
+// start launches the event loop and the exec fallback workers. The engine
 // belongs to one poller: shutdown tears it down with the poller's pools.
 func (e *pingEngine) start() {
-	e.wg.Add(2)
+	e.wg.Add(1 + pingFallbackWorkers)
 	go e.run()
-	go e.runFallback()
+	for range pingFallbackWorkers {
+		go e.runFallback()
+	}
 }
 
 // shutdown cancels outstanding jobs, waits for the goroutines to return,
@@ -298,18 +307,26 @@ func (e *pingEngine) enqueueJob(pj *pingJob) {
 		return
 	}
 	if pj.needsExec {
+		pj.noteExecFallback()
 		e.mu.Lock()
 		e.live[pj] = struct{}{}
 		e.mu.Unlock()
 		select {
 		case e.fallback <- pj:
 		default:
-			slog.Debug("ping fallback queue full", "device", pj.job.DeviceId)
 			e.mu.Lock()
 			delete(e.live, pj)
 			pj.finishing = true
-			pj.cancel()
 			recordJobDropped()
+			// The overflow used to drop the job silently; the server
+			// needs the same busy signal a pool refusal would send.
+			sendResult(pj.ctx, pj.out, "error", &pb.AgentError{
+				DeviceId:  pj.job.DeviceId,
+				JobId:     pj.job.JobId,
+				Message:   "ping check could not run on the agent: exec fallback queue full",
+				Timestamp: time.Now().Unix(),
+			}, pj.job.JobId)
+			pj.cancel()
 			pj.done()
 			e.mu.Unlock()
 		}
@@ -536,9 +553,18 @@ func (e *pingEngine) drainLive() {
 	}
 }
 
-// runFallback processes jobs whose target has no usable ICMP socket. One
-// worker is enough: exec ping is inherently serial and slow, and the queue
-// bounds the wait.
+// noteExecFallback reports once that the host cannot open any ICMP socket
+// and pings will run through the system binary. The mode is an order of
+// magnitude slower, so it is visible on the debug metrics as
+// ping_exec_fallback 1 until the agent restarts.
+func (pj *pingJob) noteExecFallback() {
+	if processMetrics.pingExecFallback.CompareAndSwap(0, 1) {
+		slog.Warn("no ICMP socket available; ping checks run through the exec fallback, which is much slower")
+	}
+}
+
+// runFallback processes jobs whose target has no usable ICMP socket. One of
+// pingFallbackWorkers goroutines runs one `ping -c N` subprocess per device.
 func (e *pingEngine) runFallback() {
 	defer e.wg.Done()
 	for {
@@ -567,20 +593,19 @@ func (e *pingEngine) execPingRound(pj *pingJob) {
 		e.mu.Unlock()
 		return
 	}
-	probeTimeoutMs := pj.timeoutMs / pingProbeCount
-	if probeTimeoutMs <= 0 {
-		probeTimeoutMs = 1
+	// One subprocess sends all probes at the same 200 ms spacing the ICMP
+	// engine uses. The job context bounds the whole round, so a round can
+	// never outlive the configured timeout the way sequential per-probe
+	// waits could.
+	ctx, cancel := context.WithDeadline(pj.ctx, pj.deadline)
+	defer cancel()
+	replies, firstRTT, err := execPingSeries(ctx, pj.job.SnmpDevice.Ip, pingProbeCount, pj.timeoutMs)
+	if err == nil {
+		pj.replies = replies
+		pj.firstRTT = firstRTT
 	}
 	for i := range pj.probes {
-		rtt, err := execPing(pj.ctx, pj.job.SnmpDevice.Ip, probeTimeoutMs)
-		if err != nil {
-			pj.probes[i].err = err
-		} else {
-			pj.replies++
-			if pj.replies == 1 {
-				pj.firstRTT = rtt
-			}
-		}
+		pj.probes[i].err = err
 		pj.probes[i].checked = true
 		pj.resolved++
 	}

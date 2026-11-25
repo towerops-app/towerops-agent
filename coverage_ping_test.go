@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -242,8 +243,8 @@ func TestEnqueueJobPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("full fallback queue drops the job", func(t *testing.T) {
-		e, pj, _ := newTestPingJob(t, true)
+	t.Run("full fallback queue rejects the job with a notice", func(t *testing.T) {
+		e, pj, out := newTestPingJob(t, true)
 		for i := 0; i < cap(e.fallback); i++ {
 			e.fallback <- pj
 		}
@@ -257,6 +258,20 @@ func TestEnqueueJobPaths(t *testing.T) {
 		}
 		if !pj.finishing {
 			t.Error("dropped job must be finishing")
+		}
+		// Overflow used to vanish silently; the server must see a busy
+		// signal instead (issue 5163).
+		select {
+		case res := <-out.items:
+			var agentErr pb.AgentError
+			if err := proto.Unmarshal(res.protoPayload, &agentErr); err != nil {
+				t.Fatalf("rejection decode: %v", err)
+			}
+			if agentErr.JobId != "ping-job" || agentErr.Message == "" {
+				t.Errorf("rejection = %+v", &agentErr)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("fallback overflow queued no rejection notice")
 		}
 	})
 
@@ -279,8 +294,8 @@ func TestEnqueueJobPaths(t *testing.T) {
 }
 
 func TestExecPingRound(t *testing.T) {
-	orig := execPing
-	t.Cleanup(func() { execPing = orig })
+	orig := execPingSeries
+	t.Cleanup(func() { execPingSeries = orig })
 
 	t.Run("cancelled job is cleaned up", func(t *testing.T) {
 		e, pj, _ := newTestPingJob(t, true)
@@ -304,13 +319,11 @@ func TestExecPingRound(t *testing.T) {
 		e.live[pj] = struct{}{}
 		done := make(chan struct{}, 1)
 		pj.done = func() { done <- struct{}{} }
-		call := 0
-		execPing = func(ctx context.Context, ip string, timeoutMs int) (float64, error) {
-			call++
-			if call <= replies {
-				return 1.5, nil
+		execPingSeries = func(ctx context.Context, ip string, count, timeoutMs int) (int, float64, error) {
+			if replies == 0 {
+				return 0, 0, errors.New("timeout")
 			}
-			return 0, errors.New("timeout")
+			return replies, 1.5, nil
 		}
 		e.execPingRound(pj)
 		select {
@@ -349,32 +362,32 @@ func TestExecPingRound(t *testing.T) {
 		e, pj, _ := newTestPingJob(t, true)
 		e.live[pj] = struct{}{}
 		pj.finishing = true
-		execPing = func(ctx context.Context, ip string, timeoutMs int) (float64, error) {
-			return 1, nil
+		execPingSeries = func(ctx context.Context, ip string, count, timeoutMs int) (int, float64, error) {
+			return 0, 0, errors.New("not reached")
 		}
 		e.execPingRound(pj)
 	})
 }
 
 func TestPingJobZeroProbeTimeout(t *testing.T) {
-	orig := execPing
-	t.Cleanup(func() { execPing = orig })
+	orig := execPingSeries
+	t.Cleanup(func() { execPingSeries = orig })
 	e, pj, _ := newTestPingJob(t, true)
 	e.live[pj] = struct{}{}
-	pj.timeoutMs = 1 // 1/3 = 0 → clamped to 1
+	pj.timeoutMs = 1 // the job's own deadline bounds the subprocess
 	got := make(chan int, 4)
-	execPing = func(ctx context.Context, ip string, timeoutMs int) (float64, error) {
+	execPingSeries = func(ctx context.Context, ip string, count, timeoutMs int) (int, float64, error) {
 		got <- timeoutMs
-		return 0, errors.New("x")
+		return 0, 0, errors.New("x")
 	}
 	e.execPingRound(pj)
 	select {
 	case ms := <-got:
 		if ms != 1 {
-			t.Errorf("probeTimeoutMs = %d, want 1", ms)
+			t.Errorf("timeoutMs = %d, want 1", ms)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("execPing not called")
+		t.Fatal("execPingSeries not called")
 	}
 }
 
@@ -614,5 +627,58 @@ func TestExpireProbeLockedFinishingJob(t *testing.T) {
 	e.mu.Unlock()
 	if pj.probes[0].checked {
 		t.Error("finishing job's probe was resolved")
+	}
+}
+
+// A batch of dead devices must not starve healthy ones behind a single
+// exec-ping worker: the fallback runs a small pool (issue 5163).
+func TestFallbackWorkersDoNotSerialize(t *testing.T) {
+	e := newPingEngine(context.Background())
+	out := newResultQueueForAgentBytes(context.Background(), 1<<20)
+
+	releaseBlocked := make(chan struct{})
+	defer func() {
+		close(releaseBlocked)
+		e.cancel()
+		e.wg.Wait()
+	}()
+	orig := execPingSeries
+	t.Cleanup(func() { execPingSeries = orig })
+	execPingSeries = func(ctx context.Context, ip string, count, timeoutMs int) (int, float64, error) {
+		if strings.HasPrefix(ip, "10.255.") {
+			<-releaseBlocked
+			return 0, 0, errors.New("down")
+		}
+		return count, 1.0, nil
+	}
+
+	e.wg.Add(pingFallbackWorkers)
+	for range pingFallbackWorkers {
+		go e.runFallback()
+	}
+
+	results := make(chan struct{}, 5)
+	for i := 0; i < pingFallbackWorkers-1; i++ {
+		_, pj, _ := newTestPingJob(t, true)
+		pj.out = out
+		pj.ip = net.ParseIP("10.255.0.1")
+		pj.job.SnmpDevice.Ip = "10.255.0.1"
+		pj.done = func() {}
+		e.enqueueJob(pj)
+	}
+	for i := 0; i < 5; i++ {
+		_, pj, _ := newTestPingJob(t, true)
+		pj.out = out
+		pj.done = func() { results <- struct{}{} }
+		e.enqueueJob(pj)
+	}
+
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < 5; i++ {
+		select {
+		case <-results:
+		case <-deadline:
+			t.Fatalf("healthy ping result %d of 5 never completed behind blocked exec pings", i+1)
+		}
 	}
 }

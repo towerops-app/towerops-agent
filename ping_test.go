@@ -2144,3 +2144,34 @@ func TestPingCommandOutputUsesPingChildEnv(t *testing.T) {
 		t.Errorf("child env ignored pingChildEnv; output:\n%s", out)
 	}
 }
+
+func TestParsePingSeries(t *testing.T) {
+	iputils := "PING 10.0.0.1 (10.0.0.1) 56(84) bytes of data.\n" +
+		"64 bytes from 10.0.0.1: icmp_seq=1 ttl=64 time=0.031 ms\n" +
+		"64 bytes from 10.0.0.1: icmp_seq=3 ttl=64 time=0.040 ms\n" +
+		"\n" +
+		"--- 10.0.0.1 ping statistics ---\n" +
+		"3 packets transmitted, 2 received, 33.3333% packet loss, time 402ms\n" +
+		"rtt min/avg/max/mdev = 0.031/0.035/0.040/0.004 ms\n"
+	replies, rtt, err := parsePingSeries(iputils, 3)
+	if err != nil || replies != 2 || rtt != 0.031 {
+		t.Errorf("iputils: replies=%d rtt=%v err=%v, want 2/0.031/nil", replies, rtt, err)
+	}
+
+	busybox := "PING 10.0.0.1 (10.0.0.1): 56 data bytes\n" +
+		"64 bytes from 10.0.0.1: seq=0 ttl=64 time<1 ms\n" +
+		"64 bytes from 10.0.0.1: seq=1 ttl=64 time=0.9 ms\n" +
+		"64 bytes from 10.0.0.1: seq=2 ttl=64 time=0.8 ms\n" +
+		"\n" +
+		"--- 10.0.0.1 ping statistics ---\n" +
+		"3 packets transmitted, 3 packets received, 0% packet loss\n"
+	replies, rtt, err = parsePingSeries(busybox, 3)
+	// The first reply is a BusyBox "time<1 ms", which reports as 0 ms.
+	if err != nil || replies != 3 || rtt != 0 {
+		t.Errorf("busybox: replies=%d rtt=%v err=%v, want 3/0/nil", replies, rtt, err)
+	}
+
+	if _, _, err := parsePingSeries("connect: Network is unreachable\n", 3); err == nil {
+		t.Error("zero-reply output must report an error")
+	}
+}
