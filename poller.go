@@ -171,7 +171,9 @@ func (p *processPoller) connected() {
 
 // disconnected starts the disconnect grace countdown. Called only after a
 // session that used the poller ended; the next session can still attach and
-// cancel the timer.
+// cancel the timer. A countdown already running keeps counting: the retry
+// loop calls this after every failed attempt, so re-arming here would let
+// the grace never expire while the agent keeps trying (issue 5150).
 func (p *processPoller) disconnected() {
 	if !p.attached.Load() {
 		return
@@ -180,7 +182,7 @@ func (p *processPoller) disconnected() {
 	p.graceMu.Lock()
 	defer p.graceMu.Unlock()
 	if p.graceTimer != nil {
-		p.graceTimer.Stop()
+		return
 	}
 	p.graceTimer = time.AfterFunc(grace, func() {
 		slog.Warn("disconnect grace expired, stopping scheduled polling",

@@ -497,13 +497,11 @@ func TestRuntimeSettingDefaults(t *testing.T) {
 	}
 }
 
-func TestPollerGraceTimerRestart(t *testing.T) {
-	// Shrink the grace so the AfterFunc body actually fires: it logs the
-	// expiry and runs the full poller stop path.
+func TestPollerGraceTimerDoesNotRestart(t *testing.T) {
+	// Pin a long grace so the armed timer cannot fire while the test
+	// inspects it; expiry is driven explicitly below.
 	configureAgentRuntime(agentRuntimeConfig{
-		SNMPDeviceRate:   50,
-		ResultSpoolBytes: 64 << 20,
-		DisconnectGrace:  20 * time.Millisecond,
+		DisconnectGrace: time.Hour,
 	})
 	t.Cleanup(func() {
 		configureAgentRuntime(agentRuntimeConfig{
@@ -521,10 +519,21 @@ func TestPollerGraceTimerRestart(t *testing.T) {
 		stopDone:     make(chan struct{}),
 	}
 	p.attached.Store(true)
-	// Pre-arm a stale timer so the first call hits the Stop arm too.
-	p.graceTimer = time.AfterFunc(time.Hour, func() {})
 	p.disconnected()
+	armed := p.graceTimer
+	if armed == nil {
+		t.Fatal("first disconnect must arm the grace countdown")
+	}
+	// The retry loop calls disconnected() after every failed attempt; the
+	// countdown must keep the original deadline rather than restarting, or
+	// the grace never expires while the agent keeps trying (issue 5150).
 	p.disconnected()
+	if p.graceTimer != armed {
+		t.Fatal("second disconnect restarted the grace countdown")
+	}
+	// The countdown still runs the expiry path: advancing the armed timer
+	// stops the poller.
+	armed.Reset(time.Millisecond)
 	select {
 	case <-p.stopDone:
 	case <-time.After(3 * time.Second):

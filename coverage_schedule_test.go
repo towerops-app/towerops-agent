@@ -349,8 +349,8 @@ func TestPollerLifecycle(t *testing.T) {
 	// A nil update is ignored.
 	poller.applyInventoryUpdate(nil, results)
 
-	// Disconnected twice: the second call replaces the timer. The poller must
-	// be attached first or disconnected() is a no-op.
+	// Disconnected twice: the second call keeps the armed countdown (issue
+	// 5150). The poller must be attached first or disconnected() is a no-op.
 	poller.connected()
 	poller.disconnected()
 	poller.disconnected()
