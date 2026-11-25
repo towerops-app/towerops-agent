@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -473,5 +474,95 @@ func TestCollectUbntRepliesCapsPeers(t *testing.T) {
 	}
 	if !truncated {
 		t.Fatal("an over-cap sweep was not reported as truncated")
+	}
+}
+
+// A full spool must not drop the whole sweep: send retries with a minimal,
+// all-agent-generated result (issue 5160).
+func TestExecuteUbntDiscoveryFallsBackWhenSpoolFull(t *testing.T) {
+	out := newResultQueue(1)
+	if !out.enqueue(outbound{event: "filler"}) {
+		t.Fatal("seed enqueue failed")
+	}
+
+	executeUbntDiscovery(context.Background(), &pb.AgentJob{
+		JobId:         "u-full",
+		JobType:       pb.JobType_UBNT_DISCOVERY,
+		UbntDiscovery: &pb.UbntDiscoveryJob{Target: "127.0.0.1", CollectMs: 20},
+	}, out)
+
+	if got := len(out.items); got != 1 {
+		t.Fatalf("queue holds %d items, want only the filler after two failed sends", got)
+	}
+}
+
+// A sweep that hits the peer cap reports the truncation on the result the
+// server sees (issue 5160).
+func TestExecuteUbntDiscoveryReportsTruncation(t *testing.T) {
+	orig := ubntMaxPeersPerSweep
+	ubntMaxPeersPerSweep = 1
+	t.Cleanup(func() { ubntMaxPeersPerSweep = orig })
+
+	responder, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("responder listen: %v", err)
+	}
+	defer func() { _ = responder.Close() }()
+	port := responder.LocalAddr().(*net.UDPAddr).Port
+
+	go func() {
+		buf := make([]byte, 64)
+		n, src, err := responder.ReadFromUDP(buf)
+		if err != nil || n < len(ubntDiscoveryRequest) {
+			return
+		}
+		for i := byte(0); i < 2; i++ {
+			_, _ = responder.WriteToUDP(ubntReply(
+				ubntTLV(ubntTLVMAC, ubntTestMAC(0xdc, 0x9f, 0xdb, 0x12, 0x34, i)),
+			), src)
+		}
+	}()
+
+	out := testQueue()
+	executeUbntDiscovery(context.Background(), &pb.AgentJob{
+		JobId:         "u-trunc",
+		JobType:       pb.JobType_UBNT_DISCOVERY,
+		UbntDiscovery: &pb.UbntDiscoveryJob{Target: "127.0.0.1", Port: uint32(port), CollectMs: 60},
+	}, out)
+
+	result := wantResult[*pb.UbntDiscoveryResult](t, out, "ubnt_discovery_result", 2*time.Second)
+	if !strings.Contains(result.ErrorMessage, "peer list capped at 1") {
+		t.Fatalf("truncated sweep error = %q, want a cap notice", result.ErrorMessage)
+	}
+}
+
+// Two replies keyed to the same peer collapse to one row (issue 5160).
+func TestRunUbntProbeDedupesPeerKey(t *testing.T) {
+	responder, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("responder listen: %v", err)
+	}
+	defer func() { _ = responder.Close() }()
+	port := responder.LocalAddr().(*net.UDPAddr).Port
+
+	go func() {
+		buf := make([]byte, 64)
+		n, src, err := responder.ReadFromUDP(buf)
+		if err != nil || n < len(ubntDiscoveryRequest) {
+			return
+		}
+		for i := 0; i < 2; i++ {
+			_, _ = responder.WriteToUDP(ubntReply(
+				ubntTLV(ubntTLVMAC, ubntTestMAC(0xdc, 0x9f, 0xdb, 0x12, 0x34, 0x56)),
+			), src)
+		}
+	}()
+
+	peers, _, err := runUbntProbe(context.Background(), "127.0.0.1", port, 200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if len(peers) != 1 {
+		t.Fatalf("expected 1 deduped peer, got %d", len(peers))
 	}
 }
