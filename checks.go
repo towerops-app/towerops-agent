@@ -638,11 +638,14 @@ func resolverForServer(server string, timeout time.Duration) *net.Resolver {
 }
 
 // executeSSLCheck connects via TLS and applies the certificate status policy.
-// Operational failures before a certificate can be evaluated, including root
-// store, connection, handshake, non-TLS, and no-certificate failures, are
-// UNKNOWN. Expired, not-yet-valid, untrusted, and hostname-mismatched
-// certificates are CRITICAL. A trusted certificate inside warning_days is
-// WARNING; every other trusted certificate is OK.
+// Connection, timeout, handshake, non-TLS, and no-certificate failures mean
+// the monitored service is down, so they are CRITICAL, matching the cloud
+// executor and this agent's TCP check (issue 5140). UNKNOWN is reserved for
+// faults local to the agent that say nothing about the target: the empty
+// host guard, a root store load failure, and a cancelled session context.
+// Expired, not-yet-valid, untrusted, and hostname-mismatched certificates
+// are CRITICAL. A trusted certificate inside warning_days is WARNING; every
+// other trusted certificate is OK.
 func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs uint32) (uint32, string) {
 	// An empty host would dial ":port" on the local system and grade the
 	// agent host's own certificate.
@@ -684,17 +687,22 @@ func executeSSLCheck(ctx context.Context, config *pb.SslCheckConfig, timeoutMs u
 		if errors.Is(err, errPrivateTarget) {
 			return checkCritical, errPrivateTarget.Error()
 		}
-		return checkUnknown, fmt.Sprintf("Connection failed: %v", err)
+		if ctx.Err() != nil {
+			// The session went away mid-check; the error says nothing about
+			// the target.
+			return checkUnknown, fmt.Sprintf("Connection failed: %v", err)
+		}
+		return checkCritical, fmt.Sprintf("Connection failed: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
 
 	tlsConn, ok := conn.(*tls.Conn)
 	if !ok {
-		return checkUnknown, "Connection did not negotiate TLS"
+		return checkCritical, "Connection did not negotiate TLS"
 	}
 	certs := tlsConn.ConnectionState().PeerCertificates
 	if len(certs) == 0 {
-		return checkUnknown, fmt.Sprintf("No certificate presented by %s:%d", host, port)
+		return checkCritical, fmt.Sprintf("No certificate presented by %s:%d", host, port)
 	}
 
 	now := time.Now()
