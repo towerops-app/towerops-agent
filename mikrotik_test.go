@@ -246,25 +246,6 @@ func TestMikrotikMalformedTextRemainsDeliverable(t *testing.T) {
 	}
 }
 
-func TestMikrotikLegacyBackupMalformedTextRemainsDeliverable(t *testing.T) {
-	originalBackup := sshBackup
-	sshBackup = func(context.Context, string, uint16, string, string) (string, error) { return "# bad\xfftext", nil }
-	t.Cleanup(func() { sshBackup = originalBackup })
-	out := testQueue()
-	executeMikrotikJob(context.Background(), &pb.AgentJob{
-		JobId: "backup:utf8", MikrotikDevice: &pb.MikrotikDevice{Ip: "192.0.2.1"},
-	}, out)
-	select {
-	case queued := <-out.items:
-		result := decodeQueuedResult[*pb.MikrotikResult](t, queued)
-		if got := result.Sentences[0].Attributes["config"]; got != "# bad\uFFFDtext" {
-			t.Fatalf("backup = %q, want sanitized text", got)
-		}
-	default:
-		t.Fatal("legacy backup text made the result undeliverable")
-	}
-}
-
 func TestMikrotikEmptyTrapMessageIsFailure(t *testing.T) {
 	stream := bytes.NewBuffer(append(encodeSentence([]string{"!trap", "=message="}), encodeSentence([]string{"!done"})...))
 	client := &mikrotikClient{conn: &nopCloser{readWriter: stream}}
@@ -1722,31 +1703,6 @@ func TestCompareMikrotikArgKeys(t *testing.T) {
 		if got := compareMikrotikArgKeys(tc.a, tc.b); got != tc.want {
 			t.Errorf("compareMikrotikArgKeys(%q, %q) = %d, want %d", tc.a, tc.b, got, tc.want)
 		}
-	}
-}
-
-func TestExecuteMikrotikBackupViaSSHDefaultsPort(t *testing.T) {
-	orig := sshBackup
-	defer func() { sshBackup = orig }()
-
-	var gotPort uint16
-	sshBackup = func(_ context.Context, _ string, port uint16, _, _ string) (string, error) {
-		gotPort = port
-		return "config", nil
-	}
-
-	out := newResultQueue(1)
-	executeMikrotikBackupViaSSH(context.Background(), &pb.AgentJob{
-		JobId:    "backup:1",
-		DeviceId: "dev-1",
-	}, &pb.MikrotikDevice{Ip: "192.0.2.1"}, out, time.Now().Unix())
-
-	if gotPort != 22 {
-		t.Fatalf("ssh port = %d, want 22", gotPort)
-	}
-	result := decodeQueuedResult[*pb.MikrotikResult](t, <-out.items)
-	if result.Error != "" {
-		t.Fatalf("unexpected error: %s", result.Error)
 	}
 }
 

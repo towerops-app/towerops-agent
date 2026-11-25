@@ -576,7 +576,7 @@ func TestHmSaveSuccessWritesAtomically(t *testing.T) {
 }
 
 // TestHostKeyStorePinnedKeyAlgorithm covers the typed store entry that lets
-// executeMikrotikBackupContext pin HostKeyAlgorithms: first-use records the
+// configBackupDial pin HostKeyAlgorithms: first-use records the
 // presented key type, legacy and untyped entries yield "" until a successful
 // verify migrates them, and a nil store is safe for pre-init calls.
 func TestHostKeyStorePinnedKeyAlgorithm(t *testing.T) {

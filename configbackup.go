@@ -86,8 +86,7 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 // Bytes returns the retained prefix, at most limit bytes.
 func (b *boundedBuffer) Bytes() []byte { return b.buf.Bytes() }
 
-// configBackupDialTimeout is a var so tests can shrink the dial budget, the
-// same way ssh_test.go shrinks sshBackupTimeout.
+// configBackupDialTimeout is a var so tests can shrink the dial budget.
 var configBackupDialTimeout = 15 * time.Second
 
 // configBackupVendor is implemented per vendor. Both methods return a result
