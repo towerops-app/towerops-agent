@@ -597,9 +597,7 @@ func (e *pingEngine) execPingRound(pj *pingJob) {
 	// engine uses. The job context bounds the whole round, so a round can
 	// never outlive the configured timeout the way sequential per-probe
 	// waits could.
-	ctx, cancel := context.WithDeadline(pj.ctx, pj.deadline)
-	defer cancel()
-	replies, firstRTT, err := execPingSeries(ctx, pj.job.SnmpDevice.Ip, pingProbeCount, pj.timeoutMs)
+	replies, firstRTT, err := execPingSeries(pj.ctx, pj.job.SnmpDevice.Ip, pingProbeCount, pj.timeoutMs)
 	if err == nil {
 		pj.replies = replies
 		pj.firstRTT = firstRTT
