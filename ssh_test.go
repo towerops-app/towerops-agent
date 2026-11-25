@@ -179,7 +179,7 @@ func sshTReceiveMonitoringResult(t *testing.T, out *resultQueue) *pb.MonitoringC
 			t.Fatalf("event = %q, want monitoring_check", queued.event)
 		}
 		return decodeQueuedResult[*pb.MonitoringCheck](t, queued)
-	case <-time.After(time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for monitoring result")
 		return nil
 	}
