@@ -86,6 +86,8 @@ func writerSupportsColor(w io.Writer) bool {
 // and counted, the same policy as the result spool, and the total is
 // reported when the writer closes.
 type asyncLineWriter struct {
+	mu      sync.RWMutex
+	closed  bool
 	ch      chan []byte
 	done    chan struct{}
 	w       io.Writer
@@ -114,17 +116,19 @@ func (a *asyncLineWriter) pump() {
 	}
 }
 
-// Write never blocks and never fails: a full queue drops the line. A send
-// against an already-closed queue (a stray slog call after Close, e.g. from
-// a parallel test) is recovered and counted as a drop instead of panicking.
+// Write never blocks and never fails: a full queue drops the line. The
+// read lock keeps the send from racing Close: a writer that arrives after
+// Close holds the write lock takes the drop path instead of sending on a
+// closed channel.
 func (a *asyncLineWriter) Write(p []byte) (n int, err error) {
 	buf := make([]byte, len(p))
 	copy(buf, p)
-	defer func() {
-		if recover() != nil {
-			a.dropped.Add(1)
-		}
-	}()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.closed {
+		a.dropped.Add(1)
+		return len(p), nil
+	}
 	select {
 	case a.ch <- buf:
 	default:
@@ -136,7 +140,12 @@ func (a *asyncLineWriter) Write(p []byte) (n int, err error) {
 // Close drains the queue and reports how many lines an overloaded log
 // driver caused the agent to drop.
 func (a *asyncLineWriter) Close() {
-	close(a.ch)
+	a.mu.Lock()
+	if !a.closed {
+		a.closed = true
+		close(a.ch)
+	}
+	a.mu.Unlock()
 	<-a.done
 	if dropped := a.dropped.Load(); dropped > 0 {
 		_, _ = fmt.Fprintf(a.w, "log writer dropped %d lines (log driver blocked)\n", dropped)

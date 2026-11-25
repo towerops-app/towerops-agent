@@ -22,7 +22,17 @@ const (
 	defaultSNMPRetries        = 1
 	snmpSilentProbeTimeout    = 2 * time.Second
 	snmpSessionIdleTimeout    = 5 * time.Minute
-	oidSNMPsysUpTime          = "1.3.6.1.2.1.1.3.0"
+	// snmpDeviceStateIdleTTL bounds how long an untouched device entry lives:
+	// credential probes key state by address, so without eviction every
+	// probed address accretes a permanent entry (issue 5158).
+	snmpDeviceStateIdleTTL = 30 * time.Minute
+	// snmpAdaptiveRecoverAfter is the count of consecutive clean exchanges
+	// that steps a degraded batch size back up.
+	snmpAdaptiveRecoverAfter = 4
+	// snmpAdaptiveCeilingTTL keeps the last failed size a soft ceiling on
+	// recovery growth; once it expires the size may climb past it.
+	snmpAdaptiveCeilingTTL = 10 * time.Minute
+	oidSNMPsysUpTime       = "1.3.6.1.2.1.1.3.0"
 
 	// snmpPingHintMaxAge bounds how long a ping outcome may suppress silent
 	// recovery probes: a hint from a long-abandoned or cancelled round must
@@ -89,6 +99,19 @@ type snmpDeviceState struct {
 	rtt               time.Duration
 	getBatchSize      int
 	bulkMaxRepetition uint32
+	// Adaptive sizes only shrink today; these fields drive the recovery.
+	// Clean counters grow a degraded size after snmpAdaptiveRecoverAfter
+	// consecutive successes, while the last size that failed stays a soft
+	// ceiling until snmpAdaptiveCeilingTTL passes (issue 5158).
+	getCleanBatches  int
+	getFailCeiling   int
+	getFailAt        time.Time
+	bulkCleanReplies int
+	bulkFailCeiling  uint32
+	bulkFailAt       time.Time
+	// lastSeen stamps the last job that used this state; idle entries are
+	// evicted so probe-only addresses and removed devices do not accrete.
+	lastSeen time.Time
 
 	sessionMu sync.Mutex
 	session   *snmpCachedSession
@@ -99,6 +122,7 @@ func newSNMPDeviceState(rate float64) *snmpDeviceState {
 		limiter:           newTokenBucket(rate, nil),
 		getBatchSize:      snmpMaxOIDsPerGet,
 		bulkMaxRepetition: snmpMaxRepetitions,
+		lastSeen:          time.Now(),
 	}
 }
 
@@ -172,13 +196,57 @@ func (s *snmpDeviceState) getSize() int {
 	return s.getBatchSize
 }
 
+// rememberGETSize ratchets the batch size down to a size that just worked.
+// It never grows the size: recovery moves back up on clean-batch evidence,
+// which is the only way a one-off loss does not pin the device small.
 func (s *snmpDeviceState) rememberGETSize(size int) {
 	if size <= 0 || size > snmpMaxOIDsPerGet {
 		return
 	}
 	s.mu.Lock()
-	s.getBatchSize = size
+	s.getBatchSize = min(s.getBatchSize, size)
 	s.mu.Unlock()
+}
+
+// noteGetFailure records the batch size that timed out or came back tooBig.
+// The failed size stays a soft ceiling on recovery so growth cannot walk
+// straight back into the request that failed.
+func (s *snmpDeviceState) noteGetFailure(size int) {
+	if size <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getCleanBatches = 0
+	s.getFailCeiling = size
+	s.getFailAt = time.Now()
+}
+
+// noteGetBatchOK counts one cleanly answered GET batch. After
+// snmpAdaptiveRecoverAfter in a row the batch size steps halfway back toward
+// the remaining headroom, staying below the failed size until it expires.
+func (s *snmpDeviceState) noteGetBatchOK() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.getBatchSize >= snmpMaxOIDsPerGet {
+		return
+	}
+	s.getCleanBatches++
+	if s.getCleanBatches < snmpAdaptiveRecoverAfter {
+		return
+	}
+	s.getCleanBatches = 0
+	ceiling := s.getCeilingAtLocked(time.Now())
+	s.getBatchSize = min(ceiling, s.getBatchSize+max(1, (ceiling-s.getBatchSize)/2))
+}
+
+// getCeilingAtLocked is the largest batch size growth may reach: one below
+// the last failed size while that failure is fresh, the default afterwards.
+func (s *snmpDeviceState) getCeilingAtLocked(now time.Time) int {
+	if s.getFailCeiling > 1 && now.Sub(s.getFailAt) < snmpAdaptiveCeilingTTL {
+		return min(snmpMaxOIDsPerGet, s.getFailCeiling-1)
+	}
+	return snmpMaxOIDsPerGet
 }
 
 func (s *snmpDeviceState) bulkRepetitions() uint32 {
@@ -187,24 +255,38 @@ func (s *snmpDeviceState) bulkRepetitions() uint32 {
 	return s.bulkMaxRepetition
 }
 
-func (s *snmpDeviceState) noteTooBig() uint32 {
+// noteBulkTooBig halves the remembered max-repetitions after a tooBig and
+// keeps the failed request size as a soft ceiling on later recovery.
+func (s *snmpDeviceState) noteBulkTooBig(requested uint32) uint32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.bulkMaxRepetition > 1 {
-		s.bulkMaxRepetition /= 2
-	}
+	s.bulkCleanReplies = 0
+	s.bulkFailCeiling = requested
+	s.bulkFailAt = time.Now()
+	halved := max(1, requested/2)
+	s.bulkMaxRepetition = min(s.bulkMaxRepetition, halved)
 	return s.bulkMaxRepetition
 }
 
-func (s *snmpDeviceState) noteBulkRows(rows int) {
-	if rows <= 0 {
-		return
-	}
+// noteBulkFull counts a GETBULK reply that filled every requested row: the
+// device demonstrably takes more than it is being given. After
+// snmpAdaptiveRecoverAfter in a row, max-repetitions steps halfway back to
+// the ceiling so a device that degraded once does not stay small forever.
+func (s *snmpDeviceState) noteBulkFull() uint32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if uint32(rows) > s.bulkMaxRepetition {
-		s.bulkMaxRepetition = min(64, uint32(rows))
+	const hardCeiling = 64
+	s.bulkCleanReplies++
+	if s.bulkCleanReplies < snmpAdaptiveRecoverAfter || s.bulkMaxRepetition >= hardCeiling {
+		return s.bulkMaxRepetition
 	}
+	s.bulkCleanReplies = 0
+	ceiling := uint32(hardCeiling)
+	if s.bulkFailCeiling > 1 && time.Since(s.bulkFailAt) < snmpAdaptiveCeilingTTL {
+		ceiling = min(ceiling, s.bulkFailCeiling-1)
+	}
+	s.bulkMaxRepetition = min(ceiling, s.bulkMaxRepetition+max(1, (ceiling-s.bulkMaxRepetition)/2))
+	return s.bulkMaxRepetition
 }
 
 // snmpEngine is deliberately independent of worker pools. The scheduler owns
@@ -244,6 +326,7 @@ func (e *snmpEngine) state(job *pb.AgentJob) *snmpDeviceState {
 		state = newSNMPDeviceState(e.deviceRate)
 		e.devices[key] = state
 	}
+	state.touch()
 	return state
 }
 
@@ -362,6 +445,29 @@ func closeSNMPAfterJob(ctx context.Context, q snmpQuerier, closeFn func()) func(
 	return closeOnCancellation(ctx, closeFn)
 }
 
+func (s *snmpDeviceState) touch() {
+	s.mu.Lock()
+	s.lastSeen = time.Now()
+	s.mu.Unlock()
+}
+
+// evictable reports whether the entry may leave the device map: no cached
+// session is held and no job has used it within the TTL.
+func (s *snmpDeviceState) evictable(now time.Time, ttl time.Duration) bool {
+	if !s.sessionMu.TryLock() {
+		// A running job owns the session; never stall maintenance behind it.
+		return false
+	}
+	hasSession := s.session != nil
+	s.sessionMu.Unlock()
+	if hasSession {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return now.Sub(s.lastSeen) >= ttl
+}
+
 func (s *snmpDeviceState) closeIdle(now time.Time, all bool) {
 	if all {
 		s.sessionMu.Lock()
@@ -381,7 +487,11 @@ func (s *snmpDeviceState) closeIdle(now time.Time, all bool) {
 func (e *snmpEngine) expireSessions(now time.Time, all bool) {
 	e.mu.Lock()
 	states := make([]*snmpDeviceState, 0, len(e.devices))
-	for _, state := range e.devices {
+	for key, state := range e.devices {
+		if !all && state.evictable(now, snmpDeviceStateIdleTTL) {
+			delete(e.devices, key)
+			continue
+		}
 		states = append(states, state)
 	}
 	e.mu.Unlock()

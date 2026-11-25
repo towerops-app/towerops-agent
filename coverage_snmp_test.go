@@ -80,15 +80,23 @@ func TestSNMPDeviceStateTuners(t *testing.T) {
 	if got := s.getSize(); got != 7 {
 		t.Errorf("batch size = %d", got)
 	}
-	if got := s.noteTooBig(); got != s.bulkMaxRepetition {
-		t.Errorf("noteTooBig = %d", got)
+	if got := s.noteBulkTooBig(25); got != s.bulkMaxRepetition {
+		t.Errorf("noteBulkTooBig = %d", got)
 	}
 	s.bulkMaxRepetition = 1
-	if got := s.noteTooBig(); got != 1 {
-		t.Error("noteTooBig must floor at 1")
+	if got := s.noteBulkTooBig(1); got != 1 {
+		t.Error("noteBulkTooBig must floor at 1")
 	}
-	s.noteBulkRows(0)
-	s.noteBulkRows(200)
+	s.bulkMaxRepetition = 60
+	for i := 0; i < snmpAdaptiveRecoverAfter; i++ {
+		s.noteBulkFull()
+	}
+	if s.bulkMaxRepetition <= 60 {
+		t.Errorf("full replies must grow repetitions above 60, got %d", s.bulkMaxRepetition)
+	}
+	for i := 0; i < snmpAdaptiveRecoverAfter*4; i++ {
+		s.noteBulkFull()
+	}
 	if s.bulkMaxRepetition != 64 {
 		t.Errorf("bulk repetition clamp = %d, want 64", s.bulkMaxRepetition)
 	}

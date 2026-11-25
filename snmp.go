@@ -751,7 +751,7 @@ func isSnmpV1(version string) bool { return version == "1" || version == "v1" }
 // "object absent" from "OID outside the credential's view" — both read as
 // noSuchObject/noSuchInstance (v1: noSuchName) — so the caller must surface
 // the absent count: a scoped credential otherwise prunes rows silently.
-func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[string]string) (absent int, err error) {
+func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, state *snmpDeviceState, oids []string, into map[string]string) (absent int, err error) {
 	// Copy only when an indexed removal first needs to modify this batch.
 	// Subsequent removals reuse that buffer; every retry strictly shrinks.
 	owned := false
@@ -805,9 +805,18 @@ func snmpGetInto(conn snmpQuerier, dev *pb.SnmpDevice, oids []string, into map[s
 				return absent, nil
 			}
 			slog.Debug("snmp get batch split", "device", dev.Ip, "batch_size", len(oids), "status", result.Error, "error_index", result.ErrorIndex)
+			if state != nil && result.Error == gosnmp.TooBig {
+				// The batch itself was too large: remember both the failed
+				// size and, once the halves land, the largest one that
+				// worked, so later ticks skip straight to it (issue 5158).
+				state.noteGetFailure(len(oids))
+			}
 			mid := len(oids) / 2
-			loAbsent, loErr := snmpGetInto(conn, dev, oids[:mid], into)
-			hiAbsent, hiErr := snmpGetInto(conn, dev, oids[mid:], into)
+			loAbsent, loErr := snmpGetInto(conn, dev, state, oids[:mid], into)
+			hiAbsent, hiErr := snmpGetInto(conn, dev, state, oids[mid:], into)
+			if state != nil && result.Error == gosnmp.TooBig && loErr == nil && hiErr == nil {
+				state.rememberGETSize(mid)
+			}
 			return absent + loAbsent + hiAbsent, errors.Join(loErr, hiErr)
 		default:
 			return absent, snmpGetError(oids, time.Since(started), fmt.Errorf("status %s at index %d", result.Error, result.ErrorIndex))
@@ -933,7 +942,7 @@ func readSystemGroup(ctx context.Context, job *pb.AgentJob, failure string) (map
 	}
 
 	values := systemValues(packet)
-	_, _ = snmpGetInto(conn, job.SnmpDevice, []string{oidSysObjectID, oidSysName}, values)
+	_, _ = snmpGetInto(conn, job.SnmpDevice, nil, []string{oidSysObjectID, oidSysName}, values)
 	return values, nil
 }
 

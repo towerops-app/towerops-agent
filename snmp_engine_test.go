@@ -280,3 +280,82 @@ func TestWaitSNMPBucketsReportsWaitMetric(t *testing.T) {
 		t.Fatal("millisecond heartbeat value lost the recorded wait")
 	}
 }
+
+// A degraded GET batch size must recover on clean-batch evidence, staying
+// below the last failed size while that failure is fresh (issue 5158).
+func TestSNMPGetBatchSizeRecovers(t *testing.T) {
+	state := newSNMPDeviceState(defaultSNMPDevicePDURate)
+	state.noteGetFailure(snmpMaxOIDsPerGet)
+	state.rememberGETSize(2)
+	if got := state.getSize(); got != 2 {
+		t.Fatalf("getSize = %d after rememberGETSize(2), want 2", got)
+	}
+	for i := 0; i < snmpAdaptiveRecoverAfter; i++ {
+		state.noteGetBatchOK()
+	}
+	if got := state.getSize(); got <= 2 || got >= snmpMaxOIDsPerGet {
+		t.Fatalf("getSize = %d after clean batches, want a step up still under %d", got, snmpMaxOIDsPerGet)
+	}
+	for i := 0; i < snmpAdaptiveRecoverAfter*6; i++ {
+		state.noteGetBatchOK()
+	}
+	if got := state.getSize(); got >= snmpMaxOIDsPerGet {
+		t.Fatalf("getSize = %d reached the failed %d before the ceiling expired", got, snmpMaxOIDsPerGet)
+	}
+	state.getFailAt = time.Now().Add(-snmpAdaptiveCeilingTTL - time.Second)
+	for i := 0; i < snmpAdaptiveRecoverAfter*6; i++ {
+		state.noteGetBatchOK()
+	}
+	if got := state.getSize(); got != snmpMaxOIDsPerGet {
+		t.Fatalf("getSize = %d after ceiling expiry, want %d", got, snmpMaxOIDsPerGet)
+	}
+}
+
+// Device entries that no job has touched within the idle TTL are evicted so
+// probe-only addresses and removed devices do not accrete (issue 5158).
+func TestSNMPDeviceStateEvictedWhenIdle(t *testing.T) {
+	job := &pb.AgentJob{DeviceId: "evict-me", SnmpDevice: &pb.SnmpDevice{Ip: "10.9.8.7"}}
+	state := defaultSNMPEngine.state(job)
+	t.Cleanup(func() { resetSNMPDeviceState(job) })
+
+	state.lastSeen = time.Now().Add(-snmpDeviceStateIdleTTL - time.Second)
+	defaultSNMPEngine.expireSessions(time.Now(), false)
+
+	key := snmpStateKey(job)
+	defaultSNMPEngine.mu.Lock()
+	_, kept := defaultSNMPEngine.devices[key]
+	defaultSNMPEngine.mu.Unlock()
+	if kept {
+		t.Error("idle device state was not evicted")
+	}
+}
+
+// evictable must never evict under a running job or a cached session, and
+// noteGetFailure must ignore a non-positive size (issue 5158).
+func TestSNMPDeviceStateEvictableGuards(t *testing.T) {
+	state := newSNMPDeviceState(defaultSNMPDevicePDURate)
+	state.mu.Lock()
+	state.lastSeen = time.Now().Add(-time.Hour)
+	state.mu.Unlock()
+
+	state.sessionMu.Lock()
+	if state.evictable(time.Now(), snmpDeviceStateIdleTTL) {
+		t.Fatal("evictable while a job holds the session lock")
+	}
+	state.sessionMu.Unlock()
+
+	state.session = &snmpCachedSession{}
+	if state.evictable(time.Now(), snmpDeviceStateIdleTTL) {
+		t.Fatal("evictable with a cached session")
+	}
+	state.session = nil
+	if !state.evictable(time.Now(), snmpDeviceStateIdleTTL) {
+		t.Fatal("not evictable once the session is gone and the entry is idle")
+	}
+
+	state.getCleanBatches = 3
+	state.noteGetFailure(0)
+	if state.getCleanBatches != 3 {
+		t.Fatal("noteGetFailure(0) reset the clean-batch counter")
+	}
+}
