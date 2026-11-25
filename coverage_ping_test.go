@@ -260,7 +260,7 @@ func TestEnqueueJobPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("icmp job schedules sends and deadline", func(t *testing.T) {
+	t.Run("icmp job schedules sends and expiries", func(t *testing.T) {
 		e, pj, _ := newTestPingJob(t, false)
 		e.enqueueJob(pj)
 		e.mu.Lock()
@@ -268,8 +268,9 @@ func TestEnqueueJobPaths(t *testing.T) {
 		if _, live := e.live[pj]; !live {
 			t.Fatal("job must be live")
 		}
-		if e.heap.Len() != pingProbeCount+1 {
-			t.Errorf("heap = %d events, want %d", e.heap.Len(), pingProbeCount+1)
+		// Each probe gets a send event and its own reply-window expiry.
+		if e.heap.Len() != pingProbeCount*2 {
+			t.Errorf("heap = %d events, want %d", e.heap.Len(), pingProbeCount*2)
 		}
 		if e.timer == nil {
 			t.Error("timer must be armed")
