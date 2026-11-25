@@ -6674,3 +6674,23 @@ func TestSubmitCheckRefusedDuringDrain(t *testing.T) {
 		t.Fatal("refused check did not run done")
 	}
 }
+
+// A degenerate uniformDelay window returns the floor instead of feeding a
+// non-positive span to Int64N, and refusedError unwraps to its cause
+// (issue 5152).
+func TestUniformDelayDegenerateWindow(t *testing.T) {
+	if got := uniformDelay(time.Second, time.Second); got != time.Second {
+		t.Errorf("uniformDelay(1s, 1s) = %v, want the floor", got)
+	}
+	if got := uniformDelay(5*time.Second, 2*time.Second); got != 5*time.Second {
+		t.Errorf("uniformDelay(5s, 2s) = %v, want the floor", got)
+	}
+
+	re := refusedError{errors.New("join rejected")}
+	if got := re.Error(); got != "join rejected" {
+		t.Errorf("refusedError.Error() = %q", got)
+	}
+	if !errors.Is(re, re.err) {
+		t.Error("refusedError does not unwrap to its cause")
+	}
+}
