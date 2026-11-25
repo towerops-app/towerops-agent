@@ -255,8 +255,7 @@ func runLoadAgent(ctx context.Context, baseURL string, results *resultQueue) err
 	var traps <-chan *pb.SnmpTrap
 	stopJobSummary := startJobSummaryLogger(ctx)
 	defer stopJobSummary()
-	retryDelay := initialRetryDelay
-	maxRetry := 10 * time.Second
+	backoff := initialRetryDelay
 	var poller *processPoller
 	defer func() {
 		if poller != nil {
@@ -271,8 +270,9 @@ func runLoadAgent(ctx context.Context, baseURL string, results *resultQueue) err
 		sessionStart := time.Now()
 		err := runSessionWithPoller(ctx, baseURL, "loadtest-token", traps, results, poller)
 		sessionDuration := time.Since(sessionStart)
-		if sessionDuration >= successfulConnectionThreshold {
-			retryDelay = initialRetryDelay
+		healthy := sessionDuration >= successfulConnectionThreshold
+		if healthy {
+			backoff = initialRetryDelay
 		}
 		if ctx.Err() != nil {
 			return nil
@@ -280,7 +280,7 @@ func runLoadAgent(ctx context.Context, baseURL string, results *resultQueue) err
 		if errors.Is(err, errRestartRequested) || errors.Is(err, errSelfUpdateAborted) {
 			poller.stop()
 			poller = nil
-			retryDelay = initialRetryDelay
+			backoff = initialRetryDelay
 			continue
 		}
 		poller.disconnected()
@@ -290,9 +290,9 @@ func runLoadAgent(ctx context.Context, baseURL string, results *resultQueue) err
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(retryDelay):
+		case <-time.After(reconnectDelay(healthy, isRefused(err), backoff)):
 		}
-		retryDelay = nextBackoff(retryDelay, maxRetry)
+		backoff = retryCeiling(backoff)
 	}
 	return nil
 }

@@ -63,6 +63,17 @@ var resultDropLogInterval = time.Minute
 // reconnect backoff is considered stale and reset to initialRetryDelay.
 var successfulConnectionThreshold = 30 * time.Second
 
+// maxRetryDelay caps the exponential ceiling the reconnect loop draws its
+// wait under for repeated failures.
+var maxRetryDelay = time.Minute
+
+// A refusal the server cannot heal on its own (join rejected, HTTP 401 or
+// 403 on the upgrade) draws from [minRefusalDelay, maxRefusalDelay): still
+// retried, since an operator may fix the credential, but far below the
+// rate a transient outage earns.
+var minRefusalDelay = time.Minute
+var maxRefusalDelay = 5 * time.Minute
+
 // poolShutdownTimeout bounds how long session teardown waits for worker pools
 // to drain before abandoning their in-flight jobs.
 var poolShutdownTimeout = 5 * time.Second
@@ -181,8 +192,10 @@ func runAgentWithScheduling(
 	results := newResultQueueForAgentBytes(ctx, resultSpoolByteLimit())
 	stopJobSummary := startJobSummaryLogger(ctx)
 	defer stopJobSummary()
-	retryDelay := initialRetryDelay
-	maxRetry := 10 * time.Second
+	// backoff is the ceiling the next retry draws under, not the wait
+	// itself: reconnectDelay jitters inside it so a fleet dropped at once
+	// does not redial in the same second.
+	backoff := initialRetryDelay
 
 	var poller *processPoller
 	defer func() {
@@ -224,12 +237,14 @@ func runAgentWithScheduling(
 		)
 		sessionDuration := time.Since(sessionStart)
 
-		// Reset backoff if session ran successfully for a while (indicates stable connection)
-		if sessionDuration >= successfulConnectionThreshold {
+		// Reset the ceiling if the session ran successfully for a while
+		// (indicates stable connection).
+		healthy := sessionDuration >= successfulConnectionThreshold
+		if healthy {
 			slog.Debug("resetting reconnect backoff after successful session",
 				"duration", sessionDuration,
-				"previous_delay", retryDelay)
-			retryDelay = initialRetryDelay
+				"previous_delay", backoff)
+			backoff = initialRetryDelay
 		}
 
 		if ctx.Err() != nil {
@@ -237,7 +252,7 @@ func runAgentWithScheduling(
 		}
 		if errors.Is(err, errRestartRequested) || errors.Is(err, errSelfUpdateAborted) {
 			slog.Info("restart requested, reconnecting immediately", "reason", err)
-			retryDelay = initialRetryDelay
+			backoff = initialRetryDelay
 			// A self-update drain paused the poller permanently and a
 			// restart may have invalidated its inventory: rebuild either way.
 			poller.stop()
@@ -251,13 +266,14 @@ func runAgentWithScheduling(
 			slog.Error("agent disconnected", "error", err)
 		}
 
-		slog.Info("reconnecting", "delay", retryDelay)
+		delay := reconnectDelay(healthy, isRefused(err), backoff)
+		slog.Info("reconnecting", "delay", delay)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(retryDelay):
+		case <-time.After(delay):
 		}
-		retryDelay = nextBackoff(retryDelay, maxRetry)
+		backoff = retryCeiling(backoff)
 	}
 }
 
@@ -711,9 +727,9 @@ func parseJoinReplyMsg(reply channelMsg, topic string) ([]string, error) {
 	}
 	if status != "ok" {
 		if payloadStatus.Response.Reason != "" {
-			return nil, fmt.Errorf("join rejected: %s (%s)", status, payloadStatus.Response.Reason)
+			return nil, refusedError{fmt.Errorf("join rejected: %s (%s)", status, payloadStatus.Response.Reason)}
 		}
-		return nil, fmt.Errorf("join rejected: %s", status)
+		return nil, refusedError{fmt.Errorf("join rejected: %s", status)}
 	}
 	return payloadStatus.Response.Capabilities, nil
 }
@@ -2959,21 +2975,55 @@ func hostPortKey(host string, port uint32) string {
 	return net.JoinHostPort(host, strconv.Itoa(int(port)))
 }
 
-// nextBackoff doubles the current delay (capped at max) and adds up to 25% jitter.
-func nextBackoff(current, maxDelay time.Duration) time.Duration {
+// retryCeiling doubles the backoff ceiling, capped at maxRetryDelay. A
+// non-positive start is normalized to initialRetryDelay first. The jitter
+// lives in reconnectDelay: the ceiling itself stays deterministic.
+func retryCeiling(current time.Duration) time.Duration {
 	if current <= 0 {
 		current = initialRetryDelay
 	}
-	next := current * 2
-	if next > maxDelay {
-		next = maxDelay
+	return min(current*2, maxRetryDelay)
+}
+
+// reconnectDelay draws the wait before the next dial. A session that
+// stayed up past successfulConnectionThreshold earns a first retry spread
+// uniformly over [initialRetryDelay/2, 5*initialRetryDelay) so a fleet
+// dropped together does not redial in the same second. Sustained failures
+// get full jitter under the doubling ceiling. A refusal the server cannot
+// heal draws from the refusal window instead.
+func reconnectDelay(healthy, refused bool, ceiling time.Duration) time.Duration {
+	switch {
+	case refused:
+		return uniformDelay(minRefusalDelay, maxRefusalDelay)
+	case healthy:
+		return uniformDelay(initialRetryDelay/2, initialRetryDelay*5)
+	default:
+		return uniformDelay(0, ceiling)
 	}
-	jitterRange := int64(next / 4)
-	if jitterRange <= 0 {
-		return next
+}
+
+// uniformDelay draws a duration in [lo, hi); a non-positive span returns
+// lo exactly so degenerate test settings cannot panic the draw.
+func uniformDelay(lo, hi time.Duration) time.Duration {
+	if hi <= lo {
+		return lo
 	}
-	jitter := time.Duration(rand.Int64N(jitterRange))
-	return next + jitter
+	return lo + time.Duration(rand.Int64N(int64(hi-lo)))
+}
+
+// refusedError marks a session failure the server will not heal on its
+// own: a rejected join, or an HTTP 401/403 on the upgrade. The reconnect
+// loop backs off to the refusal window rather than hammering a dead
+// credential every couple of seconds.
+type refusedError struct{ err error }
+
+func (e refusedError) Error() string { return e.err.Error() }
+func (e refusedError) Unwrap() error { return e.err }
+
+// isRefused reports whether err marks a refusal, through any wrapping.
+func isRefused(err error) bool {
+	var re refusedError
+	return errors.As(err, &re)
 }
 
 // base64BinaryPayload wraps exact protobuf bytes in the legacy channel object.

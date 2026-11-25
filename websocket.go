@@ -138,6 +138,13 @@ func wsDial(ctx context.Context, rawURL string, token ...string) (*wsConn, error
 		_ = response.Body.Close()
 	}
 	if err != nil {
+		// A 401/403 handshake refusal means the token or this host's IP is
+		// denied; that does not heal between retries, so mark it for the
+		// refusal backoff window.
+		if response != nil && (response.StatusCode == http.StatusUnauthorized ||
+			response.StatusCode == http.StatusForbidden) {
+			return nil, refusedError{fmt.Errorf("dial websocket: %w", err)}
+		}
 		return nil, fmt.Errorf("dial websocket: %w", err)
 	}
 	conn.SetReadLimit(int64(maxMessageSize))
