@@ -28,8 +28,9 @@ func TestWorkerPoolReservesOneShotCapacity(t *testing.T) {
 	started := make(chan struct{}, 1)
 	var startOnce sync.Once
 
-	// Recurring lane: one running task plus a full recurring lane of queued
-	// tasks. The worker is busy, so every queued task occupies a buffer slot.
+	// Recurring lane: one running task plus a full lane of queued tasks.
+	// The lane token frees when a task leaves the queue, so the lane is
+	// saturated by queued tasks alone.
 	block := func() {
 		startOnce.Do(func() { close(started) })
 		<-release
@@ -38,14 +39,14 @@ func TestWorkerPoolReservesOneShotCapacity(t *testing.T) {
 		t.Fatal("recurring submission rejected on an empty pool")
 	}
 	<-started
-	for range stats.RecurringCapacity - 1 {
+	for range stats.RecurringCapacity {
 		if !pool.submitMode(ctx, block, true) {
 			t.Fatal("recurring submission rejected before its lane filled")
 		}
 	}
 	stats = pool.stats()
-	if stats.RecurringInFlight != stats.RecurringCapacity {
-		t.Fatalf("recurring in flight = %d, want %d", stats.RecurringInFlight, stats.RecurringCapacity)
+	if stats.RecurringInFlight != stats.RecurringCapacity+1 {
+		t.Fatalf("recurring in flight = %d, want %d", stats.RecurringInFlight, stats.RecurringCapacity+1)
 	}
 
 	// The reserved slot stays reachable for one-shot work.
@@ -237,5 +238,38 @@ func TestSNMPWorkerLimitDefaults(t *testing.T) {
 		if reserve := oneShotReserveFor(n); reserve < 1 {
 			t.Fatalf("oneShotReserveFor(%d) = %d, want >= 1", n, reserve)
 		}
+	}
+}
+
+// A resized pool must let recurring work reach the new worker limit
+// (issue 5164): the lane token bounds queue occupancy for the A5 reserve,
+// not running tasks, so it frees when a worker picks the task up.
+func TestWorkerPoolRecurringRunsToResizedLimit(t *testing.T) {
+	pool := newWorkerPool(10)
+	pool.setWorkerLimit(100)
+	defer pool.stop()
+
+	const tasks = 100
+	blocker := make(chan struct{})
+	defer close(blocker)
+	var started atomic.Int32
+	allStarted := make(chan struct{})
+	for range tasks {
+		go func() {
+			if !pool.submitWait(context.Background(), func() {
+				if started.Add(1) == tasks {
+					close(allStarted)
+				}
+				<-blocker
+			}) {
+				t.Error("recurring submission refused")
+			}
+		}()
+	}
+
+	select {
+	case <-allStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("running recurring tasks = %d of %d after resize; lane token capped the pool", pool.stats().Running, tasks)
 	}
 }

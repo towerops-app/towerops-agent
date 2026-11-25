@@ -44,10 +44,12 @@ type workerPoolStats struct {
 	Running int64
 	// Queued is the number of tasks waiting in the task channel.
 	Queued int
-	// RecurringInFlight is queued-plus-running recurring work; it is capped
-	// at RecurringCapacity by the recurring lane's admission tokens.
+	// RecurringInFlight is queued-plus-running recurring work. It can
+	// exceed RecurringCapacity because the lane token frees at dequeue
+	// while this count holds until the task finishes.
 	RecurringInFlight int
-	// RecurringCapacity is the maximum recurring work the lane admits.
+	// RecurringCapacity is the maximum queued recurring work the lane
+	// admits; the A5 reserve for one-shot jobs sits on top of it.
 	RecurringCapacity int
 	// OneShotReserve is the queue capacity recurring load can never occupy.
 	OneShotReserve int
@@ -59,11 +61,12 @@ type workerPoolStats struct {
 // in-flight work is never cancelled by a resize.
 //
 // Admission has two lanes sharing one task channel. Recurring scheduler
-// submissions take an in-flight token first and may occupy at most
-// recurringCapacity = cap(tasks) - oneShotReserve slots, so a saturated
+// submissions take a queue token first and may occupy at most
+// recurringCapacity = cap(tasks) - oneShotReserve queue slots, so a saturated
 // recurring schedule always leaves oneShotReserve queue slots for one-shot
-// work (finding A5). One-shot submissions use the whole queue but never take
-// tokens.
+// work (finding A5). The token frees when a worker dequeues the task, so the
+// worker limit, not the lane, bounds how much recurring work runs at once.
+// One-shot submissions use the whole queue but never take tokens.
 type workerPool struct {
 	tasks chan func()
 	// dispatch bounds the one-shot coordinators parked on a busy target's
@@ -92,10 +95,15 @@ type workerPool struct {
 	workers map[*poolWorker]struct{}
 	// limit is the configured worker count; mutated under mu.
 	limit int
-	// recurring holds one token per admitted recurring task (queued or
-	// running). Capacity cap(tasks)-oneShotReserve keeps the reserved queue
-	// slots unreachable from the recurring lane.
+	// recurring holds one token per queued recurring task. Capacity
+	// cap(tasks)-oneShotReserve keeps the reserved queue slots unreachable
+	// from the recurring lane. The token frees when a worker dequeues the
+	// task: the lane guards queue occupancy, not running work, so
+	// setWorkerLimit can grow recurring execution past the queue size.
 	recurring chan struct{}
+	// recurringInFlight counts admitted recurring tasks that have not
+	// finished (queued plus running), for the heartbeat load snapshot.
+	recurringInFlight atomic.Int64
 	// oneShotReserve is the number of queue slots held back from recurring
 	// submissions; computed once from the initial pool size.
 	oneShotReserve int
@@ -231,12 +239,22 @@ func (p *workerPool) admitLane(ctx context.Context, fn func(), wait, honorPause 
 		return false
 	}
 	// Recurring work takes its lane token before the busy increment so a
-	// token can never be held by work the pool refused.
+	// token can never be held by work the pool refused. The token guards
+	// queue occupancy for the A5 reserve and frees at dequeue; the
+	// recurringInFlight counter keeps the queued-plus-running figure for
+	// stats after the token is released.
 	if lane == laneRecurring {
 		select {
 		case p.recurring <- struct{}{}:
+			p.recurringInFlight.Add(1)
 		case <-ctx.Done():
 			return false
+		}
+	}
+	releaseLane := func() {
+		if lane == laneRecurring {
+			<-p.recurring
+			p.recurringInFlight.Add(-1)
 		}
 	}
 	// Count the task before it can reach a worker so busy never dips to
@@ -247,15 +265,17 @@ func (p *workerPool) admitLane(ctx context.Context, fn func(), wait, honorPause 
 	// this read sees the pause.
 	if honorPause && p.paused.Load() {
 		p.busy.Add(-1)
-		if lane == laneRecurring {
-			<-p.recurring
-		}
+		releaseLane()
 		return false
 	}
 	task := func() {
 		defer p.busy.Add(-1)
 		if lane == laneRecurring {
-			defer func() { <-p.recurring }()
+			defer p.recurringInFlight.Add(-1)
+			// The lane token guards queue slots for the A5 one-shot
+			// reserve, so it frees when the task leaves the queue.
+			// Running work is bounded by the worker limit, not the lane.
+			<-p.recurring
 		}
 		fn()
 	}
@@ -265,9 +285,7 @@ func (p *workerPool) admitLane(ctx context.Context, fn func(), wait, honorPause 
 			return true
 		case <-ctx.Done():
 			p.busy.Add(-1)
-			if lane == laneRecurring {
-				<-p.recurring
-			}
+			releaseLane()
 			return false
 		}
 	}
@@ -276,9 +294,7 @@ func (p *workerPool) admitLane(ctx context.Context, fn func(), wait, honorPause 
 		return true
 	default:
 		p.busy.Add(-1)
-		if lane == laneRecurring {
-			<-p.recurring
-		}
+		releaseLane()
 		return false
 	}
 }
@@ -326,7 +342,7 @@ func (p *workerPool) stats() workerPoolStats {
 		Busy:              p.busy.Load(),
 		Running:           p.running.Load(),
 		Queued:            len(p.tasks),
-		RecurringInFlight: len(p.recurring),
+		RecurringInFlight: int(p.recurringInFlight.Load()),
 		RecurringCapacity: cap(p.recurring),
 		OneShotReserve:    p.oneShotReserve,
 	}
