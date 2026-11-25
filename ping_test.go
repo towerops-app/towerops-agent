@@ -2175,3 +2175,73 @@ func TestParsePingSeries(t *testing.T) {
 		t.Error("zero-reply output must report an error")
 	}
 }
+
+// execPingSeries rejects an unparsable IP, swaps the binary for IPv6, drops
+// -W under macOS ping6, and returns parsed output on success (issue 5163).
+func TestExecPingSeriesArgsAndErrors(t *testing.T) {
+	origGOOS := pingGOOS
+	origLookPath := pingLookPath
+	origCommand := pingCommandOutput
+	t.Cleanup(func() {
+		pingGOOS = origGOOS
+		pingLookPath = origLookPath
+		pingCommandOutput = origCommand
+	})
+	pingLookPath = func(file string) (string, error) { return "/sbin/" + file, nil }
+
+	t.Run("invalid IP", func(t *testing.T) {
+		if _, _, err := execPingSeries(context.Background(), "not-an-ip", 3, 1500); err == nil {
+			t.Fatal("execPingSeries accepted an unparseable address")
+		}
+	})
+
+	tests := []struct {
+		name     string
+		goos     string
+		ip       string
+		wantCmd  string
+		wantArgs []string
+	}{
+		{name: "linux ipv6 keeps -W on ping6", goos: "linux", ip: "2001:db8::1", wantCmd: "ping6", wantArgs: []string{"-c", "3", "-i", "0.2", "-W", "2", "2001:db8::1"}},
+		{name: "darwin ipv6 omits -W so ping6 sees the host", goos: "darwin", ip: "2001:db8::1", wantCmd: "ping6", wantArgs: []string{"-c", "3", "-i", "0.2", "2001:db8::1"}},
+		{name: "darwin ipv4 keeps -W in milliseconds", goos: "darwin", ip: "127.0.0.1", wantCmd: "ping", wantArgs: []string{"-c", "3", "-i", "0.2", "-W", "1100", "127.0.0.1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pingGOOS = tt.goos
+			var gotCmd string
+			var gotArgs []string
+			pingCommandOutput = func(_ context.Context, name string, args ...string) ([]byte, error) {
+				gotCmd = name
+				gotArgs = args
+				return []byte("64 bytes from target: icmp_seq=1 time=1.5 ms\n64 bytes from target: icmp_seq=2 time=2.5 ms\n"), nil
+			}
+			replies, firstRTT, err := execPingSeries(context.Background(), tt.ip, 3, 1500)
+			if err != nil {
+				t.Fatalf("execPingSeries(%s): %v", tt.ip, err)
+			}
+			if replies != 2 || firstRTT != 1.5 {
+				t.Fatalf("execPingSeries = %d replies rtt %v, want 2 replies rtt 1.5", replies, firstRTT)
+			}
+			if gotCmd != tt.wantCmd {
+				t.Errorf("command = %q, want %q", gotCmd, tt.wantCmd)
+			}
+			if !slices.Equal(gotArgs, tt.wantArgs) {
+				t.Errorf("args = %q, want %q", gotArgs, tt.wantArgs)
+			}
+		})
+	}
+}
+
+// The first-RTT cut at " ms" has two fallbacks: any other space, then the end
+// of the reply line (issue 5163).
+func TestParsePingSeriesRTTBoundaries(t *testing.T) {
+	replies, firstRTT, err := parsePingSeries("reply time=1.5 \n", 3)
+	if err != nil || replies != 1 || firstRTT != 1.5 {
+		t.Fatalf("space without ms: replies=%d rtt=%v err=%v", replies, firstRTT, err)
+	}
+	replies, firstRTT, err = parsePingSeries("reply time=9", 3)
+	if err != nil || replies != 1 || firstRTT != 9 {
+		t.Fatalf("end of line: replies=%d rtt=%v err=%v", replies, firstRTT, err)
+	}
+}
