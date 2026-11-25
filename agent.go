@@ -2686,6 +2686,9 @@ func submitJob(
 			if ctx.Err() != nil {
 				return
 			}
+			// The "run" count lives here alone: executors record failure and
+			// partial outcomes but must never count the run, or a poll counts
+			// twice (issue 5168).
 			recordJobRun()
 			execute()
 		}

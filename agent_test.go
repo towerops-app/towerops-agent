@@ -5441,6 +5441,50 @@ func TestSubmitJobWaitPoolRejectionFreesGate(t *testing.T) {
 	r()
 }
 
+// The dispatch wrapper owns the "run" count: before issue 5168 the SNMP,
+// credential and UBNT executors also called recordJobRun on entry, so every
+// one of those jobs added two to the job summary and halved the apparent
+// failure rate.
+func TestSubmitJobCountsOneRunPerPoll(t *testing.T) {
+	origDial := snmpDial
+	defer func() { snmpDial = origDial }()
+	snmpDial = func(_ context.Context, _ *pb.AgentJob) (snmpQuerier, func(), error) {
+		return &mockSnmpQuerier{
+			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+				variables := make([]gosnmp.SnmpPDU, 0, len(oids))
+				for _, oid := range oids {
+					variables = append(variables, gosnmp.SnmpPDU{
+						Name: oid, Type: gosnmp.Integer, Value: 1,
+					})
+				}
+				return &gosnmp.SnmpPacket{Variables: variables}, nil
+			},
+		}, func() {}, nil
+	}
+
+	pools := testPools(t)
+	done := make(chan struct{})
+	before := jobSummary.run.Load()
+	if !submitJob(context.Background(), &pb.AgentJob{
+		JobId:      "counted-poll",
+		JobType:    pb.JobType_POLL,
+		SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.9", Port: 161},
+		Queries: []*pb.SnmpQuery{
+			{QueryType: pb.QueryType_GET, Oids: []string{"1.3.6.1.2.1.1.3.0"}},
+		},
+	}, pools, testQueue(), func() { close(done) }, true) {
+		t.Fatal("submitJob refused the poll")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("poll job never finished")
+	}
+	if got := jobSummary.run.Load() - before; got != 1 {
+		t.Fatalf("jobSummary.run advanced %d for one poll, want 1", got)
+	}
+}
+
 // A finished job must release its device gate, or every later job for that
 // device blocks forever. Two sequential pings against the same target both
 // run.

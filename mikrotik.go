@@ -564,7 +564,6 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue)
 		recordJobFailure()
 		slog.Error("mikrotik job failed", "device", job.DeviceId, "job", job.JobId, "error", result.Error)
 	} else {
-		recordJobRun()
 		slog.Debug("mikrotik job complete", "device", job.DeviceId, "job", job.JobId, "command_failures", len(failures))
 	}
 	sendResult(ctx, out, "mikrotik_result", result, job.JobId)
@@ -607,7 +606,6 @@ func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.
 		return
 	}
 
-	recordJobRun()
 	slog.Debug("mikrotik job complete", "device", job.DeviceId, "job", job.JobId)
 	sendResult(ctx, out, "mikrotik_result", &pb.MikrotikResult{
 		DeviceId: job.DeviceId,

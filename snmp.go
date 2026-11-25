@@ -90,7 +90,6 @@ func closeOnCancellation(ctx context.Context, closeFn func()) func() {
 // the agent context — not the job context — so a cancelled job's partial
 // result still reaches the spool and survives a reconnect.
 func executeSnmpJob(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
-	recordJobRun()
 	dev := job.SnmpDevice
 	if dev == nil {
 		recordJobFailure()
@@ -876,7 +875,6 @@ func truncateBytes(s string, n int) string {
 
 // executeCredentialTest tests SNMP credentials by reading the system group.
 func executeCredentialTest(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
-	recordJobRun()
 	result := &pb.CredentialTestResult{TestId: job.JobId}
 	if job.SnmpDevice == nil {
 		slog.Error("job missing snmp device", "job_id", job.JobId)
@@ -944,7 +942,6 @@ func readSystemGroup(ctx context.Context, job *pb.AgentJob, failure string) (map
 // device's system values so the server can classify it and pin the working
 // credential set.
 func executeCredentialProbe(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
-	recordJobRun()
 	probe := job.CredentialProbe
 	started := time.Now()
 	result := &pb.CredentialProbeResult{ProbeId: job.JobId, MatchedIndex: -1}
