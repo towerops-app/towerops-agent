@@ -598,3 +598,16 @@ func TestPublishAndLookupReachability(t *testing.T) {
 		t.Error("nil ip device must register")
 	}
 }
+
+// A probe expiry for a job already finishing is a no-op (issue 5161).
+func TestExpireProbeLockedFinishingJob(t *testing.T) {
+	e, pj, _ := newTestPingJob(t, false)
+	e.live[pj] = struct{}{}
+	pj.finishing = true
+	e.mu.Lock()
+	e.expireProbeLocked(pj, 0)
+	e.mu.Unlock()
+	if pj.probes[0].checked {
+		t.Error("finishing job's probe was resolved")
+	}
+}
