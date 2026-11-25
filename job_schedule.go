@@ -188,6 +188,58 @@ func (s *recurringScheduler) replaceChecks(
 	s.replace(&s.checks, specs)
 }
 
+// applyJobDelta applies the job side of an incremental inventory update,
+// touching only the ids the update names.
+func (s *recurringScheduler) applyJobDelta(
+	jobs []*pb.AgentJob,
+	removes map[string]struct{},
+	pools *jobPools,
+	out *resultQueue,
+) {
+	specs := make([]scheduleSpec, 0, len(jobs))
+	for _, job := range jobs {
+		if job == nil || job.JobId == "" {
+			slog.Error("recurring job dropped, stable job ID is required")
+			continue
+		}
+		specs = append(specs, scheduleSpec{
+			id:       job.JobId,
+			interval: interval(job.IntervalSeconds),
+			payload:  job,
+			submit: func(ctx context.Context, done func()) bool {
+				return submitJob(ctx, job, pools, out, done, true)
+			},
+		})
+	}
+	s.applyDelta(&s.jobs, specs, removes)
+}
+
+// applyCheckDelta applies the check side of an incremental inventory update,
+// touching only the ids the update names.
+func (s *recurringScheduler) applyCheckDelta(
+	checks []*pb.Check,
+	removes map[string]struct{},
+	pools *jobPools,
+	out *resultQueue,
+) {
+	specs := make([]scheduleSpec, 0, len(checks))
+	for _, check := range checks {
+		if check == nil || check.Id == "" {
+			slog.Error("recurring check dropped, stable check ID is required")
+			continue
+		}
+		specs = append(specs, scheduleSpec{
+			id:       check.Id,
+			interval: interval(check.IntervalSeconds),
+			payload:  check,
+			submit: func(ctx context.Context, done func()) bool {
+				return submitCheck(ctx, check, pools, out, done, true)
+			},
+		})
+	}
+	s.applyDelta(&s.checks, specs, removes)
+}
+
 func interval(seconds uint32) time.Duration {
 	if seconds == 0 {
 		return legacyJobInterval
@@ -199,14 +251,83 @@ func interval(seconds uint32) time.Duration {
 // payload so replace can detect unchanged assignments without retaining a
 // serialized copy — and its SNMP credentials — per schedule entry (finding
 // B8). A nil result marks an unmarshalable payload, which is treated as
-// always changed.
-func payloadFingerprint(payload proto.Message) []byte {
+// always changed. It is a var so tests can count invocations.
+var payloadFingerprint = func(payload proto.Message) []byte {
 	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(payload)
 	if err != nil {
 		return nil
 	}
 	sum := sha256.Sum256(data)
 	return sum[:]
+}
+
+// specMatches reports whether a scheduled entry already runs the given spec:
+// same interval and either the same payload pointer (unchanged assignments
+// keep their decoded message across updates) or the same fingerprint.
+func specMatches(current *scheduleEntry, spec scheduleSpec, fingerprint []byte) bool {
+	if current == nil || current.spec.interval != spec.interval {
+		return false
+	}
+	if current.spec.payload == spec.payload {
+		return true
+	}
+	return fingerprint != nil && bytes.Equal(current.fingerprint, fingerprint)
+}
+
+// admitLocked swaps one changed spec into a group: the displaced entry is
+// cancelled and chains its completion barrier, and the replacement starts
+// with the staged immediate flag. Called with s.mu held.
+func (s *recurringScheduler) admitLocked(
+	group *map[string]*scheduleEntry,
+	retiring map[string]<-chan struct{},
+	spec scheduleSpec,
+	fingerprint []byte,
+	immediate bool,
+) {
+	current := (*group)[spec.id]
+	predecessor := retiring[spec.id]
+	if current != nil {
+		current.cancel()
+		if current.predecessor != nil {
+			predecessor = current.predecessor
+		} else {
+			predecessor = current.stopped
+		}
+	}
+
+	ctx, cancel := context.WithCancel(s.ctx)
+	entry := &scheduleEntry{
+		cancel:      cancel,
+		stopped:     make(chan struct{}),
+		predecessor: predecessor,
+		spec:        spec,
+		fingerprint: fingerprint,
+		immediate:   immediate && current != nil,
+	}
+	entry.stagedImmediate = entry.immediate
+	(*group)[spec.id] = entry
+	s.wg.Add(1)
+	go s.run(ctx, entry)
+}
+
+// removeLocked retires one entry that is absent from the next inventory.
+// Called with s.mu held.
+func (s *recurringScheduler) removeLocked(
+	group *map[string]*scheduleEntry,
+	retiring map[string]<-chan struct{},
+	id string,
+) {
+	current := (*group)[id]
+	if current == nil {
+		return
+	}
+	current.cancel()
+	var barrier <-chan struct{} = current.stopped
+	if current.predecessor != nil {
+		barrier = current.predecessor
+	}
+	s.retire(retiring, id, barrier)
+	delete(*group, id)
 }
 
 func (s *recurringScheduler) replace(group *map[string]*scheduleEntry, specs []scheduleSpec) {
@@ -225,66 +346,113 @@ func (s *recurringScheduler) replace(group *map[string]*scheduleEntry, specs []s
 		retiring = s.retiringJobs
 	}
 
+	// Fingerprint each payload once; both passes below reuse the map.
+	fingerprints := make(map[string][]byte, len(next))
+	for id, spec := range next {
+		current := (*group)[id]
+		if current != nil && current.spec.interval == spec.interval &&
+			current.spec.payload == spec.payload {
+			continue
+		}
+		fingerprints[id] = payloadFingerprint(spec.payload)
+	}
+
 	// Count in-place changes before touching the maps: a fleet-wide push
 	// (more than immediateChangeSlots of the group) must not run everything
 	// immediately and align the fleet (finding B4).
 	inventorySize := max(len(*group), len(next))
 	changed := 0
 	for id, spec := range next {
-		current := (*group)[id]
-		fingerprint := payloadFingerprint(spec.payload)
-		if current != nil && current.spec.interval == spec.interval &&
-			fingerprint != nil && bytes.Equal(current.fingerprint, fingerprint) {
+		if specMatches((*group)[id], spec, fingerprints[id]) {
 			continue
 		}
 		changed++
 	}
 	immediate := changed > 0 && changed <= immediateChangeSlots(inventorySize)
 
-	for id, current := range *group {
+	for id := range *group {
 		if _, ok := next[id]; !ok {
-			current.cancel()
-			var barrier <-chan struct{} = current.stopped
-			if current.predecessor != nil {
-				barrier = current.predecessor
-			}
-			s.retire(retiring, id, barrier)
-			delete(*group, id)
+			s.removeLocked(group, retiring, id)
 		}
 	}
 
 	for id, spec := range next {
-		current := (*group)[id]
-		fingerprint := payloadFingerprint(spec.payload)
-		if current != nil && current.spec.interval == spec.interval &&
-			fingerprint != nil && bytes.Equal(current.fingerprint, fingerprint) {
+		fingerprint, computed := fingerprints[id]
+		if !computed {
 			continue
 		}
-
-		predecessor := retiring[id]
-		if current != nil {
-			current.cancel()
-			if current.predecessor != nil {
-				predecessor = current.predecessor
-			} else {
-				predecessor = current.stopped
-			}
+		if specMatches((*group)[id], spec, fingerprint) {
+			continue
 		}
-
-		ctx, cancel := context.WithCancel(s.ctx)
-		entry := &scheduleEntry{
-			cancel:      cancel,
-			stopped:     make(chan struct{}),
-			predecessor: predecessor,
-			spec:        spec,
-			fingerprint: fingerprint,
-			immediate:   immediate && current != nil,
-		}
-		entry.stagedImmediate = entry.immediate
-		(*group)[id] = entry
-		s.wg.Add(1)
-		go s.run(ctx, entry)
+		s.admitLocked(group, retiring, spec, fingerprint, immediate)
 	}
+}
+
+// applyDelta folds an incremental inventory update into one group: only the
+// entries named by upserts or removes are fingerprinted or swapped, so a one
+// job delta on a large fleet does not marshal and hash the whole inventory.
+// A remove naming an id that is also upserted is ignored; the upsert wins.
+func (s *recurringScheduler) applyDelta(
+	group *map[string]*scheduleEntry,
+	upserts []scheduleSpec,
+	removes map[string]struct{},
+) {
+	type deltaChange struct {
+		spec        scheduleSpec
+		fingerprint []byte
+	}
+	changes := make([]deltaChange, 0, len(upserts))
+	// Last upsert wins on a duplicate id, matching replace's next map.
+	named := make(map[string]scheduleSpec, len(upserts))
+	for _, spec := range upserts {
+		named[spec.id] = spec
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.paused.Load() {
+		return
+	}
+	retiring := s.retiringChecks
+	if group == &s.jobs {
+		retiring = s.retiringJobs
+	}
+
+	nextSize := len(*group)
+	for id, spec := range named {
+		delete(removes, spec.id)
+		current := (*group)[id]
+		if current == nil {
+			nextSize++
+		} else if current.spec.interval == spec.interval && current.spec.payload == spec.payload {
+			continue
+		}
+		fingerprint := payloadFingerprint(spec.payload)
+		if specMatches(current, spec, fingerprint) {
+			continue
+		}
+		changes = append(changes, deltaChange{spec, fingerprint})
+	}
+	for id := range removes {
+		if (*group)[id] != nil {
+			nextSize--
+		}
+		s.removeLocked(group, retiring, id)
+	}
+
+	inventorySize := max(len(*group), nextSize)
+	immediate := len(changes) > 0 && len(changes) <= immediateChangeSlots(inventorySize)
+	for _, change := range changes {
+		s.admitLocked(group, retiring, change.spec, change.fingerprint, immediate)
+	}
+}
+
+// counts reports the live group sizes for concurrency sizing and footprint
+// telemetry after a delta update.
+func (s *recurringScheduler) counts() (jobs, checks int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.jobs), len(s.checks)
 }
 
 // retire is called with s.mu held. A waiting replacement can stop before
