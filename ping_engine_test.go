@@ -315,7 +315,9 @@ func TestPingEngineLocalSendFailureReportsAgentError(t *testing.T) {
 	conn := peTInstallFakeICMP(t)
 	conn.writeErr = syscall.EPERM
 	out := newResultQueue(4)
-	t.Cleanup(stopPingEngine)
+	e := newPingEngine(context.Background())
+	e.start()
+	t.Cleanup(e.shutdown)
 
 	publishReachability("pe-local", nil, true, 7, 0)
 	defer func() {
@@ -324,7 +326,7 @@ func TestPingEngineLocalSendFailureReportsAgentError(t *testing.T) {
 		reachabilityMu.Unlock()
 	}()
 
-	ok := submitPingJob(context.Background(), &pb.AgentJob{
+	ok := submitPingJob(context.Background(), e, &pb.AgentJob{
 		JobId:         "pe-local",
 		DeviceId:      "pe-local",
 		SnmpDevice:    &pb.SnmpDevice{Ip: "10.0.0.1"},
