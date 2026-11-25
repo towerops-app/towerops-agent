@@ -404,3 +404,124 @@ func TestDrainForShutdownCountsAckedResults(t *testing.T) {
 		t.Fatalf("flushed count does not match the 2 acked results\nlogged:\n%s", logs.dump())
 	}
 }
+
+// A poller stopped by disconnect-grace expiry is drained and replaced on the
+// next reconnect pass: the loop waits on stopDone so the new poller never
+// schedules onto the old ping engine (issue 5167).
+func TestRunAgentReplacesGraceStoppedPoller(t *testing.T) {
+	origRetry := initialRetryDelay
+	t.Cleanup(func() { initialRetryDelay = origRetry })
+	initialRetryDelay = 20 * time.Millisecond
+
+	configureAgentRuntime(agentRuntimeConfig{
+		SNMPDeviceRate:   50,
+		ResultSpoolBytes: 64 << 20,
+		DisconnectGrace:  20 * time.Millisecond,
+	})
+	t.Cleanup(func() {
+		configureAgentRuntime(agentRuntimeConfig{
+			SNMPDeviceRate:   50,
+			ResultSpoolBytes: 64 << 20,
+			DisconnectGrace:  15 * time.Minute,
+		})
+	})
+
+	logs := agtCaptureLogs(t)
+	ln := agtListen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runAgent(ctx, agtURL(ln), "token", nil)
+		close(done)
+	}()
+
+	conn, _ := agtAccept(t, ln)
+	_ = conn.Close()
+	_ = ln.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !logs.has("disconnect grace expired, stopping scheduled polling") {
+		if time.Now().After(deadline) {
+			t.Fatalf("grace never expired\nlogged:\n%s", logs.dump())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The stopped poller drains quickly with no work; give the reconnect
+	// loop a few delays to reach the rebuild select before ending the run.
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runAgent did not return after ctx cancel")
+	}
+}
+
+// Cancelling the run while a grace-stopped poller is still draining takes the
+// ctx arm of the rebuild select (issue 5167).
+func TestRunAgentCancelWhileStoppedPollerDrains(t *testing.T) {
+	origRetry := initialRetryDelay
+	t.Cleanup(func() { initialRetryDelay = origRetry })
+	initialRetryDelay = 20 * time.Millisecond
+
+	configureAgentRuntime(agentRuntimeConfig{
+		SNMPDeviceRate:   50,
+		ResultSpoolBytes: 64 << 20,
+		DisconnectGrace:  20 * time.Millisecond,
+	})
+	t.Cleanup(func() {
+		configureAgentRuntime(agentRuntimeConfig{
+			SNMPDeviceRate:   50,
+			ResultSpoolBytes: 64 << 20,
+			DisconnectGrace:  15 * time.Minute,
+		})
+	})
+
+	// Hold a device session lock: closeSNMPSessions runs near the end of
+	// stop(), so stopDone stays open until this test lets go.
+	job := &pb.AgentJob{DeviceId: "drain-wedge", SnmpDevice: &pb.SnmpDevice{Ip: "10.7.7.7"}}
+	state := defaultSNMPEngine.state(job)
+	t.Cleanup(func() { resetSNMPDeviceState(job) })
+	state.sessionMu.Lock()
+	unlocked := false
+	unlock := func() {
+		if !unlocked {
+			unlocked = true
+			state.sessionMu.Unlock()
+		}
+	}
+	defer unlock()
+
+	logs := agtCaptureLogs(t)
+	ln := agtListen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runAgent(ctx, agtURL(ln), "token", nil)
+		close(done)
+	}()
+
+	conn, _ := agtAccept(t, ln)
+	_ = conn.Close()
+	_ = ln.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !logs.has("disconnect grace expired, stopping scheduled polling") {
+		if time.Now().After(deadline) {
+			t.Fatalf("grace never expired\nlogged:\n%s", logs.dump())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The wedged drain keeps stopDone open, so the loop parks in the rebuild
+	// select once a reconnect delay passes; cancelling then takes ctx.Done.
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+	// runAgent's deferred poller.stop() joins the wedged stop on stopOnce:
+	// release the session lock so both can finish.
+	unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runAgent did not return after ctx cancel")
+	}
+}
