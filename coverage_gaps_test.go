@@ -953,8 +953,70 @@ func TestWalkExactRootStored(t *testing.T) {
 	st := newSnmpWalkRootState(".1.3.6.1.2.1.1.1.0")
 	done, exact, err := st.absorb(gosnmp.SnmpPDU{
 		Name: ".1.3.6.1.2.1.1.1.0", Type: gosnmp.OctetString, Value: "leaf"})
-	if err != nil || !done || !exact {
+	// The device already answered the leaf: the value is stored and no
+	// exact GET is needed.
+	if err != nil || !done || exact {
 		t.Fatalf("exact leaf: done=%v exact=%v err=%v", done, exact, err)
+	}
+	if st.values["1.3.6.1.2.1.1.1.0"] != "leaf" {
+		t.Errorf("leaf value not stored: %v", st.values)
+	}
+}
+
+// Absent roots must share one batched GET for the leaf check instead of one
+// paced request each (issue 5166).
+func TestWalkExactLeavesShareOneGet(t *testing.T) {
+	ctx := context.Background()
+	roots := []string{
+		".1.3.6.1.4.1.9.9.1",
+		".1.3.6.1.4.1.9.9.2",
+		".1.3.6.1.4.1.9.9.3",
+		".1.3.6.1.4.1.9.9.4",
+		".1.3.6.1.4.1.9.9.5",
+	}
+	var getCalls [][]string
+	bulk := &mockSnmpQuerier{
+		getBulkFunc: func(oids []string, nr uint8, mr uint32) (*gosnmp.SnmpPacket, error) {
+			// Every root's first answer escapes its subtree.
+			vars := make([]gosnmp.SnmpPDU, len(oids))
+			for i := range oids {
+				vars[i] = gosnmp.SnmpPDU{Name: ".1.3.6.1.9.9.9", Type: gosnmp.Integer, Value: 1}
+			}
+			return &gosnmp.SnmpPacket{Variables: vars}, nil
+		},
+		getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+			getCalls = append(getCalls, append([]string(nil), oids...))
+			vars := make([]gosnmp.SnmpPDU, len(oids))
+			for i, oid := range oids {
+				vars[i] = gosnmp.SnmpPDU{Name: oid, Type: gosnmp.NoSuchObject}
+			}
+			return &gosnmp.SnmpPacket{Variables: vars}, nil
+		},
+	}
+	_, errs := snmpWalkRoots(ctx, bulk, roots, false, nil)
+	if len(getCalls) != 1 || len(getCalls[0]) != 5 {
+		t.Fatalf("exact GETs: got %d calls %v, want one GET with 5 OIDs", len(getCalls), getCalls)
+	}
+	for i, e := range errs {
+		if e.err != nil {
+			t.Errorf("root %d should complete cleanly: %v", i, e.err)
+		}
+	}
+
+	// A silent device stops the whole leaf check after one attempt.
+	getCalls = nil
+	bulk.getFunc = func(oids []string) (*gosnmp.SnmpPacket, error) {
+		getCalls = append(getCalls, oids)
+		return nil, context.DeadlineExceeded
+	}
+	_, errs = snmpWalkRoots(ctx, bulk, roots, false, nil)
+	if len(getCalls) != 1 {
+		t.Fatalf("silent device: got %d GET calls, want 1", len(getCalls))
+	}
+	for i, e := range errs {
+		if !e.noResponse {
+			t.Errorf("root %d must be flagged noResponse", i)
+		}
 	}
 }
 
