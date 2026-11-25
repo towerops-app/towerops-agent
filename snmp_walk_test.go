@@ -281,3 +281,29 @@ func TestExecuteSnmpJobAbortsWalkAfterSilentResponse(t *testing.T) {
 		t.Fatalf("walk notice = %q", notice.Message)
 	}
 }
+
+// Once the transport dies, every group still queued behind a split is marked
+// dead without spending another request on silence (issue 5158).
+func TestSnmpWalkRootsTransportDeathMarksPendingGroups(t *testing.T) {
+	roots := []string{".1.3.6.1.2.400", ".1.3.6.1.2.401", ".1.3.6.1.2.402", ".1.3.6.1.2.403"}
+	calls := 0
+	mock := &mockSnmpQuerier{getBulkFunc: func(oids []string, _ uint8, _ uint32) (*gosnmp.SnmpPacket, error) {
+		calls++
+		if calls == 1 {
+			return &gosnmp.SnmpPacket{Error: gosnmp.TooBig}, nil
+		}
+		return nil, errors.New("response timeout")
+	}}
+	state := newSNMPDeviceState(defaultSNMPDevicePDURate)
+	state.bulkMaxRepetition = 1
+
+	_, errs := snmpWalkRoots(context.Background(), mock, roots, false, state)
+	if calls != 2 {
+		t.Fatalf("requests = %d, want the oversized request plus one timeout before the rest are marked dead", calls)
+	}
+	for i, rootErr := range errs {
+		if rootErr.err == nil || !rootErr.noResponse {
+			t.Fatalf("root %d err = %v noResponse = %v, want a transport-dead mark", i, rootErr.err, rootErr.noResponse)
+		}
+	}
+}

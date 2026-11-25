@@ -329,3 +329,33 @@ func TestSNMPDeviceStateEvictedWhenIdle(t *testing.T) {
 		t.Error("idle device state was not evicted")
 	}
 }
+
+// evictable must never evict under a running job or a cached session, and
+// noteGetFailure must ignore a non-positive size (issue 5158).
+func TestSNMPDeviceStateEvictableGuards(t *testing.T) {
+	state := newSNMPDeviceState(defaultSNMPDevicePDURate)
+	state.mu.Lock()
+	state.lastSeen = time.Now().Add(-time.Hour)
+	state.mu.Unlock()
+
+	state.sessionMu.Lock()
+	if state.evictable(time.Now(), snmpDeviceStateIdleTTL) {
+		t.Fatal("evictable while a job holds the session lock")
+	}
+	state.sessionMu.Unlock()
+
+	state.session = &snmpCachedSession{}
+	if state.evictable(time.Now(), snmpDeviceStateIdleTTL) {
+		t.Fatal("evictable with a cached session")
+	}
+	state.session = nil
+	if !state.evictable(time.Now(), snmpDeviceStateIdleTTL) {
+		t.Fatal("not evictable once the session is gone and the entry is idle")
+	}
+
+	state.getCleanBatches = 3
+	state.noteGetFailure(0)
+	if state.getCleanBatches != 3 {
+		t.Fatal("noteGetFailure(0) reset the clean-batch counter")
+	}
+}
