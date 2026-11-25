@@ -18,13 +18,17 @@ func ubntTLV(tlvType byte, value []byte) []byte {
 	return append(out, value...)
 }
 
-// ubntReply assembles a full TLV reply packet.
+// ubntReply assembles a full reply packet the way a device frames it:
+// the 4-byte header (version 1, command 0, payload length) then the
+// TLV records.
 func ubntReply(tlvs ...[]byte) []byte {
-	var packet []byte
+	var payload []byte
 	for _, t := range tlvs {
-		packet = append(packet, t...)
+		payload = append(payload, t...)
 	}
-	return packet
+	packet := []byte{0x01, 0x00, 0, 0}
+	binary.BigEndian.PutUint16(packet[2:4], uint16(len(payload)))
+	return append(packet, payload...)
 }
 
 func ubntTestMAC(b0, b1, b2, b3, b4, b5 byte) []byte {
@@ -82,16 +86,55 @@ func TestParseUbntReply(t *testing.T) {
 	})
 
 	t.Run("truncated tlv is rejected", func(t *testing.T) {
-		packet := []byte{ubntTLVModel, 0, 9, 'n', 'R'}
+		packet := []byte{0x01, 0x00, 0, 5, ubntTLVModel, 0, 9, 'n', 'R'}
 		if _, err := parseUbntReply(packet, "10.0.0.1"); err == nil {
 			t.Fatal("expected truncated tlv to fail")
 		}
 	})
 
 	t.Run("field-less packet is rejected", func(t *testing.T) {
-		packet := ubntTLV(0x7f, []byte("only an unknown tlv"))
+		packet := ubntReply(ubntTLV(0x7f, []byte("only an unknown tlv")))
 		if _, err := parseUbntReply(packet, "10.0.0.1"); err == nil {
 			t.Fatal("expected empty reply to fail")
+		}
+	})
+
+	t.Run("headerless tlv stream is rejected", func(t *testing.T) {
+		packet := ubntTLV(ubntTLVModel, []byte("m5"))
+		if _, err := parseUbntReply(packet, "10.0.0.1"); err == nil {
+			t.Fatal("expected a reply with no header to fail")
+		}
+	})
+
+	t.Run("short packet is rejected", func(t *testing.T) {
+		if _, err := parseUbntReply([]byte{0x01, 0x00, 0}, "10.0.0.1"); err == nil {
+			t.Fatal("expected a 3-byte reply to fail")
+		}
+	})
+
+	t.Run("unexpected version is rejected", func(t *testing.T) {
+		packet := []byte{0x02, 0x00, 0, 0}
+		if _, err := parseUbntReply(packet, "10.0.0.1"); err == nil {
+			t.Fatal("expected a version 2 reply to fail")
+		}
+	})
+
+	t.Run("unexpected command is rejected", func(t *testing.T) {
+		packet := []byte{0x01, 0x01, 0, 0}
+		if _, err := parseUbntReply(packet, "10.0.0.1"); err == nil {
+			t.Fatal("expected a non-discovery command to fail")
+		}
+	})
+
+	t.Run("bytes past the declared payload are ignored", func(t *testing.T) {
+		packet := ubntReply(ubntTLV(ubntTLVModel, []byte("m5")))
+		packet = append(packet, 0xff, 0xff)
+		peer, err := parseUbntReply(packet, "10.0.0.1")
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		if peer.Model != "m5" {
+			t.Errorf("model = %q", peer.Model)
 		}
 	})
 }
@@ -235,7 +278,7 @@ func TestRunUbntProbeDropsMalformedAndKeysByIP(t *testing.T) {
 				return
 			}
 			// A truncated packet: the reader drops it and keeps collecting.
-			_, _ = responder.WriteToUDP([]byte{0x0c, 0x00, 0x09, 'n'}, src)
+			_, _ = responder.WriteToUDP([]byte{0x01, 0x00, 0, 4, 0x0c, 0x00, 0x09, 'n'}, src)
 			// A reply whose only usable field is a model, keyed on source IP
 			// since no MAC TLV arrived.
 			_, _ = responder.WriteToUDP(ubntReply(
@@ -254,8 +297,11 @@ func TestRunUbntProbeDropsMalformedAndKeysByIP(t *testing.T) {
 }
 
 func TestParseUbntReplyTrailingBytes(t *testing.T) {
-	packet := ubntReply(ubntTLV(ubntTLVModel, []byte("m5")))
-	packet = append(packet, 0xff) // one dangling byte after the last TLV
+	tlv := ubntTLV(ubntTLVModel, []byte("m5"))
+	// The declared payload covers the TLV plus one dangling byte.
+	packet := []byte{0x01, 0x00, 0, byte(len(tlv) + 1)}
+	packet = append(packet, tlv...)
+	packet = append(packet, 0xff)
 	if _, err := parseUbntReply(packet, "10.0.0.1"); err == nil {
 		t.Fatal("expected trailing bytes to fail")
 	}
