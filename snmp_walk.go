@@ -183,6 +183,16 @@ func snmpWalkRoots(ctx context.Context, conn snmpQuerier, roots []string, v1 boo
 					continue
 				}
 				done, leaf, pduErr := st.absorb(pdu)
+				if done || pduErr != nil {
+					// A binding that lands inside another active root is a
+					// misdirected row, not this root's answer: a device that
+					// does not interleave its bulk rows must not end or fail
+					// the root its slot named (issue 5157).
+					if owner := escapeOwner(pdu, active, st); owner != nil {
+						_, _, _ = owner.absorb(pdu)
+						continue
+					}
+				}
 				if pduErr != nil {
 					st.err = pduErr
 					st.done = true
@@ -220,14 +230,19 @@ func snmpWalkRoots(ctx context.Context, conn snmpQuerier, roots []string, v1 boo
 					active[first].duration += elapsed - distributed
 				}
 			}
-			// A short response ends the roots that received no binding: there is
-			// nothing left for them to request, and waiting again cannot help.
-			for _, st := range active {
-				if !st.done && !st.started {
-					st.done = true
-				}
+			// A reply shorter than the active set never reached the tail
+			// slots: those roots were not answered at all, so ending them
+			// would report empty subtrees that were never walked (issue
+			// 5157). Halve the group so the next request fits the device's
+			// PDU budget; each side retries in turn.
+			survivors := activeRoots(active)
+			if len(packet.Variables) < len(active) && len(survivors) > 1 {
+				mid := len(survivors) / 2
+				pending = append([][]*snmpWalkRootState{survivors[:mid], survivors[mid:]}, pending...)
+				active = nil
+			} else {
+				active = survivors
 			}
-			active = activeRoots(active)
 		}
 	}
 
@@ -265,6 +280,26 @@ func activeRoots(states []*snmpWalkRootState) []*snmpWalkRootState {
 		}
 	}
 	return active
+}
+
+// escapeOwner finds the still-active root a binding actually belongs to when
+// its positional owner treated it as the end of subtree or a protocol fault.
+// Exception bindings carry no value to hand on, and a name behind the owner's
+// cursor would only replay a row it already stored.
+func escapeOwner(pdu gosnmp.SnmpPDU, active []*snmpWalkRootState, except *snmpWalkRootState) *snmpWalkRootState {
+	switch pdu.Type {
+	case gosnmp.EndOfMibView, gosnmp.NoSuchObject, gosnmp.NoSuchInstance:
+		return nil
+	}
+	for _, st := range active {
+		if st == except || st.done {
+			continue
+		}
+		if strings.HasPrefix(pdu.Name, st.root+".") && snmpOIDLess(st.last, pdu.Name) {
+			return st
+		}
+	}
+	return nil
 }
 
 // absorb records one GETBULK binding for this root. It returns done when the
