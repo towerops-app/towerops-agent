@@ -172,6 +172,7 @@ func snmpWalkRoots(ctx context.Context, conn snmpQuerier, roots []string, v1 boo
 			// the number of bindings each root received so summed root durations
 			// still equal the actual exchange time.
 			counts := make([]int, len(active))
+			var exact []*snmpWalkRootState
 			for i, pdu := range packet.Variables {
 				rootIndex := i % len(active)
 				counts[rootIndex]++
@@ -181,19 +182,25 @@ func snmpWalkRoots(ctx context.Context, conn snmpQuerier, roots []string, v1 boo
 				if st.done {
 					continue
 				}
-				done, exact, pduErr := st.absorb(pdu)
+				done, leaf, pduErr := st.absorb(pdu)
 				if pduErr != nil {
 					st.err = pduErr
 					st.done = true
 					continue
 				}
-				if exact {
-					st.finishExact(conn)
+				if leaf {
+					// The leaf check is deferred until the whole reply is
+					// distributed so absent roots share one GET per batch.
+					exact = append(exact, st)
+					st.done = true
 					continue
 				}
 				if done {
 					st.done = true
 				}
+			}
+			if len(exact) > 0 {
+				resolveExactRoots(conn, state, exact)
 			}
 			if total := len(packet.Variables); total > 0 {
 				distributed := time.Duration(0)
@@ -271,11 +278,18 @@ func (st *snmpWalkRootState) absorb(pdu gosnmp.SnmpPDU) (done, exact bool, err e
 		return true, first, nil
 	}
 	if !strings.HasPrefix(pdu.Name, st.root+".") {
-		if pdu.Name == st.root && pdu.Type != gosnmp.NoSuchInstance {
-			snmpStorePDU(st.values, pdu)
+		if pdu.Name == st.root {
+			// The device answered the leaf itself: the value is already
+			// stored, so a follow-up GET could only repeat it.
+			if pdu.Type != gosnmp.NoSuchInstance {
+				snmpStorePDU(st.values, pdu)
+			}
+			return true, false, nil
 		}
-		// The first answer escaped the subtree: the root names a leaf.
-		return true, first, nil
+		// The first answer escaped the subtree: the root names a leaf. An
+		// answer below the root is some other root's chain landing in this
+		// slot, not proof of a leaf, so it earns no exact GET.
+		return true, first && !snmpOIDLess(pdu.Name, st.root), nil
 	}
 	if !snmpOIDLess(st.last, pdu.Name) {
 		return true, false, fmt.Errorf("device answered a non-increasing OID %s after %s", canonicalOID(pdu.Name), canonicalOID(st.last))
@@ -285,27 +299,89 @@ func (st *snmpWalkRootState) absorb(pdu gosnmp.SnmpPDU) (done, exact bool, err e
 	return false, false, nil
 }
 
+// resolveExactRoots resolves every root flagged for the leaf check with one
+// GET per batch instead of one GET per root: a typical poll lists several
+// tables a device does not implement, and those absent roots would otherwise
+// each cost a full paced round trip. The first batch that gets no response
+// ends the rest with the same error, since a silent device would make every
+// later request wait out the same timeout.
+func resolveExactRoots(conn snmpQuerier, state *snmpDeviceState, pending []*snmpWalkRootState) {
+	batchSize := snmpMaxOIDsPerGet
+	if state != nil {
+		batchSize = max(1, state.getSize())
+	}
+	var silence error
+	for start := 0; start < len(pending); start += batchSize {
+		batch := pending[start:min(start+batchSize, len(pending))]
+		if silence != nil {
+			for _, st := range batch {
+				st.err, st.noResponse = silence, true
+			}
+			continue
+		}
+		if err := exactRootsGet(conn, batch); isSNMPTimeout(err) {
+			silence = err
+		}
+	}
+}
+
+// exactRootsGet issues one GET for a batch of leaf-check roots and stores any
+// binding that answers a root exactly. Recoverable statuses split the batch
+// like snmpGetInto does; a transport error marks every root in the batch and
+// is returned so the caller can stop the remaining batches on a timeout.
+func exactRootsGet(conn snmpQuerier, batch []*snmpWalkRootState) error {
+	oids := make([]string, len(batch))
+	for i, st := range batch {
+		oids[i] = st.root
+	}
+	started := time.Now()
+	packet, err := conn.Get(oids)
+	elapsed := time.Since(started) / time.Duration(len(batch))
+	for _, st := range batch {
+		st.duration += elapsed
+	}
+	if err != nil {
+		noResponse := isSNMPTimeout(err)
+		for _, st := range batch {
+			st.err, st.noResponse = err, noResponse
+		}
+		return err
+	}
+	switch packet.Error {
+	case gosnmp.NoError:
+		byName := make(map[string]*snmpWalkRootState, len(batch))
+		for _, st := range batch {
+			byName[st.root] = st
+		}
+		for _, pdu := range packet.Variables {
+			if st := byName[pdu.Name]; st != nil {
+				snmpStorePDU(st.values, pdu)
+			}
+		}
+	case gosnmp.TooBig, gosnmp.NoSuchName:
+		if len(batch) == 1 {
+			st := batch[0]
+			st.err = fmt.Errorf("device answered %v (error index %d) for %s", packet.Error, packet.ErrorIndex, canonicalOID(st.root))
+			return nil
+		}
+		mid := len(batch) / 2
+		if err := exactRootsGet(conn, batch[:mid]); err != nil {
+			return err
+		}
+		return exactRootsGet(conn, batch[mid:])
+	default:
+		message := fmt.Errorf("device answered %v (error index %d)", packet.Error, packet.ErrorIndex)
+		for _, st := range batch {
+			st.err = message
+		}
+	}
+	return nil
+}
+
 // finishExact performs the single exact GET gosnmp's walk semantics use for a
 // leaf root (gosnmp issues #78, #93).
 func (st *snmpWalkRootState) finishExact(conn snmpQuerier) {
-	started := time.Now()
-	packet, err := conn.Get([]string{st.root})
-	st.duration += time.Since(started)
-	if err != nil {
-		st.err, st.noResponse = err, isSNMPTimeout(err)
-		st.done = true
-		return
-	}
-	if packet.Error != gosnmp.NoError {
-		st.err = fmt.Errorf("device answered %v (error index %d) for %s", packet.Error, packet.ErrorIndex, canonicalOID(st.root))
-		st.done = true
-		return
-	}
-	for _, pdu := range packet.Variables {
-		if pdu.Name == st.root {
-			snmpStorePDU(st.values, pdu)
-		}
-	}
+	_ = exactRootsGet(conn, []*snmpWalkRootState{st})
 	st.done = true
 }
 

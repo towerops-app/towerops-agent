@@ -307,3 +307,89 @@ func TestSnmpWalkRootsTransportDeathMarksPendingGroups(t *testing.T) {
 		}
 	}
 }
+
+// After one batched leaf-check GET times out, later batches are marked dead
+// without spending another request on a silent transport (issue 5166).
+func TestResolveExactRootsStopsAfterSilence(t *testing.T) {
+	oids := []string{".1.3.6.1.2.400.1", ".1.3.6.1.2.400.2", ".1.3.6.1.2.400.3", ".1.3.6.1.2.400.4"}
+	roots := make([]*snmpWalkRootState, len(oids))
+	for i, oid := range oids {
+		roots[i] = newSnmpWalkRootState(oid)
+	}
+	mock := &mockSnmpQuerier{getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+		return nil, errors.New("response timeout")
+	}}
+	state := newSNMPDeviceState(defaultSNMPDevicePDURate)
+	state.getBatchSize = 2
+
+	resolveExactRoots(mock, state, roots)
+	if len(mock.getRequests) != 2 {
+		t.Fatalf("GET OIDs = %v, want one two-OID batch before silence", mock.getRequests)
+	}
+	for i, st := range roots {
+		if st.err == nil || !st.noResponse {
+			t.Fatalf("root %d err = %v noResponse = %v, want a dead-transport mark", i, st.err, st.noResponse)
+		}
+	}
+}
+
+// A tooBig batch answer bisects until every root gets its own verdict, a
+// failed left half aborts the sibling half, and any other packet status
+// marks the whole batch (issue 5166).
+func TestExactRootsGetBisectsAndMarksStatus(t *testing.T) {
+	rootA, rootB := ".1.3.6.1.2.400.1", ".1.3.6.1.2.400.2"
+
+	states := []*snmpWalkRootState{newSnmpWalkRootState(rootA), newSnmpWalkRootState(rootB)}
+	calls := 0
+	mock := &mockSnmpQuerier{getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+		calls++
+		if len(oids) > 1 {
+			return &gosnmp.SnmpPacket{Error: gosnmp.TooBig}, nil
+		}
+		return &gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{intVar(oids[0], 7)}}, nil
+	}}
+	if err := exactRootsGet(mock, states); err != nil {
+		t.Fatalf("exactRootsGet: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("requests = %d, want one oversized request plus one per bisected root", calls)
+	}
+	for i, st := range states {
+		if st.err != nil {
+			t.Fatalf("root %d err = %v after a successful bisect", i, st.err)
+		}
+	}
+
+	// A transport error inside the left half propagates; the right half is
+	// never requested.
+	states = []*snmpWalkRootState{newSnmpWalkRootState(rootA), newSnmpWalkRootState(rootB)}
+	dead := &mockSnmpQuerier{getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+		if len(oids) > 1 {
+			return &gosnmp.SnmpPacket{Error: gosnmp.TooBig}, nil
+		}
+		return nil, errors.New("response timeout")
+	}}
+	if err := exactRootsGet(dead, states); err == nil {
+		t.Fatal("a bisected half's transport error must propagate")
+	}
+	if len(dead.getRequests) != 3 {
+		t.Fatalf("GET OIDs = %v, want the batch plus the left half only", dead.getRequests)
+	}
+	if states[1].err != nil {
+		t.Fatalf("right half err = %v, want untouched by the dead left half", states[1].err)
+	}
+
+	// Any other packet-level status marks every root in the batch.
+	states = []*snmpWalkRootState{newSnmpWalkRootState(rootA), newSnmpWalkRootState(rootB)}
+	bad := &mockSnmpQuerier{getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+		return &gosnmp.SnmpPacket{Error: gosnmp.GenErr, ErrorIndex: 1}, nil
+	}}
+	if err := exactRootsGet(bad, states); err != nil {
+		t.Fatalf("a status answer is not a transport error: %v", err)
+	}
+	for i, st := range states {
+		if st.err == nil {
+			t.Fatalf("root %d err = nil after a genErr answer", i)
+		}
+	}
+}
