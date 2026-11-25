@@ -7,8 +7,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/towerops-app/towerops-agent/pb"
 	"google.golang.org/protobuf/proto"
@@ -287,3 +290,87 @@ func TestApplyInventoryDecode(t *testing.T) {
 }
 
 func base64enc(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
+
+// A one-job delta must fingerprint only the named upsert, not marshal and
+// hash the whole inventory twice (issue 5169), and unchanged entries must
+// keep their scheduleEntry, phase and fingerprint.
+func TestApplyIncrementalUpdateFingerprintsOnlyNamedEntries(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pools := testPools(t)
+	scheduler := pools.scheduler
+	results := newResultQueueForAgent(ctx, 8)
+
+	const inventorySize = 10_000
+	jobs := make([]*pb.AgentJob, 0, inventorySize)
+	for i := 0; i < inventorySize; i++ {
+		jobs = append(jobs, &pb.AgentJob{
+			JobId:           "job-" + strconv.Itoa(i),
+			IntervalSeconds: 300,
+		})
+	}
+	scheduler.replaceJobs(jobs, pools, results)
+
+	before := make(map[string]*scheduleEntry, inventorySize)
+	for id, entry := range scheduler.jobs {
+		before[id] = entry
+	}
+
+	var fingerprintCalls atomic.Int32
+	original := payloadFingerprint
+	payloadFingerprint = func(payload proto.Message) []byte {
+		fingerprintCalls.Add(1)
+		return original(payload)
+	}
+	t.Cleanup(func() { payloadFingerprint = original })
+
+	applyInventoryUpdate(pools, scheduler, &pb.AgentInventoryUpdate{
+		Revision: 2,
+		Upserts: []*pb.AgentJob{
+			// Identical to the seeded job: still fingerprinted once to
+			// prove it is unchanged, but the entry is kept.
+			{JobId: "job-0", IntervalSeconds: 300},
+		},
+		RemoveJobIds: []string{"job-1"},
+	}, results)
+
+	if got := fingerprintCalls.Load(); got != 1 {
+		t.Errorf("payloadFingerprint calls = %d, want 1", got)
+	}
+	if _, gone := scheduler.jobs["job-1"]; gone {
+		t.Error("removed job still scheduled")
+	}
+	for id, entry := range before {
+		if id == "job-1" {
+			continue
+		}
+		if scheduler.jobs[id] != entry {
+			t.Fatalf("unchanged job %s lost its scheduleEntry", id)
+		}
+	}
+}
+
+func TestApplyIncrementalUpdateSwapsChangedEntry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pools := testPools(t)
+	scheduler := pools.scheduler
+	results := newResultQueueForAgent(ctx, 8)
+
+	scheduler.replaceJobs([]*pb.AgentJob{
+		{JobId: "job-a", IntervalSeconds: 300},
+	}, pools, results)
+	entry := scheduler.jobs["job-a"]
+
+	applyInventoryUpdate(pools, scheduler, &pb.AgentInventoryUpdate{
+		Revision: 3,
+		Upserts:  []*pb.AgentJob{{JobId: "job-a", IntervalSeconds: 60}},
+	}, results)
+
+	if scheduler.jobs["job-a"] == entry {
+		t.Fatal("changed job kept its scheduleEntry")
+	}
+	if got := scheduler.jobs["job-a"].spec.interval; got != time.Minute {
+		t.Errorf("interval = %v", got)
+	}
+}

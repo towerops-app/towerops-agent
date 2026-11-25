@@ -287,28 +287,23 @@ func applyIncrementalUpdate(
 	expandInventoryJobs(update.Upserts)
 	expandInventoryChecks(update.UpsertChecks)
 
-	// Merge the incremental change into the current assignment payloads so
-	// unchanged assignments keep their scheduler phase and fingerprint.
-	jobs := scheduler.currentJobPayloads()
+	// The delta path touches only the ids the update names: unchanged
+	// assignments keep their scheduleEntry, phase and fingerprint without a
+	// marshal or hash of the rest of the inventory.
 	removeJobs := make(map[string]struct{}, len(update.RemoveJobIds))
 	for _, id := range update.RemoveJobIds {
 		removeJobs[id] = struct{}{}
 	}
-	jobs = filterJobPayloads(jobs, removeJobs)
-	jobs = append(jobs, update.Upserts...)
-
-	checks := scheduler.currentCheckPayloads()
 	removeChecks := make(map[string]struct{}, len(update.RemoveCheckIds))
 	for _, id := range update.RemoveCheckIds {
 		removeChecks[id] = struct{}{}
 	}
-	checks = filterCheckPayloads(checks, removeChecks)
-	checks = append(checks, update.UpsertChecks...)
 
-	scheduler.replaceJobs(jobs, pools, out)
-	scheduler.replaceChecks(checks, pools, out)
-	applySNMPConcurrencySizing(pools, len(jobs))
-	noteInventoryFootprint(len(jobs)+len(checks), proto.Size(update))
+	scheduler.applyJobDelta(update.Upserts, removeJobs, pools, out)
+	scheduler.applyCheckDelta(update.UpsertChecks, removeChecks, pools, out)
+	jobs, checks := scheduler.counts()
+	applySNMPConcurrencySizing(pools, jobs)
+	noteInventoryFootprint(jobs+checks, proto.Size(update))
 	pools.applyInventoryRevision("inventory_update", update.Revision)
 	slog.Info("applied inventory update",
 		"revision", update.Revision,
@@ -363,58 +358,4 @@ func expandInventoryChecks(checks []*pb.Check) {
 	// compact form lands in one normalization path.
 }
 
-// currentJobPayloads snapshots the recurring job payloads currently
-// scheduled, so an incremental update can merge into them without replacing
-// unchanged assignments' phases.
-func (s *recurringScheduler) currentJobPayloads() []*pb.AgentJob {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	jobs := make([]*pb.AgentJob, 0, len(s.jobs))
-	for _, entry := range s.jobs {
-		if job, ok := entry.spec.payload.(*pb.AgentJob); ok && job != nil {
-			jobs = append(jobs, job)
-		}
-	}
-	return jobs
-}
 
-// currentCheckPayloads snapshots the recurring checks currently scheduled.
-func (s *recurringScheduler) currentCheckPayloads() []*pb.Check {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	checks := make([]*pb.Check, 0, len(s.checks))
-	for _, entry := range s.checks {
-		if check, ok := entry.spec.payload.(*pb.Check); ok && check != nil {
-			checks = append(checks, check)
-		}
-	}
-	return checks
-}
-
-func filterJobPayloads(jobs []*pb.AgentJob, remove map[string]struct{}) []*pb.AgentJob {
-	if len(remove) == 0 {
-		return jobs
-	}
-	filtered := jobs[:0:0]
-	for _, job := range jobs {
-		if _, removed := remove[job.GetJobId()]; removed {
-			continue
-		}
-		filtered = append(filtered, job)
-	}
-	return filtered
-}
-
-func filterCheckPayloads(checks []*pb.Check, remove map[string]struct{}) []*pb.Check {
-	if len(remove) == 0 {
-		return checks
-	}
-	filtered := checks[:0:0]
-	for _, check := range checks {
-		if _, removed := remove[check.GetId()]; removed {
-			continue
-		}
-		filtered = append(filtered, check)
-	}
-	return filtered
-}
