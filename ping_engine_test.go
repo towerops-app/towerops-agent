@@ -361,6 +361,13 @@ func TestPingEngineLocalSendFailureReportsAgentError(t *testing.T) {
 // an agent fault: it must produce an agent error, not a down device
 // (issue 5162).
 func TestPingEngineExecFallbackLocalErrorReportsAgentError(t *testing.T) {
+	// dev-1's hint is shared map state: clear anything an earlier test
+	// published so the assertion below reads only this test's outcome.
+	reachabilityMu.Lock()
+	delete(reachByDevice, "dev-1")
+	delete(reachByIP, "127.0.0.1")
+	reachabilityMu.Unlock()
+
 	orig := execPing
 	execPing = func(context.Context, string, int) (float64, error) {
 		return 0, &exec.Error{Name: "ping", Err: exec.ErrNotFound}
