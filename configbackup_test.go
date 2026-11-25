@@ -3062,3 +3062,17 @@ func TestSSHClientAliveBounded(t *testing.T) {
 		t.Fatal("sshClientAlive blocked on an unanswered keepalive")
 	}
 }
+
+// A resolution failure surfaces before any dial is attempted (issue 5144).
+func TestConfigBackupDialResolveError(t *testing.T) {
+	origResolve := sshResolve
+	t.Cleanup(func() { sshResolve = origResolve })
+	sshResolve = func(context.Context, string) (string, error) {
+		return "", errors.New("no such host")
+	}
+
+	_, _, err := configBackupDial(context.Background(), cbJob("192.0.2.1", 22))
+	if err == nil || !strings.Contains(err.Error(), "resolve") {
+		t.Fatalf("err = %v, want a resolve failure", err)
+	}
+}
