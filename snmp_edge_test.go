@@ -116,7 +116,7 @@ func TestSnmpGetIntoShortReplyRecordsMissingOIDs(t *testing.T) {
 		}}, nil
 	}}
 	into := map[string]string{}
-	absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"},
+	absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, nil,
 		[]string{".1.3.6.1.2.1.1.5.0", ".1.3.6.1.2.1.1.6.0", "1.3.6.1.2.1.1.4.0"}, into)
 	if err != nil {
 		t.Fatalf("snmpGetInto error = %v", err)

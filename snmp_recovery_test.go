@@ -95,7 +95,7 @@ func TestSnmpGetIntoIndexedNoSuchNameRecovery(t *testing.T) {
 				return recoveryValues(batch), nil
 			}}
 			values := make(map[string]string)
-			absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "192.0.2.1", Version: "1"}, oids, values)
+			absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "192.0.2.1", Version: "1"}, nil, oids, values)
 			if err != nil {
 				t.Fatalf("collection failed: %v", err)
 			}
@@ -188,7 +188,7 @@ func TestSnmpGetIntoMalformedNoSuchNameIndex(t *testing.T) {
 				return recoveryValues(batch), nil
 			}}
 			values := make(map[string]string)
-			absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "192.0.2.1", Version: "1"}, oids, values)
+			absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "192.0.2.1", Version: "1"}, nil, oids, values)
 			if err != nil || absent != 1 {
 				t.Fatalf("absent = %d, error = %v; want one absent and no error", absent, err)
 			}
@@ -227,7 +227,7 @@ func TestSnmpGetIntoIndexedRemovalThenTimeout(t *testing.T) {
 		return nil, timeout
 	}}
 	values := map[string]string{"1.3.6.1.2.1.1.1.0": "earlier success"}
-	absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "192.0.2.1", Version: "1"}, oids, values)
+	absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "192.0.2.1", Version: "1"}, nil, oids, values)
 	if !errors.Is(err, timeout) {
 		t.Errorf("error = %v, want wrapped timeout", err)
 	}
@@ -279,7 +279,7 @@ func TestSnmpGetIntoSplitPreservesSuccessfulSibling(t *testing.T) {
 				return nil, timeout
 			}}
 			values := make(map[string]string)
-			absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "192.0.2.1", Version: "1"}, oids, values)
+			absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "192.0.2.1", Version: "1"}, nil, oids, values)
 			if !errors.Is(err, timeout) || absent != 0 || calls != 3 {
 				t.Fatalf("error = %v, absent = %d, requests = %d; want timeout, 0, 3", err, absent, calls)
 			}
@@ -316,7 +316,7 @@ func TestSnmpGetIntoIndexedRemovalThenFallback(t *testing.T) {
 		return recoveryValues(batch), nil
 	}}
 	values := make(map[string]string)
-	absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "192.0.2.1", Version: "1"}, oids, values)
+	absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "192.0.2.1", Version: "1"}, nil, oids, values)
 	if err != nil || absent != 2 {
 		t.Fatalf("absent = %d, error = %v; want two absent and no error", absent, err)
 	}

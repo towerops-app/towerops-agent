@@ -69,133 +69,159 @@ func snmpWalkRoots(ctx context.Context, conn snmpQuerier, roots []string, v1 boo
 	active := states
 	queryStarted := time.Now()
 
-	for len(active) > 0 {
-		if err := ctx.Err(); err != nil {
+	// A tooBig at one repetition cannot shrink further, so the active group
+	// splits in half and each side retries alone before any root fails.
+	pending := [][]*snmpWalkRootState{states}
+	var deadErr error
+	var deadNoResponse bool
+	for len(pending) > 0 {
+		active = pending[0]
+		pending = pending[1:]
+		if deadErr != nil {
+			// The transport already stopped answering: every later request
+			// would wait through the same silence, so mark this group the
+			// same without asking again.
 			for _, st := range active {
-				st.err = err
+				st.err, st.noResponse = deadErr, deadNoResponse
 			}
-			break
+			continue
 		}
-		request := make([]string, len(active))
-		for i, st := range active {
-			request[i] = st.last
-		}
-		started := time.Now()
-		packet, err := conn.GetBulk(request, 0, uint32(repetitions))
-		elapsed := time.Since(started)
-		if err != nil {
-			noResponse := isSNMPTimeout(err)
-			for _, st := range active {
-				st.duration += elapsed
-				st.err, st.noResponse = err, noResponse
-			}
-			break
-		}
-
-		switch packet.Error {
-		case gosnmp.NoError:
-		case gosnmp.TooBig:
-			for _, st := range active {
-				st.duration += elapsed
-			}
-			// Retry the identical request with fewer repetitions. A device
-			// cannot answer tooBig forever at one repetition.
-			if state != nil {
-				repetitions = int(state.noteTooBig())
-			} else if repetitions > 1 {
-				repetitions /= 2
-			}
-			if repetitions <= 1 {
+		for len(active) > 0 {
+			if err := ctx.Err(); err != nil {
 				for _, st := range active {
-					st.duration += elapsed
-					st.err = fmt.Errorf("device answered %v at max-repetitions 1", gosnmp.TooBig)
+					st.err = err
 				}
 				break
 			}
-			continue
-		default:
-			message := fmt.Errorf("device answered %v (error index %d)", packet.Error, packet.ErrorIndex)
-			for _, st := range active {
-				st.duration += elapsed
-				st.err = message
+			request := make([]string, len(active))
+			for i, st := range active {
+				request[i] = st.last
 			}
-		}
-		if packet.Error != gosnmp.NoError {
-			break
-		}
-		if len(packet.Variables) == 0 {
-			message := fmt.Errorf("device answered with an empty varbind list")
-			for _, st := range active {
-				st.duration += elapsed
-				st.err = message
+			started := time.Now()
+			packet, err := conn.GetBulk(request, 0, uint32(repetitions))
+			elapsed := time.Since(started)
+			if err != nil {
+				noResponse := isSNMPTimeout(err)
+				for _, st := range active {
+					st.duration += elapsed
+					st.err, st.noResponse = err, noResponse
+				}
+				if noResponse {
+					deadErr, deadNoResponse = err, true
+				}
+				break
 			}
-			break
-		}
-		if len(packet.Variables) >= len(active)*repetitions {
-			// A full response means the device could have filled more: learn
-			// the delivered row count and ask for that many next round, so
-			// large tables cost fewer packets without overshooting tooBig.
-			rows := len(packet.Variables) / len(active)
-			if state != nil {
-				state.noteBulkRows(rows)
-			} else {
-				repetitions = min(64, max(repetitions, rows))
-			}
-		}
 
-		// One shared request is one elapsed-time observation. Split it by
-		// the number of bindings each root received so summed root durations
-		// still equal the actual exchange time.
-		counts := make([]int, len(active))
-		for i, pdu := range packet.Variables {
-			rootIndex := i % len(active)
-			counts[rootIndex]++
-			st := active[rootIndex]
-			// A sentinel ends this root's subtree: later bindings in the same
-			// multi-root response belong to no live walk and stay ignored.
-			if st.done {
-				continue
-			}
-			done, exact, pduErr := st.absorb(pdu)
-			if pduErr != nil {
-				st.err = pduErr
-				st.done = true
-				continue
-			}
-			if exact {
-				st.finishExact(conn)
-				continue
-			}
-			if done {
-				st.done = true
-			}
-		}
-		if total := len(packet.Variables); total > 0 {
-			distributed := time.Duration(0)
-			first := -1
-			for i, count := range counts {
-				if count == 0 {
+			switch packet.Error {
+			case gosnmp.NoError:
+			case gosnmp.TooBig:
+				for _, st := range active {
+					st.duration += elapsed
+				}
+				if repetitions > 1 {
+					// Retry the identical request with fewer repetitions. A
+					// device cannot answer tooBig forever at one repetition.
+					if state != nil {
+						repetitions = int(state.noteBulkTooBig(uint32(repetitions)))
+					} else {
+						repetitions = max(1, repetitions/2)
+					}
 					continue
 				}
-				if first < 0 {
-					first = i
+				// Already at one repetition: only the root count can still
+				// shrink, so split the group before failing anything.
+				if len(active) > 1 {
+					mid := len(active) / 2
+					pending = append([][]*snmpWalkRootState{active[:mid], active[mid:]}, pending...)
+				} else {
+					active[0].err = fmt.Errorf("device answered %v at max-repetitions 1", gosnmp.TooBig)
 				}
-				piece := elapsed * time.Duration(count) / time.Duration(total)
-				active[i].duration += piece
-				distributed += piece
+				active = nil
+				continue
+			default:
+				message := fmt.Errorf("device answered %v (error index %d)", packet.Error, packet.ErrorIndex)
+				for _, st := range active {
+					st.duration += elapsed
+					st.err = message
+				}
 			}
-			if first >= 0 {
-				active[first].duration += elapsed - distributed
+			if packet.Error != gosnmp.NoError {
+				break
 			}
+			if len(packet.Variables) == 0 {
+				message := fmt.Errorf("device answered with an empty varbind list")
+				for _, st := range active {
+					st.duration += elapsed
+					st.err = message
+				}
+				break
+			}
+			if len(packet.Variables) >= len(active)*repetitions {
+				// A full response means the device could have filled more: with
+				// device state, count it toward stepping the remembered size
+				// back up; without, raise the local repetitions directly.
+				if state != nil {
+					repetitions = int(state.noteBulkFull())
+				} else {
+					rows := len(packet.Variables) / len(active)
+					repetitions = min(64, max(repetitions, rows))
+				}
+			}
+
+			// One shared request is one elapsed-time observation. Split it by
+			// the number of bindings each root received so summed root durations
+			// still equal the actual exchange time.
+			counts := make([]int, len(active))
+			for i, pdu := range packet.Variables {
+				rootIndex := i % len(active)
+				counts[rootIndex]++
+				st := active[rootIndex]
+				// A sentinel ends this root's subtree: later bindings in the same
+				// multi-root response belong to no live walk and stay ignored.
+				if st.done {
+					continue
+				}
+				done, exact, pduErr := st.absorb(pdu)
+				if pduErr != nil {
+					st.err = pduErr
+					st.done = true
+					continue
+				}
+				if exact {
+					st.finishExact(conn)
+					continue
+				}
+				if done {
+					st.done = true
+				}
+			}
+			if total := len(packet.Variables); total > 0 {
+				distributed := time.Duration(0)
+				first := -1
+				for i, count := range counts {
+					if count == 0 {
+						continue
+					}
+					if first < 0 {
+						first = i
+					}
+					piece := elapsed * time.Duration(count) / time.Duration(total)
+					active[i].duration += piece
+					distributed += piece
+				}
+				if first >= 0 {
+					active[first].duration += elapsed - distributed
+				}
+			}
+			// A short response ends the roots that received no binding: there is
+			// nothing left for them to request, and waiting again cannot help.
+			for _, st := range active {
+				if !st.done && !st.started {
+					st.done = true
+				}
+			}
+			active = activeRoots(active)
 		}
-		// A short response ends the roots that received no binding: there is
-		// nothing left for them to request, and waiting again cannot help.
-		for _, st := range active {
-			if !st.done && !st.started {
-				st.done = true
-			}
-		}
-		active = activeRoots(states)
 	}
 
 	// A shared GETBULK is one exchange observed by every active root. Scale
@@ -330,14 +356,23 @@ func (q *snmpJobQuerier) responded() bool { return q.observation.responded }
 // batch is retried in halves. The largest successful half size is remembered
 // per device, so later ticks start at the size the link actually delivers.
 func snmpGetWithRecovery(ctx context.Context, conn snmpQuerier, dev *pb.SnmpDevice, state *snmpDeviceState, oids []string, into map[string]string) (int, error) {
-	absent, err := snmpGetInto(conn, dev, oids, into)
-	if err == nil || ctx.Err() != nil || len(oids) <= 1 || !isSNMPTimeout(err) {
+	absent, err := snmpGetInto(conn, dev, state, oids, into)
+	if err == nil {
+		if state != nil {
+			state.noteGetBatchOK()
+		}
+		return absent, nil
+	}
+	if ctx.Err() != nil || len(oids) <= 1 || !isSNMPTimeout(err) {
 		return absent, err
 	}
 	observer, ok := conn.(snmpResponseObserver)
 	if !ok || !observer.responded() {
 		// A3: this was the job's first zero-response request.
 		return absent, err
+	}
+	if state != nil {
+		state.noteGetFailure(len(oids))
 	}
 
 	mid := len(oids) / 2

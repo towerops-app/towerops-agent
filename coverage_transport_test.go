@@ -376,7 +376,7 @@ func TestWSWriteBinary(t *testing.T) {
 func TestExecuteMikrotikJobDeadline(t *testing.T) {
 	out := newResultQueueForAgentBytes(context.Background(), 1<<20)
 	job := &pb.AgentJob{
-		JobId:     "deadline-job",
+		JobId:      "deadline-job",
 		DeadlineMs: 1,
 		MikrotikDevice: &pb.MikrotikDevice{
 			Ip:       "127.0.0.1",

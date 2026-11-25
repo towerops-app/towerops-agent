@@ -1415,7 +1415,7 @@ func TestSnmpGetIntoSingleOIDTooBigFails(t *testing.T) {
 		},
 	}
 	values := make(map[string]string)
-	absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "192.0.2.1"}, []string{oid}, values)
+	absent, err := snmpGetInto(mock, &pb.SnmpDevice{Ip: "192.0.2.1"}, nil, []string{oid}, values)
 	if err == nil {
 		t.Error("single-OID TooBig response reported successful collection")
 	} else if !strings.Contains(err.Error(), fmt.Sprint(gosnmp.TooBig)) {
@@ -1445,7 +1445,7 @@ func TestSnmpGetIntoUnhandledErrorStatus(t *testing.T) {
 	}
 
 	into := map[string]string{}
-	absent, _ := snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, oids, into)
+	absent, _ := snmpGetInto(mock, &pb.SnmpDevice{Ip: "10.0.0.1"}, nil, oids, into)
 	if absent != 0 {
 		t.Errorf("absent = %d, want 0 on genErr response", absent)
 	}
@@ -1478,7 +1478,7 @@ func TestSnmpGetIntoAbsentCount(t *testing.T) {
 			},
 		}
 		into := map[string]string{}
-		absent, err := snmpGetInto(mock, dev, []string{".1", ".2", ".3"}, into)
+		absent, err := snmpGetInto(mock, dev, nil, []string{".1", ".2", ".3"}, into)
 		if err != nil {
 			t.Fatalf("snmpGetInto error = %v", err)
 		}
@@ -1494,7 +1494,7 @@ func TestSnmpGetIntoAbsentCount(t *testing.T) {
 			},
 		}
 		into := map[string]string{}
-		absent, err := snmpGetInto(mock, dev, []string{".1"}, into)
+		absent, err := snmpGetInto(mock, dev, nil, []string{".1"}, into)
 		if err != nil {
 			t.Fatalf("snmpGetInto error = %v", err)
 		}
@@ -1513,7 +1513,7 @@ func TestSnmpGetIntoAbsentCount(t *testing.T) {
 			},
 		}
 		into := map[string]string{}
-		absent, err := snmpGetInto(mock, dev, []string{".1", ".2", ".3", ".4"}, into)
+		absent, err := snmpGetInto(mock, dev, nil, []string{".1", ".2", ".3", ".4"}, into)
 		if err != nil {
 			t.Fatalf("snmpGetInto error = %v", err)
 		}
