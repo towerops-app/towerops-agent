@@ -288,16 +288,20 @@ func batchableEvent(event string, size int) bool {
 }
 
 // resultPriority ranks the delivery lanes (issue C3): outage signals first,
-// then checks, then measurement polls, then one-shot bulk data.
+// then checks, then measurement polls, then one-shot bulk data, then traps.
+// Traps get their own lane below every measurement so a trap flood can never
+// starve poll delivery (issue 5165).
 func resultPriority(event string, reserved bool) uint8 {
 	if reserved {
 		return 3
 	}
 	switch event {
-	case "trap", "monitoring_check":
+	case "monitoring_check":
 		return 0
 	case "check_result":
 		return 1
+	case "trap":
+		return 4
 	default:
 		return 2
 	}
@@ -367,7 +371,7 @@ func decodeCapabilityPayload(
 
 // stageResults moves everything already available from the retry lane and
 // the spool ingress into the delivery lanes. It never blocks.
-func (s *session) stageResults(lanes *[4][]outbound) {
+func (s *session) stageResults(lanes *[5][]outbound) {
 	for {
 		result, ok := s.results.takeRetry()
 		if !ok {
@@ -390,7 +394,7 @@ func (s *session) stageResults(lanes *[4][]outbound) {
 // priority result; with it, small results accumulate into one frame until
 // the byte target, a priority trap/ping arrives, or the flush timer fires.
 // Non-batchable bulk results (large discovery/backup frames) go out alone.
-func (s *session) nextResultFrame(lanes *[4][]outbound, flushDue bool) ([]outbound, string) {
+func (s *session) nextResultFrame(lanes *[5][]outbound, flushDue bool) ([]outbound, string) {
 	// A server that did not negotiate result_batch_v1 gets one result per
 	// frame, highest priority first, as soon as it is staged. Holding a small
 	// result for the 250 ms batch window is only meaningful when that window
@@ -462,8 +466,8 @@ func (s *session) nextResultFrame(lanes *[4][]outbound, flushDue bool) ([]outbou
 
 // unstageBatch returns a held batch to the front of its lanes, preserving
 // priority order within each lane.
-func (s *session) unstageBatch(lanes *[4][]outbound, batch []outbound) {
-	byLane := [4][]outbound{}
+func (s *session) unstageBatch(lanes *[5][]outbound, batch []outbound) {
+	byLane := [5][]outbound{}
 	for _, result := range batch {
 		byLane[result.lane] = append(byLane[result.lane], result)
 	}
@@ -486,6 +490,18 @@ func (q *resultQueue) hasRoomFor(minBytes int64) bool {
 		return false
 	}
 	return q.byteUsage.Load()+minBytes <= q.byteLimit
+}
+
+// hasTrapRoomFor reports whether the trap sub-budget inside the spool can
+// take at least minBytes more (issue 5165).
+func (q *resultQueue) hasTrapRoomFor(minBytes int64) bool {
+	if !q.byteBounded() {
+		return len(q.items) < cap(q.items)
+	}
+	if len(q.items) >= cap(q.items) {
+		return false
+	}
+	return q.trapUsage.Load()+minBytes <= q.trapLimit
 }
 
 // pendingAckCount reports results sent but not yet acknowledged. The

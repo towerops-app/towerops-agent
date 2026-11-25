@@ -189,34 +189,36 @@ func TestResultQueueByteBoundAndAck(t *testing.T) {
 	}
 }
 
-// TestNextResultFramePrioritiesAndBatch verifies C3 and D5 ordering: trap and
-// ping signals flush immediately, polls hold for the 250 ms window, and the
-// held batch stays in stable order.
+// TestNextResultFramePrioritiesAndBatch verifies C3 and D5 ordering: outage
+// signals flush immediately, polls and traps hold for the 250 ms window, and
+// the held batch stays in stable order. Traps ride their own lowest lane so a
+// flood can never starve measurements (issue 5165).
 func TestNextResultFramePrioritiesAndBatch(t *testing.T) {
 	q := newResultQueueForAgentBytes(context.Background(), 1<<20)
 	s := &session{resultBatches: true, results: q}
+	signal := outbound{event: "monitoring_check", payload: json.RawMessage(`{}`)}
 	trap := outbound{event: "trap", payload: json.RawMessage(`{}`)}
 	poll := outbound{event: "result", payload: json.RawMessage(`{}`)}
-	if !q.enqueue(trap) || !q.enqueue(poll) {
+	if !q.enqueue(signal) || !q.enqueue(trap) || !q.enqueue(poll) {
 		t.Fatal("enqueue failed")
 	}
 
-	var lanes [4][]outbound
+	var lanes [5][]outbound
 	s.stageResults(&lanes)
 	frame, event := s.nextResultFrame(&lanes, false)
-	if len(frame) != 1 || frame[0].event != "trap" || event != "trap" {
-		t.Fatalf("first frame = %v (%q), want trap", frame, event)
+	if len(frame) != 1 || frame[0].event != "monitoring_check" || event != "monitoring_check" {
+		t.Fatalf("first frame = %v (%q), want monitoring_check", frame, event)
 	}
 	frame, _ = s.nextResultFrame(&lanes, false)
 	if len(frame) != 0 {
-		t.Fatalf("poll flushed before the batch window: %v", frame)
+		t.Fatalf("poll or trap flushed before the batch window: %v", frame)
 	}
-	if len(lanes[2]) != 1 {
-		t.Fatalf("held poll lane length = %d, want 1", len(lanes[2]))
+	if len(lanes[2]) != 1 || len(lanes[4]) != 1 {
+		t.Fatalf("held lanes = poll %d trap %d, want 1 each", len(lanes[2]), len(lanes[4]))
 	}
 	frame, event = s.nextResultFrame(&lanes, true)
-	if len(frame) != 1 || event != "result" {
-		t.Fatalf("flush frame = %v (%q), want poll", frame, event)
+	if len(frame) != 2 || frame[0].event != "result" || frame[1].event != "trap" || event != "result" {
+		t.Fatalf("flush frame = %v (%q), want [result trap]", frame, event)
 	}
 }
 
@@ -358,7 +360,7 @@ func batchSession(ctx context.Context) *session {
 // loop does and queues it for the writer.
 func sendFrame(t *testing.T, s *session) {
 	t.Helper()
-	var lanes [4][]outbound
+	var lanes [5][]outbound
 	s.stageResults(&lanes)
 	frame, event := s.nextResultFrame(&lanes, true)
 	if len(frame) == 0 {
@@ -488,7 +490,7 @@ func TestNextResultFrameLegacySendsHeldLanesImmediately(t *testing.T) {
 		t.Fatal("enqueue failed")
 	}
 
-	var lanes [4][]outbound
+	var lanes [5][]outbound
 	s.stageResults(&lanes)
 	if len(lanes[1]) != 1 || len(lanes[3]) != 1 {
 		t.Fatalf("staged lanes = %v, want one check_result and one identify result", lanes)
@@ -507,5 +509,111 @@ func TestNextResultFrameLegacySendsHeldLanesImmediately(t *testing.T) {
 	}
 	if len(lanes[1]) != 0 || len(lanes[3]) != 0 {
 		t.Fatalf("legacy lanes still hold results: %v", lanes)
+	}
+}
+
+// TestTrapSpoolBudgetPreservesResults checks the trap sub-budget inside the
+// spool: once it is exhausted traps drop but measurement results still fit
+// (issue 5165).
+func TestTrapSpoolBudgetPreservesResults(t *testing.T) {
+	q := newResultQueueForAgentBytes(context.Background(), 8192)
+	trap := outbound{event: "trap", payload: json.RawMessage(`{}`)}
+	for i := 0; i < 2000; i++ {
+		if !q.enqueue(trap) {
+			break
+		}
+	}
+	if got := q.trapUsage.Load(); got > 8192/trapSpoolShare {
+		t.Fatalf("trap usage %d exceeded sub-budget %d", got, 8192/trapSpoolShare)
+	}
+	if got := q.trapUsage.Load(); got == 0 {
+		t.Fatal("trap budget was never charged")
+	}
+	if !q.enqueue(outbound{event: "result", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("trap budget exhaustion refused a measurement result")
+	}
+}
+
+// TestTrapFloodDoesNotStarveResults stages thousands of traps behind one poll
+// result and requires the poll to lead the first frame (issue 5165).
+func TestTrapFloodDoesNotStarveResults(t *testing.T) {
+	q := newResultQueueForAgentBytes(context.Background(), 1<<20)
+	for i := 0; i < 5000; i++ {
+		if !q.enqueue(outbound{event: "trap", payload: json.RawMessage(`{}`)}) {
+			t.Fatalf("trap %d refused by spool", i)
+		}
+	}
+	if !q.enqueue(outbound{event: "result", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("poll refused")
+	}
+	s := &session{resultBatches: true, results: q}
+	var lanes [5][]outbound
+	s.stageResults(&lanes)
+	frame, _ := s.nextResultFrame(&lanes, true)
+	if len(frame) == 0 || frame[0].event != "result" {
+		t.Fatalf("first frame head = %v, want the poll result ahead of the flood", frame)
+	}
+}
+
+// TestTrapSpoolBudgetReleasesOnSpoolFull: a trap that fits its sub-budget but
+// loses the shared byte check must hand the trap charge back (issue 5165).
+func TestTrapSpoolBudgetReleasesOnSpoolFull(t *testing.T) {
+	q := newResultQueueForAgentBytes(context.Background(), 8192)
+	if !q.enqueue(outbound{event: "result", payload: make(json.RawMessage, 8191)}) {
+		t.Fatal("fill result refused")
+	}
+	if q.enqueue(outbound{event: "trap", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("trap must be refused by the shared byte budget")
+	}
+	if got := q.trapUsage.Load(); got != 0 {
+		t.Fatalf("trap charge leaked into sub-budget: %d", got)
+	}
+}
+
+func TestHasTrapRoomFor(t *testing.T) {
+	count := newResultQueueForAgent(context.Background(), 4)
+	if !count.hasTrapRoomFor(1) {
+		t.Error("empty count-mode spool must report trap room")
+	}
+	for i := 0; i < cap(count.items); i++ {
+		count.items <- outbound{}
+	}
+	if count.hasTrapRoomFor(1) {
+		t.Error("full count-mode spool must report no trap room")
+	}
+
+	q := newResultQueueForAgentBytes(context.Background(), 8192)
+	if !q.hasTrapRoomFor(1) {
+		t.Error("empty byte spool must report trap room")
+	}
+	q.trapUsage.Store(q.trapLimit)
+	if q.hasTrapRoomFor(1) {
+		t.Error("exhausted trap budget must report no room")
+	}
+	full := newResultQueueForAgentBytes(context.Background(), 1<<30)
+	for i := 0; i < cap(full.items); i++ {
+		full.items <- outbound{}
+	}
+	if full.hasTrapRoomFor(1) {
+		t.Error("full ingress must report no trap room")
+	}
+}
+
+func TestResultQueueTinySpoolKeepsTrapBudget(t *testing.T) {
+	q := newResultQueueForAgentBytes(context.Background(), 4)
+	if q.trapLimit != 1 {
+		t.Fatalf("trapLimit = %d, want floor of 1", q.trapLimit)
+	}
+}
+
+func TestTrapReleaseCapacityUncharges(t *testing.T) {
+	q := newResultQueueForAgentBytes(context.Background(), 8192)
+	if !q.enqueue(outbound{event: "trap", payload: json.RawMessage(`{}`)}) {
+		t.Fatal("trap enqueue refused")
+	}
+	got := <-q.items
+	q.releaseCapacity(got, true)
+	if q.trapUsage.Load() != 0 {
+		t.Fatalf("trapUsage = %d after release, want 0", q.trapUsage.Load())
 	}
 }

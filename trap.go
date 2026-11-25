@@ -5,6 +5,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -85,6 +86,13 @@ var (
 	// trapDroppedTotal is the cumulative queue-full drop count, summed
 	// across rebinds, which is what the heartbeat reports.
 	trapDroppedTotal atomic.Uint64
+	// trapRateLimitedTotal counts packets the per-source and global rate
+	// ceilings dropped before they could reach the queue (issue 5165).
+	trapRateLimitedTotal atomic.Uint64
+	// trapEncodeDroppedTotal counts traps whose protobuf encoding failed;
+	// kept separate from spool-full drops so a malformed packet is never
+	// reported as capacity loss (issue 5165).
+	trapEncodeDroppedTotal atomic.Uint64
 )
 
 const (
@@ -120,6 +128,44 @@ func beginTrapRebind() {
 	}
 }
 
+// Trap admission ceilings (issue 5165). Source addresses are spoofable, so a
+// per-source bucket alone cannot bound a flood: the global bucket caps total
+// intake. Vars rather than consts so tests can tighten them.
+var (
+	trapPerSourceRate  = 20.0  // packets per second per source address
+	trapPerSourceBurst = 40.0  // absorb a reboot fan-out from one device
+	trapGlobalRate     = 200.0 // packets per second across all sources
+	trapGlobalBurst    = 400.0
+	// trapSourceMaxIdle is how long a per-source bucket survives without a
+	// packet; trapSourceMaxTracked bounds the source map against spoofed
+	// floods.
+	trapSourceMaxIdle    = time.Minute
+	trapSourceMaxTracked = 4096
+)
+
+// trapTokenBucket is a lazy-refill token bucket; admit callers hold rateMu.
+type trapTokenBucket struct {
+	tokens float64
+	last   time.Time
+}
+
+func (b *trapTokenBucket) allow(now time.Time, rate, burst float64) bool {
+	if b.last.IsZero() {
+		b.tokens = burst
+	} else {
+		b.tokens += now.Sub(b.last).Seconds() * rate
+		if b.tokens > burst {
+			b.tokens = burst
+		}
+	}
+	b.last = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
 // trapListener receives SNMP traps on a UDP port and converts them to protobuf.
 //
 // The listener outlives any single WebSocket session: devices send traps
@@ -138,6 +184,12 @@ type trapListener struct {
 	lastDropLog atomic.Int64
 	closed      chan struct{}
 	port        uint16
+	// rateMu guards the admission buckets: per-source ceilings plus a
+	// process-wide one (issue 5165).
+	rateMu        sync.Mutex
+	rateGlobal    trapTokenBucket
+	rateSources   map[string]*trapTokenBucket
+	rateLastSweep time.Time
 	// probeSeen is set by handle when a probe arrives and cleared by probe
 	// on each check. probeWorks records that any probe ever arrived.
 	probeSeen  atomic.Bool
@@ -156,11 +208,12 @@ func startTrapListener(bindAddr string, port uint16, community string) (*trapLis
 	}
 
 	t := &trapListener{
-		traps:     make(chan *pb.SnmpTrap, trapQueueSize),
-		community: community,
-		bindAddr:  bindAddr,
-		closed:    make(chan struct{}),
-		port:      port,
+		traps:       make(chan *pb.SnmpTrap, trapQueueSize),
+		community:   community,
+		bindAddr:    bindAddr,
+		closed:      make(chan struct{}),
+		port:        port,
+		rateSources: make(map[string]*trapTokenBucket),
 	}
 
 	listener := t.newListener()
@@ -196,10 +249,30 @@ func (t *trapListener) newListener() *gosnmp.TrapListener {
 	return listener
 }
 
+// listenCall invokes the listener's blocking read loop. A var so a test can
+// make it panic and cover the recovery path (issue 5165).
+var listenCall = func(l *gosnmp.TrapListener, addr string) error {
+	return l.Listen(addr)
+}
+
+// listenTrap runs the listener, converting a decoder panic into an error the
+// serve loop can log and rebind from (issue 5165).
+func listenTrap(l *gosnmp.TrapListener, addr string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("snmp trap decoder panic: %v", r)
+		}
+	}()
+	return listenCall(l, addr)
+}
+
 func (t *trapListener) serve(listener *gosnmp.TrapListener, done chan struct{}, startupErr chan<- error) {
 	addr := net.JoinHostPort(t.bindAddr, strconv.Itoa(int(t.port)))
 	for {
-		err := listener.Listen(addr)
+		// gosnmp recovers panics only on its request path; a decoder panic
+		// on a hostile datagram would otherwise end the process (issue
+		// 5165). Treat it like any listen failure: log and rebind.
+		err := listenTrap(listener, addr)
 		close(done)
 		if startupErr != nil {
 			startupErr <- err
@@ -400,6 +473,11 @@ func (t *trapListener) handle(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) {
 		return
 	}
 
+	if !t.admit(addr, time.Now()) {
+		trapRateLimitedTotal.Add(1)
+		return
+	}
+
 	trap := trapToProto(packet, addr)
 	select {
 	case t.traps <- trap:
@@ -410,13 +488,64 @@ func (t *trapListener) handle(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) {
 	}
 }
 
+// admit applies the global and per-source admission ceilings (issue 5165).
+// A spoofed flood can mint unlimited source keys, so the global bucket is
+// checked first and the source map is swept of idle buckets and bounded.
+func (t *trapListener) admit(addr *net.UDPAddr, now time.Time) bool {
+	ip := addr.IP.String()
+	t.rateMu.Lock()
+	defer t.rateMu.Unlock()
+	if !t.rateGlobal.allow(now, trapGlobalRate, trapGlobalBurst) {
+		return false
+	}
+	src, ok := t.rateSources[ip]
+	if !ok {
+		if t.rateSources == nil {
+			t.rateSources = make(map[string]*trapTokenBucket)
+		}
+		if len(t.rateSources) >= trapSourceMaxTracked || now.Sub(t.rateLastSweep) >= trapSourceMaxIdle {
+			for key, bucket := range t.rateSources {
+				if now.Sub(bucket.last) > trapSourceMaxIdle {
+					delete(t.rateSources, key)
+				}
+			}
+			t.rateLastSweep = now
+		}
+		if len(t.rateSources) >= trapSourceMaxTracked {
+			// The map is full of live sources; refuse rather than grow
+			// without bound on attacker-controlled keys.
+			return false
+		}
+		src = &trapTokenBucket{}
+		t.rateSources[ip] = src
+	}
+	return src.allow(now, trapPerSourceRate, trapPerSourceBurst)
+}
+
 // countTrapSpoolDrop increments the heartbeat's trap drop count for a trap
 // the result spool could not hold. The session loop calls this when a trap's
-// sendResult lands on a full spool, so traps_dropped covers queue-full AND
+// enqueue lands on a full spool, so traps_dropped covers queue-full AND
 // spool-full drops rather than only the queue's own count.
 func countTrapSpoolDrop() {
 	trapDroppedTotal.Add(1)
 }
+
+// countTrapEncodeDrop counts a trap whose protobuf encoding failed. Encode
+// failures are not capacity loss, so they stay out of traps_dropped (issue
+// 5165); the rate-limited warn keeps a broken encoder from spamming the log.
+func countTrapEncodeDrop() {
+	dropped := trapEncodeDroppedTotal.Add(1)
+	now := time.Now().UnixNano()
+	last := trapEncodeDropLog.Load()
+	if last != 0 && now-last < int64(trapDropLogInterval) {
+		return
+	}
+	if trapEncodeDropLog.CompareAndSwap(last, now) {
+		slog.Warn("snmp traps failed protobuf encoding, dropping", "dropped_total", dropped)
+	}
+}
+
+var trapEncodeDropLog atomic.Int64
 
 // reportDrop warns about a saturated queue at most once per
 // trapDropLogInterval. A long-running agent whose queue keeps overflowing
@@ -434,6 +563,22 @@ func (t *trapListener) reportDrop(dropped uint64) {
 	}
 	slog.Warn("snmp trap queue full, dropping traps",
 		"dropped_total", dropped, "queue_size", trapQueueSize)
+}
+
+// validOIDName reports whether a varbind name is a plain OID string (digits
+// and dots). Anything else is raw packet bytes gosnmp could not decode as an
+// OBJECT IDENTIFIER (issue 5165).
+func validOIDName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c < '0' || c > '9') && c != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 // trapToProto converts a received trap packet to its wire representation.
@@ -476,7 +621,15 @@ func trapToProto(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) *pb.SnmpTrap {
 			truncated = true
 			continue
 		}
-		trap.Varbinds[trimOID(pdu.Name)] = snmpValueToString(pdu)
+		name := trimOID(pdu.Name)
+		if !validOIDName(name) {
+			// gosnmp returns the raw bytes as the name when the varbind's
+			// tag is not OBJECT IDENTIFIER; those bytes can be invalid
+			// UTF-8 and make proto.Marshal fail (issue 5165). Hex keeps
+			// the key ASCII and still records which binding arrived.
+			name = "0x" + hex.EncodeToString([]byte(pdu.Name))
+		}
+		trap.Varbinds[name] = snmpValueToString(pdu)
 	}
 	if truncated {
 		slog.Warn("truncating trap varbinds", "source", trap.SourceIp, "limit", maxTrapVarbinds)
