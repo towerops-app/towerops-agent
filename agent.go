@@ -199,6 +199,17 @@ func runAgentWithScheduling(
 		}
 
 		if poller == nil || poller.stopped.Load() {
+			if poller != nil {
+				// stop() runs on the grace-timer goroutine and outlives the
+				// stopped flag by the whole pool drain. Wait for it so the
+				// new poller never schedules onto the old ping engine or has
+				// its load hook blanked by the old stop().
+				select {
+				case <-poller.stopDone:
+				case <-ctx.Done():
+					return
+				}
+			}
 			poller = newProcessPoller(ctx, results, localScheduling)
 		}
 
@@ -2504,6 +2515,10 @@ type jobPools struct {
 	scheduler       *recurringScheduler
 	targets         *targetGates
 	localScheduling bool
+	// pingEngine is owned by this poller: it starts in newProcessPoller and
+	// is shut down inside stop(), so a rebuilt poller never shares an engine
+	// with the one still draining.
+	pingEngine *pingEngine
 
 	// stopAccepting is set during a self-update drain so the session refuses
 	// new job and check submissions while the spool flushes. In-flight work
@@ -2724,7 +2739,7 @@ func submitJob(
 		pools.ping.dispatchGated(ctx, ctx, pools.targets, jobTargetKey(job),
 			dispatchJitter(),
 			func(release func()) {
-				if !submitPingJob(ctx, job, out, func() {
+				if pools.pingEngine == nil || !submitPingJob(ctx, pools.pingEngine, job, out, func() {
 					release()
 					done()
 				}) {

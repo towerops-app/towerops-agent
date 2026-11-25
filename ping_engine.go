@@ -58,6 +58,9 @@ type pingEngine struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
+	// stopped is set under mu by shutdown; submitPingJob checks it under the
+	// same mutex so a job can never land in submit after the drain ran.
+	stopped bool
 }
 
 // pingProbeRef locates one probe inside a live job.
@@ -109,34 +112,10 @@ type deviceReachability struct {
 }
 
 var (
-	engineOnce sync.Once
-	engine     *pingEngine
-
 	reachabilityMu sync.RWMutex
 	reachByDevice  = make(map[string]deviceReachability)
 	reachByIP      = make(map[string]deviceReachability)
 )
-
-// startPingEngine starts the process-wide ping engine. Idempotent.
-func startPingEngine(ctx context.Context) {
-	engineOnce.Do(func() {
-		engine = newPingEngine(ctx)
-		engine.wg.Add(2)
-		go engine.run()
-		go engine.runFallback()
-	})
-}
-
-// stopPingEngine cancels outstanding jobs and waits for the goroutines to
-// return. Production never calls this; tests do.
-func stopPingEngine() {
-	if engine != nil {
-		engine.cancel()
-		engine.wg.Wait()
-		engine = nil
-		engineOnce = sync.Once{}
-	}
-}
 
 func newPingEngine(ctx context.Context) *pingEngine {
 	ctx, cancel := context.WithCancel(ctx)
@@ -151,17 +130,57 @@ func newPingEngine(ctx context.Context) *pingEngine {
 	}
 }
 
+// start launches the event loop and the exec fallback worker. The engine
+// belongs to one poller: shutdown tears it down with the poller's pools.
+func (e *pingEngine) start() {
+	e.wg.Add(2)
+	go e.run()
+	go e.runFallback()
+}
+
+// shutdown cancels outstanding jobs, waits for the goroutines to return,
+// then releases every job still queued on submit. run() is gone at that
+// point, so nothing else can dequeue them and their done callbacks must
+// still fire to free the target gates and unblock runTick waiters.
+func (e *pingEngine) shutdown() {
+	e.mu.Lock()
+	e.stopped = true
+	e.mu.Unlock()
+	e.cancel()
+	e.wg.Wait()
+	for {
+		select {
+		case pj := <-e.submit:
+			pj.cancel()
+			if pj.done != nil {
+				pj.done()
+				pj.done = nil
+			}
+		default:
+			return
+		}
+	}
+}
+
 // submitPingJob enqueues one ping round without holding a worker. Returns
-// false when the queue is full; the caller owns done() in that case.
-func submitPingJob(ctx context.Context, job *pb.AgentJob, out *resultQueue, done func()) bool {
-	startPingEngine(context.Background())
+// false when the queue is full or the engine is stopping; the caller owns
+// done() in that case.
+func submitPingJob(ctx context.Context, e *pingEngine, job *pb.AgentJob, out *resultQueue, done func()) bool {
 	pj, ok := newPingJob(ctx, job, out, done)
 	if !ok {
 		// Refusal: the caller owns done and the target gate.
 		return false
 	}
+	// The mutex orders the send against shutdown: once stopped is set the
+	// engine never reads submit again, so a queued job would never finish.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.stopped {
+		pj.cancel()
+		return false
+	}
 	select {
-	case engine.submit <- pj:
+	case e.submit <- pj:
 		return true
 	default:
 		// Refusal: the caller owns done and the target gate. Calling done

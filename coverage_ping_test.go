@@ -534,9 +534,13 @@ func heapPushPing(e *pingEngine, ev pingEvent) {
 }
 
 func TestSubmitPingJobPaths(t *testing.T) {
+	e := newPingEngine(context.Background())
+	e.start()
+	t.Cleanup(e.shutdown)
+
 	// Bad device → refusal returns false; done stays the caller's job.
 	done := make(chan struct{}, 1)
-	if submitPingJob(context.Background(), &pb.AgentJob{JobId: "bad"}, newResultQueue(4), func() { done <- struct{}{} }) {
+	if submitPingJob(context.Background(), e, &pb.AgentJob{JobId: "bad"}, newResultQueue(4), func() { done <- struct{}{} }) {
 		t.Error("job without device must fail")
 	}
 	select {
@@ -547,23 +551,17 @@ func TestSubmitPingJobPaths(t *testing.T) {
 
 	// Full submit queue → false. A hand-built engine without goroutines
 	// avoids the run loop draining the queue mid-fill.
-	stopPingEngine()
-	engine = newPingEngine(context.Background())
-	engineOnce.Do(func() {}) // mark the once consumed so startPingEngine is a no-op
-	t.Cleanup(func() {
-		engine.cancel()
-		engine = nil
-		engineOnce = sync.Once{}
-	})
+	full := newPingEngine(context.Background())
+	t.Cleanup(full.cancel)
 	job := &pb.AgentJob{
 		JobId:      "flood",
 		SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1"},
 	}
-	for i := 0; i < cap(engine.submit); i++ {
-		engine.submit <- &pingJob{ctx: context.Background(), cancel: func() {}}
+	for i := 0; i < cap(full.submit); i++ {
+		full.submit <- &pingJob{ctx: context.Background(), cancel: func() {}}
 	}
 	done2 := make(chan struct{}, 1)
-	if submitPingJob(context.Background(), job, newResultQueue(4), func() { done2 <- struct{}{} }) {
+	if submitPingJob(context.Background(), full, job, newResultQueue(4), func() { done2 <- struct{}{} }) {
 		t.Error("full queue must refuse")
 	}
 	select {
@@ -571,8 +569,15 @@ func TestSubmitPingJobPaths(t *testing.T) {
 		t.Error("refusal must not fire done")
 	default:
 	}
-	for i := 0; i < cap(engine.submit); i++ {
-		<-engine.submit
+	for i := 0; i < cap(full.submit); i++ {
+		<-full.submit
+	}
+
+	// A stopped engine must refuse: after shutdown nothing reads submit.
+	e.shutdown()
+	done3 := make(chan struct{}, 1)
+	if submitPingJob(context.Background(), e, job, newResultQueue(4), func() { done3 <- struct{}{} }) {
+		t.Error("stopped engine must refuse")
 	}
 }
 

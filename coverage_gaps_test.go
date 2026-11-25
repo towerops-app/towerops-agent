@@ -344,26 +344,16 @@ func TestEnqueueIngressFull(t *testing.T) {
 func TestSubmitJobPingEngineRefusal(t *testing.T) {
 	// Full engine submit queue → submitPingJob fails inside the ping pool
 	// dispatch → reportPoolRejection + done.
-	stopPingEngine()
-	engine = newPingEngine(context.Background())
-	engineOnce.Do(func() {})
-	t.Cleanup(func() {
-		engine.cancel()
-		engine = nil
-		engineOnce = sync.Once{}
-	})
+	engine := newPingEngine(context.Background())
 	for i := 0; i < cap(engine.submit); i++ {
 		engine.submit <- &pingJob{ctx: context.Background(), cancel: func() {}}
 	}
-	defer func() {
-		for len(engine.submit) > 0 {
-			<-engine.submit
-		}
-	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pools := testPools(t)
+	pools.pingEngine.shutdown()
+	pools.pingEngine = engine
 	out := newResultQueueForAgent(ctx, 8)
 	done := make(chan struct{}, 1)
 	job := &pb.AgentJob{

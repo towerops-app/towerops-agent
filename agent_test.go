@@ -106,6 +106,8 @@ func testPools(t *testing.T) *jobPools {
 		localScheduling: true,
 	}
 	p.scheduler = newRecurringScheduler(ctx, realScheduleClock{})
+	p.pingEngine = newPingEngine(ctx)
+	p.pingEngine.start()
 	t.Cleanup(func() {
 		cancel()
 		p.scheduler.cancelAll()
@@ -114,6 +116,7 @@ func testPools(t *testing.T) *jobPools {
 		p.ping.stop()
 		p.checks.stop()
 		p.ubnt.stop()
+		p.pingEngine.shutdown()
 		if !p.scheduler.wait(time.Second) {
 			t.Error("scheduler did not stop")
 		}
@@ -1184,8 +1187,6 @@ func TestDispatchJob(t *testing.T) {
 	})
 
 	t.Run("PING", func(t *testing.T) {
-		stopPingEngine()
-		t.Cleanup(stopPingEngine)
 		conn := tpTNewFakeICMPConn()
 		tpTUseFakeICMPConn(t, conn)
 		job := &pb.AgentJob{
@@ -4954,8 +4955,6 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 	t.Cleanup(func() { dispatchJitterMax = origJitter })
 
 	t.Run("same pool", func(t *testing.T) {
-		stopPingEngine()
-		t.Cleanup(stopPingEngine)
 		conn := tpTNewFakeICMPConn()
 		tpTUseFakeICMPConn(t, conn)
 
@@ -5055,8 +5054,6 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 	t.Run("ping is not gated behind snmp", func(t *testing.T) {
 		origDial := snmpDial
 		defer func() { snmpDial = origDial }()
-		stopPingEngine()
-		t.Cleanup(stopPingEngine)
 		conn := tpTNewFakeICMPConn()
 		tpTUseFakeICMPConn(t, conn)
 
@@ -5102,8 +5099,6 @@ func TestJobsForSameTargetSerialize(t *testing.T) {
 	})
 
 	t.Run("different targets stay parallel", func(t *testing.T) {
-		stopPingEngine()
-		t.Cleanup(stopPingEngine)
 		conn := tpTNewFakeICMPConn()
 		tpTUseFakeICMPConn(t, conn)
 
@@ -5354,8 +5349,6 @@ func TestJobCancelledWhileGated(t *testing.T) {
 	origJitter := dispatchJitterMax
 	dispatchJitterMax = 0
 	t.Cleanup(func() { dispatchJitterMax = origJitter })
-	stopPingEngine()
-	t.Cleanup(stopPingEngine)
 	conn := tpTNewFakeICMPConn()
 	tpTUseFakeICMPConn(t, conn)
 
@@ -5492,8 +5485,6 @@ func TestSequentialJobsOnSameTargetBothRun(t *testing.T) {
 	origJitter := dispatchJitterMax
 	dispatchJitterMax = 0
 	t.Cleanup(func() { dispatchJitterMax = origJitter })
-	stopPingEngine()
-	t.Cleanup(stopPingEngine)
 	conn := tpTNewFakeICMPConn()
 	tpTUseFakeICMPConn(t, conn)
 
@@ -5535,8 +5526,6 @@ func TestDifferentKindsOnSameTargetRunConcurrently(t *testing.T) {
 
 	// Start a real engine ping, then submit a backup for the same device: it
 	// must not block on the ping's protocol-specific gate.
-	stopPingEngine()
-	t.Cleanup(stopPingEngine)
 	conn := tpTNewFakeICMPConn()
 	tpTUseFakeICMPConn(t, conn)
 	pingDone := make(chan struct{})
