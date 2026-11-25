@@ -393,3 +393,108 @@ func TestExactRootsGetBisectsAndMarksStatus(t *testing.T) {
 		}
 	}
 }
+
+// A GETBULK reply that ends before the tail slots were reached left those
+// roots unanswered: they are re-requested in narrower groups instead of
+// completing empty (issue 5157).
+func TestSnmpWalkRootsShortReplyReRequestsTail(t *testing.T) {
+	const a = ".1.3.6.1.2.100"
+	const b = ".1.3.6.1.2.200"
+	const c = ".1.3.6.1.2.300"
+	// The first reply truncates after one binding, so B and C were never
+	// answered. Halved retries then walk each side properly.
+	script := &multiBulkScript{packets: []*gosnmp.SnmpPacket{
+		{Variables: []gosnmp.SnmpPDU{intVar(a+".1", 1)}},
+		{Variables: []gosnmp.SnmpPDU{endVar(a)}},
+		{Variables: []gosnmp.SnmpPDU{endVar(b), intVar(c+".1", 3)}},
+		{Variables: []gosnmp.SnmpPDU{endVar(c)}},
+	}}
+	mock := &mockSnmpQuerier{getBulkFunc: script.bulk}
+
+	state := newSNMPDeviceState(defaultSNMPDevicePDURate)
+	buckets, errs := snmpWalkRoots(context.Background(), mock, []string{a, b, c}, false, state)
+	for _, rootErr := range errs {
+		if rootErr.err != nil {
+			t.Fatalf("root %s failed: %v", rootErr.root, rootErr.err)
+		}
+	}
+	for i, bucket := range buckets {
+		if !bucket.completed {
+			t.Fatalf("bucket %d completed = false; every root was answered", i)
+		}
+	}
+	if !maps.Equal(buckets[2].values, map[string]string{c[1:] + ".1": "3"}) {
+		t.Fatalf("tail root values = %v", buckets[2].values)
+	}
+	want := [][]string{{a, b, c}, {a + ".1"}, {b, c}, {c + ".1"}}
+	if len(script.requests) != len(want) {
+		t.Fatalf("GETBULK requests = %v, want %v", script.requests, want)
+	}
+	for i := range want {
+		if len(script.requests[i]) != len(want[i]) {
+			t.Fatalf("request %d = %v, want %v", i, script.requests[i], want[i])
+		}
+		for j := range want[i] {
+			if script.requests[i][j] != want[i][j] {
+				t.Fatalf("request %d oid %d = %q, want %q", i, j, script.requests[i][j], want[i][j])
+			}
+		}
+	}
+}
+
+// A root the device never answers is not complete: the server must not
+// reconcile its tables against an empty bucket (issue 5157).
+func TestSnmpWalkRootsNeverAnsweredRootIsNotComplete(t *testing.T) {
+	const a = ".1.3.6.1.2.100"
+	const b = ".1.3.6.1.2.200"
+	// A's lone binding truncates B out of the first reply; the retried
+	// request for B alone then dies on the wire.
+	script := &multiBulkScript{packets: []*gosnmp.SnmpPacket{
+		{Variables: []gosnmp.SnmpPDU{intVar(a+".1", 1)}},
+		{Variables: []gosnmp.SnmpPDU{endVar(a)}},
+	}}
+	mock := &mockSnmpQuerier{getBulkFunc: script.bulk}
+
+	buckets, errs := snmpWalkRoots(context.Background(), mock, []string{a, b}, false,
+		newSNMPDeviceState(defaultSNMPDevicePDURate))
+	if !buckets[0].completed {
+		t.Fatal("answered root A should complete")
+	}
+	if buckets[1].completed {
+		t.Fatal("unanswered root B must not complete")
+	}
+	if errs[1].err == nil {
+		t.Fatal("unanswered root B must carry an error")
+	}
+}
+
+// A device that does not interleave its bulk rows puts another root's
+// binding in this root's slot: the row feeds its real owner instead of
+// ending the positional root early (issue 5157).
+func TestSnmpWalkRootsMisdirectedBindingFeedsOwner(t *testing.T) {
+	const a = ".1.3.6.1.2.100"
+	const b = ".1.3.6.1.2.200"
+	script := &multiBulkScript{packets: []*gosnmp.SnmpPacket{
+		{Variables: []gosnmp.SnmpPDU{intVar(b+".1", 1), intVar(b+".2", 2)}},
+		{Variables: []gosnmp.SnmpPDU{endVar(a), endVar(b)}},
+	}}
+	mock := &mockSnmpQuerier{getBulkFunc: script.bulk}
+
+	buckets, errs := snmpWalkRoots(context.Background(), mock, []string{a, b}, false,
+		newSNMPDeviceState(defaultSNMPDevicePDURate))
+	for _, rootErr := range errs {
+		if rootErr.err != nil {
+			t.Fatalf("root %s failed: %v", rootErr.root, rootErr.err)
+		}
+	}
+	if !buckets[0].completed || !buckets[1].completed {
+		t.Fatal("both roots must complete")
+	}
+	wantB := map[string]string{b[1:] + ".1": "1", b[1:] + ".2": "2"}
+	if !maps.Equal(buckets[1].values, wantB) {
+		t.Fatalf("root B values = %v, want %v", buckets[1].values, wantB)
+	}
+	if len(script.requests) != 2 {
+		t.Fatalf("GETBULK requests = %v, want the shared round plus one retry", script.requests)
+	}
+}
