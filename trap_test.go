@@ -1379,9 +1379,10 @@ func TestTpTQueueFullDropsCoalesceUnderContention(t *testing.T) {
 // tpTFastProbes shortens the probe cadence for one test.
 func tpTFastProbes(t *testing.T, interval time.Duration, misses int) {
 	t.Helper()
-	prevInterval, prevMisses := trapProbeInterval, trapProbeMisses
-	t.Cleanup(func() { trapProbeInterval, trapProbeMisses = prevInterval, prevMisses })
-	trapProbeInterval, trapProbeMisses = interval, misses
+	prevInterval, prevMisses := trapProbeInterval.Load(), trapProbeMisses.Load()
+	t.Cleanup(func() { trapProbeInterval.Store(prevInterval); trapProbeMisses.Store(prevMisses) })
+	trapProbeInterval.Store(int64(interval))
+	trapProbeMisses.Store(int64(misses))
 }
 
 func TestTrapListenerHandleConsumesProbe(t *testing.T) {
@@ -1459,7 +1460,7 @@ func TestTrapListenerProbesKeepHealthyListener(t *testing.T) {
 			}
 			// Ten intervals is more than three misses' worth: a listener that
 			// kept receiving its probes must not have been restarted.
-			time.Sleep(10 * trapProbeInterval)
+			time.Sleep(10 * time.Duration(trapProbeInterval.Load()))
 
 			l.mu.Lock()
 			current := l.listener

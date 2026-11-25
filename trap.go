@@ -52,13 +52,20 @@ var trapDropLogInterval = time.Minute
 // trap every trapProbeInterval and closes the listener after trapProbeMisses
 // probes in a row fail to arrive, which hands control back to serve.
 var (
-	trapProbeInterval = 30 * time.Second
-	trapProbeMisses   = 3
+	// Atomics: tests shorten the cadence while a leftover probe goroutine
+	// may still be reading these on another test's behalf.
+	trapProbeInterval atomic.Int64 // nanoseconds
+	trapProbeMisses   atomic.Int64
 	// trapProbeNonce is the community string that marks a probe. It is random
 	// per process, so a packet from anywhere else cannot pass as a probe and
 	// hide itself from the server.
 	trapProbeNonce = "towerops-probe-" + rand.Text()
 )
+
+func init() {
+	trapProbeInterval.Store(int64(30 * time.Second))
+	trapProbeMisses.Store(3)
+}
 
 // Process-wide trap listener telemetry for the heartbeat (issue 2754). The
 // session does not know the listener exists, so the state lives here: one
@@ -264,7 +271,7 @@ func trapReady(listener *gosnmp.TrapListener, done <-chan struct{}) <-chan struc
 // firewall dropping loopback traffic to the trap port, say). Closing would
 // then restart a working listener every few intervals, so probe stops instead.
 func (t *trapListener) probe(listener *gosnmp.TrapListener, done <-chan struct{}) {
-	ticker := time.NewTicker(trapProbeInterval)
+	ticker := time.NewTicker(time.Duration(trapProbeInterval.Load()))
 	defer ticker.Stop()
 	t.probeSeen.Store(false)
 	misses := 0
@@ -283,7 +290,7 @@ func (t *trapListener) probe(listener *gosnmp.TrapListener, done <-chan struct{}
 			continue
 		}
 		misses++
-		if misses < trapProbeMisses {
+		if misses < int(trapProbeMisses.Load()) {
 			continue
 		}
 		if !t.probeWorks.Load() {
