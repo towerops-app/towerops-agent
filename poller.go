@@ -86,6 +86,8 @@ func newProcessPoller(
 	}
 	scheduler := newRecurringScheduler(ctx, realScheduleClock{})
 	pools.scheduler = scheduler
+	pools.pingEngine = newPingEngine(ctx)
+	pools.pingEngine.start()
 	poller := &processPoller{
 		agentCtx:     agentCtx,
 		workCtx:      ctx,
@@ -233,11 +235,14 @@ func (p *processPoller) stop() {
 		}
 		releaseInventoryAssembler(p.pools)
 		// Maintenance stops on stopDone; only now can no worker still hold
-		// an SNMP device session, so close them all. The shared ping engine
-		// drains live jobs with the poller's schedule ownership.
+		// an SNMP device session, so close them all. The poller's own ping
+		// engine drains live and queued jobs as part of this teardown, so no
+		// ping done callback is left behind for the next poller.
 		<-p.maintainDone
 		closeSNMPSessions()
-		stopPingEngine()
+		if p.pools != nil && p.pools.pingEngine != nil {
+			p.pools.pingEngine.shutdown()
+		}
 		close(p.stopDone)
 	})
 }

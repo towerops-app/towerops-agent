@@ -5,7 +5,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,9 +42,11 @@ func peTSubmitJob(t *testing.T, deviceID string, timeoutMs uint32) (*tpTFakeICMP
 	t.Helper()
 	conn := peTInstallFakeICMP(t)
 	out := newResultQueue(1)
-	t.Cleanup(stopPingEngine)
+	e := newPingEngine(context.Background())
+	e.start()
+	t.Cleanup(e.shutdown)
 
-	ok := submitPingJob(context.Background(), &pb.AgentJob{
+	ok := submitPingJob(context.Background(), e, &pb.AgentJob{
 		JobId:         "pe-" + deviceID,
 		DeviceId:      deviceID,
 		SnmpDevice:    &pb.SnmpDevice{Ip: "127.0.0.1"},
@@ -173,11 +178,13 @@ func TestPingEngineSubmitNonBlocking(t *testing.T) {
 		t.Skip("timing test skipped in short mode")
 	}
 	peTInstallFakeICMP(t)
-	t.Cleanup(stopPingEngine)
+	e := newPingEngine(context.Background())
+	e.start()
+	t.Cleanup(e.shutdown)
 
 	out := newResultQueue(1)
 	start := time.Now()
-	ok := submitPingJob(context.Background(), &pb.AgentJob{
+	ok := submitPingJob(context.Background(), e, &pb.AgentJob{
 		JobId:         "pe-nonblocking",
 		DeviceId:      "pe-nonblocking",
 		SnmpDevice:    &pb.SnmpDevice{Ip: "127.0.0.1"},
@@ -192,13 +199,72 @@ func TestPingEngineSubmitNonBlocking(t *testing.T) {
 	}
 }
 
+// A poller teardown must release every ping job the engine admitted but had
+// not run yet: jobs sitting in submit lose their done callback otherwise,
+// which wedges the per-target gate and every later ping for that device
+// (issue 5167).
+func TestPingEngineShutdownReleasesQueuedJobs(t *testing.T) {
+	peTInstallFakeICMP(t)
+	e := newPingEngine(context.Background())
+	e.start()
+
+	const n = 64
+	var finished atomic.Int32
+	done := func() { finished.Add(1) }
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			job := &pb.AgentJob{
+				JobId:         fmt.Sprintf("drain-%d", i),
+				DeviceId:      "drain-target",
+				SnmpDevice:    &pb.SnmpDevice{Ip: "127.0.0.1"},
+				PingTimeoutMs: 5000,
+			}
+			if !submitPingJob(context.Background(), e, job, newResultQueue(4), done) {
+				done()
+			}
+		}(i)
+	}
+	wg.Wait()
+	e.shutdown()
+
+	if got := finished.Load(); got != n {
+		t.Errorf("done ran %d times for %d jobs; a leaked job wedges its target gate", got, n)
+	}
+}
+
+// Jobs still buffered on submit when the run loop stops get their done
+// callback from the shutdown drain, in order.
+func TestPingEngineShutdownDrainsSubmitBuffer(t *testing.T) {
+	e := newPingEngine(context.Background())
+	// Deliberately not started: everything queued stays on submit.
+	const n = 4
+	var finished atomic.Int32
+	for i := 0; i < n; i++ {
+		e.submit <- &pingJob{
+			ctx:    context.Background(),
+			cancel: func() {},
+			done:   func() { finished.Add(1) },
+		}
+	}
+	e.shutdown()
+	if got := finished.Load(); got != n {
+		t.Errorf("submit drain ran %d done callbacks, want %d", got, n)
+	}
+}
+
 func TestPingEngineNilDeviceRejected(t *testing.T) {
 	peTInstallFakeICMP(t)
-	t.Cleanup(stopPingEngine)
+	e := newPingEngine(context.Background())
+	e.start()
+	t.Cleanup(e.shutdown)
 
 	out := newResultQueue(1)
 	done := make(chan struct{})
-	ok := submitPingJob(context.Background(), &pb.AgentJob{JobId: "pe-nil"}, out, func() { close(done) })
+	ok := submitPingJob(context.Background(), e, &pb.AgentJob{JobId: "pe-nil"}, out, func() { close(done) })
 	if ok {
 		t.Error("submitPingJob accepted a nil-device job; want rejection")
 	}
