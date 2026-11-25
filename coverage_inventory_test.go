@@ -374,3 +374,78 @@ func TestApplyIncrementalUpdateSwapsChangedEntry(t *testing.T) {
 		t.Errorf("interval = %v", got)
 	}
 }
+
+// applyCheckDelta drops unschedulable checks, a same-payload upsert is a
+// no-op, a paused scheduler refuses the delta, and an admitted check's
+// submit reaches the check pool (issue 5169).
+func TestApplyCheckDeltaGuards(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pools := testPools(t)
+	scheduler := pools.scheduler
+	results := newResultQueueForAgent(ctx, 8)
+
+	scheduler.applyCheckDelta([]*pb.Check{nil, {}}, nil, pools, results)
+	if len(scheduler.checks) != 0 {
+		t.Fatalf("checks = %d after unschedulable entries, want 0", len(scheduler.checks))
+	}
+
+	check := &pb.Check{Id: "chk-1", IntervalSeconds: 300}
+	scheduler.applyCheckDelta([]*pb.Check{check}, nil, pools, results)
+	entry := scheduler.checks["chk-1"]
+	if entry == nil {
+		t.Fatal("check was not scheduled")
+	}
+	if !entry.spec.submit(ctx, func() {}) {
+		t.Error("check submit refused by an idle pool")
+	}
+
+	// The same payload pointer at the same interval is a no-op: no
+	// fingerprint, no entry swap.
+	before := scheduler.checks["chk-1"]
+	scheduler.applyCheckDelta([]*pb.Check{check}, nil, pools, results)
+	if scheduler.checks["chk-1"] != before {
+		t.Fatal("identical check upsert replaced the schedule entry")
+	}
+
+	// A paused scheduler refuses the delta entirely.
+	scheduler.paused.Store(true)
+	defer scheduler.paused.Store(false)
+	scheduler.applyCheckDelta([]*pb.Check{{Id: "chk-2", IntervalSeconds: 300}}, nil, pools, results)
+	if _, ok := scheduler.checks["chk-2"]; ok {
+		t.Fatal("paused scheduler admitted a delta")
+	}
+}
+
+// A replace whose specs reuse the stored payload pointer and interval
+// fingerprints nothing and admits nothing (issue 5169).
+func TestReplaceSkipsIdenticalPayloadPointer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pools := testPools(t)
+	scheduler := pools.scheduler
+	results := newResultQueueForAgent(ctx, 8)
+
+	jobs := []*pb.AgentJob{{JobId: "job-1", IntervalSeconds: 300}}
+	scheduler.replaceJobs(jobs, pools, results)
+	before := scheduler.jobs["job-1"]
+	if before == nil {
+		t.Fatal("job was not scheduled")
+	}
+
+	var fingerprintCalls atomic.Int32
+	original := payloadFingerprint
+	payloadFingerprint = func(payload proto.Message) []byte {
+		fingerprintCalls.Add(1)
+		return original(payload)
+	}
+	t.Cleanup(func() { payloadFingerprint = original })
+
+	scheduler.replaceJobs(jobs, pools, results)
+	if fingerprintCalls.Load() != 0 {
+		t.Fatalf("payloadFingerprint calls = %d for an identical update, want 0", fingerprintCalls.Load())
+	}
+	if scheduler.jobs["job-1"] != before {
+		t.Fatal("identical update replaced the schedule entry")
+	}
+}
