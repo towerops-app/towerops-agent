@@ -710,6 +710,76 @@ var execPing = func(parent context.Context, ip string, timeoutMs int) (float64, 
 	return parsePingTime(string(output))
 }
 
+// execPingSeries runs one `ping -c count` subprocess for a whole round.
+// Probes leave at the same spacing the ICMP engine uses, and one -W budget
+// covers the final reply's wait; the parent context carries the job's own
+// deadline so the round cannot outlive its configured timeout. It is a
+// variable so tests can substitute a stub for the subprocess.
+var execPingSeries = func(parent context.Context, ip string, count, timeoutMs int) (replies int, firstRTT float64, err error) {
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return 0, 0, fmt.Errorf("invalid IP address: %s", ip)
+	}
+
+	pingCmd := "ping"
+	if parsedIP.To4() == nil {
+		pingCmd = ipv6PingCommand()
+	}
+
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutMs+1000)*time.Millisecond)
+	defer cancel()
+
+	// The last probe needs the time left after the earlier sends: with the
+	// 200 ms spacing the engine uses, the whole window is spoken for by the
+	// final reply's wait.
+	replyBudget := timeoutMs - (count-1)*pingProbeSpacingMs
+	args := []string{"-c", strconv.Itoa(count), "-i", "0.2", "-W", strconv.Itoa(pingTimeoutArg(replyBudget)), ip}
+	if pingGOOS == "darwin" && pingCmd == "ping6" {
+		// macOS ping6 has no per-reply wait option; the context deadline
+		// bounds a silent host instead.
+		args = []string{"-c", strconv.Itoa(count), "-i", "0.2", ip}
+	}
+
+	output, err := pingCommandOutput(ctx, pingCmd, args...)
+	if err != nil {
+		return 0, 0, fmt.Errorf("ping failed: %s: %w", strings.TrimSpace(string(output)), errors.Join(err, ctx.Err()))
+	}
+
+	return parsePingSeries(string(output), count)
+}
+
+// parsePingSeries counts the replies in a multi-probe ping transcript: each
+// answer line carries a "time=" or "time<" marker. The summary line is not
+// counted; only reply lines match those markers.
+func parsePingSeries(output string, count int) (int, float64, error) {
+	replies := 0
+	var firstRTT float64
+	for _, line := range strings.Split(output, "\n") {
+		if idx := strings.Index(line, "time="); idx >= 0 {
+			replies++
+			if replies == 1 {
+				timeStr := line[idx+5:]
+				end := strings.Index(timeStr, " ms")
+				if end < 0 {
+					end = strings.IndexByte(timeStr, ' ')
+				}
+				if end < 0 {
+					end = len(timeStr)
+				}
+				firstRTT, _ = strconv.ParseFloat(timeStr[:end], 64)
+			}
+			continue
+		}
+		if strings.Contains(line, "time<") {
+			replies++
+		}
+	}
+	if replies > 0 {
+		return min(replies, count), firstRTT, nil
+	}
+	return 0, 0, fmt.Errorf("no replies in ping output")
+}
+
 // ipv6PingCommand prefers ping6 where it exists (macOS ships it separately)
 // and otherwise uses ping, whose iputils build - the one in the agent image -
 // handles IPv6 addresses itself and is the only capable binary present.

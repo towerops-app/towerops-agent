@@ -2144,3 +2144,115 @@ func TestPingCommandOutputUsesPingChildEnv(t *testing.T) {
 		t.Errorf("child env ignored pingChildEnv; output:\n%s", out)
 	}
 }
+
+func TestParsePingSeries(t *testing.T) {
+	iputils := "PING 10.0.0.1 (10.0.0.1) 56(84) bytes of data.\n" +
+		"64 bytes from 10.0.0.1: icmp_seq=1 ttl=64 time=0.031 ms\n" +
+		"64 bytes from 10.0.0.1: icmp_seq=3 ttl=64 time=0.040 ms\n" +
+		"\n" +
+		"--- 10.0.0.1 ping statistics ---\n" +
+		"3 packets transmitted, 2 received, 33.3333% packet loss, time 402ms\n" +
+		"rtt min/avg/max/mdev = 0.031/0.035/0.040/0.004 ms\n"
+	replies, rtt, err := parsePingSeries(iputils, 3)
+	if err != nil || replies != 2 || rtt != 0.031 {
+		t.Errorf("iputils: replies=%d rtt=%v err=%v, want 2/0.031/nil", replies, rtt, err)
+	}
+
+	busybox := "PING 10.0.0.1 (10.0.0.1): 56 data bytes\n" +
+		"64 bytes from 10.0.0.1: seq=0 ttl=64 time<1 ms\n" +
+		"64 bytes from 10.0.0.1: seq=1 ttl=64 time=0.9 ms\n" +
+		"64 bytes from 10.0.0.1: seq=2 ttl=64 time=0.8 ms\n" +
+		"\n" +
+		"--- 10.0.0.1 ping statistics ---\n" +
+		"3 packets transmitted, 3 packets received, 0% packet loss\n"
+	replies, rtt, err = parsePingSeries(busybox, 3)
+	// The first reply is a BusyBox "time<1 ms", which reports as 0 ms.
+	if err != nil || replies != 3 || rtt != 0 {
+		t.Errorf("busybox: replies=%d rtt=%v err=%v, want 3/0/nil", replies, rtt, err)
+	}
+
+	if _, _, err := parsePingSeries("connect: Network is unreachable\n", 3); err == nil {
+		t.Error("zero-reply output must report an error")
+	}
+}
+
+// execPingSeries rejects an unparsable IP, swaps the binary for IPv6, drops
+// -W under macOS ping6, and returns parsed output on success (issue 5163).
+func TestExecPingSeriesArgsAndErrors(t *testing.T) {
+	origGOOS := pingGOOS
+	origLookPath := pingLookPath
+	origCommand := pingCommandOutput
+	t.Cleanup(func() {
+		pingGOOS = origGOOS
+		pingLookPath = origLookPath
+		pingCommandOutput = origCommand
+	})
+	pingLookPath = func(file string) (string, error) { return "/sbin/" + file, nil }
+
+	t.Run("invalid IP", func(t *testing.T) {
+		if _, _, err := execPingSeries(context.Background(), "not-an-ip", 3, 1500); err == nil {
+			t.Fatal("execPingSeries accepted an unparseable address")
+		}
+	})
+
+	tests := []struct {
+		name     string
+		goos     string
+		ip       string
+		wantCmd  string
+		wantArgs []string
+	}{
+		{name: "linux ipv6 keeps -W on ping6", goos: "linux", ip: "2001:db8::1", wantCmd: "ping6", wantArgs: []string{"-c", "3", "-i", "0.2", "-W", "2", "2001:db8::1"}},
+		{name: "darwin ipv6 omits -W so ping6 sees the host", goos: "darwin", ip: "2001:db8::1", wantCmd: "ping6", wantArgs: []string{"-c", "3", "-i", "0.2", "2001:db8::1"}},
+		{name: "darwin ipv4 keeps -W in milliseconds", goos: "darwin", ip: "127.0.0.1", wantCmd: "ping", wantArgs: []string{"-c", "3", "-i", "0.2", "-W", "1100", "127.0.0.1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pingGOOS = tt.goos
+			var gotCmd string
+			var gotArgs []string
+			pingCommandOutput = func(_ context.Context, name string, args ...string) ([]byte, error) {
+				gotCmd = name
+				gotArgs = args
+				return []byte("64 bytes from target: icmp_seq=1 time=1.5 ms\n64 bytes from target: icmp_seq=2 time=2.5 ms\n"), nil
+			}
+			replies, firstRTT, err := execPingSeries(context.Background(), tt.ip, 3, 1500)
+			if err != nil {
+				t.Fatalf("execPingSeries(%s): %v", tt.ip, err)
+			}
+			if replies != 2 || firstRTT != 1.5 {
+				t.Fatalf("execPingSeries = %d replies rtt %v, want 2 replies rtt 1.5", replies, firstRTT)
+			}
+			if gotCmd != tt.wantCmd {
+				t.Errorf("command = %q, want %q", gotCmd, tt.wantCmd)
+			}
+			if !slices.Equal(gotArgs, tt.wantArgs) {
+				t.Errorf("args = %q, want %q", gotArgs, tt.wantArgs)
+			}
+		})
+	}
+
+	t.Run("subprocess failure surfaces stderr", func(t *testing.T) {
+		pingGOOS = "linux"
+		pingCommandOutput = func(context.Context, string, ...string) ([]byte, error) {
+			return []byte("ping: sendmsg: Network is unreachable\n"), errors.New("exit status 2")
+		}
+		_, _, err := execPingSeries(context.Background(), "127.0.0.1", 3, 1500)
+		if err == nil || !strings.Contains(err.Error(), "Network is unreachable") {
+			t.Fatalf("execPingSeries err = %v, want stderr in the error", err)
+		}
+	})
+}
+
+// The first-RTT cut at " ms" has two fallbacks: any other space, then the end
+// of the reply line (issue 5163).
+func TestParsePingSeriesRTTBoundaries(t *testing.T) {
+	replies, firstRTT, err := parsePingSeries("reply time=1.5 \n", 3)
+	if err != nil || replies != 1 || firstRTT != 1.5 {
+		t.Fatalf("space without ms: replies=%d rtt=%v err=%v", replies, firstRTT, err)
+	}
+	replies, firstRTT, err = parsePingSeries("reply time=9", 3)
+	if err != nil || replies != 1 || firstRTT != 9 {
+		t.Fatalf("end of line: replies=%d rtt=%v err=%v", replies, firstRTT, err)
+	}
+}

@@ -23,10 +23,13 @@ type agentMetrics struct {
 	snmpTimeouts    atomic.Uint64
 	rateLimitWaitNs atomic.Uint64
 	skippedTicks    atomic.Uint64
-	scheduleLagMu   sync.Mutex
-	scheduleLag     []uint64
-	scheduleLagPos  int
-	scheduleLagFull bool
+	// pingExecFallback flips to 1 the first time a ping job lands on the
+	// exec path because no ICMP socket could be opened.
+	pingExecFallback atomic.Uint64
+	scheduleLagMu    sync.Mutex
+	scheduleLag      []uint64
+	scheduleLagPos   int
+	scheduleLagFull  bool
 }
 
 var processMetrics = &agentMetrics{}
@@ -85,6 +88,7 @@ type metricsSnapshot struct {
 	SpoolLimit        uint64
 	Pools             []poolLoadSnapshot
 	InventoryCapacity uint64
+	PingExecFallback  uint64
 }
 
 type poolLoadSnapshot struct {
@@ -107,13 +111,14 @@ func poolLoadSnapshots() []poolLoadSnapshot {
 func (m *agentMetrics) snapshot() metricsSnapshot {
 	lag, hasLag := m.scheduleLagP95()
 	return metricsSnapshot{
-		SNMPTimeouts:    m.snmpTimeouts.Load(),
-		RateLimitWaitMS: m.rateLimitWaitNs.Load() / uint64(time.Millisecond),
-		SkippedTicks:    m.skippedTicks.Load(),
-		ScheduleLagMS:   lag,
-		HasScheduleLag:  hasLag,
-		ResultDropped:   resultQueueDroppedTotal.Load(),
-		TrapsDropped:    trapDroppedTotal.Load(),
+		SNMPTimeouts:     m.snmpTimeouts.Load(),
+		RateLimitWaitMS:  m.rateLimitWaitNs.Load() / uint64(time.Millisecond),
+		SkippedTicks:     m.skippedTicks.Load(),
+		ScheduleLagMS:    lag,
+		HasScheduleLag:   hasLag,
+		ResultDropped:    resultQueueDroppedTotal.Load(),
+		TrapsDropped:     trapDroppedTotal.Load(),
+		PingExecFallback: m.pingExecFallback.Load(),
 	}
 }
 
@@ -125,6 +130,7 @@ func formatMetrics(snapshot metricsSnapshot, poolLoads []poolLoadSnapshot) strin
 	fmt.Fprintf(&b, "schedule_lag_ms_p95 %d\n", snapshot.ScheduleLagMS)
 	fmt.Fprintf(&b, "results_dropped %d\n", snapshot.ResultDropped)
 	fmt.Fprintf(&b, "traps_dropped %d\n", snapshot.TrapsDropped)
+	fmt.Fprintf(&b, "ping_exec_fallback %d\n", snapshot.PingExecFallback)
 	fmt.Fprintf(&b, "spool_depth %d\n", snapshot.SpoolDepth)
 	fmt.Fprintf(&b, "spool_bytes %d\n", snapshot.SpoolBytes)
 	if snapshot.InventoryCapacity > 0 {

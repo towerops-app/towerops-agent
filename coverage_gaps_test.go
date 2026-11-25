@@ -776,10 +776,10 @@ func TestFallbackLoop(t *testing.T) {
 	e, pj, out := newTestPingJob(t, true)
 	done := make(chan struct{}, 1)
 	pj.done = func() { done <- struct{}{} }
-	orig := execPing
-	t.Cleanup(func() { execPing = orig })
-	execPing = func(ctx context.Context, ip string, timeoutMs int) (float64, error) {
-		return 2.0, nil
+	orig := execPingSeries
+	t.Cleanup(func() { execPingSeries = orig })
+	execPingSeries = func(ctx context.Context, ip string, count, timeoutMs int) (int, float64, error) {
+		return count, 2.0, nil
 	}
 	var wg sync.WaitGroup
 	e.wg.Add(1)
