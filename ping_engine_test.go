@@ -370,11 +370,11 @@ func TestPingEngineExecFallbackLocalErrorReportsAgentError(t *testing.T) {
 	delete(reachByIP, "127.0.0.1")
 	reachabilityMu.Unlock()
 
-	orig := execPing
-	execPing = func(context.Context, string, int) (float64, error) {
-		return 0, &exec.Error{Name: "ping", Err: exec.ErrNotFound}
+	orig := execPingSeries
+	execPingSeries = func(context.Context, string, int, int) (int, float64, error) {
+		return 0, 0, &exec.Error{Name: "ping", Err: exec.ErrNotFound}
 	}
-	t.Cleanup(func() { execPing = orig })
+	t.Cleanup(func() { execPingSeries = orig })
 
 	e, pj, out := newTestPingJob(t, true)
 	e.fallback = make(chan *pingJob, 1)
