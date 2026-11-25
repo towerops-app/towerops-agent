@@ -416,3 +416,19 @@ func TestPingIsLocalExecError(t *testing.T) {
 		t.Error("a parse failure must stay device loss")
 	}
 }
+
+// firstLocalError scans for a marked probe and yields nil when none is
+// flagged: a guard for callers that classify before counting (issue 5162).
+func TestPingJobFirstLocalErrorNone(t *testing.T) {
+	e, pj, _ := newTestPingJob(t, true)
+	_ = e
+	if err := pj.firstLocalError(); err != nil {
+		t.Fatalf("firstLocalError with no flagged probes = %v, want nil", err)
+	}
+	sent := errors.New("sendto refused")
+	pj.probes[1].localErr = true
+	pj.probes[1].err = sent
+	if err := pj.firstLocalError(); err != sent {
+		t.Fatalf("firstLocalError = %v, want the flagged probe's error", err)
+	}
+}
