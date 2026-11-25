@@ -184,11 +184,6 @@ func runAgentWithScheduling(
 	traps <-chan *pb.SnmpTrap,
 	localScheduling bool,
 ) {
-	// If this process booted into an unproven self-update, arm the startup
-	// guard before anything else runs: a build that cannot reach its channel
-	// gets its predecessor restored instead of crash-looping (issue #2736).
-	_ = checkPendingUpdate()
-
 	results := newResultQueueForAgentBytes(ctx, resultSpoolByteLimit())
 	stopJobSummary := startJobSummaryLogger(ctx)
 	defer stopJobSummary()

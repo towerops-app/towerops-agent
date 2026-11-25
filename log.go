@@ -94,6 +94,10 @@ type asyncLineWriter struct {
 	dropped atomic.Uint64
 }
 
+// logFlushHook drains the async stderr writer before a process image swap;
+// deferred closes never run across syscall.Exec.
+var logFlushHook atomic.Pointer[func()]
+
 const asyncLogQueueLines = 4096
 
 func newAsyncLineWriter(w io.Writer) *asyncLineWriter {

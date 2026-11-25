@@ -37,6 +37,10 @@ func stopSignalNotifier(ctx context.Context, stop context.CancelFunc) {
 
 // runMain is the testable entry point. Returns an exit code.
 func runMain(ctx context.Context, args []string) int {
+	// An unproven self-update must count every boot attempt, including the
+	// ones that die in flag parsing or setup below: reaching this line at
+	// all means the new binary ran (issue 5153).
+	_ = checkPendingUpdate()
 	configureMemoryLimit()
 	fs := flag.NewFlagSet("towerops-agent", flag.ContinueOnError)
 	apiURL := fs.String("api-url", "", "API URL (e.g., wss://towerops.net; or set TOWEROPS_API_URL)")
@@ -129,6 +133,8 @@ func runMain(ctx context.Context, args []string) int {
 	// driver can never block a poll worker holding a result (A6).
 	logSink := newAsyncLineWriter(os.Stderr)
 	defer logSink.Close()
+	flush := logSink.Close
+	logFlushHook.Store(&flush)
 	slog.SetDefault(slog.New(newLogHandler(logSink, level, format)))
 	if !validLogLevel {
 		slog.Warn("ignoring unrecognized log level", "value", *logLevel)

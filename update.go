@@ -198,8 +198,7 @@ func checkPendingUpdate() *pendingUpdate {
 	if p.Attempts > maxUpdateBootAttempts {
 		slog.Error("updated binary crashed before joining repeatedly; restoring previous build",
 			"version", p.Version, "attempts", p.Attempts)
-		rollbackUpdate(fmt.Sprintf("updated binary failed to join within %d boots", maxUpdateBootAttempts))
-		osExit(1)
+		rollbackAndRestart(fmt.Sprintf("updated binary failed to join within %d boots", maxUpdateBootAttempts))
 		return nil
 	}
 
@@ -216,8 +215,7 @@ func checkPendingUpdate() *pendingUpdate {
 		}
 		slog.Error("updated binary did not join its channel; restoring previous build",
 			"version", p.Version, "timeout", updateJoinTimeout)
-		rollbackUpdate(fmt.Sprintf("updated binary did not join its channel within %s", updateJoinTimeout))
-		osExit(1)
+		rollbackAndRestart(fmt.Sprintf("updated binary did not join its channel within %s", updateJoinTimeout))
 	})
 	updateWatchdog.Store(timer)
 	armedUpdate.Store(p)
@@ -250,15 +248,40 @@ func updateJoined() {
 	slog.Info("self-update verified: session joined", "version", p.Version)
 }
 
+// rollbackAndRestart rolls the previous build back and re-executes it so a
+// standalone agent comes back up instead of staying stopped under no
+// supervisor (issue 5153). The async log sink is flushed first: no deferred
+// close runs across an exec. A failed restore or exec ends in the same exit
+// the rollback path used before.
+func rollbackAndRestart(reason string) {
+	restored := rollbackUpdate(reason)
+	if flush := logFlushHook.Load(); flush != nil {
+		(*flush)()
+	}
+	if restored {
+		exe, err := osExecutable()
+		if err == nil {
+			err = syscallExec(exe, os.Args, os.Environ())
+		}
+		if err == nil {
+			// A real exec never returns; a nil error means the exec seam is
+			// stubbed, same convention as the forward update path.
+			return
+		}
+		slog.Error("cannot re-execute restored binary after update rollback", "error", err)
+	}
+	osExit(1)
+}
+
 // rollbackUpdate restores the previous binary over the unproven one and
 // records the failure so the heartbeat that eventually runs reports it.
 // The marker is removed regardless: whatever happens next boot must not be
 // treated as still-unproven.
-func rollbackUpdate(reason string) {
+func rollbackUpdate(reason string) bool {
 	exe, err := osExecutable()
 	if err != nil {
 		slog.Error("cannot resolve executable for update rollback", "error", err)
-		return
+		return false
 	}
 	prev := exe + ".prev"
 	path, perr := pendingUpdatePath()
@@ -277,13 +300,14 @@ func rollbackUpdate(reason string) {
 		slog.Error("update rollback failed: cannot restore previous binary",
 			"prev", prev, "error", err)
 		recordUpdateFailure(pending.Version, fmt.Errorf("%s; rollback failed: %w", reason, err))
-		return
+		return false
 	}
 	if err := syncDirectory(filepath.Dir(exe)); err != nil {
 		slog.Warn("fsync after update rollback failed", "error", err)
 	}
 	slog.Warn("restored previous agent binary after failed update", "reason", reason)
 	recordUpdateFailure(pending.Version, errors.New(reason))
+	return true
 }
 
 // validateStagedBinary rejects a staged download that cannot execute here:
