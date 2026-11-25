@@ -84,7 +84,6 @@ type pingJob struct {
 
 	timeoutMs int
 	timestamp int64
-	deadline  time.Time
 	probes    []pingProbe
 	replies   int
 	resolved  int
@@ -222,7 +221,6 @@ func newPingJob(ctx context.Context, job *pb.AgentJob, out *resultQueue, done fu
 		needsExec: needsExec,
 		timeoutMs: timeoutMs,
 		timestamp: now.Unix(),
-		deadline:  now.Add(time.Duration(timeoutMs) * time.Millisecond),
 		probes:    make([]pingProbe, pingProbeCount),
 	}
 	return pj, true
@@ -248,12 +246,13 @@ func selectPingNetwork(isIPv4 bool) (string, bool) {
 	return "", true
 }
 
-// pingEvent is one scheduled action: send probe i, or reach the deadline.
+// pingEvent is one scheduled action: send probe i, or expire probe i when
+// its own reply window closes.
 type pingEvent struct {
 	at    time.Time
 	seq   uint64
 	job   *pingJob
-	send  bool // true = send probe; false = deadline reached
+	send  bool // true = send probe; false = probe reply window expired
 	probe int
 }
 
@@ -290,7 +289,7 @@ func (e *pingEngine) run() {
 	}
 }
 
-// enqueueJob schedules the probe sends and the deadline for one job, or
+// enqueueJob schedules the probe sends and their expiries for one job, or
 // hands an exec-fallback job straight to the fallback worker.
 func (e *pingEngine) enqueueJob(pj *pingJob) {
 	if pj.ctx.Err() != nil {
@@ -321,16 +320,18 @@ func (e *pingEngine) enqueueJob(pj *pingJob) {
 	defer e.mu.Unlock()
 	e.live[pj] = struct{}{}
 	now := time.Now()
-	pj.deadline = now.Add(time.Duration(pj.timeoutMs) * time.Millisecond)
+	timeout := time.Duration(pj.timeoutMs) * time.Millisecond
 	for i := range pj.probes {
+		// Each probe gets the full timeout measured from its own send. One
+		// shared round deadline would shorten the later probes' windows and
+		// skip them entirely under about a second, so a healthy device
+		// reported steady loss at low timeouts (issue 5161).
 		at := now.Add(time.Duration(i*pingProbeSpacingMs) * time.Millisecond)
-		if at.Before(pj.deadline) {
-			e.seq++
-			heap.Push(&e.heap, pingEvent{at: at, seq: e.seq, job: pj, send: true, probe: i})
-		}
+		e.seq++
+		heap.Push(&e.heap, pingEvent{at: at, seq: e.seq, job: pj, send: true, probe: i})
+		e.seq++
+		heap.Push(&e.heap, pingEvent{at: at.Add(timeout), seq: e.seq, job: pj, send: false, probe: i})
 	}
-	e.seq++
-	heap.Push(&e.heap, pingEvent{at: pj.deadline, seq: e.seq, job: pj, send: false})
 	e.resetTimerLocked()
 }
 
@@ -367,7 +368,7 @@ func (e *pingEngine) fireDueLocked() {
 		if ev.send {
 			e.sendProbeLocked(ev.job, ev.probe)
 		} else {
-			e.finishJobLocked(ev.job)
+			e.expireProbeLocked(ev.job, ev.probe)
 		}
 	}
 	e.resetTimerLocked()
@@ -396,6 +397,29 @@ func (e *pingEngine) sendProbeLocked(pj *pingJob, idx int) {
 	pj.probes[idx].waiter = echo.w
 	pj.probes[idx].sent = true
 	e.waiterIndex[echo.w] = pingProbeRef{job: pj, prob: idx}
+}
+
+// expireProbeLocked resolves one probe whose own reply window closed
+// without an answer: it counts as loss. Called with e.mu held.
+func (e *pingEngine) expireProbeLocked(pj *pingJob, idx int) {
+	if pj.finishing {
+		return
+	}
+	p := &pj.probes[idx]
+	if p.checked {
+		return
+	}
+	if p.waiter != nil {
+		p.echo.sock.unregister(p.echo.key, p.waiter)
+		delete(e.waiterIndex, p.waiter)
+		p.waiter = nil
+	}
+	p.checked = true
+	pj.resolved++
+	if pj.resolved == pingProbeCount {
+		e.finishJobLocked(pj)
+		e.resetTimerLocked()
+	}
 }
 
 // handleReply routes one reply from the shared socket to its probe.

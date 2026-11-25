@@ -210,7 +210,6 @@ func newTestPingJob(t *testing.T, needsExec bool) (*pingEngine, *pingJob, *resul
 		needsExec: needsExec,
 		timeoutMs: 500,
 		timestamp: time.Now().Unix(),
-		deadline:  time.Now().Add(500 * time.Millisecond),
 		probes:    make([]pingProbe, pingProbeCount),
 	}
 	return e, pj, out
@@ -261,7 +260,7 @@ func TestEnqueueJobPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("icmp job schedules sends and deadline", func(t *testing.T) {
+	t.Run("icmp job schedules sends and expiries", func(t *testing.T) {
 		e, pj, _ := newTestPingJob(t, false)
 		e.enqueueJob(pj)
 		e.mu.Lock()
@@ -269,8 +268,9 @@ func TestEnqueueJobPaths(t *testing.T) {
 		if _, live := e.live[pj]; !live {
 			t.Fatal("job must be live")
 		}
-		if e.heap.Len() != pingProbeCount+1 {
-			t.Errorf("heap = %d events, want %d", e.heap.Len(), pingProbeCount+1)
+		// Each probe gets a send event and its own reply-window expiry.
+		if e.heap.Len() != pingProbeCount*2 {
+			t.Errorf("heap = %d events, want %d", e.heap.Len(), pingProbeCount*2)
 		}
 		if e.timer == nil {
 			t.Error("timer must be armed")
@@ -601,5 +601,18 @@ func TestPublishAndLookupReachability(t *testing.T) {
 	publishReachability("dev-nil", nil, false, 0, 100)
 	if _, ok := lastDeviceReachability("dev-nil"); !ok {
 		t.Error("nil ip device must register")
+	}
+}
+
+// A probe expiry for a job already finishing is a no-op (issue 5161).
+func TestExpireProbeLockedFinishingJob(t *testing.T) {
+	e, pj, _ := newTestPingJob(t, false)
+	e.live[pj] = struct{}{}
+	pj.finishing = true
+	e.mu.Lock()
+	e.expireProbeLocked(pj, 0)
+	e.mu.Unlock()
+	if pj.probes[0].checked {
+		t.Error("finishing job's probe was resolved")
 	}
 }
