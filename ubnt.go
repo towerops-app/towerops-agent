@@ -51,7 +51,6 @@ const (
 // executeUbntDiscovery broadcasts the request, collects TLV replies for
 // the window, and reports one UbntDiscoveryResult.
 func executeUbntDiscovery(ctx context.Context, job *pb.AgentJob, out *resultQueue) {
-	recordJobRun()
 	started := time.Now()
 	result := &pb.UbntDiscoveryResult{ProbeId: job.JobId}
 
