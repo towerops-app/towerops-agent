@@ -1666,8 +1666,8 @@ func TestValidateJoinReplyRejectsWrongRef(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := validateJoinReply(data, ""); err == nil || !strings.Contains(err.Error(), "unexpected ref") {
-			t.Fatalf("validateJoinReply() error = %v, want unexpected ref", err)
+		if err := testValidateJoinReply(data, ""); err == nil || !strings.Contains(err.Error(), "unexpected ref") {
+			t.Fatalf("testValidateJoinReply() error = %v, want unexpected ref", err)
 		}
 	}
 }
@@ -1700,12 +1700,12 @@ func TestValidateJoinReplyRejectionReason(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = validateJoinReply(data, "")
+			err = testValidateJoinReply(data, "")
 			if err == nil || err.Error() != tt.want {
-				t.Fatalf("validateJoinReply() error = %v, want %q", err, tt.want)
+				t.Fatalf("testValidateJoinReply() error = %v, want %q", err, tt.want)
 			}
 			if !isRefused(err) {
-				t.Errorf("validateJoinReply() error = %v, want it marked as a refusal", err)
+				t.Errorf("testValidateJoinReply() error = %v, want it marked as a refusal", err)
 			}
 		})
 	}
@@ -3026,14 +3026,18 @@ func TestRunSessionLegacySchedulingHeartbeat(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		results := newResultQueue(1)
-		done <- runSessionWithResultsAndScheduling(
-			context.Background(),
-			agtURL(ln),
-			"token",
-			nil,
-			results,
-			false,
-		)
+		func() {
+			poller := newProcessPoller(context.Background(), results, false)
+			defer poller.stop()
+			done <- runSessionWithPoller(
+				context.Background(),
+				agtURL(ln),
+				"token",
+				nil,
+				results,
+				poller,
+			)
+		}()
 	}()
 
 	conn, topic := agtAccept(t, ln)
@@ -4206,7 +4210,7 @@ func TestSettleInFlightRetainsEarlyRejectionAfterCompletedWrite(t *testing.T) {
 	result := <-results.items
 	s := &session{results: results}
 	ref := "5"
-	s.trackPending(ref, result)
+	s.trackPendingFrame(ref, []outbound{result})
 	ack := make(chan error, 1)
 	ack <- nil
 	s.settleInFlight(&inFlightWrite{
@@ -5622,7 +5626,7 @@ func TestHandleResultReplyRetriesRejectedResult(t *testing.T) {
 
 	result := outbound{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)}
 	ref := "42"
-	s.trackPending(ref, result)
+	s.trackPendingFrame(ref, []outbound{result})
 
 	reply := channelMsg{
 		Topic:   "agent:test",
@@ -5649,7 +5653,7 @@ func TestHandleResultReplyRetriesRejectedResult(t *testing.T) {
 	}
 
 	// A second rejection of the same result drops it.
-	s.trackPending("43", outbound{event: "result", payload: result.payload, attempts: 1})
+	s.trackPendingFrame("43", []outbound{{event: "result", payload: result.payload, attempts: 1}})
 	ref2 := "43"
 	s.handleResultReply(channelMsg{
 		Topic:   "agent:test",
@@ -5676,7 +5680,7 @@ func TestHandleResultReplyIgnoresUnrelatedReplies(t *testing.T) {
 	s.refCounter.Store(1)
 
 	result := outbound{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)}
-	s.trackPending("7", result)
+	s.trackPendingFrame("7", []outbound{result})
 
 	// An ok reply clears the pending entry without requeueing.
 	ref := "7"
@@ -5719,7 +5723,7 @@ func TestPrunePendingDropsStaleEntries(t *testing.T) {
 		result: outbound{event: "result"},
 		sentAt: time.Now().Add(-2 * pendingReplyTTL),
 	}
-	s.trackPending("fresh", outbound{event: "result"})
+	s.trackPendingFrame("fresh", []outbound{{event: "result"}})
 
 	// Tracking alone no longer prunes: the sweep runs on the channel
 	// heartbeat tick, exercised directly here.
@@ -5747,7 +5751,7 @@ func TestHandleResultReplyEdgeCases(t *testing.T) {
 	s.handleResultReply(channelMsg{Topic: "agent:test", Event: "phx_reply"})
 
 	// Unparseable payload: the pending entry is cleared, nothing requeued.
-	s.trackPending("9", outbound{event: "result", payload: json.RawMessage(`{}`)})
+	s.trackPendingFrame("9", []outbound{{event: "result", payload: json.RawMessage(`{}`)}})
 	ref := "9"
 	s.handleResultReply(channelMsg{
 		Topic:   "agent:test",
@@ -5766,7 +5770,7 @@ func TestHandleResultReplyEdgeCases(t *testing.T) {
 
 	// Error status with an empty reason: retried once, reason falls back to
 	// the status string.
-	s.trackPending("10", outbound{event: "result", payload: json.RawMessage(`{}`)})
+	s.trackPendingFrame("10", []outbound{{event: "result", payload: json.RawMessage(`{}`)}})
 	ref2 := "10"
 	s.handleResultReply(channelMsg{
 		Topic:   "agent:test",
@@ -5798,7 +5802,7 @@ func TestHandleResultReplyDropsRetryWhenSpoolFull(t *testing.T) {
 		results: results,
 	}
 
-	s.trackPending("11", outbound{event: "result", payload: json.RawMessage(`{}`)})
+	s.trackPendingFrame("11", []outbound{{event: "result", payload: json.RawMessage(`{}`)}})
 	ref := "11"
 	s.handleResultReply(channelMsg{
 		Topic:   "agent:test",
@@ -5831,7 +5835,7 @@ func TestSessionLoopDispatchesResultReply(t *testing.T) {
 		results:    results,
 	}
 
-	s.trackPending("5", outbound{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)})
+	s.trackPendingFrame("5", []outbound{{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)}})
 	reply, _ := json.Marshal(map[string]any{
 		"topic":   "agent:test",
 		"event":   "phx_reply",
@@ -5865,7 +5869,7 @@ func TestHandleResultReplyDropsOversizedResult(t *testing.T) {
 	results := newResultQueue(4)
 	s := &session{results: results}
 
-	s.trackPending("5", outbound{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)})
+	s.trackPendingFrame("5", []outbound{{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)}})
 	payload, _ := json.Marshal(map[string]any{
 		"status":   "error",
 		"response": map[string]string{"reason": "Message too large (max 10485760 bytes)"},

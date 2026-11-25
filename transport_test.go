@@ -53,12 +53,12 @@ func TestResultBatchCarriesRawProtobuf(t *testing.T) {
 
 func TestPhoenixV2ClientPushGoldenFrame(t *testing.T) {
 	payload := []byte(`{"binary":"e30="}`)
-	buf, data, binaryFrame := marshalChannelFrameV2(
-		"agent:test", "result_batch", "1", payload, new("17"), true)
-	defer putFrameBuffer(buf)
-	if !binaryFrame {
-		t.Fatal("V2 negotiation produced a JSON frame")
+	buf, data, err := encodePhoenixV2Push(
+		"agent:test", "result_batch", "1", "17", payload)
+	if err != nil {
+		t.Fatalf("V2 push: %v", err)
 	}
+	defer putFrameBuffer(buf)
 
 	want := []byte{
 		0x00, // client push

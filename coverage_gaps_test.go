@@ -53,7 +53,6 @@ func TestSessionStopPoolAndSchedulerTimeout(t *testing.T) {
 		ctx:        context.Background(),
 		cancel:     cancel,
 		ws:         ws,
-		ownsPools:  true,
 		pools:      pools,
 		scheduler:  pools.scheduler,
 		writeCh:    make(chan writeRequest),
@@ -129,9 +128,9 @@ func TestMarshalPhoenixEnvelopeV1(t *testing.T) {
 	putFrameBuffer(buf)
 
 	// The V2 dispatcher on a legacy session emits the same JSON frame.
-	buf2, data2, bin2 := marshalChannelFrameV2("agent:cov", "result", "1", json.RawMessage(`{"a":1}`), &ref, false)
-	if data2 == nil || bin2 {
-		t.Error("v2 dispatcher must fall back to JSON on a legacy session")
+	buf2, data2 := marshalChannelFrame("agent:cov", "result", json.RawMessage(`{"a":1}`), &ref)
+	if data2 == nil {
+		t.Error("legacy session must produce a JSON frame")
 	}
 	putFrameBuffer(buf2)
 }

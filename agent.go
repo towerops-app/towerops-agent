@@ -292,10 +292,9 @@ type session struct {
 	// drains; cancel — via stop — is what actually ends it. jobCtx tracks the
 	// agent context: jobs and scheduled work die on shutdown while the spool
 	// flushes around them.
-	ctx       context.Context
-	cancel    context.CancelFunc
-	jobCtx    context.Context
-	jobCancel context.CancelFunc
+	ctx    context.Context
+	cancel context.CancelFunc
+	jobCtx context.Context
 
 	writeCh    chan writeRequest
 	msgCh      chan channelMsg
@@ -307,18 +306,15 @@ type session struct {
 	readerDone chan struct{}
 	writerDone chan struct{}
 
-	// pools and results exist only once the channel join has been accepted;
-	// see runSessionWithResultsAndScheduling. With a process poller they are
+	// pools and results exist only once the channel join has been accepted.
+	// With a process poller they are
 	// borrowed for the session's lifetime and survive its end (C1/D2).
 	pools     *jobPools
 	scheduler *recurringScheduler
 	results   *resultQueue
 	notices   <-chan outbound
 	// poller is the process-level poller this session transports, if any.
-	// ownsPools marks a session-built pool set that stop must drain (the
-	// compatibility path used by tests and non-poller callers).
-	poller    *processPoller
-	ownsPools bool
+	poller *processPoller
 
 	refCounter atomic.Uint64
 
@@ -354,22 +350,6 @@ type session struct {
 	// shutdown drain reads it from its own goroutine to log how many
 	// results it flushed.
 	ackedResults atomic.Uint64
-}
-
-// runSessionWithResultsAndScheduling is the compatibility entry point: it
-// builds a poller for this call only and tears it down when the session ends.
-// The production loop uses runSessionWithPoller so the poller outlives the
-// transport (C1/D2).
-func runSessionWithResultsAndScheduling(
-	ctx context.Context,
-	baseURL, token string,
-	traps <-chan *pb.SnmpTrap,
-	results *resultQueue,
-	localScheduling bool,
-) error {
-	poller := newProcessPoller(ctx, results, localScheduling)
-	defer poller.stop()
-	return runSessionWithPoller(ctx, baseURL, token, traps, results, poller)
 }
 
 // runSessionWithPoller runs one WebSocket session as a transport for the
@@ -565,37 +545,17 @@ func (s *session) fail(ch chan<- error, err error) {
 }
 
 // stop tears the session down within one shared shutdown budget: socket I/O
-// first, then any session-owned worker pools and scheduler, then both I/O
-// goroutines. A process-poller session stops only its transport; the poller
-// keeps polling across disconnects (C1/D2) and is drained by its own stop.
+// first, then the inventory worker and both I/O goroutines. A process-poller
+// session stops only its transport; the poller keeps polling across
+// disconnects (C1/D2) and is drained by its own stop.
 func (s *session) stop() {
 	s.cancel()
-	if s.jobCancel != nil {
-		s.jobCancel()
-	}
 	_ = s.ws.Close()
 
 	if s.inventoryWork != nil {
 		close(s.inventoryWork)
 	}
 
-	if s.ownsPools {
-		if s.scheduler != nil {
-			s.scheduler.cancelAll()
-		}
-		deadline := time.Now().Add(poolShutdownTimeout)
-		if s.pools != nil {
-			for _, name := range s.pools.stop(time.Until(deadline)) {
-				slog.Warn("worker pool shutdown timed out, abandoning in-flight jobs", "pool", name)
-			}
-		}
-		if s.scheduler != nil {
-			remaining := time.Until(deadline)
-			if remaining <= 0 || !s.scheduler.wait(remaining) {
-				slog.Warn("recurring scheduler shutdown timed out")
-			}
-		}
-	}
 	close(s.writeCh)
 	<-s.writerDone
 	<-s.readerDone
@@ -687,16 +647,6 @@ func marshalPhoenixEnvelope(
 	return buf, data, false, nil
 }
 
-// parseJoinReply validates a legacy JSON reply byte slice for callers that
-// only need the V1 validity check.
-func parseJoinReply(data []byte, topic string) ([]string, error) {
-	reply, err := decodeChannelFrame(data)
-	if err != nil {
-		return nil, fmt.Errorf("join reply unmarshal: %w", err)
-	}
-	return parseJoinReplyMsg(reply, topic)
-}
-
 // parseJoinReplyMsg validates an already kind-dispatched Phoenix frame. Both
 // V2 arrays/binary replies and a legacy V1 object reply produce channelMsg.
 func parseJoinReplyMsg(reply channelMsg, topic string) ([]string, error) {
@@ -732,13 +682,6 @@ func parseJoinReplyMsg(reply channelMsg, topic string) ([]string, error) {
 		return nil, refusedError{fmt.Errorf("join rejected: %s", status)}
 	}
 	return payloadStatus.Response.Capabilities, nil
-}
-
-// validateJoinReply preserves the pre-negotiation behavior for callers that
-// only need the validity check.
-func validateJoinReply(data []byte, topic string) error {
-	_, err := parseJoinReply(data, topic)
-	return err
 }
 
 func (s *session) nextRef() string {
@@ -802,33 +745,6 @@ func marshalChannelFrame(topic, event string, payload json.RawMessage, ref *stri
 	}
 	buf.WriteByte('}')
 	return buf, buf.Bytes()
-}
-
-// marshalChannelFrameV2 builds the V1-shaped message as a Phoenix V2 binary
-// frame when the session negotiated that transport, or falls back to the
-// JSON envelope for a legacy server.
-func marshalChannelFrameV2(
-	topic, event, joinRef string,
-	payload json.RawMessage,
-	ref *string,
-	v2 bool,
-) (*bytes.Buffer, []byte, bool) {
-	if !v2 {
-		buf, data := marshalChannelFrame(topic, event, payload, ref)
-		return buf, data, false
-	}
-	frameRef := ""
-	if ref != nil {
-		frameRef = *ref
-	}
-	buf, data, err := encodePhoenixV2Push(topic, event, joinRef, frameRef, payload)
-	if err != nil {
-		// A field over the V2 length bound is a programming error; legacy
-		// JSON encoding still gets the message out.
-		buf, data = marshalChannelFrame(topic, event, payload, ref)
-		return buf, data, false
-	}
-	return buf, data, true
 }
 
 // sendBinary queues a protobuf message. Capability servers receive the exact
@@ -1118,17 +1034,6 @@ func (s *session) settleInFlight(w *inFlightWrite) {
 			s.retryResults(inFlightResults(w))
 		}
 	}
-}
-
-// trackPending records a result under its message ref. Successful handle_in
-// calls produce no phx_reply, so expired entries are swept on the channel
-// heartbeat tick. Between sweeps the map is capped at maxPendingResults: at
-// the cap the oldest entry is evicted through the order ring (B8). The
-// evicted result was sent longest ago; a rejection for it arriving later is
-// ignored like any unknown ref.
-func (s *session) trackPending(ref string, result outbound) {
-	s.trackPendingFrame(ref, []outbound{result})
-	s.pending[ref] = pendingResult{result: result, seq: s.pending[ref].seq}
 }
 
 // evictOldestPending deletes the entry with the lowest insertion sequence via
