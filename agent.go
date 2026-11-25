@@ -79,11 +79,6 @@ const maxDecodedJobPayloadBytes = 10 << 20
 
 var maxEncodedJobPayloadBytes = base64.StdEncoding.EncodedLen(maxDecodedJobPayloadBytes)
 
-// resultQueueSize bounds the process-wide in-memory result backlog retained
-// across WebSocket reconnects. It exceeds the 420 slots the former per-type
-// result queues held together.
-const resultQueueSize = 512
-
 // overloadNoticeQueueSize bounds best-effort pool rejection notices separately
 // from completed results, so a large job push cannot consume the result spool.
 const overloadNoticeQueueSize = 64
@@ -159,9 +154,9 @@ type pendingResult struct {
 var pendingReplyTTL = 30 * time.Second
 
 // maxPendingResults caps pending by count. Every entry holds its result's
-// payload, and a fast uplink acks far more than the spool's 512 slots within
-// one TTL; without the cap that memory sits outside the spool's bound.
-const maxPendingResults = resultQueueSize
+// payload, and a fast uplink acks far more than 512 results within one TTL;
+// without the cap that memory sits outside the spool's byte bound.
+const maxPendingResults = 512
 
 // overloadRetryDelay spaces the retry of a result the server rejected as
 // "overloaded". Its ingest queue is full, so an immediate re-send lands on
@@ -823,7 +818,7 @@ func (s *session) queueResultFrame(results []outbound, event string, spooled boo
 	// refuses a batch whose first sequence is not above the position it has
 	// already handled, so every fresh batch was rejected as a duplicate (and
 	// the ack that would have released it never arrived).
-	if spooled && s.results.byteBounded() {
+	if spooled {
 		for i := range results {
 			if results[i].sequence == 0 {
 				results[i].sequence = s.results.nextSeq.Add(1)
@@ -899,9 +894,6 @@ func (s *session) queueResultFrame(results []outbound, event string, spooled boo
 // unholdSpooled removes held sequences before a retry re-enters the spool, so
 // capacity is not double-charged while the payload is retained.
 func (s *session) unholdSpooled(results []outbound) {
-	if !s.results.byteBounded() {
-		return
-	}
 	for _, result := range results {
 		s.results.unhold(result.sequence)
 	}
@@ -973,7 +965,7 @@ func (s *session) resolveInFlight(w *inFlightWrite, err error) error {
 	}
 	if w.spooled {
 		s.ackedResults.Add(uint64(len(results)))
-		if s.results.byteBounded() && s.hasCapability(capabilityResultAck) {
+		if s.hasCapability(capabilityResultAck) {
 			// Held until result_ack; the ring releases the capacity.
 			slog.Debug("awaiting result ack", "event", w.event, "count", len(results))
 		} else {
@@ -996,12 +988,8 @@ func (s *session) retryResults(results []outbound) {
 	if len(results) == 0 {
 		return
 	}
-	if s.results.byteBounded() {
-		s.unholdSpooled(results)
-		s.results.retryBatch(results)
-		return
-	}
-	s.results.retry(results[0])
+	s.unholdSpooled(results)
+	s.results.retryBatch(results)
 }
 
 func inFlightResults(w *inFlightWrite) []outbound {
@@ -1259,16 +1247,14 @@ func (s *session) handleResultReply(msg channelMsg) {
 // budget, and the queue clears their delivery sequences so they renumber in
 // send order (issue 5148).
 func (s *session) requeueRejected(results []outbound, delay time.Duration) {
-	if s.results.byteBounded() {
-		s.unholdSpooled(results)
-	}
+	s.unholdSpooled(results)
 	if delay > 0 {
 		for _, result := range results {
 			s.results.enqueueAfter(result, delay)
 		}
 		return
 	}
-	if s.results.byteBounded() && len(results) > 1 {
+	if len(results) > 1 {
 		if !s.results.enqueueBatch(results) {
 			slog.Error("result retry dropped, spool full",
 				"event", results[0].event, "count", len(results))

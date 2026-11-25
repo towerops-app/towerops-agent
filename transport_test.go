@@ -571,15 +571,15 @@ func TestTrapSpoolBudgetReleasesOnSpoolFull(t *testing.T) {
 }
 
 func TestHasTrapRoomFor(t *testing.T) {
-	count := newResultQueueForAgent(context.Background(), 4)
-	if !count.hasTrapRoomFor(1) {
-		t.Error("empty count-mode spool must report trap room")
+	filled := newResultQueueForAgentBytes(context.Background(), 8<<10)
+	if !filled.hasTrapRoomFor(1) {
+		t.Error("empty spool must report trap room")
 	}
-	for i := 0; i < cap(count.items); i++ {
-		count.items <- outbound{}
+	for i := 0; i < cap(filled.items); i++ {
+		filled.items <- outbound{}
 	}
-	if count.hasTrapRoomFor(1) {
-		t.Error("full count-mode spool must report no trap room")
+	if filled.hasTrapRoomFor(1) {
+		t.Error("full spool must report no trap room")
 	}
 
 	q := newResultQueueForAgentBytes(context.Background(), 8192)

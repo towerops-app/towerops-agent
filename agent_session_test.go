@@ -26,7 +26,7 @@ func runAgent(ctx context.Context, wsURL, token string, traps <-chan *pb.SnmpTra
 // runSession runs one WebSocket session with local recurring scheduling and
 // a fresh spool.
 func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.SnmpTrap) error {
-	return runSessionWithResults(ctx, baseURL, token, traps, newResultQueueForAgent(ctx, resultQueueSize))
+	return runSessionWithResults(ctx, baseURL, token, traps, newResultQueueForAgentBytes(ctx, resultSpoolByteLimit()))
 }
 
 func runSessionWithResults(
@@ -157,11 +157,11 @@ func TestHandleResultReplyDelaysOverloadedRetry(t *testing.T) {
 // The delayed retry reports a full spool instead of blocking or panicking.
 func TestDelayedRetryDroppedWhenSpoolFull(t *testing.T) {
 	logs := agtCaptureLogs(t)
-	results := newResultQueue(1)
-	if !results.enqueue(outbound{event: "filler"}) {
+	results := newResultQueueForAgentBytes(context.Background(), 4)
+	if !results.enqueue(outbound{event: "filler", payload: json.RawMessage("xxxx")}) {
 		t.Fatal("seed enqueue failed")
 	}
-	results.enqueueAfter(outbound{event: "result"}, time.Millisecond)
+	results.enqueueAfter(outbound{event: "result", payload: json.RawMessage("x")}, time.Millisecond)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for !logs.has("result buffer full - agent overloaded") {

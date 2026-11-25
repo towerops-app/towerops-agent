@@ -21,7 +21,7 @@ var resultDropLogInterval = time.Minute
 // The payload is built exactly once into a pooled buffer (B7): no protobuf
 // re-marshal, no base64 string, and no JSON map at enqueue time. It survives
 // reconnects without retaining mutable executor state. reserved marks results
-// on the bulk lane; reservedSlot records a legacy count spool lane.
+// on the bulk lane.
 type outbound struct {
 	event string
 	// protoPayload is the exact protobuf bytes. It is the source of truth for
@@ -31,9 +31,8 @@ type outbound struct {
 	// payload is a prebuilt legacy JSON frame payload, used by direct
 	// session tests and by inbound notices that do not originate from a
 	// proto.Message executor result.
-	payload      json.RawMessage
-	reserved     bool
-	reservedSlot bool
+	payload  json.RawMessage
+	reserved bool
 	// attempts counts server-rejected deliveries; handleResultReply retries
 	// the first rejection and drops the second.
 	attempts int
@@ -62,23 +61,17 @@ func (o *outbound) wireSize() int {
 	return len(o.payload)
 }
 
-// resultQueue is a bounded process-wide spool. Two modes share one struct:
-//
-//   - byte mode (newResultQueueForAgentBytes) bounds retained payloads by
-//     encoded bytes (default 64 MB, --result-spool-bytes). Depth, byte usage
-//     and drops ride the heartbeat. Every result keeps a delivery sequence
-//     and stays in the sent ring until the server's cumulative ack arrives.
-//   - count mode (newResultQueueForAgent) preserves the historical behavior
-//     for callers that do not carry the runtime byte budget: a slot remains
-//     reserved while the session writer has a result in flight.
+// resultQueue is a bounded process-wide spool. Retained payloads are
+// bounded by encoded bytes (default 64 MB, --result-spool-bytes). Depth,
+// byte usage and drops ride the heartbeat. Every result keeps a delivery
+// sequence and stays in the sent ring until the server's cumulative ack
+// arrives.
 //
 // Failed writes use a dedicated retry lane so they remain ahead of newer
 // queued measurements.
 type resultQueue struct {
-	items         chan outbound
-	slots         chan struct{}
-	reservedSlots chan struct{}
-	agentCtx      context.Context
+	items    chan outbound
+	agentCtx context.Context
 
 	// retryMu guards retries, the lane of failed frames kept ahead of newer
 	// spooled work. A slice rather than a channel: the lane must hold a whole
@@ -89,7 +82,6 @@ type resultQueue struct {
 	retryMu sync.Mutex
 	retries []outbound
 
-	// byte mode state.
 	byteLimit   int64
 	byteUsage   atomic.Int64
 	depth       atomic.Uint64
@@ -118,17 +110,6 @@ type resultQueue struct {
 // results that dominate a healthy fleet to use their full byte budget.
 const resultIngressDepth = 65536
 
-// newResultQueueForAgent creates the historical count-bounded spool.
-func newResultQueueForAgent(agentCtx context.Context, size int) *resultQueue {
-	reserved := size / 4
-	return &resultQueue{
-		items:         make(chan outbound, size),
-		slots:         make(chan struct{}, size-reserved),
-		reservedSlots: make(chan struct{}, reserved),
-		agentCtx:      agentCtx,
-	}
-}
-
 // newResultQueueForAgentBytes creates the byte-bounded spool (C2).
 func newResultQueueForAgentBytes(agentCtx context.Context, byteLimit int64) *resultQueue {
 	if byteLimit <= 0 {
@@ -143,7 +124,6 @@ func newResultQueueForAgentBytes(agentCtx context.Context, byteLimit int64) *res
 	}
 	return &resultQueue{
 		items:     make(chan outbound, resultIngressDepth),
-		slots:     make(chan struct{}, resultIngressDepth),
 		agentCtx:  agentCtx,
 		byteLimit: byteLimit,
 		trapLimit: trapLimit,
@@ -158,82 +138,56 @@ const (
 	trapSpoolMaxBytes = 8 << 20
 )
 
-// byteBounded reports which accounting mode the queue runs in.
-func (q *resultQueue) byteBounded() bool { return q.byteLimit > 0 }
-
 // enqueue queues one completed result, dropping the newest when the bound is
-// exhausted. In byte mode the result's lane is recorded before handoff; the
-// session loop picks lanes in priority order (C3).
+// exhausted. The result's lane is recorded before handoff; the session loop
+// picks lanes in priority order (C3).
 func (q *resultQueue) enqueue(result outbound) bool {
-	if q.byteBounded() {
-		// Delivery sequences are assigned in send order (queueResultFrame),
-		// not enqueue order: a priority result that jumps ahead of queued
-		// polls must not receive a later sequence than results the server
-		// has not been offered yet. Anything re-entering the spool is a
-		// replay from an earlier send position; its old sequence is already
-		// below the server's handled-through mark, so it is cleared and
-		// renumbered in send order (issue 5148).
-		result.sequence = 0
-		result.lane = resultPriority(result.event, result.reserved)
-		result.encodedBytes = result.wireSize()
-		trapCharged := false
-		if result.event == "trap" {
-			for {
-				current := q.trapUsage.Load()
-				if current+int64(result.encodedBytes) > q.trapLimit {
-					q.reportDrop("", result.event)
-					return false
-				}
-				if q.trapUsage.CompareAndSwap(current, current+int64(result.encodedBytes)) {
-					trapCharged = true
-					break
-				}
-			}
-		}
+	// Delivery sequences are assigned in send order (queueResultFrame),
+	// not enqueue order: a priority trap that jumps ahead of queued
+	// polls must not receive a later sequence than results the server
+	// has not been offered yet. Anything re-entering the spool is a
+	// replay from an earlier send position; its old sequence is already
+	// below the server's handled-through mark, so it is cleared and
+	// renumbered in send order (issue 5148).
+	result.sequence = 0
+	result.lane = resultPriority(result.event, result.reserved)
+	result.encodedBytes = result.wireSize()
+	trapCharged := false
+	if result.event == "trap" {
 		for {
-			current := q.byteUsage.Load()
-			if current+int64(result.encodedBytes) > q.byteLimit {
-				if trapCharged {
-					q.trapUsage.Add(-int64(result.encodedBytes))
-				}
+			current := q.trapUsage.Load()
+			if current+int64(result.encodedBytes) > q.trapLimit {
 				q.reportDrop("", result.event)
 				return false
 			}
-			if q.byteUsage.CompareAndSwap(current, current+int64(result.encodedBytes)) {
+			if q.trapUsage.CompareAndSwap(current, current+int64(result.encodedBytes)) {
+				trapCharged = true
 				break
 			}
 		}
-		q.depth.Add(1)
-		select {
-		case q.items <- result:
-			return true
-		default:
-			// The ingress channel is small and fixed; treat it as bound
-			// exhaustion rather than blocking a worker.
-			q.releaseCapacity(result, true)
+	}
+	for {
+		current := q.byteUsage.Load()
+		if current+int64(result.encodedBytes) > q.byteLimit {
+			if trapCharged {
+				q.trapUsage.Add(-int64(result.encodedBytes))
+			}
 			q.reportDrop("", result.event)
 			return false
 		}
-	}
-
-	if result.reserved {
-		select {
-		case q.reservedSlots <- struct{}{}:
-			result.reservedSlot = true
-			q.items <- result
-			return true
-		default:
+		if q.byteUsage.CompareAndSwap(current, current+int64(result.encodedBytes)) {
+			break
 		}
 	}
+	q.depth.Add(1)
 	select {
-	case q.slots <- struct{}{}:
-		// A requeued reserved result can land here when its reserved lane
-		// is full; the flag must record the lane actually taken or ack
-		// releases the wrong token.
-		result.reservedSlot = false
-		q.items <- result
+	case q.items <- result:
 		return true
 	default:
+		// The ingress channel is small and fixed; treat it as bound
+		// exhaustion rather than blocking a worker.
+		q.releaseCapacity(result, true)
+		q.reportDrop("", result.event)
 		return false
 	}
 }
@@ -267,16 +221,14 @@ func (q *resultQueue) enqueueBatch(results []outbound) bool {
 // session that scheduled it has ended.
 func (q *resultQueue) enqueueAfter(result outbound, delay time.Duration) {
 	time.AfterFunc(delay, func() {
-		if !q.enqueue(result) && !q.byteBounded() {
-			q.reportDrop("", result.event)
-		}
+		q.enqueue(result)
 	})
 }
 
 // hold records a sent result in the pending-ack ring. Byte mode only: the
 // result's capacity stays charged until ackThrough/dropSent releases it.
 func (q *resultQueue) hold(result outbound) {
-	if !q.byteBounded() || result.sequence == 0 {
+	if result.sequence == 0 {
 		return
 	}
 	q.sentMu.Lock()
@@ -300,7 +252,7 @@ func (q *resultQueue) hold(result outbound) {
 // ack covers and compact the remainder. It returns the highest sequence
 // actually released.
 func (q *resultQueue) ackThrough(cumulative uint64) uint64 {
-	if !q.byteBounded() || cumulative == 0 {
+	if cumulative == 0 {
 		return 0
 	}
 	q.sentMu.Lock()
@@ -336,7 +288,7 @@ func (q *resultQueue) ackThrough(cumulative uint64) uint64 {
 // held entry was found and released, so a caller can skip a second release
 // for results that were never in the ring (issue 5151).
 func (q *resultQueue) dropSent(sequence uint64) bool {
-	if !q.byteBounded() || sequence == 0 {
+	if sequence == 0 {
 		return false
 	}
 	q.sentMu.Lock()
@@ -384,7 +336,7 @@ func (q *resultQueue) releaseLocked(result outbound, returnBuf bool) {
 // unhold removes one held sequence before its retry re-enters the spool. The
 // payload buffer is retained: the retry sends the exact same bytes.
 func (q *resultQueue) unhold(sequence uint64) {
-	if !q.byteBounded() || sequence == 0 {
+	if sequence == 0 {
 		return
 	}
 	q.sentMu.Lock()
@@ -412,14 +364,6 @@ func (q *resultQueue) unhold(sequence uint64) {
 // ring. returnBuf releases the pooled payload buffer only when the payload
 // is not about to retry.
 func (q *resultQueue) releaseCapacity(result outbound, returnBuf bool) {
-	if !q.byteBounded() {
-		if result.reservedSlot {
-			<-q.reservedSlots
-			return
-		}
-		<-q.slots
-		return
-	}
 	if result.event == "trap" {
 		q.trapUsage.Add(-int64(result.encodedBytes))
 	}
@@ -433,25 +377,15 @@ func (q *resultQueue) releaseCapacity(result outbound, returnBuf bool) {
 	}
 }
 
-// ack releases a result the writer acknowledged. Legacy count mode frees the
-// slot here; byte mode leaves the charge to the server's storage ack.
+// ack releases a result the writer acknowledged. The charge normally stays
+// held for the server's storage ack, but a direct consumer (tests) acks
+// without the ring, so the release is exclusive: a result still held in the
+// sent ring is freed there, and only a result the ring never saw takes the
+// capacity path, or both run and byteUsage dives negative (issue 5151).
 func (q *resultQueue) ack(result outbound) {
-	if q.byteBounded() {
-		// A direct consumer (tests) acks without the server path; keep the
-		// budget consistent rather than leaking it. The release is exclusive:
-		// a result still held in the sent ring is freed there, and only a
-		// result the ring never saw takes the capacity path, or both run and
-		// byteUsage dives negative (issue 5151).
-		if !q.dropSent(result.sequence) {
-			q.releaseCapacity(result, true)
-		}
-		return
+	if !q.dropSent(result.sequence) {
+		q.releaseCapacity(result, true)
 	}
-	if result.reservedSlot {
-		<-q.reservedSlots
-		return
-	}
-	<-q.slots
 }
 
 // retry puts a failed frame's result back at the head of the spool. The lane
@@ -500,9 +434,6 @@ func (q *resultQueue) takeRetry() (outbound, bool) {
 // charged, so byte mode releases the held entry and re-enqueues the same
 // payload; a truly saturated spool drops it instead of leaking the ring.
 func (q *resultQueue) requeueUnacked() {
-	if !q.byteBounded() {
-		return
-	}
 	q.sentMu.Lock()
 	held := make([]outbound, 0, q.sentCount)
 	for i := range q.sentCount {
@@ -522,18 +453,13 @@ func (q *resultQueue) requeueUnacked() {
 }
 
 // requeueLanes returns results the loop staged but did not send before the
-// session ended. Byte mode releases and re-enqueues so a full spool applies
-// normal drop accounting; count mode still holds its slot token, so the
-// channel send is guaranteed room.
+// session ended. The staged charge is released and re-enqueued so a full
+// spool applies normal drop accounting.
 func (q *resultQueue) requeueLanes(lanes *[5][]outbound) {
 	for lane := range lanes {
 		for _, result := range lanes[lane] {
-			if q.byteBounded() {
-				q.releaseCapacity(result, false)
-				q.enqueue(result)
-				continue
-			}
-			q.items <- result
+			q.releaseCapacity(result, false)
+			q.enqueue(result)
 		}
 		lanes[lane] = nil
 	}
@@ -542,16 +468,13 @@ func (q *resultQueue) requeueLanes(lanes *[5][]outbound) {
 // empty reports whether nothing is queued, in flight or awaiting an ack.
 // Shared by the self-update drain and the shutdown drain.
 func (q *resultQueue) empty() bool {
-	if q.byteBounded() {
-		q.sentMu.Lock()
-		pendingAcks := q.sentCount
-		q.sentMu.Unlock()
-		q.retryMu.Lock()
-		retryLen := len(q.retries)
-		q.retryMu.Unlock()
-		return pendingAcks == 0 && len(q.items) == 0 && retryLen == 0
-	}
-	return len(q.items) == 0 && len(q.slots) == 0 && len(q.reservedSlots) == 0
+	q.sentMu.Lock()
+	pendingAcks := q.sentCount
+	q.sentMu.Unlock()
+	q.retryMu.Lock()
+	retryLen := len(q.retries)
+	q.retryMu.Unlock()
+	return pendingAcks == 0 && len(q.items) == 0 && retryLen == 0
 }
 
 // base64BinaryPayload wraps exact protobuf bytes in the legacy channel object.

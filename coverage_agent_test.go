@@ -548,22 +548,6 @@ func TestResultQueueBatchAndRing(t *testing.T) {
 		}
 	})
 
-	t.Run("count-mode releaseCapacity frees slots", func(t *testing.T) {
-		q := newResultQueue(4)
-		q.slots <- struct{}{}
-		q.releaseCapacity(outbound{}, false)
-		q.reservedSlots <- struct{}{}
-		q.releaseCapacity(outbound{reservedSlot: true}, false)
-	})
-
-	t.Run("count-mode ack frees slots", func(t *testing.T) {
-		q := newResultQueue(4)
-		q.slots <- struct{}{}
-		q.ack(outbound{})
-		q.reservedSlots <- struct{}{}
-		q.ack(outbound{reservedSlot: true})
-	})
-
 	t.Run("retryBatch preserves order", func(t *testing.T) {
 		q := newResultQueue(4)
 		q.retryBatch([]outbound{

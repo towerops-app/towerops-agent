@@ -71,7 +71,7 @@ func TestInventoryAssemblerGuards(t *testing.T) {
 
 	// The byte bound rejects an oversized assembly and reports rejection.
 	pools := &jobPools{notices: make(chan outbound, 1), targets: &targetGates{}}
-	results := newResultQueueForAgent(context.Background(), 8)
+	results := newResultQueueForAgentBytes(context.Background(), 8<<20)
 	big := &pb.AgentInventoryUpdate{
 		Revision: 1, FullSync: true, ChunkIndex: 1, ChunkCount: 2,
 		Upserts: []*pb.AgentJob{{
@@ -92,7 +92,7 @@ func TestApplyInventoryUpdateGuards(t *testing.T) {
 	defer cancel()
 	scheduler := newRecurringScheduler(ctx, realScheduleClock{})
 	defer scheduler.cancelAll()
-	results := newResultQueueForAgent(ctx, 8)
+	results := newResultQueueForAgentBytes(ctx, 8<<20)
 
 	applyInventoryUpdate(nil, scheduler, &pb.AgentInventoryUpdate{}, results)
 	pools := &jobPools{notices: make(chan outbound, 1), targets: &targetGates{}}
@@ -120,7 +120,7 @@ func TestApplyIncrementalUpdateMerge(t *testing.T) {
 	defer cancel()
 	pools := testPools(t)
 	scheduler := pools.scheduler
-	results := newResultQueueForAgent(ctx, 8)
+	results := newResultQueueForAgentBytes(ctx, 8<<20)
 
 	update := &pb.AgentInventoryUpdate{
 		Revision: 9,
@@ -299,7 +299,7 @@ func TestApplyIncrementalUpdateFingerprintsOnlyNamedEntries(t *testing.T) {
 	defer cancel()
 	pools := testPools(t)
 	scheduler := pools.scheduler
-	results := newResultQueueForAgent(ctx, 8)
+	results := newResultQueueForAgentBytes(ctx, 8<<20)
 
 	const inventorySize = 10_000
 	jobs := make([]*pb.AgentJob, 0, inventorySize)
@@ -355,7 +355,7 @@ func TestApplyIncrementalUpdateSwapsChangedEntry(t *testing.T) {
 	defer cancel()
 	pools := testPools(t)
 	scheduler := pools.scheduler
-	results := newResultQueueForAgent(ctx, 8)
+	results := newResultQueueForAgentBytes(ctx, 8<<20)
 
 	scheduler.replaceJobs([]*pb.AgentJob{
 		{JobId: "job-a", IntervalSeconds: 300},
@@ -383,7 +383,7 @@ func TestApplyCheckDeltaGuards(t *testing.T) {
 	defer cancel()
 	pools := testPools(t)
 	scheduler := pools.scheduler
-	results := newResultQueueForAgent(ctx, 8)
+	results := newResultQueueForAgentBytes(ctx, 8<<20)
 
 	scheduler.applyCheckDelta([]*pb.Check{nil, {}}, nil, pools, results)
 	if len(scheduler.checks) != 0 {
@@ -424,7 +424,7 @@ func TestReplaceSkipsIdenticalPayloadPointer(t *testing.T) {
 	defer cancel()
 	pools := testPools(t)
 	scheduler := pools.scheduler
-	results := newResultQueueForAgent(ctx, 8)
+	results := newResultQueueForAgentBytes(ctx, 8<<20)
 
 	jobs := []*pb.AgentJob{{JobId: "job-1", IntervalSeconds: 300}}
 	scheduler.replaceJobs(jobs, pools, results)

@@ -304,22 +304,14 @@ func TestReleaseLockedReturnsBuffer(t *testing.T) {
 	}
 }
 
-func TestReleaseCapacityCountAndReserved(t *testing.T) {
-	// Count mode drains the slot channel.
-	q := newResultQueue(4)
-	q.slots <- struct{}{}
-	q.releaseCapacity(outbound{event: "result"}, false)
-	// Reserved lane drains reservedSlots instead.
-	q2 := newResultQueue(4)
-	q2.reservedSlots <- struct{}{}
-	q2.releaseCapacity(outbound{event: "result", reservedSlot: true}, false)
-	// Byte mode with a buffer returns it to the pool.
-	q3 := newResultQueueForAgentBytes(context.Background(), 1<<20)
-	q3.byteUsage.Store(4)
-	q3.depth.Store(1)
-	q3.releaseCapacity(outbound{event: "result", encodedBytes: 4, buf: bytes.NewBuffer(nil)}, true)
-	if q3.byteUsage.Load() != 0 {
-		t.Error("byte release must free the charge")
+func TestReleaseCapacity(t *testing.T) {
+	// A released charge returns the pooled buffer to the pool.
+	q := newResultQueueForAgentBytes(context.Background(), 1<<20)
+	q.byteUsage.Store(4)
+	q.depth.Store(1)
+	q.releaseCapacity(outbound{event: "result", encodedBytes: 4, buf: bytes.NewBuffer(nil)}, true)
+	if q.byteUsage.Load() != 0 {
+		t.Error("release must free the charge")
 	}
 }
 
@@ -353,7 +345,7 @@ func TestSubmitJobPingEngineRefusal(t *testing.T) {
 	pools := testPools(t)
 	pools.pingEngine.shutdown()
 	pools.pingEngine = engine
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 	done := make(chan struct{}, 1)
 	job := &pb.AgentJob{
 		JobId:      "ping-refused",
@@ -382,7 +374,7 @@ func TestSubmitJobClosedPool(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pools := testPools(t)
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 	pools.snmp.stop() // closed, not paused → reportPoolRejection
 	done := make(chan struct{}, 1)
 	job := &pb.AgentJob{
@@ -409,7 +401,7 @@ func TestSubmitJobGateAcquireCancelled(t *testing.T) {
 	// Covers the wait-path targets.acquire ctx-cancellation refusal.
 	ctx, cancel := context.WithCancel(context.Background())
 	pools := testPools(t)
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 	done := make(chan struct{}, 1)
 	job := &pb.AgentJob{
 		JobId:      "snmp-gate-cancelled",
@@ -532,7 +524,7 @@ func TestPollerGraceTimerDoesNotRestart(t *testing.T) {
 
 func TestApplyInventoryUpdateEarlyReturns(t *testing.T) {
 	ctx := context.Background()
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 	var nilPoller *processPoller
 	// nil receiver
 	nilPoller.applyInventoryUpdate(&pb.AgentInventoryUpdate{}, out)
@@ -564,7 +556,7 @@ func TestInventoryResultAppliesViaPoller(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pools := testPools(t)
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 	s := &session{
 		jobCtx:    ctx,
 		pools:     pools,
@@ -591,7 +583,7 @@ func TestApplyJobListRemoteScheduling(t *testing.T) {
 	ctx := context.Background()
 	pools := testPools(t)
 	pools.localScheduling = false
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 	applyJobList(ctx, "jobs", &pb.AgentJobList{Jobs: []*pb.AgentJob{
 		{JobId: "j1", JobType: pb.JobType_PING, SnmpDevice: &pb.SnmpDevice{Ip: "127.0.0.1"}},
 	}}, pools, out)
@@ -604,7 +596,7 @@ func TestApplyJobListStopAccepting(t *testing.T) {
 	ctx := context.Background()
 	pools := testPools(t)
 	pools.stopAccepting.Store(true)
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 	applyJobList(ctx, "jobs", &pb.AgentJobList{}, pools, out)
 	applyCheckList(ctx, "check_jobs", &pb.CheckList{}, pools, out)
 }
@@ -632,7 +624,7 @@ func TestExpandInventoryQueryDedup(t *testing.T) {
 func TestFullSyncDefaultsAndRemoveChecks(t *testing.T) {
 	ctx := context.Background()
 	pools := testPools(t)
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 
 	// ChunkCount/ChunkIndex unset must default to 1.
 	update := &pb.AgentInventoryUpdate{Revision: 1, FullSync: true}
@@ -645,7 +637,7 @@ func TestFullSyncDefaultsAndRemoveChecks(t *testing.T) {
 func TestIncrementalRemoveChecks(t *testing.T) {
 	ctx := context.Background()
 	pools := testPools(t)
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 
 	// Seed two checks via a full sync: removing one leaves the other, which
 	// exercises the filtered append arm.
@@ -674,7 +666,7 @@ func TestIncrementalRemoveChecks(t *testing.T) {
 func TestAssemblerBoundRejects(t *testing.T) {
 	ctx := context.Background()
 	pools := testPools(t)
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 
 	// First chunk near the bound; the second pushes over it.
 	big := strings.Repeat("x", maxInventoryAssemblyBytes/2)
@@ -1044,7 +1036,7 @@ func TestWalkDoneRootSkipsPDU(t *testing.T) {
 func TestExecuteSnmpJobPlainConn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 	job := &pb.AgentJob{
 		JobId:      "cov-plain",
 		DeviceId:   "cov-plain-dev",
@@ -1079,7 +1071,7 @@ func TestExecuteSnmpJobPlainConn(t *testing.T) {
 func TestExecuteSnmpJobWalkTimeoutMarksSilent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 	job := &pb.AgentJob{
 		JobId:      "cov-walktimeout",
 		DeviceId:   "cov-walktimeout-dev",
@@ -1184,7 +1176,7 @@ func (w *cbBlockWriter) Close() error { return nil }
 func TestExecuteSnmpJobLimitedGetTimeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 	job := &pb.AgentJob{
 		JobId:      "cov-limited-timeout",
 		DeviceId:   "cov-limited-timeout-dev",

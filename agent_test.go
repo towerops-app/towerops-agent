@@ -137,10 +137,12 @@ func TestSendBinaryRejectsInvalidProtobufString(t *testing.T) {
 	}
 }
 
-// newResultQueue supplies an active agent context to tests that do not need to
-// distinguish session cancellation from process shutdown.
+// newResultQueue supplies an active agent context and a generous byte
+// budget to tests that do not need to distinguish session cancellation from
+// process shutdown. Tests asserting drop behavior construct the queue with
+// newResultQueueForAgentBytes and an explicit budget.
 func newResultQueue(size int) *resultQueue {
-	return newResultQueueForAgent(context.Background(), size)
+	return newResultQueueForAgentBytes(context.Background(), int64(size)<<20)
 }
 
 // testQueue returns a buffered result queue for tests that only need to see
@@ -1882,7 +1884,7 @@ func TestPoolOverloadReportsEveryJobClassWithoutUsingResultSpool(t *testing.T) {
 	}, p, out)
 	_ = submitCheck(context.Background(), &pb.Check{Id: "check-overload"}, p, out, func() {}, false)
 
-	if len(out.items) != 0 || len(out.slots) != 0 {
+	if len(out.items) != 0 || out.byteUsage.Load() != 0 {
 		t.Fatal("pool rejection notices consumed completed-result spool capacity")
 	}
 	if !out.enqueue(outbound{event: "real-result"}) {
@@ -1944,19 +1946,20 @@ func TestPoolOverloadReportsEveryJobClassWithoutUsingResultSpool(t *testing.T) {
 }
 
 func TestResultQueueKeepsRetryAheadOfNewerResults(t *testing.T) {
-	queue := newResultQueue(2)
+	// Budget: first (17B) plus newer (2B) fit; a third 2B result does not.
+	queue := newResultQueueForAgentBytes(context.Background(), 20)
 	first := outbound{event: "first", payload: json.RawMessage(`{"binary":"first"}`)}
 	if !queue.enqueue(first) {
 		t.Fatal("result queue rejected its first result")
 	}
 
 	inFlight := <-queue.items
-	newer := outbound{event: "newer"}
+	newer := outbound{event: "newer", payload: json.RawMessage("xx")}
 	if !queue.enqueue(newer) {
-		t.Fatal("result queue rejected a newer result despite one free slot")
+		t.Fatal("result queue rejected a newer result within the byte budget")
 	}
-	if queue.enqueue(outbound{event: "overflow"}) {
-		t.Fatal("result queue reused the in-flight result's reserved slot")
+	if queue.enqueue(outbound{event: "overflow", payload: json.RawMessage("xx")}) {
+		t.Fatal("result queue admitted a result past its byte budget")
 	}
 
 	queue.retry(inFlight)
@@ -1982,7 +1985,7 @@ func TestSendResultCancellationAndDropRateLimit(t *testing.T) {
 	t.Cleanup(func() { resultDropLogInterval = previousInterval })
 
 	agentCtx, stopAgent := context.WithCancel(context.Background())
-	out := newResultQueueForAgent(agentCtx, 0)
+	out := newResultQueueForAgentBytes(agentCtx, 1)
 	sessionCtx, stopSession := context.WithCancel(context.Background())
 	stopSession()
 
@@ -2137,8 +2140,8 @@ func TestRunSessionDeliversPreviouslyBufferedResult(t *testing.T) {
 	if err := <-done; !errors.Is(err, errRestartRequested) {
 		t.Fatalf("runSessionWithResults error = %v, want %v", err, errRestartRequested)
 	}
-	if len(results.slots) != 0 {
-		t.Fatal("delivered result remained reserved in the reconnect buffer")
+	if results.byteUsage.Load() != 0 {
+		t.Fatal("delivered result remained charged in the reconnect buffer")
 	}
 }
 
@@ -2184,8 +2187,8 @@ func TestRunSessionFlushDrainsQueuedResultOnCancel(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("session did not exit after the shutdown flush")
 	}
-	if n := len(results.slots); n != 0 {
-		t.Fatalf("flushed result kept %d slot tokens reserved", n)
+	if n := results.byteUsage.Load(); n != 0 {
+		t.Fatalf("flushed result kept %d bytes charged", n)
 	}
 }
 
@@ -3788,8 +3791,8 @@ func TestSessionLoopRetriesResultWhenWriterQueueStalls(t *testing.T) {
 		t.Fatalf("session loop error = %v, want result queue timeout", err)
 	}
 	retried, ok := results.takeRetry()
-	if !ok || retried.event != result.event || len(results.items) != 0 || len(results.slots) != 1 {
-		t.Fatal("failed write did not restore the result at the head with its reservation")
+	if !ok || retried.event != result.event || len(results.items) != 0 {
+		t.Fatal("failed write did not restore the result at the head of the retry lane")
 	}
 }
 
@@ -4182,8 +4185,8 @@ func TestSettleInFlightPrefersCompletedWrite(t *testing.T) {
 	ack := make(chan error, 1)
 	ack <- nil
 	s.settleInFlight(&inFlightWrite{result: result, ack: ack, spooled: true})
-	if len(results.slots) != 0 {
-		t.Fatal("completed write did not release the spool slot")
+	if results.byteUsage.Load() != 0 {
+		t.Fatal("completed write did not release the spool charge")
 	}
 
 	// A write still pending at teardown is requeued for the next session.
@@ -5237,80 +5240,60 @@ func TestQueuedJobSkipsAfterSessionEnds(t *testing.T) {
 	}
 }
 
-// The reserved discovery lane must hold discovery results even when the
-// general lane is saturated by pings and checks.
-func TestResultQueueDiscoveryLane(t *testing.T) {
-	out := newResultQueue(8) // 6 general slots, 2 reserved for discovery
-
+// Reserved and general results share one byte budget: a full spool drops
+// the newest result regardless of lane, and freed capacity admits the next
+// discovery result.
+func TestResultQueueDiscoverySharesByteBudget(t *testing.T) {
 	pingResult := &pb.MonitoringCheck{DeviceId: "d", Status: "success"}
 	discResult := &pb.SnmpResult{JobType: pb.JobType_DISCOVER}
-
-	// Saturate the general lane with non-discovery results.
-	for range 6 {
-		sendResult(context.Background(), out, "monitoring_check", pingResult, "ping")
+	ping, ok := encodeOutbound("monitoring_check", pingResult, "ping")
+	if !ok {
+		t.Fatal("encode ping result")
 	}
-	// The general lane is full: another ping result must drop.
-	sendResult(context.Background(), out, "monitoring_check", pingResult, "overflow")
-	if got := len(out.items); got != 6 {
-		t.Fatalf("queued results = %d, want 6", got)
-	}
+	out := newResultQueueForAgentBytes(context.Background(), int64(ping.wireSize()))
 
-	// Discovery results still fit in their reserved lane.
+	sendResult(context.Background(), out, "monitoring_check", pingResult, "ping")
+	// The budget is spent: a discovery result drops like any other result.
 	sendResult(context.Background(), out, "result", discResult, "d1")
-	sendResult(context.Background(), out, "result", discResult, "d2")
-	if got := len(out.items); got != 8 {
-		t.Fatalf("queued results = %d, want 8", got)
-	}
-	// Both lanes full: a third discovery result drops.
-	sendResult(context.Background(), out, "result", discResult, "d3")
-	if got := len(out.items); got != 8 {
-		t.Fatalf("queued results = %d, want 8 after drop", got)
+	if got := len(out.items); got != 1 {
+		t.Fatalf("queued results = %d, want 1", got)
 	}
 
-	// Freeing a general slot lets a discovery result overflow into it.
+	// Freeing capacity admits the discovery result.
 	out.ack(<-out.items)
-	sendResult(context.Background(), out, "result", discResult, "d3")
-	if got := len(out.items); got != 8 {
-		t.Fatalf("queued results = %d, want 8 after overflow", got)
+	sendResult(context.Background(), out, "result", discResult, "d1")
+	if got := len(out.items); got != 1 {
+		t.Fatalf("queued results = %d, want 1 after freeing the budget", got)
 	}
 }
 
-// A discovery result requeued after a server rejection still carries
-// discSlot from its first delivery. When the reserved lane is full the
-// requeue takes a general slot, and ack must release that general token —
-// not consume a discovery token owned by another in-flight result.
-func TestResultQueueRequeuedDiscoveryReleasesGeneralLane(t *testing.T) {
-	out := newResultQueue(8) // 6 general slots, 2 reserved for discovery
+// A result requeued after a server rejection is charged again on re-entry,
+// and ack releases exactly that charge, not the charge of another in-flight
+// result.
+func TestResultQueueRequeuedResultReleasesOnAck(t *testing.T) {
+	out := newResultQueueForAgentBytes(context.Background(), 1<<10)
 	discResult := &pb.SnmpResult{JobType: pb.JobType_DISCOVER}
 
-	// Saturate the reserved lane.
 	sendResult(context.Background(), out, "result", discResult, "d1")
 	sendResult(context.Background(), out, "result", discResult, "d2")
 
-	// Deliver d1: its discovery token is acked, and a newer discovery
-	// result immediately claims the freed slot. When the server then
-	// rejects d1 and handleResultReply requeues it, the reserved lane is
-	// full again, so the requeue must take a general slot.
+	// Deliver d1: its charge is acked. When the server then rejects d1 and
+	// handleResultReply requeues it, the re-entry charges the budget again.
 	d1 := <-out.items
 	out.ack(d1)
-	sendResult(context.Background(), out, "result", discResult, "d3")
 	d1.attempts++
 	if !out.enqueue(d1) {
-		t.Fatal("requeue of rejected discovery result dropped, want general-lane fallback")
+		t.Fatal("requeue of rejected result dropped on an open budget")
 	}
 
-	// Drain to the requeued item and ack it: it must release the general
-	// token it actually holds.
-	<-out.items // d2
-	<-out.items // d3
+	// Drain to the requeued item and ack it: it must release the charge it
+	// actually holds while d2 stays in flight.
+	d2 := <-out.items
 	requeued := <-out.items
 	out.ack(requeued)
 
-	if got := len(out.slots); got != 0 {
-		t.Fatalf("general lane holds %d tokens after ack, want 0 (leaked token)", got)
-	}
-	if got := len(out.reservedSlots); got != 2 {
-		t.Fatalf("discovery lane holds %d tokens after ack, want 2 (d2/d3 still in flight)", got)
+	if got, want := out.byteUsage.Load(), int64(d2.wireSize()); got != want {
+		t.Fatalf("byte usage after ack = %d, want %d (d2 still in flight)", got, want)
 	}
 }
 
@@ -5668,6 +5651,37 @@ func TestHandleResultReplyRetriesRejectedResult(t *testing.T) {
 	}
 }
 
+// A pending entry recorded without the batch slice (a single send) falls
+// back to its lone result when the server rejects the frame.
+func TestHandleResultReplyFallsBackToPendingResult(t *testing.T) {
+	results := newResultQueue(4)
+	s := &session{
+		ctx:     context.Background(),
+		topic:   "agent:test",
+		results: results,
+	}
+	res := outbound{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)}
+	ref := "9"
+	s.pending = map[string]pendingResult{ref: {result: res}}
+
+	s.handleResultReply(channelMsg{
+		Topic:   "agent:test",
+		Event:   "phx_reply",
+		Ref:     &ref,
+		Payload: json.RawMessage(`{"status":"error","response":{"reason":"timeout"}}`),
+	})
+
+	select {
+	case queued := <-results.items:
+		if queued.event != "result" || queued.attempts != 1 {
+			t.Fatalf("requeued result = %+v, want the pending result retried once", queued)
+		}
+		results.ack(queued)
+	default:
+		t.Fatal("rejected single result was not requeued")
+	}
+}
+
 // TestHandleResultReplyIgnoresUnrelatedReplies covers ok replies and refs the
 // session never sent (e.g. the channel heartbeat).
 func TestHandleResultReplyIgnoresUnrelatedReplies(t *testing.T) {
@@ -5792,7 +5806,7 @@ func TestHandleResultReplyEdgeCases(t *testing.T) {
 // TestHandleResultReplyDropsRetryWhenSpoolFull covers the loud drop when the
 // retry cannot re-enter a full result queue.
 func TestHandleResultReplyDropsRetryWhenSpoolFull(t *testing.T) {
-	results := newResultQueue(1)
+	results := newResultQueueForAgentBytes(context.Background(), 2)
 	if !results.enqueue(outbound{event: "filler", payload: json.RawMessage(`{}`)}) {
 		t.Fatal("failed to fill the result queue")
 	}
@@ -5912,31 +5926,40 @@ func TestDrainResults(t *testing.T) {
 		}
 	})
 
-	t.Run("returns true once queued and in-flight results release slots", func(t *testing.T) {
+	t.Run("returns true once a sent result is acked", func(t *testing.T) {
 		results := newResultQueue(4)
 		s := newDrainableSession(t, results)
 
 		if !results.enqueue(outbound{event: "result"}) {
 			t.Fatal("enqueue failed")
 		}
-		// Simulate an in-flight send: dequeued but not yet acked.
+		// Simulate a sent-but-unacked result: the ring holds it until the
+		// server's storage ack.
 		inFlight := <-results.items
+		inFlight.sequence = 1
+		results.hold(inFlight)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		done := make(chan bool, 1)
 		go func() { done <- s.drainResults(ctx) }()
 
-		// Delivered: the write ack releases the slot, and the drain sees it.
+		select {
+		case <-done:
+			t.Fatal("drain finished while a sent result awaited its ack")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		// The storage ack releases the held entry, and the drain sees it.
 		results.ack(inFlight)
 
 		select {
 		case drained := <-done:
 			if !drained {
-				t.Fatal("drain returned false after slots freed")
+				t.Fatal("drain returned false after the ack")
 			}
 		case <-time.After(2 * time.Second):
-			t.Fatal("drain did not observe freed slots")
+			t.Fatal("drain did not observe the released ack")
 		}
 	})
 
@@ -5947,7 +5970,9 @@ func TestDrainResults(t *testing.T) {
 		release := make(chan struct{})
 		if !s.pools.snmp.submit(context.Background(), func() {
 			<-release
-			results.enqueue(outbound{event: "result"})
+			// Simulate a sent-but-unacked result: the ring holds it until
+			// the server's storage ack.
+			results.hold(outbound{event: "result", sequence: 1})
 		}) {
 			t.Fatal("submit failed")
 		}
@@ -5963,9 +5988,9 @@ func TestDrainResults(t *testing.T) {
 		}
 
 		// The job finishes and publishes; the drain must still wait for the
-		// result to be delivered.
+		// sent result to be acked.
 		close(release)
-		item := <-results.items
+		item := outbound{event: "result", sequence: 1}
 		select {
 		case <-done:
 			t.Fatal("drain finished before the job's result was acked")
@@ -6268,8 +6293,8 @@ func TestSessionLoopServicesInboundDuringInFlightWrite(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("session loop returned %v after agent shutdown", err)
 	}
-	if len(results.slots) != 0 {
-		t.Fatal("completed in-flight write did not release its slot")
+	if results.byteUsage.Load() != 0 {
+		t.Fatal("completed in-flight write did not release its charge")
 	}
 }
 

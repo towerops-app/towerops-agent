@@ -483,9 +483,6 @@ func (s *session) unstageBatch(lanes *[5][]outbound, batch []outbound) {
 // hasRoomFor reports whether the spool can take at least minBytes more
 // without dropping a producer's result. Used for trap backpressure (C5).
 func (q *resultQueue) hasRoomFor(minBytes int64) bool {
-	if !q.byteBounded() {
-		return len(q.items) < cap(q.items)
-	}
 	if len(q.items) >= cap(q.items) {
 		return false
 	}
@@ -495,9 +492,6 @@ func (q *resultQueue) hasRoomFor(minBytes int64) bool {
 // hasTrapRoomFor reports whether the trap sub-budget inside the spool can
 // take at least minBytes more (issue 5165).
 func (q *resultQueue) hasTrapRoomFor(minBytes int64) bool {
-	if !q.byteBounded() {
-		return len(q.items) < cap(q.items)
-	}
 	if len(q.items) >= cap(q.items) {
 		return false
 	}
