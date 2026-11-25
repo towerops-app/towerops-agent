@@ -672,27 +672,6 @@ func TestHandleMessage(t *testing.T) {
 		)
 	})
 
-	t.Run("backup_job event", func(t *testing.T) {
-		origDial := mikrotikDial
-		origSSH := sshBackup
-		defer func() { mikrotikDial = origDial; sshBackup = origSSH }()
-
-		sshBackup = func(_ context.Context, ip string, port uint16, username, password string) (string, error) {
-			return "/ip address\nadd address=10.0.0.1/24", nil
-		}
-
-		out := testQueue()
-
-		payload := makeJobPayload(&pb.AgentJob{
-			JobId:          "backup:dev1",
-			JobType:        pb.JobType_MIKROTIK,
-			MikrotikDevice: &pb.MikrotikDevice{Ip: "10.0.0.1", SshPort: 22, Username: "admin", Password: "pass"},
-		})
-		_, _ = handleMessage(context.Background(), channelMsg{Topic: "agent:test", Event: "backup_job", Payload: payload}, "agent:test", testPools(t), out)
-		if result := wantResult[*pb.MikrotikResult](t, out, "mikrotik_result", 500*time.Millisecond); result.Error != "" {
-			t.Errorf("unexpected error: %s", result.Error)
-		}
-	})
 }
 
 func TestHandleMessageRejectsPayloadAboveServerLimit(t *testing.T) {

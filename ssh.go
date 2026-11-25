@@ -5,24 +5,14 @@ package main
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log/slog"
 	"net"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/towerops-app/towerops-agent/pb"
 	"golang.org/x/crypto/ssh"
 )
 
-var sshBackup = executeMikrotikBackupContext
-var sshBackupTimeout = 60 * time.Second
-
-// sshBackupMaxOutputBytes bounds the /export output a legacy SSH backup will
-// hold in memory. It is a var so tests can shrink it like sshBackupTimeout.
-var sshBackupMaxOutputBytes uint64 = defaultMaxConfigBytes
 var sshDial = func(ctx context.Context, network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
 	dialer := net.Dialer{Control: privateTargetControl}
 	conn, err := dialer.DialContext(ctx, network, addr)
@@ -88,102 +78,6 @@ func sshClientAlive(c *ssh.Client) bool {
 
 // sshKeepaliveTimeout bounds sshClientAlive. A var so tests can shrink it.
 var sshKeepaliveTimeout = 10 * time.Second
-
-// redactBackupDetail mirrors configBackupError: scrub the credentials the
-// legacy SSH backup carries, then shorten device output to one 300-byte
-// line before it can reach an error field.
-func redactBackupDetail(detail, password string) string {
-	return firstLine(redactConfigSecrets(detail, &pb.ConfigBackupJob{Password: password}), maxConfigBackupDetailLen)
-}
-
-// executeMikrotikBackupContext connects via SSH and bounds the complete export,
-// including the handshake and command, so a stalled device cannot pin a worker.
-func executeMikrotikBackupContext(ctx context.Context, ip string, port uint16, username, password string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, sshBackupTimeout)
-	defer cancel()
-
-	addr := net.JoinHostPort(ip, strconv.Itoa(int(port)))
-	// Resolve before the pin lookup: the TOFU store keys entries by the
-	// resolved remote.String() the handshake callback reports, so a
-	// hostname or non-canonical IPv6 dev.Ip would never find its pin under
-	// the raw dial string. Dialing the resolved literal keeps the dialed
-	// address identical to the resolved one even when DNS round-robins.
-	resolved, err := sshResolve(ctx, addr)
-	if err != nil {
-		return "", fmt.Errorf("resolve %s: %w", addr, err)
-	}
-
-	// SECURITY: TOFU (Trust-On-First-Use) host key verification.
-	// On first connection the key is stored; subsequent connections reject
-	// mismatches. When a key is already pinned, HostKeyAlgorithms is
-	// restricted to its type so an x/crypto preference change cannot make a
-	// dual-key device present a different key and trip a false MITM error.
-	config := &ssh.ClientConfig{
-		User:            username,
-		Auth:            []ssh.AuthMethod{ssh.Password(password)},
-		HostKeyCallback: sshHostKeyCallback(),
-	}
-
-	legacySSHAlgorithms(config)
-
-	if alg := getHostKeyStore().pinnedKeyAlgorithm("ssh:" + resolved); alg != "" {
-		config.HostKeyAlgorithms = hostKeyAlgorithmsFor(alg)
-	}
-
-	conn, err := sshDial(ctx, "tcp", resolved, config)
-	if err != nil {
-		return "", fmt.Errorf("ssh dial %s: %w", addr, err)
-	}
-	defer func() { _ = conn.Close() }()
-	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stopCancel()
-
-	session, err := conn.NewSession()
-	if err != nil {
-		return "", fmt.Errorf("ssh session: %w", err)
-	}
-	defer func() { _ = session.Close() }()
-
-	// stdout and stderr are buffered separately and capped so a broken or
-	// hostile device cannot grow the heap until the job deadline; crossing
-	// the stdout cap closes the channel to abort the stream.
-	outBuf := boundedBuffer{
-		limit:      sshBackupMaxOutputBytes,
-		onOverflow: func() { _ = session.Close() },
-	}
-	errBuf := boundedBuffer{limit: configBackupStderrCap}
-	session.Stdout = &outBuf
-	session.Stderr = &errBuf
-	err = session.Run("/export compact")
-	// RouterOS 6 closes the exec channel without an exit-status, which
-	// surfaces as *ssh.ExitMissingError with the output still delivered.
-	// Tolerate it only while the connection still answers a keepalive: a
-	// device that dropped mid-export closes the transport, which produces
-	// the same error and must stay an error.
-	var exitMissing *ssh.ExitMissingError
-	if errors.As(err, &exitMissing) && sshClientAlive(conn) {
-		err = nil
-	}
-	output := append(outBuf.Bytes(), errBuf.Bytes()...)
-	if outBuf.overflow {
-		return "", fmt.Errorf("ssh command: %w", errConfigBackupTooLarge)
-	}
-	if err != nil {
-		if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
-			return "", fmt.Errorf("ssh command: %w: %s", err, redactBackupDetail(trimmed, password))
-		}
-		return "", fmt.Errorf("ssh command: %w", err)
-	}
-
-	if failure := routerOSCommandFailure(string(errBuf.Bytes())); failure != nil {
-		return "", fmt.Errorf("ssh command: %s", redactBackupDetail(failure.detail, password))
-	}
-	exportOutput := string(outBuf.Bytes())
-	if code := classifyExportOutput(exportOutput); code != pb.ConfigBackupErrorCode_CONFIG_BACKUP_OK {
-		return "", fmt.Errorf("ssh command: %s: %s", code, redactBackupDetail(strings.TrimSpace(exportOutput), password))
-	}
-	return exportOutput, nil
-}
 
 // legacySSHAlgorithms widens the client config with the legacy algorithms
 // old devices offer. It now serves every config backup vendor, not just

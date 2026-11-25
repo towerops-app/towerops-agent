@@ -481,12 +481,6 @@ func executeMikrotikJob(ctx context.Context, job *pb.AgentJob, out *resultQueue)
 
 	timestamp := time.Now().Unix()
 
-	// Backup jobs use SSH
-	if strings.HasPrefix(job.JobId, "backup:") {
-		executeMikrotikBackupViaSSH(jobCtx, job, dev, out, timestamp)
-		return
-	}
-
 	port := dev.Port
 	if port == 0 {
 		if dev.UseSsl {
@@ -577,42 +571,4 @@ func sanitizeMikrotikFailure(message, password string) string {
 		message = strings.ReplaceAll(message, password, "***")
 	}
 	return firstLine(message, maxMikrotikFailureLen)
-}
-
-// executeMikrotikBackupViaSSH runs /export compact over SSH.
-func executeMikrotikBackupViaSSH(ctx context.Context, job *pb.AgentJob, dev *pb.MikrotikDevice, out *resultQueue, timestamp int64) {
-	slog.Debug("executing backup via ssh", "device", job.DeviceId, "ip", dev.Ip, "ssh_port", dev.SshPort)
-	if dev.SshPort > 65535 {
-		sendResult(ctx, out, "mikrotik_result", mikrotikError(
-			job,
-			fmt.Sprintf("invalid SSH port %d", dev.SshPort),
-			timestamp,
-		), job.JobId)
-		return
-	}
-
-	port := dev.SshPort
-	if port == 0 {
-		port = 22
-	}
-
-	config, err := sshBackup(ctx, dev.Ip, uint16(port), dev.Username, dev.Password)
-	if err != nil {
-		sendResult(ctx, out, "mikrotik_result", mikrotikError(
-			job,
-			fmt.Sprintf("SSH backup failed: %v", err),
-			timestamp,
-		), job.JobId)
-		return
-	}
-
-	slog.Debug("mikrotik job complete", "device", job.DeviceId, "job", job.JobId)
-	sendResult(ctx, out, "mikrotik_result", &pb.MikrotikResult{
-		DeviceId: job.DeviceId,
-		JobId:    job.JobId,
-		Sentences: []*pb.MikrotikSentence{
-			{Attributes: map[string]string{"config": strings.ToValidUTF8(config, "\uFFFD")}},
-		},
-		Timestamp: timestamp,
-	}, job.JobId)
 }
