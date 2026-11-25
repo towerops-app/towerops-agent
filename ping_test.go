@@ -2231,6 +2231,17 @@ func TestExecPingSeriesArgsAndErrors(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("subprocess failure surfaces stderr", func(t *testing.T) {
+		pingGOOS = "linux"
+		pingCommandOutput = func(context.Context, string, ...string) ([]byte, error) {
+			return []byte("ping: sendmsg: Network is unreachable\n"), errors.New("exit status 2")
+		}
+		_, _, err := execPingSeries(context.Background(), "127.0.0.1", 3, 1500)
+		if err == nil || !strings.Contains(err.Error(), "Network is unreachable") {
+			t.Fatalf("execPingSeries err = %v, want stderr in the error", err)
+		}
+	})
 }
 
 // The first-RTT cut at " ms" has two fallbacks: any other space, then the end
