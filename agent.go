@@ -1546,7 +1546,7 @@ func (s *session) loop(ctx context.Context) error {
 
 	// lanes hold results already taken from the spool, grouped by delivery
 	// priority, until they form the next frame.
-	var lanes [4][]outbound
+	var lanes [5][]outbound
 	flushDue := false
 
 	// Shutdown asks for the same drain the self-update path gets (issue
@@ -1592,9 +1592,9 @@ func (s *session) loop(ctx context.Context) error {
 			resultsCh = s.results.items
 			noticesCh = s.notices
 			// Trap backpressure (C5): stop reading the trap channel while
-			// the spool has no room for even a small trap, rather than
-			// dropping it as a generic result overflow.
-			if s.results.hasRoomFor(1 << 10) {
+			// the trap sub-budget has no room left, rather than dropping
+			// each one as a generic result overflow (issue 5165).
+			if s.results.hasTrapRoomFor(1) {
 				trapCh = s.traps
 			}
 		} else {
@@ -1662,8 +1662,15 @@ func (s *session) loop(ctx context.Context) error {
 			// them so a failed write is retried by the next connection. The
 			// enqueue verdict for THIS trap is the drop signal: a shared
 			// spool counter would also count poll results another
-			// goroutine dropped between load and check (C5).
-			if sendResult(s.results.agentCtx, s.results, "trap", trap, "") {
+			// goroutine dropped between load and check (C5). A marshal
+			// failure is not spool pressure and counts separately (issue
+			// 5165).
+			encoded, ok := encodeOutbound("trap", trap, "")
+			if !ok {
+				countTrapEncodeDrop()
+				continue
+			}
+			if s.results.enqueue(encoded) {
 				slog.Debug("spooled snmp trap", "source", trap.SourceIp, "trap_oid", trap.TrapOid)
 			} else {
 				countTrapSpoolDrop()
@@ -1777,7 +1784,7 @@ func (s *session) loop(ctx context.Context) error {
 // endLoop settles the in-flight write and returns staged-but-unsent lane
 // results to the spool before the session returns. The next session (or
 // poller) replays them.
-func (s *session) endLoop(lanes *[4][]outbound, inFlight *inFlightWrite, err error) error {
+func (s *session) endLoop(lanes *[5][]outbound, inFlight *inFlightWrite, err error) error {
 	s.settleInFlight(inFlight)
 	s.results.requeueLanes(lanes)
 	return err
@@ -2106,6 +2113,12 @@ type resultQueue struct {
 	nextSeq     atomic.Uint64
 	lastDropLog atomic.Int64
 
+	// trapUsage and trapLimit bound the encoded bytes traps may hold inside
+	// the shared spool, so a trap flood cannot evict measurement results
+	// (issue 5165). Only byte mode charges traps.
+	trapUsage atomic.Int64
+	trapLimit int64
+
 	// sent is the pending-ack ring (C4/B8): results the agent sent and the
 	// server has not yet acknowledged, ordered by sequence. head/count make
 	// cumulative acks an O(1) pop from the front instead of a full-map scan.
@@ -2137,13 +2150,29 @@ func newResultQueueForAgentBytes(agentCtx context.Context, byteLimit int64) *res
 	if byteLimit <= 0 {
 		byteLimit = defaultResultSpoolBytes
 	}
+	trapLimit := byteLimit / trapSpoolShare
+	if trapLimit > trapSpoolMaxBytes {
+		trapLimit = trapSpoolMaxBytes
+	}
+	if trapLimit < 1 {
+		trapLimit = 1
+	}
 	return &resultQueue{
 		items:     make(chan outbound, resultIngressDepth),
 		slots:     make(chan struct{}, resultIngressDepth),
 		agentCtx:  agentCtx,
 		byteLimit: byteLimit,
+		trapLimit: trapLimit,
 	}
 }
+
+const (
+	// trapSpoolShare is the fraction of the result spool traps may occupy;
+	// trapSpoolMaxBytes caps that budget absolutely. A flood may delay other
+	// traps, never measurements (issue 5165).
+	trapSpoolShare    = 8
+	trapSpoolMaxBytes = 8 << 20
+)
 
 // byteBounded reports which accounting mode the queue runs in.
 func (q *resultQueue) byteBounded() bool { return q.byteLimit > 0 }
@@ -2154,7 +2183,7 @@ func (q *resultQueue) byteBounded() bool { return q.byteLimit > 0 }
 func (q *resultQueue) enqueue(result outbound) bool {
 	if q.byteBounded() {
 		// Delivery sequences are assigned in send order (queueResultFrame),
-		// not enqueue order: a priority trap that jumps ahead of queued
+		// not enqueue order: a priority result that jumps ahead of queued
 		// polls must not receive a later sequence than results the server
 		// has not been offered yet. Anything re-entering the spool is a
 		// replay from an earlier send position; its old sequence is already
@@ -2163,9 +2192,26 @@ func (q *resultQueue) enqueue(result outbound) bool {
 		result.sequence = 0
 		result.lane = resultPriority(result.event, result.reserved)
 		result.encodedBytes = result.wireSize()
+		trapCharged := false
+		if result.event == "trap" {
+			for {
+				current := q.trapUsage.Load()
+				if current+int64(result.encodedBytes) > q.trapLimit {
+					q.reportDrop("", result.event)
+					return false
+				}
+				if q.trapUsage.CompareAndSwap(current, current+int64(result.encodedBytes)) {
+					trapCharged = true
+					break
+				}
+			}
+		}
 		for {
 			current := q.byteUsage.Load()
 			if current+int64(result.encodedBytes) > q.byteLimit {
+				if trapCharged {
+					q.trapUsage.Add(-int64(result.encodedBytes))
+				}
 				q.reportDrop("", result.event)
 				return false
 			}
@@ -2335,6 +2381,9 @@ func (q *resultQueue) dropSent(sequence uint64) bool {
 // payload buffer back to the pool; retry paths must pass false because the
 // same buffer carries the payload back into the spool.
 func (q *resultQueue) releaseLocked(result outbound, returnBuf bool) {
+	if result.event == "trap" {
+		q.trapUsage.Add(-int64(result.encodedBytes))
+	}
 	if remaining := q.byteUsage.Add(-int64(result.encodedBytes)); remaining < 0 {
 		// A negative balance means a result was released twice, which is a
 		// spool accounting bug, not load. The counter is left negative so the
@@ -2386,6 +2435,9 @@ func (q *resultQueue) releaseCapacity(result outbound, returnBuf bool) {
 		}
 		<-q.slots
 		return
+	}
+	if result.event == "trap" {
+		q.trapUsage.Add(-int64(result.encodedBytes))
 	}
 	if remaining := q.byteUsage.Add(-int64(result.encodedBytes)); remaining < 0 {
 		slog.Error("result spool byte usage went negative",
@@ -2489,7 +2541,7 @@ func (q *resultQueue) requeueUnacked() {
 // session ended. Byte mode releases and re-enqueues so a full spool applies
 // normal drop accounting; count mode still holds its slot token, so the
 // channel send is guaranteed room.
-func (q *resultQueue) requeueLanes(lanes *[4][]outbound) {
+func (q *resultQueue) requeueLanes(lanes *[5][]outbound) {
 	for lane := range lanes {
 		for _, result := range lanes[lane] {
 			if q.byteBounded() {

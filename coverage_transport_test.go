@@ -167,8 +167,11 @@ func TestResultPriority(t *testing.T) {
 	if resultPriority("result", true) != 3 {
 		t.Error("reserved results go to lane 3")
 	}
-	if resultPriority("trap", false) != 0 {
-		t.Error("traps go to lane 0")
+	if resultPriority("trap", false) != 4 {
+		t.Error("traps go to the lowest lane")
+	}
+	if resultPriority("monitoring_check", false) != 0 {
+		t.Error("monitoring checks go to lane 0")
 	}
 	if resultPriority("check_result", false) != 1 {
 		t.Error("check results go to lane 1")
@@ -186,14 +189,14 @@ func TestNextResultFrameSelection(t *testing.T) {
 	}
 
 	// Lane 0 preempts an empty batch; the bulk event is returned alone.
-	lanes := &[4][]outbound{{mk("trap", 10, 0)}}
+	lanes := &[5][]outbound{{mk("monitoring_check", 10, 0)}}
 	got, event := s.nextResultFrame(lanes, false)
-	if event != "trap" || len(got) != 1 || len(lanes[0]) != 0 {
+	if event != "monitoring_check" || len(got) != 1 || len(lanes[0]) != 0 {
 		t.Errorf("lane 0 preemption: event=%q results=%d left=%d", event, len(got), len(lanes[0]))
 	}
 
 	// A non-batchable bulk head on a lower lane flushes the forming batch.
-	lanes = &[4][]outbound{
+	lanes = &[5][]outbound{
 		1: {mk("check_result", 10, 1)},
 		2: {mk("discovery", big, 2), mk("result", 10, 2)},
 	}
@@ -213,7 +216,7 @@ func TestNextResultFrameSelection(t *testing.T) {
 
 	// Batch accumulates to the byte target and flushes on flushDue.
 	half := resultBatchFlushBytes / 2
-	lanes = &[4][]outbound{2: {mk("result", half, 2), mk("result", half, 2)}}
+	lanes = &[5][]outbound{2: {mk("result", half, 2), mk("result", half, 2)}}
 	got, event = s.nextResultFrame(lanes, false)
 	if len(got) != 2 || event != "result" {
 		t.Errorf("byte target flush: results=%d event=%q", len(got), event)
@@ -222,7 +225,7 @@ func TestNextResultFrameSelection(t *testing.T) {
 	// A candidate that would overflow the target breaks the inner loop; the
 	// forming batch is released on flushDue.
 	chunk := resultBatchFlushBytes/2 - 30000
-	lanes = &[4][]outbound{2: {mk("result", chunk, 2), mk("result", chunk, 2), mk("result", chunk, 2)}}
+	lanes = &[5][]outbound{2: {mk("result", chunk, 2), mk("result", chunk, 2), mk("result", chunk, 2)}}
 	got, event = s.nextResultFrame(lanes, true)
 	if len(got) != 2 || event != "result" {
 		t.Errorf("overflow break then flush: results=%d event=%q", len(got), event)
@@ -232,7 +235,7 @@ func TestNextResultFrameSelection(t *testing.T) {
 	}
 
 	// Below the target without flushDue the batch is unstaged.
-	lanes = &[4][]outbound{2: {mk("result", 10, 2)}}
+	lanes = &[5][]outbound{2: {mk("result", 10, 2)}}
 	got, event = s.nextResultFrame(lanes, false)
 	if got != nil || event != "" {
 		t.Errorf("held batch should return empty, got %d %q", len(got), event)
@@ -247,7 +250,7 @@ func TestNextResultFrameSelection(t *testing.T) {
 	}
 
 	// Empty lanes return nothing.
-	empty := &[4][]outbound{}
+	empty := &[5][]outbound{}
 	if got, event := s.nextResultFrame(empty, true); got != nil || event != "" {
 		t.Errorf("empty lanes: results=%d event=%q", len(got), event)
 	}

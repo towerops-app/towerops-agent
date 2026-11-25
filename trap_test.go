@@ -948,6 +948,16 @@ func TestTpTCloseWithoutReadyListener(t *testing.T) {
 func TestTpTCloseWarnsAboutDroppedTraps(t *testing.T) {
 	warned := tpTWatchLog(t, "snmp traps dropped", 1)
 
+	// This test floods handle faster than the admission ceilings allow.
+	oldRate, oldBurst := trapPerSourceRate, trapPerSourceBurst
+	oldGlobalRate, oldGlobalBurst := trapGlobalRate, trapGlobalBurst
+	trapPerSourceRate, trapPerSourceBurst = 1e9, 1e9
+	trapGlobalRate, trapGlobalBurst = 1e9, 1e9
+	defer func() {
+		trapPerSourceRate, trapPerSourceBurst = oldRate, oldBurst
+		trapGlobalRate, trapGlobalBurst = oldGlobalRate, oldGlobalBurst
+	}()
+
 	tl := &trapListener{
 		traps:  make(chan *pb.SnmpTrap, trapQueueSize),
 		closed: make(chan struct{}),
@@ -1541,5 +1551,157 @@ func TestTrapProbeDisablesItselfWhenNoProbeEverArrives(t *testing.T) {
 	case <-disabled:
 	default:
 		t.Fatal("disabling the health check was not logged")
+	}
+}
+
+func TestTpTAdmitPerSourceCeiling(t *testing.T) {
+	tl := &trapListener{
+		traps:  make(chan *pb.SnmpTrap, trapQueueSize),
+		closed: make(chan struct{}),
+	}
+	addr := &net.UDPAddr{IP: net.ParseIP("192.0.2.9"), Port: 5001}
+	before := trapRateLimitedTotal.Load()
+	for i := 0; i < 1000; i++ {
+		tl.handle(tpTV2cTrap("public"), addr)
+	}
+	if got := len(tl.traps); got > int(trapPerSourceBurst)+10 {
+		t.Fatalf("admitted %d traps from one source, want about burst %d", got, int(trapPerSourceBurst))
+	}
+	if trapRateLimitedTotal.Load() == before {
+		t.Error("rate-limited traps were not counted")
+	}
+}
+
+func TestTpTAdmitGlobalCeiling(t *testing.T) {
+	tl := &trapListener{
+		traps:  make(chan *pb.SnmpTrap, trapQueueSize),
+		closed: make(chan struct{}),
+	}
+	// Spoofed sources each get a fresh bucket; the global ceiling still caps.
+	for i := 0; i < 2000; i++ {
+		addr := &net.UDPAddr{IP: net.ParseIP(fmt.Sprintf("192.0.%d.%d", i/256, i%256)), Port: 5001}
+		tl.handle(tpTV2cTrap("public"), addr)
+	}
+	if got := len(tl.traps); got > int(trapGlobalBurst)+20 {
+		t.Fatalf("admitted %d traps across sources, want about global burst %d", got, int(trapGlobalBurst))
+	}
+}
+
+func TestTpTAdmitBoundsSourceMap(t *testing.T) {
+	oldMax, oldIdle := trapSourceMaxTracked, trapSourceMaxIdle
+	trapSourceMaxTracked, trapSourceMaxIdle = 4, time.Hour
+	defer func() { trapSourceMaxTracked, trapSourceMaxIdle = oldMax, oldIdle }()
+
+	tl := &trapListener{rateSources: map[string]*trapTokenBucket{}}
+	now := time.Now()
+	for i := 0; i < trapSourceMaxTracked; i++ {
+		addr := &net.UDPAddr{IP: net.ParseIP(fmt.Sprintf("192.0.2.%d", i+1)), Port: 1}
+		if !tl.admit(addr, now) {
+			t.Fatalf("source %d refused while the map had room", i)
+		}
+	}
+	flood := &net.UDPAddr{IP: net.ParseIP("192.0.2.200"), Port: 1}
+	if tl.admit(flood, now) {
+		t.Error("a new source was admitted into a full map of live sources")
+	}
+}
+
+func TestTpTAdmitSweepsIdleSources(t *testing.T) {
+	oldMax, oldIdle := trapSourceMaxTracked, trapSourceMaxIdle
+	trapSourceMaxTracked, trapSourceMaxIdle = 2, time.Minute
+	defer func() { trapSourceMaxTracked, trapSourceMaxIdle = oldMax, oldIdle }()
+
+	tl := &trapListener{rateSources: map[string]*trapTokenBucket{}}
+	now := time.Now()
+	for i := 0; i < 2; i++ {
+		addr := &net.UDPAddr{IP: net.ParseIP(fmt.Sprintf("192.0.2.%d", i+1)), Port: 1}
+		if !tl.admit(addr, now) {
+			t.Fatalf("source %d refused while the map had room", i)
+		}
+	}
+	later := now.Add(2 * time.Minute)
+	fresh := &net.UDPAddr{IP: net.ParseIP("192.0.2.9"), Port: 1}
+	if !tl.admit(fresh, later) {
+		t.Error("idle sources were not swept to admit a new source")
+	}
+}
+
+func TestTpTVarbindNameNotOIDStillEncodable(t *testing.T) {
+	packet := tpTV2cTrap("public")
+	packet.Variables = append(packet.Variables, gosnmp.SnmpPDU{
+		Name:  "000000\xad000",
+		Type:  gosnmp.OctetString,
+		Value: "junk",
+	})
+	trap := trapToProto(packet, &net.UDPAddr{IP: net.ParseIP("192.0.2.9"), Port: 5001})
+	if _, ok := encodeOutbound("trap", trap, ""); !ok {
+		t.Fatal("trap with a non-OID varbind name must still marshal")
+	}
+	found := false
+	for key := range trap.Varbinds {
+		if strings.HasPrefix(key, "0x") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("non-OID varbind name was not hex-encoded: %v", trap.Varbinds)
+	}
+}
+
+func TestTpTListenTrapRecoversPanic(t *testing.T) {
+	old := listenCall
+	defer func() { listenCall = old }()
+	listenCall = func(*gosnmp.TrapListener, string) error { panic("decoder boom") }
+	if err := listenTrap(nil, "127.0.0.1:1"); err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("listenTrap = %v, want a converted panic error", err)
+	}
+	listenCall = func(*gosnmp.TrapListener, string) error { return nil }
+	if err := listenTrap(nil, ""); err != nil {
+		t.Fatalf("listenTrap = %v, want nil", err)
+	}
+}
+
+func TestTpTCountTrapEncodeDrop(t *testing.T) {
+	before := trapEncodeDroppedTotal.Load()
+	countTrapEncodeDrop()
+	if got := trapEncodeDroppedTotal.Load(); got != before+1 {
+		t.Errorf("trapEncodeDroppedTotal = %d, want %d", got, before+1)
+	}
+}
+
+func TestTpTCountTrapEncodeDropRaces(t *testing.T) {
+	// Hammer the counter so CompareAndSwap loses somewhere; mirrors the
+	// reportDrop race test so the CAS-fail branch is exercised.
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 200 {
+				countTrapEncodeDrop()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+}
+
+func TestValidOIDName(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ok   bool
+	}{
+		{"1.3.6.1.4.1", true},
+		{".1.3.6", true},
+		{"", false},
+		{"abc", false},
+		{"1.3.x", false},
+		{"000000\xad000", false},
+	} {
+		if got := validOIDName(tc.name); got != tc.ok {
+			t.Errorf("validOIDName(%q) = %v, want %v", tc.name, got, tc.ok)
+		}
 	}
 }

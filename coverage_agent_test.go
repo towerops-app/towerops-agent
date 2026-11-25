@@ -616,7 +616,7 @@ func TestResultQueueBatchAndRing(t *testing.T) {
 				)
 			}},
 			{"endLoop with write in flight", func() error {
-				var lanes [4][]outbound
+				var lanes [5][]outbound
 				return s.endLoop(&lanes, &inFlightWrite{
 					ack:     make(chan error, 1),
 					spooled: true,
@@ -644,7 +644,7 @@ func TestResultQueueBatchAndRing(t *testing.T) {
 
 	t.Run("requeueLanes byte mode re-enqueues", func(t *testing.T) {
 		q := newResultQueueForAgentBytes(ctx, 1<<20)
-		var lanes [4][]outbound
+		var lanes [5][]outbound
 		lanes[1] = []outbound{{event: "check_result", encodedBytes: 5}}
 		q.requeueLanes(&lanes)
 		select {
@@ -662,7 +662,7 @@ func TestResultQueueBatchAndRing(t *testing.T) {
 
 	t.Run("requeueLanes count mode pushes to items", func(t *testing.T) {
 		q := newResultQueue(4)
-		var lanes [4][]outbound
+		var lanes [5][]outbound
 		lanes[2] = []outbound{{event: "result"}}
 		q.requeueLanes(&lanes)
 		select {

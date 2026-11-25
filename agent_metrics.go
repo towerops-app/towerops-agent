@@ -77,20 +77,22 @@ func (m *agentMetrics) scheduleLagP95() (uint64, bool) {
 
 // metricsSnapshot is a consistent point-in-time copy of the engine counters.
 type metricsSnapshot struct {
-	SNMPTimeouts      uint64
-	RateLimitWaitMS   uint64
-	SkippedTicks      uint64
-	ScheduleLagMS     uint64
-	HasScheduleLag    bool
-	ResultDropped     uint64
-	TrapsDropped      uint64
-	PingLocalErrors   uint64
-	SpoolDepth        uint64
-	SpoolBytes        uint64
-	SpoolLimit        uint64
-	Pools             []poolLoadSnapshot
-	InventoryCapacity uint64
-	PingExecFallback  uint64
+	SNMPTimeouts       uint64
+	RateLimitWaitMS    uint64
+	SkippedTicks       uint64
+	ScheduleLagMS      uint64
+	HasScheduleLag     bool
+	ResultDropped      uint64
+	TrapsDropped       uint64
+	TrapsRateLimited   uint64
+	TrapsEncodeDropped uint64
+	PingLocalErrors    uint64
+	SpoolDepth         uint64
+	SpoolBytes         uint64
+	SpoolLimit         uint64
+	Pools              []poolLoadSnapshot
+	InventoryCapacity  uint64
+	PingExecFallback   uint64
 }
 
 type poolLoadSnapshot struct {
@@ -113,15 +115,17 @@ func poolLoadSnapshots() []poolLoadSnapshot {
 func (m *agentMetrics) snapshot() metricsSnapshot {
 	lag, hasLag := m.scheduleLagP95()
 	return metricsSnapshot{
-		SNMPTimeouts:     m.snmpTimeouts.Load(),
-		RateLimitWaitMS:  m.rateLimitWaitNs.Load() / uint64(time.Millisecond),
-		SkippedTicks:     m.skippedTicks.Load(),
-		ScheduleLagMS:    lag,
-		HasScheduleLag:   hasLag,
-		ResultDropped:    resultQueueDroppedTotal.Load(),
-		TrapsDropped:     trapDroppedTotal.Load(),
-		PingExecFallback: m.pingExecFallback.Load(),
-		PingLocalErrors:  m.pingLocalErrors.Load(),
+		SNMPTimeouts:       m.snmpTimeouts.Load(),
+		RateLimitWaitMS:    m.rateLimitWaitNs.Load() / uint64(time.Millisecond),
+		SkippedTicks:       m.skippedTicks.Load(),
+		ScheduleLagMS:      lag,
+		HasScheduleLag:     hasLag,
+		ResultDropped:      resultQueueDroppedTotal.Load(),
+		TrapsDropped:       trapDroppedTotal.Load(),
+		TrapsRateLimited:   trapRateLimitedTotal.Load(),
+		TrapsEncodeDropped: trapEncodeDroppedTotal.Load(),
+		PingExecFallback:   m.pingExecFallback.Load(),
+		PingLocalErrors:    m.pingLocalErrors.Load(),
 	}
 }
 
@@ -133,6 +137,8 @@ func formatMetrics(snapshot metricsSnapshot, poolLoads []poolLoadSnapshot) strin
 	fmt.Fprintf(&b, "schedule_lag_ms_p95 %d\n", snapshot.ScheduleLagMS)
 	fmt.Fprintf(&b, "results_dropped %d\n", snapshot.ResultDropped)
 	fmt.Fprintf(&b, "traps_dropped %d\n", snapshot.TrapsDropped)
+	fmt.Fprintf(&b, "traps_rate_limited %d\n", snapshot.TrapsRateLimited)
+	fmt.Fprintf(&b, "traps_encode_dropped %d\n", snapshot.TrapsEncodeDropped)
 	fmt.Fprintf(&b, "ping_exec_fallback %d\n", snapshot.PingExecFallback)
 	fmt.Fprintf(&b, "ping_local_errors %d\n", snapshot.PingLocalErrors)
 	fmt.Fprintf(&b, "spool_depth %d\n", snapshot.SpoolDepth)
