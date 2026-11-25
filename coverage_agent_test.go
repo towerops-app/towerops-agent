@@ -93,8 +93,6 @@ func TestSessionStopDrainsPools(t *testing.T) {
 		readerDone:    readerDone,
 		results:       newResultQueueForAgentBytes(ctx, 1<<20),
 		inventoryWork: make(chan inventoryDecodeRequest),
-		jobCancel:     func() {},
-		ownsPools:     true,
 	}
 	s.scheduler = newRecurringScheduler(ctx, newManualScheduleClock())
 	pools := testPools(t)
@@ -203,7 +201,7 @@ func TestParseJoinReplyMsgErrors(t *testing.T) {
 }
 
 func TestParseJoinReplyLegacy(t *testing.T) {
-	if _, err := parseJoinReply([]byte(`{bad`), "t"); err == nil {
+	if _, err := decodeChannelFrame([]byte(`{bad`)); err == nil {
 		t.Error("bad frame must fail")
 	}
 }
@@ -224,16 +222,6 @@ func TestMarshalPhoenixEnvelopeErrors(t *testing.T) {
 	}
 }
 
-func TestMarshalChannelFrameV2Fallback(t *testing.T) {
-	// A topic over the V2 field bound falls back to the V1 JSON envelope.
-	_, data, binary := marshalChannelFrameV2(strings.Repeat("t", 300), "e", "j", json.RawMessage(`{}`), nil, true)
-	if binary {
-		t.Error("oversized field must not produce a binary frame")
-	}
-	if len(data) == 0 || data[0] == 0 {
-		t.Error("fallback must be the JSON envelope")
-	}
-}
 
 func badProtoMessage() proto.Message {
 	// 0xFF is invalid UTF-8: proto.Marshal rejects it deterministically.
@@ -560,22 +548,6 @@ func TestResultQueueBatchAndRing(t *testing.T) {
 		}
 	})
 
-	t.Run("count-mode releaseCapacity frees slots", func(t *testing.T) {
-		q := newResultQueue(4)
-		q.slots <- struct{}{}
-		q.releaseCapacity(outbound{}, false)
-		q.reservedSlots <- struct{}{}
-		q.releaseCapacity(outbound{reservedSlot: true}, false)
-	})
-
-	t.Run("count-mode ack frees slots", func(t *testing.T) {
-		q := newResultQueue(4)
-		q.slots <- struct{}{}
-		q.ack(outbound{})
-		q.reservedSlots <- struct{}{}
-		q.ack(outbound{reservedSlot: true})
-	})
-
 	t.Run("retryBatch preserves order", func(t *testing.T) {
 		q := newResultQueue(4)
 		q.retryBatch([]outbound{
@@ -879,7 +851,7 @@ func TestLoopReplyAndAck(t *testing.T) {
 		results := newResultQueueForAgentBytes(ctx, 1<<20)
 		s, end := loopSession(ctx, results)
 		ref := "11"
-		s.trackPending(ref, outbound{event: "result", payload: json.RawMessage(`{}`), sequence: 1})
+		s.trackPendingFrame(ref, []outbound{{event: "result", payload: json.RawMessage(`{}`), sequence: 1}})
 		if err := runLoopFor(t, s, end, func() {
 			payload, _ := json.Marshal(map[string]any{
 				"status":   "ok",
@@ -1038,7 +1010,7 @@ func TestPrunePendingExpired(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := &session{ctx: ctx, results: newResultQueue(4)}
-	s.trackPending("old", outbound{event: "result", payload: json.RawMessage(`{}`)})
+	s.trackPendingFrame("old", []outbound{{event: "result", payload: json.RawMessage(`{}`)}})
 	entry := s.pending["old"]
 	entry.sentAt = time.Now().Add(-2 * pendingReplyTTL)
 	s.pending["old"] = entry
@@ -1052,8 +1024,8 @@ func TestEvictOldestPending(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := &session{ctx: ctx, results: newResultQueue(4)}
-	s.trackPending("first", outbound{event: "result"})
-	s.trackPending("second", outbound{event: "result"})
+	s.trackPendingFrame("first", []outbound{{event: "result"}})
+	s.trackPendingFrame("second", []outbound{{event: "result"}})
 	s.evictOldestPending()
 	if _, ok := s.pending["first"]; ok {
 		t.Error("oldest must be evicted")

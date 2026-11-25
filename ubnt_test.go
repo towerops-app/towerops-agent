@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -526,8 +527,8 @@ func TestCollectUbntRepliesCapsPeers(t *testing.T) {
 // A full spool must not drop the whole sweep: send retries with a minimal,
 // all-agent-generated result (issue 5160).
 func TestExecuteUbntDiscoveryFallsBackWhenSpoolFull(t *testing.T) {
-	out := newResultQueue(1)
-	if !out.enqueue(outbound{event: "filler"}) {
+	out := newResultQueueForAgentBytes(context.Background(), 1)
+	if !out.enqueue(outbound{event: "filler", payload: json.RawMessage("x")}) {
 		t.Fatal("seed enqueue failed")
 	}
 

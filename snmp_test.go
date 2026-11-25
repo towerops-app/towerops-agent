@@ -1225,7 +1225,7 @@ func TestExecuteSnmpJob(t *testing.T) {
 			return mock, func() {}, nil
 		}
 
-		ch := newResultQueue(0) // no capacity - will remain full
+		ch := newResultQueueForAgentBytes(context.Background(), 1) // no capacity - will remain full
 		executeSnmpJob(context.Background(), &pb.AgentJob{
 			JobId:      "1",
 			SnmpDevice: &pb.SnmpDevice{Ip: "10.0.0.1"},

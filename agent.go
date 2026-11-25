@@ -56,9 +56,6 @@ var writeQueueTimeout = 5 * time.Second
 var agentIDCounter atomic.Uint64
 var processStart = time.Now()
 
-// resultDropLogInterval bounds repeated spool saturation logs.
-var resultDropLogInterval = time.Minute
-
 // successfulConnectionThreshold is how long a session must last before the
 // reconnect backoff is considered stale and reset to initialRetryDelay.
 var successfulConnectionThreshold = 30 * time.Second
@@ -81,11 +78,6 @@ var poolShutdownTimeout = 5 * time.Second
 const maxDecodedJobPayloadBytes = 10 << 20
 
 var maxEncodedJobPayloadBytes = base64.StdEncoding.EncodedLen(maxDecodedJobPayloadBytes)
-
-// resultQueueSize bounds the process-wide in-memory result backlog retained
-// across WebSocket reconnects. It exceeds the 420 slots the former per-type
-// result queues held together.
-const resultQueueSize = 512
 
 // overloadNoticeQueueSize bounds best-effort pool rejection notices separately
 // from completed results, so a large job push cannot consume the result spool.
@@ -162,9 +154,9 @@ type pendingResult struct {
 var pendingReplyTTL = 30 * time.Second
 
 // maxPendingResults caps pending by count. Every entry holds its result's
-// payload, and a fast uplink acks far more than the spool's 512 slots within
-// one TTL; without the cap that memory sits outside the spool's bound.
-const maxPendingResults = resultQueueSize
+// payload, and a fast uplink acks far more than 512 results within one TTL;
+// without the cap that memory sits outside the spool's byte bound.
+const maxPendingResults = 512
 
 // overloadRetryDelay spaces the retry of a result the server rejected as
 // "overloaded". Its ingest queue is full, so an immediate re-send lands on
@@ -287,10 +279,9 @@ type session struct {
 	// drains; cancel — via stop — is what actually ends it. jobCtx tracks the
 	// agent context: jobs and scheduled work die on shutdown while the spool
 	// flushes around them.
-	ctx       context.Context
-	cancel    context.CancelFunc
-	jobCtx    context.Context
-	jobCancel context.CancelFunc
+	ctx    context.Context
+	cancel context.CancelFunc
+	jobCtx context.Context
 
 	writeCh    chan writeRequest
 	msgCh      chan channelMsg
@@ -302,18 +293,15 @@ type session struct {
 	readerDone chan struct{}
 	writerDone chan struct{}
 
-	// pools and results exist only once the channel join has been accepted;
-	// see runSessionWithResultsAndScheduling. With a process poller they are
+	// pools and results exist only once the channel join has been accepted.
+	// With a process poller they are
 	// borrowed for the session's lifetime and survive its end (C1/D2).
 	pools     *jobPools
 	scheduler *recurringScheduler
 	results   *resultQueue
 	notices   <-chan outbound
 	// poller is the process-level poller this session transports, if any.
-	// ownsPools marks a session-built pool set that stop must drain (the
-	// compatibility path used by tests and non-poller callers).
-	poller    *processPoller
-	ownsPools bool
+	poller *processPoller
 
 	refCounter atomic.Uint64
 
@@ -349,22 +337,6 @@ type session struct {
 	// shutdown drain reads it from its own goroutine to log how many
 	// results it flushed.
 	ackedResults atomic.Uint64
-}
-
-// runSessionWithResultsAndScheduling is the compatibility entry point: it
-// builds a poller for this call only and tears it down when the session ends.
-// The production loop uses runSessionWithPoller so the poller outlives the
-// transport (C1/D2).
-func runSessionWithResultsAndScheduling(
-	ctx context.Context,
-	baseURL, token string,
-	traps <-chan *pb.SnmpTrap,
-	results *resultQueue,
-	localScheduling bool,
-) error {
-	poller := newProcessPoller(ctx, results, localScheduling)
-	defer poller.stop()
-	return runSessionWithPoller(ctx, baseURL, token, traps, results, poller)
 }
 
 // runSessionWithPoller runs one WebSocket session as a transport for the
@@ -560,37 +532,17 @@ func (s *session) fail(ch chan<- error, err error) {
 }
 
 // stop tears the session down within one shared shutdown budget: socket I/O
-// first, then any session-owned worker pools and scheduler, then both I/O
-// goroutines. A process-poller session stops only its transport; the poller
-// keeps polling across disconnects (C1/D2) and is drained by its own stop.
+// first, then the inventory worker and both I/O goroutines. A process-poller
+// session stops only its transport; the poller keeps polling across
+// disconnects (C1/D2) and is drained by its own stop.
 func (s *session) stop() {
 	s.cancel()
-	if s.jobCancel != nil {
-		s.jobCancel()
-	}
 	_ = s.ws.Close()
 
 	if s.inventoryWork != nil {
 		close(s.inventoryWork)
 	}
 
-	if s.ownsPools {
-		if s.scheduler != nil {
-			s.scheduler.cancelAll()
-		}
-		deadline := time.Now().Add(poolShutdownTimeout)
-		if s.pools != nil {
-			for _, name := range s.pools.stop(time.Until(deadline)) {
-				slog.Warn("worker pool shutdown timed out, abandoning in-flight jobs", "pool", name)
-			}
-		}
-		if s.scheduler != nil {
-			remaining := time.Until(deadline)
-			if remaining <= 0 || !s.scheduler.wait(remaining) {
-				slog.Warn("recurring scheduler shutdown timed out")
-			}
-		}
-	}
 	close(s.writeCh)
 	<-s.writerDone
 	<-s.readerDone
@@ -682,16 +634,6 @@ func marshalPhoenixEnvelope(
 	return buf, data, false, nil
 }
 
-// parseJoinReply validates a legacy JSON reply byte slice for callers that
-// only need the V1 validity check.
-func parseJoinReply(data []byte, topic string) ([]string, error) {
-	reply, err := decodeChannelFrame(data)
-	if err != nil {
-		return nil, fmt.Errorf("join reply unmarshal: %w", err)
-	}
-	return parseJoinReplyMsg(reply, topic)
-}
-
 // parseJoinReplyMsg validates an already kind-dispatched Phoenix frame. Both
 // V2 arrays/binary replies and a legacy V1 object reply produce channelMsg.
 func parseJoinReplyMsg(reply channelMsg, topic string) ([]string, error) {
@@ -727,13 +669,6 @@ func parseJoinReplyMsg(reply channelMsg, topic string) ([]string, error) {
 		return nil, refusedError{fmt.Errorf("join rejected: %s", status)}
 	}
 	return payloadStatus.Response.Capabilities, nil
-}
-
-// validateJoinReply preserves the pre-negotiation behavior for callers that
-// only need the validity check.
-func validateJoinReply(data []byte, topic string) error {
-	_, err := parseJoinReply(data, topic)
-	return err
 }
 
 func (s *session) nextRef() string {
@@ -797,33 +732,6 @@ func marshalChannelFrame(topic, event string, payload json.RawMessage, ref *stri
 	}
 	buf.WriteByte('}')
 	return buf, buf.Bytes()
-}
-
-// marshalChannelFrameV2 builds the V1-shaped message as a Phoenix V2 binary
-// frame when the session negotiated that transport, or falls back to the
-// JSON envelope for a legacy server.
-func marshalChannelFrameV2(
-	topic, event, joinRef string,
-	payload json.RawMessage,
-	ref *string,
-	v2 bool,
-) (*bytes.Buffer, []byte, bool) {
-	if !v2 {
-		buf, data := marshalChannelFrame(topic, event, payload, ref)
-		return buf, data, false
-	}
-	frameRef := ""
-	if ref != nil {
-		frameRef = *ref
-	}
-	buf, data, err := encodePhoenixV2Push(topic, event, joinRef, frameRef, payload)
-	if err != nil {
-		// A field over the V2 length bound is a programming error; legacy
-		// JSON encoding still gets the message out.
-		buf, data = marshalChannelFrame(topic, event, payload, ref)
-		return buf, data, false
-	}
-	return buf, data, true
 }
 
 // sendBinary queues a protobuf message. Capability servers receive the exact
@@ -905,7 +813,7 @@ func (s *session) queueResultFrame(results []outbound, event string, spooled boo
 	// refuses a batch whose first sequence is not above the position it has
 	// already handled, so every fresh batch was rejected as a duplicate (and
 	// the ack that would have released it never arrived).
-	if spooled && s.results.byteBounded() {
+	if spooled {
 		for i := range results {
 			if results[i].sequence == 0 {
 				results[i].sequence = s.results.nextSeq.Add(1)
@@ -981,9 +889,6 @@ func (s *session) queueResultFrame(results []outbound, event string, spooled boo
 // unholdSpooled removes held sequences before a retry re-enters the spool, so
 // capacity is not double-charged while the payload is retained.
 func (s *session) unholdSpooled(results []outbound) {
-	if !s.results.byteBounded() {
-		return
-	}
 	for _, result := range results {
 		s.results.unhold(result.sequence)
 	}
@@ -1055,7 +960,7 @@ func (s *session) resolveInFlight(w *inFlightWrite, err error) error {
 	}
 	if w.spooled {
 		s.ackedResults.Add(uint64(len(results)))
-		if s.results.byteBounded() && s.hasCapability(capabilityResultAck) {
+		if s.hasCapability(capabilityResultAck) {
 			// Held until result_ack; the ring releases the capacity.
 			slog.Debug("awaiting result ack", "event", w.event, "count", len(results))
 		} else {
@@ -1078,12 +983,8 @@ func (s *session) retryResults(results []outbound) {
 	if len(results) == 0 {
 		return
 	}
-	if s.results.byteBounded() {
-		s.unholdSpooled(results)
-		s.results.retryBatch(results)
-		return
-	}
-	s.results.retry(results[0])
+	s.unholdSpooled(results)
+	s.results.retryBatch(results)
 }
 
 func inFlightResults(w *inFlightWrite) []outbound {
@@ -1113,17 +1014,6 @@ func (s *session) settleInFlight(w *inFlightWrite) {
 			s.retryResults(inFlightResults(w))
 		}
 	}
-}
-
-// trackPending records a result under its message ref. Successful handle_in
-// calls produce no phx_reply, so expired entries are swept on the channel
-// heartbeat tick. Between sweeps the map is capped at maxPendingResults: at
-// the cap the oldest entry is evicted through the order ring (B8). The
-// evicted result was sent longest ago; a rejection for it arriving later is
-// ignored like any unknown ref.
-func (s *session) trackPending(ref string, result outbound) {
-	s.trackPendingFrame(ref, []outbound{result})
-	s.pending[ref] = pendingResult{result: result, seq: s.pending[ref].seq}
 }
 
 // evictOldestPending deletes the entry with the lowest insertion sequence via
@@ -1352,16 +1242,14 @@ func (s *session) handleResultReply(msg channelMsg) {
 // budget, and the queue clears their delivery sequences so they renumber in
 // send order (issue 5148).
 func (s *session) requeueRejected(results []outbound, delay time.Duration) {
-	if s.results.byteBounded() {
-		s.unholdSpooled(results)
-	}
+	s.unholdSpooled(results)
 	if delay > 0 {
 		for _, result := range results {
 			s.results.enqueueAfter(result, delay)
 		}
 		return
 	}
-	if s.results.byteBounded() && len(results) > 1 {
+	if len(results) > 1 {
 		if !s.results.enqueueBatch(results) {
 			slog.Error("result retry dropped, spool full",
 				"event", results[0].event, "count", len(results))
@@ -2028,1000 +1916,6 @@ func decodeBinaryPayload(event string, raw json.RawMessage, msg proto.Message) b
 	return true
 }
 
-// outbound is one pre-encoded result addressed to a Phoenix channel event.
-// The payload is built exactly once into a pooled buffer (B7): no protobuf
-// re-marshal, no base64 string, and no JSON map at enqueue time. It survives
-// reconnects without retaining mutable executor state. reserved marks results
-// on the bulk lane; reservedSlot records a legacy count spool lane.
-type outbound struct {
-	event string
-	// protoPayload is the exact protobuf bytes. It is the source of truth for
-	// result_batch envelopes and is wrapped into base64 JSON only for a
-	// single legacy/V2-text frame.
-	protoPayload []byte
-	// payload is a prebuilt legacy JSON frame payload, used by direct
-	// session tests and by inbound notices that do not originate from a
-	// proto.Message executor result.
-	payload      json.RawMessage
-	reserved     bool
-	reservedSlot bool
-	// attempts counts server-rejected deliveries; handleResultReply retries
-	// the first rejection and drops the second.
-	attempts int
-	// Delivery sequence, assigned in send order. The server acks results by
-	// sequence; requeued results are cleared and renumbered in send order
-	// (issue 5148).
-	sequence uint64
-	// Delivery lane. Lower is more urgent; see resultPriority.
-	lane uint8
-	// encodedBytes is the spool charge: the retained payload length.
-	encodedBytes int
-	// buf owns payload when it was built in a pooled buffer; release returns
-	// it once the server (legacy) or the storage ack (result_batch_v1)
-	// frees the result.
-	buf *bytes.Buffer
-}
-
-// wireSize charges the spool conservatively. A raw protobuf result may be
-// sent as raw result_batch now and replayed as base64 JSON after reconnect to
-// a legacy server, so charge the larger legacy wire representation.
-func (o *outbound) wireSize() int {
-	if len(o.protoPayload) > 0 {
-		encoded := base64.StdEncoding.EncodedLen(len(o.protoPayload))
-		return encoded + len(`{"binary":""}`)
-	}
-	return len(o.payload)
-}
-
-// resultQueue is a bounded process-wide spool. Two modes share one struct:
-//
-//   - byte mode (newResultQueueForAgentBytes) bounds retained payloads by
-//     encoded bytes (default 64 MB, --result-spool-bytes). Depth, byte usage
-//     and drops ride the heartbeat. Every result keeps a delivery sequence
-//     and stays in the sent ring until the server's cumulative ack arrives.
-//   - count mode (newResultQueueForAgent) preserves the historical behavior
-//     for callers that do not carry the runtime byte budget: a slot remains
-//     reserved while the session writer has a result in flight.
-//
-// Failed writes use a dedicated retry lane so they remain ahead of newer
-// queued measurements.
-type resultQueue struct {
-	items         chan outbound
-	slots         chan struct{}
-	reservedSlots chan struct{}
-	agentCtx      context.Context
-
-	// retryMu guards retries, the lane of failed frames kept ahead of newer
-	// spooled work. A slice rather than a channel: the lane must hold a whole
-	// result_batch frame (resultBatchMaxEnvelopes), and a bounded channel fed
-	// by the session loop itself deadlocks the loop when a frame is larger
-	// than the lane (issue 5147). Memory stays bounded because retried
-	// results keep the spool charge they already carried.
-	retryMu sync.Mutex
-	retries []outbound
-
-	// byte mode state.
-	byteLimit   int64
-	byteUsage   atomic.Int64
-	depth       atomic.Uint64
-	dropped     atomic.Uint64
-	nextSeq     atomic.Uint64
-	lastDropLog atomic.Int64
-
-	// trapUsage and trapLimit bound the encoded bytes traps may hold inside
-	// the shared spool, so a trap flood cannot evict measurement results
-	// (issue 5165). Only byte mode charges traps.
-	trapUsage atomic.Int64
-	trapLimit int64
-
-	// sent is the pending-ack ring (C4/B8): results the agent sent and the
-	// server has not yet acknowledged, ordered by sequence. head/count make
-	// cumulative acks an O(1) pop from the front instead of a full-map scan.
-	sentMu    sync.Mutex
-	sent      []outbound
-	sentHead  int
-	sentCount int
-}
-
-// resultIngressDepth bounds the queue handoff between producers and the
-// session loop in byte mode. The byte budget is the authoritative memory
-// bound; this only keeps the channel itself small while allowing the small
-// results that dominate a healthy fleet to use their full byte budget.
-const resultIngressDepth = 65536
-
-// newResultQueueForAgent creates the historical count-bounded spool.
-func newResultQueueForAgent(agentCtx context.Context, size int) *resultQueue {
-	reserved := size / 4
-	return &resultQueue{
-		items:         make(chan outbound, size),
-		slots:         make(chan struct{}, size-reserved),
-		reservedSlots: make(chan struct{}, reserved),
-		agentCtx:      agentCtx,
-	}
-}
-
-// newResultQueueForAgentBytes creates the byte-bounded spool (C2).
-func newResultQueueForAgentBytes(agentCtx context.Context, byteLimit int64) *resultQueue {
-	if byteLimit <= 0 {
-		byteLimit = defaultResultSpoolBytes
-	}
-	trapLimit := byteLimit / trapSpoolShare
-	if trapLimit > trapSpoolMaxBytes {
-		trapLimit = trapSpoolMaxBytes
-	}
-	if trapLimit < 1 {
-		trapLimit = 1
-	}
-	return &resultQueue{
-		items:     make(chan outbound, resultIngressDepth),
-		slots:     make(chan struct{}, resultIngressDepth),
-		agentCtx:  agentCtx,
-		byteLimit: byteLimit,
-		trapLimit: trapLimit,
-	}
-}
-
-const (
-	// trapSpoolShare is the fraction of the result spool traps may occupy;
-	// trapSpoolMaxBytes caps that budget absolutely. A flood may delay other
-	// traps, never measurements (issue 5165).
-	trapSpoolShare    = 8
-	trapSpoolMaxBytes = 8 << 20
-)
-
-// byteBounded reports which accounting mode the queue runs in.
-func (q *resultQueue) byteBounded() bool { return q.byteLimit > 0 }
-
-// enqueue queues one completed result, dropping the newest when the bound is
-// exhausted. In byte mode the result's lane is recorded before handoff; the
-// session loop picks lanes in priority order (C3).
-func (q *resultQueue) enqueue(result outbound) bool {
-	if q.byteBounded() {
-		// Delivery sequences are assigned in send order (queueResultFrame),
-		// not enqueue order: a priority result that jumps ahead of queued
-		// polls must not receive a later sequence than results the server
-		// has not been offered yet. Anything re-entering the spool is a
-		// replay from an earlier send position; its old sequence is already
-		// below the server's handled-through mark, so it is cleared and
-		// renumbered in send order (issue 5148).
-		result.sequence = 0
-		result.lane = resultPriority(result.event, result.reserved)
-		result.encodedBytes = result.wireSize()
-		trapCharged := false
-		if result.event == "trap" {
-			for {
-				current := q.trapUsage.Load()
-				if current+int64(result.encodedBytes) > q.trapLimit {
-					q.reportDrop("", result.event)
-					return false
-				}
-				if q.trapUsage.CompareAndSwap(current, current+int64(result.encodedBytes)) {
-					trapCharged = true
-					break
-				}
-			}
-		}
-		for {
-			current := q.byteUsage.Load()
-			if current+int64(result.encodedBytes) > q.byteLimit {
-				if trapCharged {
-					q.trapUsage.Add(-int64(result.encodedBytes))
-				}
-				q.reportDrop("", result.event)
-				return false
-			}
-			if q.byteUsage.CompareAndSwap(current, current+int64(result.encodedBytes)) {
-				break
-			}
-		}
-		q.depth.Add(1)
-		select {
-		case q.items <- result:
-			return true
-		default:
-			// The ingress channel is small and fixed; treat it as bound
-			// exhaustion rather than blocking a worker.
-			q.releaseCapacity(result, true)
-			q.reportDrop("", result.event)
-			return false
-		}
-	}
-
-	if result.reserved {
-		select {
-		case q.reservedSlots <- struct{}{}:
-			result.reservedSlot = true
-			q.items <- result
-			return true
-		default:
-		}
-	}
-	select {
-	case q.slots <- struct{}{}:
-		// A requeued reserved result can land here when its reserved lane
-		// is full; the flag must record the lane actually taken or ack
-		// releases the wrong token.
-		result.reservedSlot = false
-		q.items <- result
-		return true
-	default:
-		return false
-	}
-}
-
-// enqueueBatch reserves a place for every result of a batch at once, so a
-// batch is never half-dropped. The first failure rolls back the reservations
-// already taken and drops the whole frame.
-func (q *resultQueue) enqueueBatch(results []outbound) bool {
-	queued := make([]outbound, 0, len(results))
-	for _, result := range results {
-		if q.enqueue(result) {
-			// enqueue charges wireSize(), not the caller's encodedBytes; keep
-			// the charged value so rollback releases the exact same budget.
-			result.encodedBytes = result.wireSize()
-			queued = append(queued, result)
-			continue
-		}
-		for _, taken := range queued {
-			// Remove the just-queued copies; the caller retries the batch
-			// once capacity recovers. Buffers stay with the payloads.
-			q.releaseCapacity(taken, false)
-		}
-		return false
-	}
-	return true
-}
-
-// enqueueAfter queues result once delay has passed. The timer goroutine
-// holds the payload outside the spool until then; enqueue is safe from any
-// goroutine. The spool is process-wide, so the retry still lands when the
-// session that scheduled it has ended.
-func (q *resultQueue) enqueueAfter(result outbound, delay time.Duration) {
-	time.AfterFunc(delay, func() {
-		if !q.enqueue(result) && !q.byteBounded() {
-			q.reportDrop("", result.event)
-		}
-	})
-}
-
-// hold records a sent result in the pending-ack ring. Byte mode only: the
-// result's capacity stays charged until ackThrough/dropSent releases it.
-func (q *resultQueue) hold(result outbound) {
-	if !q.byteBounded() || result.sequence == 0 {
-		return
-	}
-	q.sentMu.Lock()
-	defer q.sentMu.Unlock()
-	if q.sentCount == len(q.sent) {
-		grown := make([]outbound, len(q.sent)*2+8)
-		for i := range q.sentCount {
-			grown[i] = q.sent[(q.sentHead+i)%len(q.sent)]
-		}
-		q.sent = grown
-		q.sentHead = 0
-	}
-	pos := (q.sentHead + q.sentCount) % len(q.sent)
-	q.sent[pos] = result
-	q.sentCount++
-}
-
-// ackThrough releases every held result up to and including the server's
-// cumulative storage sequence. Rejections can re-enter a lower sequence after
-// newer ones were sent, so the ring may contain holes: release any entry the
-// ack covers and compact the remainder. It returns the highest sequence
-// actually released.
-func (q *resultQueue) ackThrough(cumulative uint64) uint64 {
-	if !q.byteBounded() || cumulative == 0 {
-		return 0
-	}
-	q.sentMu.Lock()
-	defer q.sentMu.Unlock()
-	released := uint64(0)
-	kept := make([]outbound, 0, q.sentCount)
-	for i := range q.sentCount {
-		pos := (q.sentHead + i) % len(q.sent)
-		entry := q.sent[pos]
-		q.sent[pos] = outbound{}
-		if entry.sequence > cumulative {
-			kept = append(kept, entry)
-			continue
-		}
-		q.releaseLocked(entry, true)
-		if entry.sequence > released {
-			released = entry.sequence
-		}
-	}
-	copy(q.sent, kept)
-	// Clear the vacated tail so stale payloads never linger in the ring.
-	for i := len(kept); i < q.sentCount; i++ {
-		q.sent[i] = outbound{}
-	}
-	q.sentHead = 0
-	q.sentCount = len(kept)
-	return released
-}
-
-// dropSent releases one held result the server explicitly rejected. Used by
-// deterministic rejection handling: the result will never be stored, and
-// holding its bytes forever would leak the spool budget. Reports whether a
-// held entry was found and released, so a caller can skip a second release
-// for results that were never in the ring (issue 5151).
-func (q *resultQueue) dropSent(sequence uint64) bool {
-	if !q.byteBounded() || sequence == 0 {
-		return false
-	}
-	q.sentMu.Lock()
-	defer q.sentMu.Unlock()
-	for i := range q.sentCount {
-		pos := (q.sentHead + i) % len(q.sent)
-		if q.sent[pos].sequence == sequence {
-			q.releaseLocked(q.sent[pos], true)
-			q.sent[pos] = outbound{}
-			// Keep ordering dense: shift the tail one slot forward.
-			for j := i + 1; j < q.sentCount; j++ {
-				from := (q.sentHead + j) % len(q.sent)
-				to := (q.sentHead + j - 1) % len(q.sent)
-				q.sent[to] = q.sent[from]
-			}
-			last := (q.sentHead + q.sentCount - 1) % len(q.sent)
-			q.sent[last] = outbound{}
-			q.sentCount--
-			return true
-		}
-	}
-	return false
-}
-
-// releaseLocked frees a held result's capacity. returnBuf hands the pooled
-// payload buffer back to the pool; retry paths must pass false because the
-// same buffer carries the payload back into the spool.
-func (q *resultQueue) releaseLocked(result outbound, returnBuf bool) {
-	if result.event == "trap" {
-		q.trapUsage.Add(-int64(result.encodedBytes))
-	}
-	if remaining := q.byteUsage.Add(-int64(result.encodedBytes)); remaining < 0 {
-		// A negative balance means a result was released twice, which is a
-		// spool accounting bug, not load. The counter is left negative so the
-		// heartbeat reports the corruption rather than hiding it (issue 5151).
-		slog.Error("result spool byte usage went negative",
-			"remaining_bytes", remaining, "sequence", result.sequence)
-	}
-	q.depth.Add(^uint64(0))
-	if returnBuf && result.buf != nil {
-		putFrameBuffer(result.buf)
-	}
-}
-
-// unhold removes one held sequence before its retry re-enters the spool. The
-// payload buffer is retained: the retry sends the exact same bytes.
-func (q *resultQueue) unhold(sequence uint64) {
-	if !q.byteBounded() || sequence == 0 {
-		return
-	}
-	q.sentMu.Lock()
-	defer q.sentMu.Unlock()
-	for i := range q.sentCount {
-		pos := (q.sentHead + i) % len(q.sent)
-		if q.sent[pos].sequence == sequence {
-			q.releaseLocked(q.sent[pos], false)
-			q.sent[pos] = outbound{}
-			// Keep ordering dense: shift the tail one slot forward.
-			for j := i + 1; j < q.sentCount; j++ {
-				from := (q.sentHead + j) % len(q.sent)
-				to := (q.sentHead + j - 1) % len(q.sent)
-				q.sent[to] = q.sent[from]
-			}
-			last := (q.sentHead + q.sentCount - 1) % len(q.sent)
-			q.sent[last] = outbound{}
-			q.sentCount--
-			return
-		}
-	}
-}
-
-// releaseCapacity frees the retained capacity of a result without the sent
-// ring. returnBuf releases the pooled payload buffer only when the payload
-// is not about to retry.
-func (q *resultQueue) releaseCapacity(result outbound, returnBuf bool) {
-	if !q.byteBounded() {
-		if result.reservedSlot {
-			<-q.reservedSlots
-			return
-		}
-		<-q.slots
-		return
-	}
-	if result.event == "trap" {
-		q.trapUsage.Add(-int64(result.encodedBytes))
-	}
-	if remaining := q.byteUsage.Add(-int64(result.encodedBytes)); remaining < 0 {
-		slog.Error("result spool byte usage went negative",
-			"remaining_bytes", remaining, "sequence", result.sequence)
-	}
-	q.depth.Add(^uint64(0))
-	if returnBuf && result.buf != nil {
-		putFrameBuffer(result.buf)
-	}
-}
-
-// ack releases a result the writer acknowledged. Legacy count mode frees the
-// slot here; byte mode leaves the charge to the server's storage ack.
-func (q *resultQueue) ack(result outbound) {
-	if q.byteBounded() {
-		// A direct consumer (tests) acks without the server path; keep the
-		// budget consistent rather than leaking it. The release is exclusive:
-		// a result still held in the sent ring is freed there, and only a
-		// result the ring never saw takes the capacity path, or both run and
-		// byteUsage dives negative (issue 5151).
-		if !q.dropSent(result.sequence) {
-			q.releaseCapacity(result, true)
-		}
-		return
-	}
-	if result.reservedSlot {
-		<-q.reservedSlots
-		return
-	}
-	<-q.slots
-}
-
-// retry puts a failed frame's result back at the head of the spool. The lane
-// is the session loop's own deque, so it can never block its only consumer.
-func (q *resultQueue) retry(result outbound) {
-	// The retry goes out after whatever newer work was already framed, so a
-	// kept sequence would land below handled-through and the server would
-	// refuse the whole frame (issue 5148). It renumbers in send order.
-	result.sequence = 0
-	q.retryMu.Lock()
-	q.retries = append(q.retries, result)
-	q.retryMu.Unlock()
-}
-
-// retryBatch returns every result of a failed frame to the retry lane ahead
-// of newer work. It must never block: a frame can hold
-// resultBatchMaxEnvelopes results and the session loop is both the producer
-// and the only consumer (issue 5147).
-func (q *resultQueue) retryBatch(results []outbound) {
-	// Sequences are per-connection and assigned in send order; a retried
-	// frame is renumbered like any other requeue (issue 5148).
-	for i := range results {
-		results[i].sequence = 0
-	}
-	q.retryMu.Lock()
-	q.retries = append(q.retries, results...)
-	q.retryMu.Unlock()
-}
-
-func (q *resultQueue) takeRetry() (outbound, bool) {
-	q.retryMu.Lock()
-	defer q.retryMu.Unlock()
-	if len(q.retries) == 0 {
-		return outbound{}, false
-	}
-	result := q.retries[0]
-	q.retries[0] = outbound{}
-	q.retries = q.retries[1:]
-	return result, true
-}
-
-// requeueUnacked moves held, unacknowledged results back into the spool so a
-// reconnect resends them (C4). Sequences are per-connection, so the queue
-// clears them on re-entry and the replay renumbers in send order behind
-// whatever the outage already queued (issue 5148). The capacity is already
-// charged, so byte mode releases the held entry and re-enqueues the same
-// payload; a truly saturated spool drops it instead of leaking the ring.
-func (q *resultQueue) requeueUnacked() {
-	if !q.byteBounded() {
-		return
-	}
-	q.sentMu.Lock()
-	held := make([]outbound, 0, q.sentCount)
-	for i := range q.sentCount {
-		pos := (q.sentHead + i) % len(q.sent)
-		if q.sent[pos].sequence != 0 {
-			held = append(held, q.sent[pos])
-		}
-		q.sent[pos] = outbound{}
-	}
-	q.sentHead = 0
-	q.sentCount = 0
-	q.sentMu.Unlock()
-	for _, result := range held {
-		q.releaseLocked(result, false)
-		q.enqueue(result)
-	}
-}
-
-// requeueLanes returns results the loop staged but did not send before the
-// session ended. Byte mode releases and re-enqueues so a full spool applies
-// normal drop accounting; count mode still holds its slot token, so the
-// channel send is guaranteed room.
-func (q *resultQueue) requeueLanes(lanes *[5][]outbound) {
-	for lane := range lanes {
-		for _, result := range lanes[lane] {
-			if q.byteBounded() {
-				q.releaseCapacity(result, false)
-				q.enqueue(result)
-				continue
-			}
-			q.items <- result
-		}
-		lanes[lane] = nil
-	}
-}
-
-// empty reports whether nothing is queued, in flight or awaiting an ack.
-// Shared by the self-update drain and the shutdown drain.
-func (q *resultQueue) empty() bool {
-	if q.byteBounded() {
-		q.sentMu.Lock()
-		pendingAcks := q.sentCount
-		q.sentMu.Unlock()
-		q.retryMu.Lock()
-		retryLen := len(q.retries)
-		q.retryMu.Unlock()
-		return pendingAcks == 0 && len(q.items) == 0 && retryLen == 0
-	}
-	return len(q.items) == 0 && len(q.slots) == 0 && len(q.reservedSlots) == 0
-}
-
-// jobPools holds the worker pools for each job type and the per-target
-// semaphores that serialize jobs for the same device across all of them.
-type jobPools struct {
-	snmp            *workerPool
-	mikrotik        *workerPool
-	ping            *workerPool
-	checks          *workerPool
-	backup          *workerPool
-	ubnt            *workerPool
-	notices         chan outbound
-	scheduler       *recurringScheduler
-	targets         *targetGates
-	localScheduling bool
-	// pingEngine is owned by this poller: it starts in newProcessPoller and
-	// is shut down inside stop(), so a rebuilt poller never shares an engine
-	// with the one still draining.
-	pingEngine *pingEngine
-
-	// stopAccepting is set during a self-update drain so the session refuses
-	// new job and check submissions while the spool flushes. In-flight work
-	// keeps running so its results can still reach the spool.
-	stopAccepting atomic.Bool
-
-	// Inventory reconciliation state (issue #2755): the newest authoritative
-	// inventory revision the agent applied and the name of the last
-	// inventory frame it refused. Both ride the heartbeat so the server can
-	// re-push a schedule that never landed instead of paging overdue on
-	// every device the missed frame covered.
-	appliedRevision   atomic.Uint64
-	rejectedInventory atomic.Value // string; "" means nothing outstanding
-}
-
-// loadSnapshots samples every pool for the heartbeat and the debug page.
-func (p *jobPools) loadSnapshots() []poolLoadSnapshot {
-	if p == nil {
-		return nil
-	}
-	definitions := []struct {
-		name string
-		pool *workerPool
-	}{
-		{"snmp", p.snmp}, {"mikrotik", p.mikrotik}, {"ping", p.ping},
-		{"checks", p.checks}, {"backup", p.backup}, {"ubnt", p.ubnt},
-	}
-	loads := make([]poolLoadSnapshot, 0, len(definitions))
-	for _, definition := range definitions {
-		if definition.pool == nil {
-			continue
-		}
-		stats := definition.pool.stats()
-		loads = append(loads, poolLoadSnapshot{
-			Name:   definition.name,
-			Busy:   uint64(stats.Busy),
-			Queued: uint64(stats.Queued),
-		})
-	}
-	return loads
-}
-
-// idle reports whether every pool has finished all admitted work.
-func (p *jobPools) idle() bool {
-	for _, pool := range p.all() {
-		if pool != nil && !pool.idle() {
-			return false
-		}
-	}
-	return true
-}
-
-// pause stops every pool from admitting new work; see workerPool.pause.
-func (p *jobPools) pause() {
-	for _, pool := range p.all() {
-		if pool != nil {
-			pool.pause()
-		}
-	}
-}
-
-func (p *jobPools) all() []*workerPool {
-	return []*workerPool{p.snmp, p.mikrotik, p.ping, p.checks, p.backup, p.ubnt}
-}
-
-func (p *jobPools) stop(timeout time.Duration) []string {
-	pools := map[string]*workerPool{
-		"snmp": p.snmp, "mikrotik": p.mikrotik, "ping": p.ping, "checks": p.checks,
-		"backup": p.backup, "ubnt": p.ubnt,
-	}
-	done := make(chan string, len(pools))
-	for name, pool := range pools {
-		if pool == nil {
-			// Partially-constructed pools (tests) have nothing to drain.
-			done <- name
-			continue
-		}
-		go func() {
-			pool.stop()
-			done <- name
-		}()
-	}
-
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	for len(pools) > 0 {
-		select {
-		case name := <-done:
-			delete(pools, name)
-		case <-timer.C:
-			timedOut := make([]string, 0, len(pools))
-			for name := range pools {
-				timedOut = append(timedOut, name)
-			}
-			slices.Sort(timedOut)
-			return timedOut
-		}
-	}
-	return nil
-}
-
-// applyInventoryRevision records the newest authoritative inventory revision
-// the agent accepted (issue #2755). Jobs and check_jobs share one revision
-// stream, so the stamp is monotonic per connection and a replayed or
-// reordered frame can only move it forward. The refused-frame marker is
-// cleared only when the refused frame type itself applies: otherwise a
-// successful apply of the other type would report the refused stream as
-// reconciled and the server would never re-push it. While a refusal is
-// outstanding the applied stamp is held back entirely, keeping the server's
-// re-push logic (applied_revision trailing what it sent) active.
-func (p *jobPools) applyInventoryRevision(event string, revision uint64) {
-	if revision == 0 {
-		return
-	}
-	rejected, _ := p.rejectedInventory.Load().(string)
-	if rejected != "" && rejected != event {
-		// A different frame type is still refused. Do not advance the stamp:
-		// reporting this apply as reconciliation would tell the server the
-		// refused stream landed when it never did.
-		return
-	}
-	for {
-		current := p.appliedRevision.Load()
-		if revision <= current {
-			break
-		}
-		if p.appliedRevision.CompareAndSwap(current, revision) {
-			break
-		}
-	}
-	if rejected != "" {
-		p.rejectedInventory.Store("")
-	}
-}
-
-// rejectInventory marks an authoritative inventory frame ("jobs" or
-// "check_jobs") as refused: it arrived during the self-update drain or its
-// payload failed to decode. The next heartbeat reports the name so the
-// server records the refusal instead of silently re-pushing on a schedule
-// it believes landed (issue #2755).
-func (p *jobPools) rejectInventory(event string) {
-	if event == "" {
-		return
-	}
-	p.rejectedInventory.Store(event)
-}
-
-// dispatchJob routes a one-shot job to the appropriate worker pool.
-func dispatchJob(
-	ctx context.Context,
-	job *pb.AgentJob,
-	pools *jobPools,
-	out *resultQueue,
-) {
-	_ = submitJob(ctx, job, pools, out, func() {}, false)
-}
-
-func submitJob(
-	ctx context.Context,
-	job *pb.AgentJob,
-	pools *jobPools,
-	out *resultQueue,
-	done func(),
-	wait bool,
-) bool {
-	if pools.stopAccepting.Load() {
-		slog.Debug("job submission refused during self-update drain", "job_id", job.JobId)
-		done()
-		return false
-	}
-	slog.Debug("starting job", "job_id", job.JobId, "type", job.JobType)
-
-	if job.JobType == pb.JobType_CONFIG_BACKUP {
-		return submitConfigBackupJob(ctx, job, pools, out, done, wait)
-	}
-
-	task := func(execute func()) func() {
-		return func() {
-			defer done()
-			if ctx.Err() != nil {
-				return
-			}
-			// The "run" count lives here alone: executors record failure and
-			// partial outcomes but must never count the run, or a poll counts
-			// twice (issue 5168).
-			recordJobRun()
-			execute()
-		}
-	}
-
-	var pool *workerPool
-	var execute func()
-	switch job.JobType {
-	case pb.JobType_MIKROTIK:
-		pool = pools.mikrotik
-		execute = func() { executeMikrotikJob(ctx, job, out) }
-	case pb.JobType_TEST_CREDENTIALS:
-		pool = pools.snmp
-		execute = func() { executeCredentialTest(ctx, job, out) }
-	case pb.JobType_CREDENTIAL_PROBE:
-		pool = pools.snmp
-		execute = func() { executeCredentialProbe(ctx, job, out) }
-	case pb.JobType_UBNT_DISCOVERY:
-		// UDP broadcast, not SNMP: a dedicated small pool keeps a stuck
-		// collection window from holding an SNMP worker.
-		pool = pools.ubnt
-		execute = func() { executeUbntDiscovery(ctx, job, out) }
-	case pb.JobType_PING:
-		// Pings run on the shared ICMP engine instead of holding a worker
-		// for each timeout window. The worker closure returns as soon as the
-		// engine admits the round; the target gate is released by the
-		// engine's completion callback, so one target's active round still
-		// serializes later jobs without occupying a worker while ICMP waits.
-		if ctx.Err() != nil || pools.ping.refusing() {
-			done()
-			return false
-		}
-		pools.ping.dispatchGated(ctx, ctx, pools.targets, jobTargetKey(job),
-			dispatchJitter(),
-			func(release func()) {
-				if pools.pingEngine == nil || !submitPingJob(ctx, pools.pingEngine, job, out, func() {
-					release()
-					done()
-				}) {
-					release()
-					reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
-					done()
-				}
-			},
-			func(reason dispatchFailure) {
-				if reason != dispatchCancelled {
-					reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
-				}
-				done()
-			})
-		return true
-	case pb.JobType_DISCOVER, pb.JobType_POLL:
-		pool = pools.snmp
-		execute = func() { executeSnmpJob(ctx, job, out) }
-	default:
-		reportUnsupportedJob(ctx, pools.notices, job)
-		done()
-		return false
-	}
-
-	target := jobTargetKey(job)
-
-	if wait {
-		// Recurring schedulers already run one goroutine per assignment, so
-		// acquiring the gate here costs that goroutine, not a pool worker —
-		// and the blocked wait is itself the backpressure that stops stale
-		// polls of a dead device from piling up and later running back-to-back.
-		jitterDispatch(ctx, dispatchJitter())
-		release := pools.targets.acquire(ctx, target)
-		if release == nil {
-			done()
-			return false
-		}
-		if !pool.submitMode(ctx, func() { defer release(); task(execute)() }, true) {
-			release()
-			// A paused pool is a drain refusal, not saturation.
-			if !pool.paused.Load() {
-				reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
-			}
-			done()
-			return false
-		}
-		return true
-	}
-
-	// The one-shot path cannot block the session event loop, so jitter and
-	// the gate wait run off it in dispatchGated. Only jobs parked on a busy
-	// target hold a dispatch slot; an uncontended job is refused only when the
-	// pool queue is genuinely full. The jitter is read here — the coordinator
-	// reads no package globals, which keeps tests that restore
-	// dispatchJitterMax race-free.
-	pool.dispatchGated(ctx, ctx, pools.targets, target, dispatchJitter(),
-		func(release func()) { defer release(); task(execute)() },
-		func(reason dispatchFailure) {
-			if reason != dispatchCancelled {
-				reportPoolRejection(ctx, pools.notices, job.DeviceId, job.JobId, job.JobType.String())
-			}
-			done()
-		})
-	return true
-}
-
-// submitConfigBackupJob dispatches a CONFIG_BACKUP job with its own deadline.
-// Unlike the shared path, the job context is created at dispatch — the server
-// starts its dispatch sweep when the job is sent, so the pool queue, the
-// jitter delay, and the per-target gate all count against the same budget as
-// the SSH work. A job that burns its budget waiting for the gate still reports
-// TIMEOUT rather than never answering.
-func submitConfigBackupJob(
-	ctx context.Context,
-	job *pb.AgentJob,
-	pools *jobPools,
-	out *resultQueue,
-	done func(),
-	wait bool,
-) bool {
-	jobCtx, cancel := context.WithTimeout(ctx, configBackupTimeout(job))
-	report := func(code pb.ConfigBackupErrorCode, detail string) {
-		sendResult(ctx, out, "config_backup_result", &pb.ConfigBackupResult{
-			DeviceId:    job.DeviceId,
-			JobId:       job.JobId,
-			ErrorCode:   code,
-			ErrorDetail: detail,
-			Timestamp:   time.Now().Unix(),
-		}, job.JobId)
-		slog.Warn("config backup not completed",
-			"job_id", job.JobId,
-			"device_id", job.DeviceId,
-			"error_code", code.String(),
-			"detail", detail,
-		)
-	}
-
-	// Read the jitter here, not inside the coordinator: it must not touch
-	// package globals that tests restore from cleanup.
-	delay := dispatchJitter()
-	key := jobTargetKey(job)
-	task := func(release func()) {
-		defer release()
-		defer done()
-		defer cancel()
-		executeConfigBackupJobCtx(ctx, jobCtx, job, out)
-	}
-
-	if wait {
-		// Recurring backups run on their scheduler goroutine like submitJob's
-		// wait path: the jitter, gate and queue waits are the backpressure,
-		// so a busy dispatcher delays the backup instead of failing it.
-		jitterDispatch(jobCtx, delay)
-		release := pools.targets.acquire(jobCtx, key)
-		if release == nil {
-			cancel()
-			report(pb.ConfigBackupErrorCode_TIMEOUT, "job deadline expired waiting for the device")
-			done()
-			return false
-		}
-		if !pools.backup.submitMode(jobCtx, func() { task(release) }, true) {
-			release()
-			timedOut := errors.Is(jobCtx.Err(), context.DeadlineExceeded)
-			cancel()
-			if timedOut {
-				report(pb.ConfigBackupErrorCode_TIMEOUT, "job deadline expired waiting for a worker")
-			} else {
-				report(pb.ConfigBackupErrorCode_AGENT_BUSY, "")
-			}
-			done()
-			return false
-		}
-		return true
-	}
-
-	// The gate is acquired by the coordinator rather than a worker, so a
-	// device already mid-backup doesn't pin a backup-pool slot other devices
-	// could use.
-	pools.backup.dispatchGated(jobCtx, ctx, pools.targets, key, delay, task,
-		func(reason dispatchFailure) {
-			cancel()
-			switch reason {
-			case dispatchCancelled:
-				report(pb.ConfigBackupErrorCode_TIMEOUT, "job deadline expired waiting for the device")
-			case dispatchBacklogged:
-				report(pb.ConfigBackupErrorCode_AGENT_BUSY, "backup dispatcher saturated")
-			default:
-				report(pb.ConfigBackupErrorCode_AGENT_BUSY, "")
-			}
-			done()
-		})
-	return true
-}
-
-// jobTargetKey identifies the device a job runs against so jobs for the same
-// target serialize. The device IP is preferred; jobs without one fall back to
-// the server-assigned device ID, then the job ID. The key is per protocol,
-// not per job type: every SNMP job (POLL, DISCOVER, CREDENTIAL_PROBE,
-// TEST_CREDENTIALS) shares the bare key so a device never serves two SNMP
-// walks at once. PING (ICMP), CONFIG_BACKUP (SSH) and MIKROTIK (RouterOS API)
-// each get a namespace — a stalled poll must not delay the outage signal a
-// ping delivers, and a backup queued behind a running poll can wait out the
-// poll's whole deadline, longer than the backup's dispatch budget.
-func jobTargetKey(job *pb.AgentJob) string {
-	prefix := ""
-	switch job.JobType {
-	case pb.JobType_PING:
-		prefix = "ping:"
-	case pb.JobType_CONFIG_BACKUP:
-		prefix = "config_backup:"
-	case pb.JobType_MIKROTIK:
-		prefix = "mikrotik:"
-	}
-	if job.SnmpDevice != nil && job.SnmpDevice.Ip != "" {
-		return prefix + hostPortKey(job.SnmpDevice.Ip, job.SnmpDevice.Port)
-	}
-	if job.MikrotikDevice != nil && job.MikrotikDevice.Ip != "" {
-		return prefix + hostPortKey(job.MikrotikDevice.Ip, job.MikrotikDevice.Port)
-	}
-	if job.ConfigBackup != nil && job.ConfigBackup.Host != "" {
-		return prefix + hostPortKey(job.ConfigBackup.Host, job.ConfigBackup.SshPort)
-	}
-	// Probe jobs carry the target in their candidates (snmp_device is nil):
-	// key on the shared address so a probe cannot run concurrently with a
-	// poll or discovery on the same device.
-	if job.CredentialProbe != nil && len(job.CredentialProbe.Candidates) > 0 &&
-		job.CredentialProbe.Candidates[0].Ip != "" {
-		candidate := job.CredentialProbe.Candidates[0]
-		return prefix + hostPortKey(candidate.Ip, candidate.Port)
-	}
-	// UBNT jobs sweep a broadcast domain: key on the destination so two
-	// concurrent sweeps of the same domain serialize instead of doubling
-	// replies, while different domains run in parallel.
-	if job.UbntDiscovery != nil {
-		dest := job.UbntDiscovery.Target
-		if dest == "" {
-			dest = job.UbntDiscovery.BroadcastAddress
-		}
-		if dest != "" {
-			return "ubnt:" + hostPortKey(dest, job.UbntDiscovery.Port)
-		}
-	}
-	if job.DeviceId != "" {
-		return prefix + "device:" + job.DeviceId
-	}
-	return prefix + "job:" + job.JobId
-}
-
-// hostPortKey folds a non-default destination port into the target identity.
-// Two devices behind the same NAT address on different ports are different
-// targets; serializing them behind one gate is unnecessary and, for the load
-// harness, fatal on platforms without a 127/8 loopback alias for each device.
-func hostPortKey(host string, port uint32) string {
-	if port == 0 {
-		return host
-	}
-	return net.JoinHostPort(host, strconv.Itoa(int(port)))
-}
-
 // retryCeiling doubles the backoff ceiling, capped at maxRetryDelay. A
 // non-positive start is normalized to initialRetryDelay first. The jitter
 // lives in reconnectDelay: the ceiling itself stays deterministic.
@@ -3071,193 +1965,4 @@ func (e refusedError) Unwrap() error { return e.err }
 func isRefused(err error) bool {
 	var re refusedError
 	return errors.As(err, &re)
-}
-
-// base64BinaryPayload wraps exact protobuf bytes in the legacy channel object.
-// It is only used when an endpoint did not confirm the raw capability lane.
-func base64BinaryPayload(raw []byte) []byte {
-	encoded := base64.StdEncoding.EncodeToString(raw)
-	data := make([]byte, 0, len(encoded)+len(`{"binary":""}`))
-	data = append(data, `{"binary":"`...)
-	data = append(data, encoded...)
-	data = append(data, `"}`...)
-	return data
-}
-
-// encodeOutbound marshals one result and keeps its exact protobuf bytes.
-func encodeOutbound(event string, msg proto.Message, jobID string) (outbound, bool) {
-	if result, ok := msg.(*pb.SnmpResult); ok && result != nil {
-		result.ResultBytes = 0
-		base, err := proto.Marshal(result)
-		if err != nil {
-			slog.Error("marshal protobuf", "job_id", jobID, "event", event, "error", err)
-			return outbound{}, false
-		}
-		// Field 13 includes its own tag and varint in the reported size.
-		// Solve the small fixed point, then marshal the final form.
-		size := len(base) + 2
-		for {
-			next := len(base) + 1 + varintLen(size)
-			if next == size {
-				break
-			}
-			size = next
-		}
-		result.ResultBytes = uint32(size)
-	}
-	raw, err := proto.Marshal(msg)
-	if err != nil {
-		slog.Error("marshal protobuf", "job_id", jobID, "event", event, "error", err)
-		return outbound{}, false
-	}
-	return outbound{
-		event:        event,
-		protoPayload: raw,
-		reserved:     usesReservedLane(msg),
-	}, true
-}
-
-// usesReservedLane reports whether a result message carries data the server
-// cannot re-request — a discovery report or a config backup — and therefore
-// qualifies for the reserved spool lane.
-func usesReservedLane(msg proto.Message) bool {
-	switch m := msg.(type) {
-	case *pb.SnmpResult:
-		return m.JobType == pb.JobType_DISCOVER
-	case *pb.ConfigBackupResult:
-		return true
-	default:
-		return false
-	}
-}
-
-// sendResult queues a completed measurement for at-most-once WebSocket
-// delivery. Cancellation means no measurement was completed and is never
-// translated into a failure result.
-func sendResult(ctx context.Context, out *resultQueue, event string, msg proto.Message, jobID string) bool {
-	if ctx.Err() != nil {
-		if out.agentCtx.Err() != nil {
-			slog.Debug("result dropped, agent stopped", "job_id", jobID, "event", event)
-		} else {
-			slog.Debug("result discarded, job cancelled", "job_id", jobID, "event", event)
-		}
-		return false
-	}
-	result, ok := encodeOutbound(event, msg, jobID)
-	if !ok {
-		return false
-	}
-	if out.enqueue(result) {
-		return true
-	}
-	if out.agentCtx.Err() != nil {
-		slog.Debug("result dropped, agent stopped", "job_id", jobID, "event", event)
-		return false
-	}
-	out.reportDrop(jobID, event)
-	return false
-}
-
-func (q *resultQueue) reportDrop(jobID, event string) {
-	dropped := q.dropped.Add(1)
-	resultQueueDroppedTotal.Add(1)
-	recordJobDropped()
-	// Trap spool refusals are counted by the trap path with
-	// countTrapSpoolDrop; reportDrop stays generic so the same result is
-	// never added twice.
-	now := time.Now().UnixNano()
-	last := q.lastDropLog.Load()
-	if last != 0 && now-last < int64(resultDropLogInterval) {
-		return
-	}
-	if q.lastDropLog.CompareAndSwap(last, now) {
-		slog.Error("result buffer full - agent overloaded",
-			"job_id", jobID,
-			"event", event,
-			"dropped", dropped,
-		)
-	}
-}
-func reportUnsupportedJob(ctx context.Context, notices chan<- outbound, job *pb.AgentJob) {
-	jobType := strconv.FormatInt(int64(job.JobType), 10)
-	slog.Error("job dropped, unknown job type", "job_id", job.JobId, "type", jobType)
-	reportJobRejection(
-		ctx,
-		notices,
-		job.DeviceId,
-		job.JobId,
-		jobType,
-		"unsupported job type "+jobType,
-	)
-}
-
-func reportPoolRejection(
-	ctx context.Context,
-	notices chan<- outbound,
-	deviceID, jobID, jobType string,
-) {
-	message := "worker pool overloaded; retry " + jobType + " job"
-	slog.Warn("job rejected, pool full", "job_id", jobID, "type", jobType)
-	reportJobRejection(ctx, notices, deviceID, jobID, jobType, message)
-}
-
-func reportJobRejection(
-	ctx context.Context,
-	notices chan<- outbound,
-	deviceID, jobID, jobType, message string,
-) {
-	if ctx.Err() != nil {
-		slog.Debug("job rejected, session ended", "job_id", jobID, "type", jobType)
-		return
-	}
-	notice, ok := encodeOutbound("error", &pb.AgentError{
-		DeviceId:  deviceID,
-		JobId:     jobID,
-		Message:   message,
-		Timestamp: time.Now().Unix(),
-	}, jobID)
-	if !ok {
-		return
-	}
-	select {
-	case notices <- notice:
-	default:
-		slog.Warn("job rejection notice queue full, notification dropped", "job_id", jobID, "type", jobType)
-	}
-}
-
-func submitCheck(
-	ctx context.Context,
-	check *pb.Check,
-	pools *jobPools,
-	out *resultQueue,
-	done func(),
-	wait bool,
-) bool {
-	if pools.stopAccepting.Load() {
-		slog.Debug("check submission refused during self-update drain", "check", check.Id)
-		done()
-		return false
-	}
-	ok := pools.checks.submitMode(ctx, func() {
-		defer done()
-		if ctx.Err() != nil {
-			return
-		}
-		result := ExecuteCheck(ctx, check)
-		recordJobRun()
-		if result.Status != checkOK {
-			recordJobFailure()
-		}
-		slog.Debug("check complete", "check", result.CheckId, "status", result.Status)
-		sendResult(ctx, out, "check_result", result, check.Id)
-	}, wait)
-	if !ok {
-		// A paused pool is a drain refusal, not saturation.
-		if !pools.checks.paused.Load() {
-			reportPoolRejection(ctx, pools.notices, "", check.Id, "CHECK")
-		}
-		done()
-	}
-	return ok
 }

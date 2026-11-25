@@ -1358,7 +1358,7 @@ func TestHmExecuteMikrotikJobClosesConnOnContextCancel(t *testing.T) {
 	cancel()
 
 	// Unbuffered and unread: sendResult drops the result once ctx is done.
-	out := newResultQueue(0)
+	out := newResultQueueForAgentBytes(ctx, 1)
 	// Reads block forever unless context.AfterFunc closes the connection, so
 	// returning at all proves the cancellation hook fired.
 	executeMikrotikJob(ctx, &pb.AgentJob{

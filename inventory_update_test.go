@@ -55,7 +55,7 @@ func TestInventoryFullSyncAppliesAtomically(t *testing.T) {
 		notices:  make(chan outbound, 1),
 		targets:  &targetGates{},
 	}
-	results := newResultQueueForAgent(ctx, 8)
+	results := newResultQueueForAgentBytes(ctx, 8<<20)
 	scheduler := newRecurringScheduler(ctx, realScheduleClock{})
 	pools.scheduler = scheduler
 	defer scheduler.cancelAll()
@@ -110,7 +110,7 @@ func TestInventoryIncrementalUpsertPreservesUnchanged(t *testing.T) {
 		notices:  make(chan outbound, 1),
 		targets:  &targetGates{},
 	}
-	results := newResultQueueForAgent(ctx, 8)
+	results := newResultQueueForAgentBytes(ctx, 8<<20)
 	scheduler := newRecurringScheduler(ctx, realScheduleClock{})
 	pools.scheduler = scheduler
 	defer scheduler.cancelAll()

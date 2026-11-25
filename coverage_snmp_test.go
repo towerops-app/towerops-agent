@@ -285,7 +285,7 @@ func TestSnmpJobQuerierObservation(t *testing.T) {
 func TestExecuteSnmpJobSilentProbe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 	job := &pb.AgentJob{
 		JobId:      "cov-silent",
 		DeviceId:   "cov-silent-dev",
@@ -369,7 +369,7 @@ func TestSilentSNMPPingHintBounds(t *testing.T) {
 
 	t.Run("stale unreachable hint does not suppress the probe", func(t *testing.T) {
 		job := newJob("1")
-		out := newResultQueueForAgent(ctx, 8)
+		out := newResultQueueForAgentBytes(ctx, 8<<20)
 		t.Cleanup(func() {
 			resetSNMPDeviceState(job)
 			clearHint(job.DeviceId)
@@ -394,7 +394,7 @@ func TestSilentSNMPPingHintBounds(t *testing.T) {
 
 	t.Run("fresh unreachable hint skips only so many ticks", func(t *testing.T) {
 		job := newJob("2")
-		out := newResultQueueForAgent(ctx, 64)
+		out := newResultQueueForAgentBytes(ctx, 64<<20)
 		t.Cleanup(func() {
 			resetSNMPDeviceState(job)
 			clearHint(job.DeviceId)
@@ -415,7 +415,7 @@ func TestSilentSNMPPingHintBounds(t *testing.T) {
 
 	t.Run("ping already unreachable at silence bypasses the hint", func(t *testing.T) {
 		job := newJob("3")
-		out := newResultQueueForAgent(ctx, 8)
+		out := newResultQueueForAgentBytes(ctx, 8<<20)
 		t.Cleanup(func() {
 			resetSNMPDeviceState(job)
 			clearHint(job.DeviceId)
@@ -436,7 +436,7 @@ func TestSilentSNMPPingHintBounds(t *testing.T) {
 func TestExecuteSnmpJobDialAndDeadline(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 	job := &pb.AgentJob{
 		JobId:      "cov-dial",
 		DeviceId:   "cov-dial-dev",
@@ -464,7 +464,7 @@ func TestExecuteSnmpJobDialAndDeadline(t *testing.T) {
 func TestExecuteSnmpJobRateLimitedConn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := newResultQueueForAgent(ctx, 8)
+	out := newResultQueueForAgentBytes(ctx, 8<<20)
 	job := &pb.AgentJob{
 		JobId:      "cov-limited",
 		DeviceId:   "cov-limited-dev",

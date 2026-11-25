@@ -53,12 +53,12 @@ func TestResultBatchCarriesRawProtobuf(t *testing.T) {
 
 func TestPhoenixV2ClientPushGoldenFrame(t *testing.T) {
 	payload := []byte(`{"binary":"e30="}`)
-	buf, data, binaryFrame := marshalChannelFrameV2(
-		"agent:test", "result_batch", "1", payload, new("17"), true)
-	defer putFrameBuffer(buf)
-	if !binaryFrame {
-		t.Fatal("V2 negotiation produced a JSON frame")
+	buf, data, err := encodePhoenixV2Push(
+		"agent:test", "result_batch", "1", "17", payload)
+	if err != nil {
+		t.Fatalf("V2 push: %v", err)
 	}
+	defer putFrameBuffer(buf)
 
 	want := []byte{
 		0x00, // client push
@@ -571,15 +571,15 @@ func TestTrapSpoolBudgetReleasesOnSpoolFull(t *testing.T) {
 }
 
 func TestHasTrapRoomFor(t *testing.T) {
-	count := newResultQueueForAgent(context.Background(), 4)
-	if !count.hasTrapRoomFor(1) {
-		t.Error("empty count-mode spool must report trap room")
+	filled := newResultQueueForAgentBytes(context.Background(), 8<<10)
+	if !filled.hasTrapRoomFor(1) {
+		t.Error("empty spool must report trap room")
 	}
-	for i := 0; i < cap(count.items); i++ {
-		count.items <- outbound{}
+	for i := 0; i < cap(filled.items); i++ {
+		filled.items <- outbound{}
 	}
-	if count.hasTrapRoomFor(1) {
-		t.Error("full count-mode spool must report no trap room")
+	if filled.hasTrapRoomFor(1) {
+		t.Error("full spool must report no trap room")
 	}
 
 	q := newResultQueueForAgentBytes(context.Background(), 8192)

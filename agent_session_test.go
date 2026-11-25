@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -25,7 +26,7 @@ func runAgent(ctx context.Context, wsURL, token string, traps <-chan *pb.SnmpTra
 // runSession runs one WebSocket session with local recurring scheduling and
 // a fresh spool.
 func runSession(ctx context.Context, baseURL, token string, traps <-chan *pb.SnmpTrap) error {
-	return runSessionWithResults(ctx, baseURL, token, traps, newResultQueueForAgent(ctx, resultQueueSize))
+	return runSessionWithResults(ctx, baseURL, token, traps, newResultQueueForAgentBytes(ctx, resultSpoolByteLimit()))
 }
 
 func runSessionWithResults(
@@ -34,7 +35,9 @@ func runSessionWithResults(
 	traps <-chan *pb.SnmpTrap,
 	results *resultQueue,
 ) error {
-	return runSessionWithResultsAndScheduling(ctx, baseURL, token, traps, results, true)
+	poller := newProcessPoller(ctx, results, true)
+	defer poller.stop()
+	return runSessionWithPoller(ctx, baseURL, token, traps, results, poller)
 }
 
 // joinFrameTopic reads the agent's phx_join frame and returns its topic so a
@@ -61,11 +64,11 @@ func TestAbortDrainedSessionDuringShutdownKeepsShutdownDrain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	jobCtx, jobCancel := context.WithCancel(context.Background())
+	t.Cleanup(jobCancel)
 	s := &session{
 		ctx:        ctx,
 		cancel:     cancel,
 		jobCtx:     jobCtx,
-		jobCancel:  jobCancel,
 		results:    newResultQueue(4),
 		pools:      pools,
 		scheduler:  pools.scheduler,
@@ -102,7 +105,7 @@ func TestTrackPendingCapsEntriesByCount(t *testing.T) {
 	total := maxPendingResults + 10
 	for i := range total {
 		ref := strconv.Itoa(i)
-		s.trackPending(ref, outbound{event: "result"})
+		s.trackPendingFrame(ref, []outbound{{event: "result"}})
 		s.pending[ref] = pendingResult{result: s.pending[ref].result, sentAt: time.Now(), seq: s.pending[ref].seq}
 	}
 	if got := len(s.pending); got != maxPendingResults {
@@ -127,7 +130,7 @@ func TestHandleResultReplyDelaysOverloadedRetry(t *testing.T) {
 
 	results := newResultQueue(4)
 	s := &session{results: results}
-	s.trackPending("5", outbound{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)})
+	s.trackPendingFrame("5", []outbound{{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)}})
 	ref := "5"
 	start := time.Now()
 	s.handleResultReply(channelMsg{
@@ -154,11 +157,11 @@ func TestHandleResultReplyDelaysOverloadedRetry(t *testing.T) {
 // The delayed retry reports a full spool instead of blocking or panicking.
 func TestDelayedRetryDroppedWhenSpoolFull(t *testing.T) {
 	logs := agtCaptureLogs(t)
-	results := newResultQueue(1)
-	if !results.enqueue(outbound{event: "filler"}) {
+	results := newResultQueueForAgentBytes(context.Background(), 4)
+	if !results.enqueue(outbound{event: "filler", payload: json.RawMessage("xxxx")}) {
 		t.Fatal("seed enqueue failed")
 	}
-	results.enqueueAfter(outbound{event: "result"}, time.Millisecond)
+	results.enqueueAfter(outbound{event: "result", payload: json.RawMessage("x")}, time.Millisecond)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for !logs.has("result buffer full - agent overloaded") {
@@ -174,7 +177,7 @@ func TestDelayedRetryDroppedWhenSpoolFull(t *testing.T) {
 func TestHandleResultReplyDropsInvalidMessage(t *testing.T) {
 	results := newResultQueue(4)
 	s := &session{results: results}
-	s.trackPending("6", outbound{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)})
+	s.trackPendingFrame("6", []outbound{{event: "result", payload: json.RawMessage(`{"binary":"e30="}`)}})
 	ref := "6"
 	s.handleResultReply(channelMsg{
 		Ref:     &ref,
@@ -360,8 +363,8 @@ func TestValidateJoinReplyRejectsWrongTopic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateJoinReply(data, "agent:mine"); err == nil || !strings.Contains(err.Error(), "topic") {
-		t.Fatalf("validateJoinReply() error = %v, want a topic mismatch", err)
+	if err := testValidateJoinReply(data, "agent:mine"); err == nil || !strings.Contains(err.Error(), "topic") {
+		t.Fatalf("testValidateJoinReply() error = %v, want a topic mismatch", err)
 	}
 }
 
@@ -524,4 +527,15 @@ func TestRunAgentCancelWhileStoppedPollerDrains(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("runAgent did not return after ctx cancel")
 	}
+}
+
+// testValidateJoinReply checks a legacy JSON join reply byte slice the way the
+// deleted compatibility validator did: frame decode plus reply validation.
+func testValidateJoinReply(data []byte, topic string) error {
+	reply, err := decodeChannelFrame(data)
+	if err != nil {
+		return fmt.Errorf("join reply unmarshal: %w", err)
+	}
+	_, err = parseJoinReplyMsg(reply, topic)
+	return err
 }
