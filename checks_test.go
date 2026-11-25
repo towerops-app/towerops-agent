@@ -2019,11 +2019,42 @@ func TestSSLCheck_ConnectionFailure(t *testing.T) {
 		Port: 443,
 	}, 1000)
 
-	if status != 3 {
-		t.Fatalf("expected status 3 (UNKNOWN), got %d: %s", status, output)
+	if status != 2 {
+		t.Fatalf("expected status 2 (CRITICAL), got %d: %s", status, output)
 	}
 	if !strings.Contains(output, "Connection failed") {
 		t.Fatalf("expected connection failed message, got %s", output)
+	}
+}
+
+// TestSSLCheck_PlainTCPPortIsCritical: a service that accepts TCP but never
+// speaks TLS fails the handshake, which means the monitored service is down.
+// It must page as CRITICAL, matching the cloud executor, not sit at UNKNOWN
+// forever (issue 5140).
+func TestSSLCheck_PlainTCPPortIsCritical(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			// Answer the ClientHello with plain text so the handshake fails.
+			_, _ = conn.Write([]byte("hello\n"))
+			_ = conn.Close()
+		}
+	}()
+
+	status, output := executeSSLCheck(context.Background(), &pb.SslCheckConfig{
+		Host: "127.0.0.1",
+		Port: parsePort(portFromListener(ln)),
+	}, 5000)
+	if status != 2 {
+		t.Fatalf("expected status 2 (CRITICAL), got %d: %s", status, output)
 	}
 }
 
@@ -2077,8 +2108,8 @@ func TestSSLCheck_ClosedPort(t *testing.T) {
 		Port: port,
 	}, 2000)
 
-	if status != 3 {
-		t.Fatalf("expected status 3, got %d: %s", status, output)
+	if status != 2 {
+		t.Fatalf("expected status 2, got %d: %s", status, output)
 	}
 }
 
@@ -2553,8 +2584,8 @@ func TestChkTSSLCheckNonTLSConnection(t *testing.T) {
 		Port: 8443,
 	}, 5000)
 
-	if status != 3 {
-		t.Fatalf("expected status 3 for a non-TLS conn, got %d: %s", status, output)
+	if status != 2 {
+		t.Fatalf("expected status 2 for a non-TLS conn, got %d: %s", status, output)
 	}
 	if output != "Connection did not negotiate TLS" {
 		t.Fatalf("expected TLS negotiation output, got %s", output)
@@ -2579,8 +2610,8 @@ func TestChkTSSLCheckNoPeerCertificates(t *testing.T) {
 		Port: 9443,
 	}, 5000)
 
-	if status != 3 {
-		t.Fatalf("expected status 3 without peer certs, got %d: %s", status, output)
+	if status != 2 {
+		t.Fatalf("expected status 2 without peer certs, got %d: %s", status, output)
 	}
 	if output != "No certificate presented by certless.chkt.test:9443" {
 		t.Fatalf("expected no-certificate output, got %s", output)
