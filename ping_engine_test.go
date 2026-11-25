@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -125,6 +126,34 @@ func TestPingEngineTotalLoss(t *testing.T) {
 	}
 	if result.PacketLossPercent != 100 {
 		t.Errorf("loss: got %v, want 100", result.PacketLossPercent)
+	}
+}
+
+// One shared round deadline used to skip the late probes entirely and
+// shrink the rest: at a 200 ms timeout only one probe was ever sent, so a
+// healthy device reported a constant 66% loss (issue 5161). Every probe now
+// waits out the full timeout from its own send, so a 150 ms RTT reads as
+// zero loss at any timeout the server accepts.
+func TestPingEngineShortTimeoutNoFalseLoss(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing test skipped in short mode")
+	}
+	for _, timeoutMs := range []uint32{200, 500, 1000} {
+		t.Run(fmt.Sprintf("timeout_%dms", timeoutMs), func(t *testing.T) {
+			conn, out := peTSubmitJob(t, fmt.Sprintf("pe-short-%d", timeoutMs), timeoutMs)
+			for i := range pingProbeCount {
+				sent := tpTWaitSent(t, conn, i+1)
+				time.Sleep(150 * time.Millisecond)
+				peTInjectEchoReply(t, conn, sent[i].pkt)
+			}
+			result := sshTReceiveMonitoringResult(t, out)
+			if result.Status != "success" {
+				t.Errorf("status: got %q, want success at %dms timeout", result.Status, timeoutMs)
+			}
+			if result.PacketLossPercent != 0 {
+				t.Errorf("loss: got %v, want 0 at %dms timeout", result.PacketLossPercent, timeoutMs)
+			}
+		})
 	}
 }
 

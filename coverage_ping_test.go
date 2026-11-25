@@ -210,7 +210,6 @@ func newTestPingJob(t *testing.T, needsExec bool) (*pingEngine, *pingJob, *resul
 		needsExec: needsExec,
 		timeoutMs: 500,
 		timestamp: time.Now().Unix(),
-		deadline:  time.Now().Add(500 * time.Millisecond),
 		probes:    make([]pingProbe, pingProbeCount),
 	}
 	return e, pj, out
