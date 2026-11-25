@@ -2490,3 +2490,140 @@ func TestUpdateJoinedFallsBackToJoinTime(t *testing.T) {
 		t.Errorf("success result = %+v, want AttemptedAt 5000", res)
 	}
 }
+
+func TestWatchdogRollbackReexecsRestored(t *testing.T) {
+	origExe, origTimeout, origExec, origExit := osExecutable, updateJoinTimeout, syscallExec, osExit
+	defer func() {
+		osExecutable, updateJoinTimeout, syscallExec, osExit = origExe, origTimeout, origExec, origExit
+		armedUpdate.Store(nil)
+		logFlushHook.Store(nil)
+	}()
+	exePath := stageExecutable(t)
+	if err := os.WriteFile(exePath, []byte("unproven binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exePath+".prev", []byte("previous binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exePath+".update-pending", mustJSON(pendingUpdate{Version: "1.2.3"}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	osExecutable = func() (string, error) { return exePath, nil }
+
+	flushed := make(chan struct{}, 1)
+	flush := func() { flushed <- struct{}{} }
+	logFlushHook.Store(&flush)
+	executed := make(chan string, 1)
+	syscallExec = func(argv0 string, argv []string, envv []string) error {
+		executed <- argv0
+		return nil
+	}
+	exited := make(chan int, 1)
+	osExit = func(code int) { exited <- code }
+	updateJoinTimeout = 10 * time.Millisecond
+
+	_ = checkPendingUpdate()
+	select {
+	case got := <-executed:
+		if got != exePath {
+			t.Errorf("re-exec argv0 = %q, want restored binary %q", got, exePath)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("rollback never re-executed the restored binary")
+	}
+	select {
+	case <-flushed:
+	case <-time.After(time.Second):
+		t.Error("log sink was not flushed before the re-exec")
+	}
+	select {
+	case code := <-exited:
+		t.Fatalf("osExit(%d) ran after a successful re-exec", code)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestRollbackExecFailureFallsBackToExit(t *testing.T) {
+	origExe, origExec, origExit := osExecutable, syscallExec, osExit
+	defer func() {
+		osExecutable, syscallExec, osExit = origExe, origExec, origExit
+		logFlushHook.Store(nil)
+	}()
+	exePath := stageExecutable(t)
+	if err := os.WriteFile(exePath, []byte("unproven binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exePath+".prev", []byte("previous binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	osExecutable = func() (string, error) { return exePath, nil }
+
+	syscallExec = func(string, []string, []string) error { return errors.New("exec denied") }
+	exited := make(chan int, 1)
+	osExit = func(code int) { exited <- code }
+
+	rollbackAndRestart("watchdog fired")
+	select {
+	case code := <-exited:
+		if code != 1 {
+			t.Errorf("osExit code = %d, want 1", code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a failed re-exec did not fall back to exiting")
+	}
+}
+
+func TestRollbackRenameFailureSkipsReexec(t *testing.T) {
+	origExe, origRename, origExec, origExit := osExecutable, osRename, syscallExec, osExit
+	defer func() {
+		osExecutable, osRename, syscallExec, osExit = origExe, origRename, origExec, origExit
+		logFlushHook.Store(nil)
+	}()
+	exePath := stageExecutable(t)
+	osExecutable = func() (string, error) { return exePath, nil }
+	osRename = func(string, string) error { return errors.New("rename denied") }
+
+	executed := false
+	syscallExec = func(string, []string, []string) error { executed = true; return nil }
+	exited := make(chan int, 1)
+	osExit = func(code int) { exited <- code }
+
+	rollbackAndRestart("watchdog fired")
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("a failed restore did not exit")
+	}
+	if executed {
+		t.Error("the unproven binary was re-executed after a failed restore")
+	}
+}
+
+func TestRunMainCountsEarlyFailureAgainstPendingUpdate(t *testing.T) {
+	origExe := osExecutable
+	defer func() {
+		osExecutable = origExe
+		armedUpdate.Store(nil)
+		if timer := updateWatchdog.Swap(nil); timer != nil {
+			timer.Stop()
+		}
+	}()
+	exePath := stageExecutable(t)
+	osExecutable = func() (string, error) { return exePath, nil }
+	marker := exePath + ".update-pending"
+	if err := os.WriteFile(marker, mustJSON(pendingUpdate{Version: "1.2.3"}), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := runMain(context.Background(), []string{"--definitely-not-a-flag"}); code != 1 {
+		t.Fatalf("runMain = %d, want 1 for a bad flag", code)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored pendingUpdate
+	if err := json.Unmarshal(data, &stored); err != nil || stored.Attempts != 1 {
+		t.Fatalf("marker attempts = %+v, err %v; want 1 recorded attempt", stored, err)
+	}
+}
